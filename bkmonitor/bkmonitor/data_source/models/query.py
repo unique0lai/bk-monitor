@@ -126,6 +126,12 @@ class DataQuery(object):
 
     where = filter
 
+    def time_range(self, start_time: int = None, end_time: int = None):
+        clone = self._clone()
+        clone.query.start_time = start_time
+        clone.query.end_time = end_time
+        return clone
+
     def group_by(self, *field_names):
         clone = self._clone()
         clone.query.add_grouping(*field_names)

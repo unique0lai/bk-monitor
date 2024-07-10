@@ -93,10 +93,17 @@ class SQLCompiler(compiler.SQLCompiler):
             result["aggregations"] = aggregations
 
         # 2. parse filter & keywords_query_string
+        # 时间范围过滤
+        time_field = self.query.time_field or self.DEFAULT_TIME_FIELD
+        if self.query.start_time and time_field:
+            self.query.where.add(Q({f"{time_field}__gte": self.query.start_time}), Q.AND)
+        if self.query.end_time and time_field:
+            self.query.where.add(Q({f"{time_field}__lt": self.query.end_time}), Q.AND)
+
         query_content = {}
         filter_dict = self._parser_filter(self.query.where)
         if filter_dict:
-            query_content["filter"] = self._parser_filter(self.query.where)
+            query_content["filter"] = filter_dict
         if self.query.raw_query_string and self.query.raw_query_string != "*":
             query_content["must"] = {"query_string": {"query": self.query.raw_query_string}}
         query_content.update(self._parse_agg_condition())

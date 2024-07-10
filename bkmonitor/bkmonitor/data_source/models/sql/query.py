@@ -140,6 +140,9 @@ class Query(object):
         self.target_type = "ip"
         self.using = using
 
+        self.start_time = None
+        self.end_time = None
+
     def __str__(self):
         sql, params = self.sql_with_params()
         return sql % params

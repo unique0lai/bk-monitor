@@ -21,7 +21,6 @@ from bkmonitor.data_source.backends.base import compiler
 
 
 class SQLCompiler(compiler.SQLCompiler):
-
     TIME_SECOND_AGG_FIELD_RE = re.compile(r"time\((?P<second>\d+)s\)")
     SELECT_RE = re.compile(
         r"(?P<agg_method>[^\( ]+)[\( ]+" r"(?P<metric_field>[^\) ]+)[\) ]+" r"([ ]?as[ ]+(?P<metric_alias>[^ ]+))?"
@@ -178,6 +177,12 @@ class SQLCompiler(compiler.SQLCompiler):
             result["start_time"] = start_time // 1000
         if end_time:
             result["end_time"] = end_time // 1000
+
+        # time_range_filter
+        if self.query.start_time and time_field:
+            result["start_time"] = self.query.start_time // 1000
+        if self.query.end_time and time_field:
+            result["end_time"] = self.query.end_time // 100
 
         # 5. parse keywords_query_string
         filter_string = self._parse_filter(self.query.where)

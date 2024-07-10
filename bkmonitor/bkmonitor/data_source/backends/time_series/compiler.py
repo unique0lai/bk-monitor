@@ -8,7 +8,6 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
 """
-from collections import defaultdict
 from functools import reduce
 
 from django.db.models import Q
@@ -19,6 +18,8 @@ from constants.data_source import DataSourceLabel
 
 
 class SQLCompiler(compiler.SQLCompiler):
+    DEFAULT_TIME_FIELD = "time"
+
     def as_sql(self):
         result = ["SELECT"]
 
@@ -46,6 +47,14 @@ class SQLCompiler(compiler.SQLCompiler):
         q_object = self._parse_agg_condition()
         if q_object:
             clone_where.add(q_object, AND)
+
+        # 时间范围过滤
+        time_field = self.query.time_field or self.DEFAULT_TIME_FIELD
+        if self.query.start_time and time_field:
+            clone_where.add(Q({f"{time_field}__gte": self.query.start_time}), AND)
+        if self.query.end_time and time_field:
+            clone_where.add(Q({f"{time_field}__lt": self.query.end_time}), AND)
+
         params = []
         where, w_params = self.compile(clone_where)
         if where:

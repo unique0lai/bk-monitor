@@ -378,17 +378,12 @@ class DataSource(metaclass=ABCMeta):
                 metric["method"] = "AVG"
 
         # 过滤条件中添加时间字段
-        time_filter = {}
-
-        if start_time:
-            if interval and time_align:
+        if interval and time_align:
+            if start_time:
                 start_time = time_interval_align(start_time // 1000, interval) * 1000
 
-            time_filter[f"{time_field}__gte"] = start_time
-        if end_time:
-            if interval and time_align:
+            if end_time:
                 end_time = time_interval_align(end_time // 1000, interval) * 1000
-            time_filter[f"{time_field}__lt"] = end_time
 
         # 添加时间聚合字段
         if interval:
@@ -397,9 +392,6 @@ class DataSource(metaclass=ABCMeta):
         q = DataQueryHandler(cls.data_source_label, cls.data_type_label)
         if where:
             q = q.where(dict_to_q(where))
-
-        if time_filter:
-            q = q.where(**time_filter)
 
         return (
             q.select(*select)
@@ -414,6 +406,7 @@ class DataSource(metaclass=ABCMeta):
             .slimit(slimit)
             .offset(offset)
             .time_field(time_field)
+            .time_range(start_time, end_time)
         )
 
     def _format_time_series_records(self, records: List[Dict]):
