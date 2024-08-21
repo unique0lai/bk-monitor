@@ -404,6 +404,7 @@ def escape_markdown(value):
         value = value.replace("`", r"\`")
         value = value.replace(" _", r" \_")
 
+        # 处理markdown的[]()语法
         new_value = ""
         last_end = 0
         for match in re.finditer(r"\[([^\]]*?)\]\(([^\)]*?)\)", value):
