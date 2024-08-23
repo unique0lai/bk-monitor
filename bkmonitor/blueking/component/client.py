@@ -92,21 +92,26 @@ class BaseComponentClient(object):
             data = json.dumps(_data)
         return params, data
 
-    def add_apigw_auth_header(self, headers):
+    def add_apigw_auth_header(self, headers, params, data):
         """Add apigw authorization header"""
         headers = headers.copy()
-        params = {"bk_app_code": self.app_code, "bk_app_secret": self.app_secret}
+        auth_info = {"bk_app_code": self.app_code, "bk_app_secret": self.app_secret}
 
-        if "bk_username" in self.common_args:
-            params["bk_username"] = self.common_args["bk_username"]
+        # find bk_username, bk_token, access_token
+        keys = ["bk_username", "bk_token", "access_token"]
+        args_list = [self.common_args]
+        if params:
+            args_list.append(params)
+        if data:
+            args_list.append(data)
 
-        if "bk_token" in self.common_args:
-            params["bk_token"] = self.common_args["bk_token"]
+        for key in keys:
+            for args in args_list:
+                if key in args:
+                    auth_info[key] = args[key]
+                    break
 
-        if "access_token" in self.common_args:
-            params["access_token"] = self.common_args["access_token"]
-
-        headers["x-bkapi-authorization"] = json.dumps(params)
+        headers["x-bkapi-authorization"] = json.dumps(auth_info)
         return headers
 
     def request(self, method, url, params=None, data=None, **kwargs):
