@@ -7,7 +7,7 @@ from urllib.parse import quote
 from pyppeteer.browser import Browser, Page
 from pyppeteer.errors import TimeoutError
 
-from alarm_backends.service.report.utils import get_browser
+from bkmonitor.browser import get_browser
 from core.errors.common import CustomError
 
 logger = logging.getLogger("alarm_backends")

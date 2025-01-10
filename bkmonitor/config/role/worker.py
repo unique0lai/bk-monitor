@@ -382,7 +382,6 @@ def get_logger_config(log_path, logger_level, log_file_prefix):
             "celery": LOGGER_DEFAULT,
             "kubernetes": LOGGER_DEFAULT,
             "metadata": {"level": LOGGER_LEVEL, "propagate": False, "handlers": ["metadata"]},
-            "image_exporter": {"level": LOGGER_LEVEL, "propagate": False, "handlers": ["image_exporter"]},
         },
         "handlers": {
             "console": {"class": "logging.StreamHandler", "level": "DEBUG", "formatter": "standard"},
@@ -391,13 +390,6 @@ def get_logger_config(log_path, logger_level, log_file_prefix):
                 "level": "DEBUG",
                 "formatter": "standard",
                 "filename": os.path.join(log_path, f"{log_file_prefix}kernel.log"),
-                "encoding": "utf-8",
-            },
-            "image_exporter": {
-                "class": "logging.handlers.WatchedFileHandler",
-                "level": "DEBUG",
-                "formatter": "standard",
-                "filename": os.path.join(log_path, f"{log_file_prefix}kernel_image_exporter.log"),
                 "encoding": "utf-8",
             },
             "metadata": {

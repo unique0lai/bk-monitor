@@ -8,10 +8,12 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
 """
+import base64
 import datetime
 import json
 import logging
 import os
+import tempfile
 
 import arrow
 import pytz
@@ -22,9 +24,7 @@ from django.utils.translation import gettext as _
 from alarm_backends.constants import CONST_ONE_DAY
 from alarm_backends.core.control.item import Item
 from alarm_backends.core.i18n import i18n
-from alarm_backends.service.scheduler.tasks.image_exporter import (
-    render_html_string_to_graph,
-)
+from bkmonitor.browser import get_browser, get_or_create_eventloop
 from bkmonitor.utils import time_tools
 from constants.data_source import DataTypeLabel
 from constants.strategy import AGG_METHOD_REAL_TIME
@@ -33,14 +33,54 @@ from core.unit import load_unit
 logger = logging.getLogger("fta_action.run")
 
 
-def get_chart_image(chart_data):
+async def render_html(html_file_path: str) -> bytes:
+    """
+    渲染html字符串为图片
+    """
+    browser = await get_browser()
+
+    # 打开页面
+    page = await browser.newPage()
+    await page.goto(html_file_path)
+
+    # 设置页面大小
+    await page.setViewport({"width": 900, "height": 600, "deviceScaleFactor": 2})
+
+    # 等待页面加载完成
+    await page.waitForSelector('.highcharts-container', {'timeout': 10000})  # 等待图表容器加载
+
+    # 额外等待一段时间确保动画完成
+    await page.waitForTimeout(100)
+
+    # 截图
+    img_bytes = await page.screenshot({"type": "jpeg", "quality": 90})
+
+    # 关闭页面
+    await page.close()
+
+    return img_bytes
+
+
+def get_chart_image(chart_data) -> str:
     try:
         template_path = os.path.join(settings.BASE_DIR, "alarm_backends", "templates", "image_exporter")
         template = get_template("image_exporter/graph.html")
         html_string = template.render({"context": json.dumps(chart_data)})
-        return render_html_string_to_graph(html_string, template_path)
+
+        # 将html写入临时文件，并使用浏览器渲染
+        with tempfile.NamedTemporaryFile(prefix="tmp_chart_image_", dir=template_path, suffix=".html") as f:
+            f.write(html_string.encode("utf-8"))
+            f.flush()
+
+            loop = get_or_create_eventloop()
+            img_bytes = loop.run_until_complete(render_html(f.name))
+
+            # 转换为base64
+            img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+            return img_base64
     except Exception as e:
-        logger.error("get_chart_image fail", e)
+        logger.error("get_chart_image fail: %s", e)
+        return ""
 
 
 def get_chart_by_origin_alarm(item, source_time, title=""):
