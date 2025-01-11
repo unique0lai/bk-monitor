@@ -43,13 +43,13 @@ async def render_html(html_file_path: str) -> Optional[bytes]:
 
     # 打开页面
     page = await browser.newPage()
-    await page.goto(html_file_path)
+    await page.goto(f"file://{html_file_path}")
 
     # 设置页面大小
-    await page.setViewport({"width": 950, "height": 400, "deviceScaleFactor": 2})
+    await page.setViewport({"width": 1520, "height": 635, "deviceScaleFactor": 1})
 
     # 等待页面加载完成
-    await page.waitForSelector('.highcharts-container', {'timeout': 10000})  # 等待图表容器加载
+    await page.waitForSelector('.highcharts-container', {'timeout': 1000})  # 等待图表容器加载
 
     # 额外等待一段时间确保动画完成
     await asyncio.sleep(0.1)
