@@ -8,12 +8,14 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
 """
+import asyncio
 import base64
 import datetime
 import json
 import logging
 import os
 import tempfile
+from typing import Optional
 
 import arrow
 import pytz
@@ -33,7 +35,7 @@ from core.unit import load_unit
 logger = logging.getLogger("fta_action.run")
 
 
-async def render_html(html_file_path: str) -> bytes:
+async def render_html(html_file_path: str) -> Optional[bytes]:
     """
     渲染html字符串为图片
     """
@@ -44,19 +46,26 @@ async def render_html(html_file_path: str) -> bytes:
     await page.goto(html_file_path)
 
     # 设置页面大小
-    await page.setViewport({"width": 900, "height": 600, "deviceScaleFactor": 2})
+    await page.setViewport({"width": 950, "height": 400, "deviceScaleFactor": 2})
 
     # 等待页面加载完成
     await page.waitForSelector('.highcharts-container', {'timeout': 10000})  # 等待图表容器加载
 
     # 额外等待一段时间确保动画完成
-    await page.waitForTimeout(100)
+    await asyncio.sleep(0.1)
+
+    panel = await page.querySelector(".chart-contain")
+    if not panel:
+        return
 
     # 截图
-    img_bytes = await page.screenshot({"type": "jpeg", "quality": 90})
+    img_bytes = await panel.screenshot({"type": "jpeg", "quality": 85})
 
     # 关闭页面
-    await page.close()
+    try:
+        await page.close()
+    except Exception as e:
+        logger.exception(f"[render_alarm_graph] close page error: {e}")
 
     return img_bytes
 
@@ -74,12 +83,14 @@ def get_chart_image(chart_data) -> str:
 
             loop = get_or_create_eventloop()
             img_bytes = loop.run_until_complete(render_html(f.name))
+            if not img_bytes:
+                return ""
 
             # 转换为base64
             img_base64 = base64.b64encode(img_bytes).decode("utf-8")
             return img_base64
     except Exception as e:
-        logger.error("get_chart_image fail: %s", e)
+        logger.exception(f"[render_alarm_graph] get_chart_image fail: {e}")
         return ""
 
 
