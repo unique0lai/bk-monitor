@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -9,14 +8,12 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
-
 import json
 from datetime import datetime
+from unittest import mock
 from uuid import uuid4
 
-import mock
 from django.test import TestCase
-from six.moves import range
 
 from alarm_backends.core.cache.key import (
     ANOMALY_LIST_KEY,
@@ -196,7 +193,7 @@ class TestProcessor(TestCase):
 
     def test_process_point(self):
         processor = TriggerProcessor(1, 1)
-        processor.process_point(json.dumps(POINT))
+        processor.process_point(POINT)
         self.assertEqual(len(processor.event_records), 1)
 
     def test_process(self):

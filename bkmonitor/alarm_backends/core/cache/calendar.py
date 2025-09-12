@@ -1,7 +1,6 @@
-# -*- coding: utf-8 -*-
 import json
 import time
-from typing import List, Optional
+from typing import cast
 
 from alarm_backends.core.cache.base import CacheManager
 from calendars.models import CalendarModel
@@ -14,11 +13,13 @@ class CalendarCacheManager(CacheManager):
     CACHE_KEY_TEMPLATE = CacheManager.CACHE_KEY_PREFIX + ".calendar.{calendar_id}"
 
     @classmethod
-    def mget(cls, calendar_ids: List[int], bk_tenant_id: Optional[str] = None) -> List[List]:
+    def mget(cls, calendar_ids: list[int], bk_tenant_id: str | None = None) -> list[list]:
         if not calendar_ids:
             return []
-        results = cls.cache.mget(
-            [cls.CACHE_KEY_TEMPLATE.format(calendar_id=calendar_id) for calendar_id in calendar_ids]
+
+        results = cast(
+            list[str | None],
+            cls.cache.mget([cls.CACHE_KEY_TEMPLATE.format(calendar_id=calendar_id) for calendar_id in calendar_ids]),
         )
         calendars = [json.loads(result or "[]") for result in results]
 
@@ -34,13 +35,12 @@ class CalendarCacheManager(CacheManager):
                 [calendar_item for calendar_item in calendar_items if calendar_item["bk_tenant_id"] == bk_tenant_id]
                 for calendar_items in calendars
             ]
-
         return calendars
 
     @classmethod
-    def get(cls, calendar_id: int) -> List:
+    def get(cls, calendar_id: int) -> list:
         key = cls.CACHE_KEY_TEMPLATE.format(calendar_id=calendar_id)
-        result = cls.cache.get(key)
+        result = cast(str | None, cls.cache.get(key))
         if not result:
             return []
         return json.loads(result)
@@ -55,7 +55,7 @@ class CalendarCacheManager(CacheManager):
         for calendar in calendars:
             try:
                 items = ItemDetailResource()(
-                    bk_tenant_id=calendar.bk_tenant_id, calendar_ids=[calendar.id], time=now_ts
+                    bk_tenant_id=calendar.bk_tenant_id, calendar_ids=[calendar.pk], time=now_ts
                 )
                 # 补充租户ID
                 for item in items:
@@ -63,12 +63,12 @@ class CalendarCacheManager(CacheManager):
 
                 # 写入缓存
                 pipeline.set(
-                    cls.CACHE_KEY_TEMPLATE.format(calendar_id=calendar.id), json.dumps(items), cls.CACHE_TIMEOUT
+                    cls.CACHE_KEY_TEMPLATE.format(calendar_id=calendar.pk), json.dumps(items), cls.CACHE_TIMEOUT
                 )
                 success_count += 1
             except Exception as e:
                 failed_count += 1
-                cls.logger.warning("[calendar] id(%s) query error: %s", calendar.id, e)
+                cls.logger.warning("[calendar] id(%s) query error: %s", calendar.pk, e)
         pipeline.execute()
         cls.logger.info("[calendar] refresh finished: success(%s), failed(%s)", success_count, failed_count)
 
