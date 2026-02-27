@@ -266,6 +266,18 @@ class Strategy:
         return snapshot_key
 
     @classmethod
+    def ensure_v2_strategy(cls, strategy: dict | None) -> dict | None:
+        if not strategy or strategy.get("version") == "v2":
+            return strategy
+        try:
+            from bkmonitor.strategy.new_strategy import Strategy as LegacyStrategy
+
+            return LegacyStrategy.convert_v1_to_v2(strategy)
+        except Exception:
+            logger.exception("convert strategy snapshot to v2 failed")
+            return strategy
+
+    @classmethod
     def get_strategy_snapshot_by_key(cls, snapshot_key, strategy_id=None):
         client = key.STRATEGY_SNAPSHOT_KEY.client
         if strategy_id:
@@ -276,7 +288,7 @@ class Strategy:
             return None
 
         snapshot_strategy = json.loads(snapshot)
-        return snapshot_strategy
+        return cls.ensure_v2_strategy(snapshot_strategy)
 
     @classmethod
     def get_item_in_strategy(cls, strategy, item_id):

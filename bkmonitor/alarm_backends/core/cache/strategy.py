@@ -363,7 +363,10 @@ class StrategyCacheManager(CacheManager):
         """
         获取全部策略配置, 返回字典格式
         """
-        list_kwargs: dict[str, Any] = {}
+        list_kwargs: dict[str, Any] = {
+            "apply_converters": False,
+            "conditions": [{"key": "is_enabled", "values": [True], "operator": "eq"}],
+        }
         if bk_biz_ids:
             list_kwargs["bk_biz_ids"] = sorted(set(bk_biz_ids))
         # 初始化策略失效检测信息
@@ -389,9 +392,7 @@ class StrategyCacheManager(CacheManager):
         # 根据给定的过滤条件，从数据库中筛选出所有启用的策略模型，并将它们转换为字典形式
         # 这个映射的键是策略的唯一标识符，值是策略的内容，便于进一步处理和使用
         strategy_configs_map: dict[int, dict[str, Any]] = {
-            strategy_config["id"]: strategy_config
-            for strategy_config in list_strategy(**list_kwargs)["data"]
-            if strategy_config.get("is_enabled")
+            strategy_config["id"]: strategy_config for strategy_config in list_strategy(**list_kwargs)["data"]
         }
 
         result_map = {}
