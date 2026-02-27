@@ -365,7 +365,7 @@ class StrategyCacheManager(CacheManager):
         """
         list_kwargs: dict[str, Any] = {
             "apply_converters": False,
-            "conditions": [{"key": "is_enabled", "values": [True], "operator": "eq"}],
+            "is_enabled": True,
         }
         if bk_biz_ids:
             list_kwargs["bk_biz_ids"] = sorted(set(bk_biz_ids))
