@@ -2658,17 +2658,17 @@ class ListIntelligentModelsResource(Resource):
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
         algorithm = serializers.ChoiceField(required=True, label="算法类型", choices=AlgorithmModel.AIOPS_ALGORITHMS)
 
-    def perform_request(self, validated_request_data):
-        bk_biz_id = validated_request_data["bk_biz_id"]
-        algorithm = validated_request_data["algorithm"]
-        plans = AlgorithmChoiceConfig.objects.filter(algorithm=algorithm)
+    def perform_request(self, validated_request_data: dict[str, Any]) -> list[dict[str, Any]]:
+        bk_biz_id: int = validated_request_data["bk_biz_id"]
+        algorithm: str = validated_request_data["algorithm"]
+        plans: QuerySet[AlgorithmChoiceConfig] = AlgorithmChoiceConfig.objects.filter(algorithm=algorithm)
 
         # 判断该算法是否在ai设置中，如果在ai设置中则需要挑选出开启默认配置的plan_id进行赋值
-        default_plan_id = None
+        default_plan_id: int | None = None
         if algorithm in AI_SETTING_ALGORITHMS:
             ai_setting = AiSetting(bk_biz_id=bk_biz_id)
             config: Any = None
-            is_enabled = False
+            is_enabled: bool = False
             # 单指标异常检测，对应监控中的智能异常检测
             if algorithm == AlgorithmModel.AlgorithmChoices.IntelligentDetect:
                 config = ai_setting.kpi_anomaly_detection
@@ -2679,10 +2679,10 @@ class ListIntelligentModelsResource(Resource):
                 is_enabled = config.is_enabled
 
             # 判断如果如果是开启的话，从配置中拿到默认的plan_id
-            if is_enabled and config:
+            if is_enabled:
                 default_plan_id = config.to_dict().get("default_plan_id")
 
-        model_list = []
+        model_list: list[dict[str, Any]] = []
         for plan in plans:
             if algorithm == AlgorithmModel.AlgorithmChoices.TimeSeriesForecasting and "hour" not in plan.name:
                 # TODO: 时序预测目前只支持小时级别的模型
@@ -2778,14 +2778,15 @@ class GetIntelligentDetectAccessStatusResource(Resource):
             "result_table_id": "",
         }
 
-        strategy_config = get_strategy(params["bk_biz_id"], params["strategy_id"])
+        strategy_config: dict[str, Any] = get_strategy(params["bk_biz_id"], params["strategy_id"])
 
         if not settings.IS_ACCESS_BK_DATA:
             return result
 
         intelligent_detect_config: dict[str, Any] = {}
         for query_config in chain(*[item["query_configs"] for item in strategy_config["items"]]):
-            if query_config.data_type_label not in (DataTypeLabel.TIME_SERIES, DataTypeLabel.EVENT, DataTypeLabel.LOG):
+            data_type_label: str | None = query_config.get("data_type_label")
+            if data_type_label not in (DataTypeLabel.TIME_SERIES, DataTypeLabel.EVENT, DataTypeLabel.LOG):
                 continue
             intelligent_detect_config = query_config.get("intelligent_detect", {})
 
@@ -2795,9 +2796,9 @@ class GetIntelligentDetectAccessStatusResource(Resource):
             result["status_detail"] = None
             return result
 
-        algorithm_name: str = ""
+        algorithm_name: str | None = None
         for algorithm in chain(*[item["algorithms"] for item in strategy_config["items"]]):
-            algorithm_type = algorithm["type"]
+            algorithm_type: str = algorithm["type"]
             if algorithm_type not in AlgorithmModel.AIOPS_ALGORITHMS:
                 continue
             algorithm_name = dict(AlgorithmModel.ALGORITHM_CHOICES)[algorithm_type]
