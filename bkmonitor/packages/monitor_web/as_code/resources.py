@@ -23,7 +23,7 @@ from urllib.parse import urljoin
 
 import arrow
 import yaml
-from bk_monitor_base.strategy import list_strategy
+from bk_monitor_base.strategy import FilterCondition, list_strategy
 from django.conf import settings
 from django.core.files import File
 from django.core.files.storage import default_storage
@@ -141,7 +141,7 @@ class ExportConfigResource(Resource):
         with_id = serializers.BooleanField(label="带上ID", default=False)
 
     @classmethod
-    def transform_configs(cls, parser, configs: list[dict], with_id: bool, lock_filename: bool):
+    def transform_configs(cls, parser, configs: list[dict[str, Any]], with_id: bool, lock_filename: bool):
         """
         配置转换为as_code格式
         """
@@ -223,14 +223,12 @@ class ExportConfigResource(Resource):
 
         # 配置生成
         # 所有的策略需要非告警状态采集内置策略才可以导出
-        filters: list[dict[str, Any]] = [
-            {"key": "source", "operator": "neq", "values": [DATALINK_SOURCE]},
-        ]
+        filters: list[FilterCondition] = [{"key": "source", "operator": "neq", "values": [DATALINK_SOURCE]}]
         if rule_ids is not None:
             filters.append({"key": "id", "operator": "eq", "values": rule_ids})
         if app is not None:
             filters.append({"key": "app", "operator": "eq", "values": [app]})
-        strategy_configs = list_strategy(bk_biz_id=bk_biz_id, conditions=filters)
+        strategy_configs = list_strategy(bk_biz_id=bk_biz_id, conditions=filters)["data"]
 
         # 转换为AsCode配置
         parser = StrategyConfigParser(

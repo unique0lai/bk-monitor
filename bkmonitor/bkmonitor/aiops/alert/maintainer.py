@@ -140,7 +140,7 @@ class AIOpsStrategyMaintainer:
             "data_source_label": query_config["data_source_label"],
             "data_type_label": query_config["data_type_label"],
             "metric_id": query_config["metric_id"],
-            "flow_id": getattr(query_config, "intelligent_detect", {}).get("data_flow_id"),
+            "flow_id": query_config.get("intelligent_detect", {}).get("data_flow_id"),
         }
 
     def check_strategies_valid(self):

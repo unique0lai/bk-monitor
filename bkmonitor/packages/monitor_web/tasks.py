@@ -1229,9 +1229,9 @@ def access_host_anomaly_detect_by_strategy_id(strategy_id: str):
     # 1. 根据策略ID获取主机异常检测算法配置，如果没有配置则直接返回
     strategy_id: int = cast(int, int(strategy_id))
     strategy_config: dict[str, Any] = get_strategy(strategy_id=strategy_id)
-    bk_biz_id = strategy_config["bk_biz_id"]
-    item = strategy_config["items"][0]
-    detect_algorithm = strategy_config["algorithms"][0]
+    bk_biz_id: int = strategy_config["bk_biz_id"]
+    item: dict[str, Any] = strategy_config["items"][0]
+    detect_algorithm: dict[str, Any] = item["algorithms"][0]
 
     set_local_tenant_id(bk_biz_id_to_bk_tenant_id(bk_biz_id))
 
@@ -1245,7 +1245,7 @@ def access_host_anomaly_detect_by_strategy_id(strategy_id: str):
     base_labels = {
         "bk_biz_id": bk_biz_id,
         "strategy_id": strategy_id,
-        "algorithm": detect_algorithm.type,
+        "algorithm": detect_algorithm["type"],
         "data_source_label": rt_query_config["data_source_label"],
         "data_type_label": rt_query_config["data_type_label"],
         "metric_id": rt_query_config["metric_id"],
@@ -1254,13 +1254,13 @@ def access_host_anomaly_detect_by_strategy_id(strategy_id: str):
     }
     plan_args = {
         "$metric_list": ",".join(
-            ["__".join(item["metric_name"].split(".")) for item in detect_algorithm.config.get("metrics")]
+            ["__".join(metric["metric_name"].split(".")) for metric in detect_algorithm.get("metrics", [])]
         ),
-        "$sensitivity": detect_algorithm.config.get("sensitivity", 50),
-        "$alert_levels": ",".join(map(lambda x: str(x), sorted(detect_algorithm.config.get("levels", [])))),
+        "$sensitivity": detect_algorithm.get("sensitivity", 50),
+        "$alert_levels": ",".join(map(lambda x: str(x), sorted(detect_algorithm.get("levels", [])))),
     }
-    scene_id = get_scene_id_by_algorithm(detect_algorithm.type)
-    plan_id = get_plan_id_by_algorithm(detect_algorithm.type)
+    scene_id = get_scene_id_by_algorithm(detect_algorithm["type"])
+    plan_id = get_plan_id_by_algorithm(detect_algorithm["type"])
     try:
         # 3.1 获取对应场景的参数用于构建数据流
         scene_params_dataclass = MULTIVARIATE_ANOMALY_DETECTION_SCENE_PARAMS_MAP.get(SceneSet.HOST, None)

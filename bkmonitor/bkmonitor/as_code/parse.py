@@ -664,7 +664,7 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
                 "path": record["path"],
             }
         )
-        save_strategy(bk_biz_id, record["obj"].to_dict(), "system")
+        save_strategy(bk_biz_id, record["obj"], "system")
 
     assign_group_records = convert_assign_groups(
         bk_biz_id=bk_biz_id,
