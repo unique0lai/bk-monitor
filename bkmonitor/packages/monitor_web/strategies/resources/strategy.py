@@ -2801,7 +2801,7 @@ class GetIntelligentDetectAccessStatusResource(Resource):
             algorithm_type: str = algorithm["type"]
             if algorithm_type not in AlgorithmModel.AIOPS_ALGORITHMS:
                 continue
-            algorithm_name = dict(AlgorithmModel.ALGORITHM_CHOICES)[algorithm_type]
+            algorithm_name = str(dict(AlgorithmModel.ALGORITHM_CHOICES)[algorithm_type])
             break
 
         if not intelligent_detect_config or not algorithm_name:
