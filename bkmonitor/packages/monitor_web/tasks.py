@@ -22,7 +22,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import arrow
 from arrow.parser import ParserError
-from bk_monitor_base.strategy import MultivariateAnomalyDetectionSerializer, get_metric_id, get_strategy, save_strategy
+from bk_monitor_base.strategy import (
+    MultivariateAnomalyDetectionSerializer,
+    get_metric_id,
+    get_strategy,
+    update_strategy_query_config,
+)
 from bk_monitor_base.uptime_check import UptimeCheckTaskStatus, get_task, list_tasks
 from bkstorages.exceptions import RequestError
 from celery import shared_task
@@ -615,7 +620,10 @@ def polling_aiops_strategy_status(flow_id: int, task_id: int, base_labels: dict,
         report_aiops_access_metrics(base_labels, AccessStatus.SUCCESS)
         query_config["intelligent_detect"]["status"] = AccessStatus.SUCCESS
         query_config["intelligent_detect"]["message"] = "create dataflow success"
-        save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+        update_strategy_query_config(
+            strategy_id=strategy_id,
+            config={"intelligent_detect": query_config["intelligent_detect"]},
+        )
     elif current_deploy_data["status"] == "failure":
         # 如果任务启动流程已经完成且成功，则任务任务启动失败，记录失败，继续重试，直到重试次数超过最大重试
         flow_msg = ", ".join(
@@ -637,7 +645,10 @@ def polling_aiops_strategy_status(flow_id: int, task_id: int, base_labels: dict,
             query_config["intelligent_detect"]["status"] = AccessStatus.RUNNING
             query_config["intelligent_detect"]["retries"] = retries
             query_config["intelligent_detect"]["message"] = err_msg
-            save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+            update_strategy_query_config(
+                strategy_id=strategy_id,
+                config={"intelligent_detect": query_config["intelligent_detect"]},
+            )
             polling_aiops_strategy_status.apply_async(
                 args=(flow_id, result["task_id"], base_labels, strategy_id),
                 countdown=AIOPS_ACCESS_STATUS_POLLING_INTERVAL,
@@ -645,7 +656,10 @@ def polling_aiops_strategy_status(flow_id: int, task_id: int, base_labels: dict,
         else:
             query_config["intelligent_detect"]["status"] = AccessStatus.FAILED
             query_config["intelligent_detect"]["message"] = err_msg
-            save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+            update_strategy_query_config(
+                strategy_id=strategy_id,
+                config={"intelligent_detect": query_config["intelligent_detect"]},
+            )
 
         report_aiops_access_metrics(base_labels, AccessStatus.FAILED, err_msg, AccessErrorType.START_FLOW)
     else:
@@ -703,7 +717,10 @@ def access_aiops_by_strategy_id(strategy_id):
     # 3. 获取查询配置，并更新算法接入状态为"已创建"
     rt_query_config: dict[str, Any] = item["query_configs"][0]
     rt_query_config["intelligent_detect"]["status"] = AccessStatus.CREATED
-    save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+    update_strategy_query_config(
+        strategy_id=strategy_id,
+        config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+    )
 
     # 4. 根据数据来源处理数据接入和结果表ID的转换
     base_labels = {
@@ -727,7 +744,10 @@ def access_aiops_by_strategy_id(strategy_id):
             err_msg = f"access to bkdata failed: result_table_id: {rt_query_config['result_table_id']} err_msg: {e}"
             rt_query_config["intelligent_detect"]["status"] = AccessStatus.FAILED
             rt_query_config["intelligent_detect"]["message"] = err_msg
-            save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+            update_strategy_query_config(
+                strategy_id=strategy_id,
+                config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+            )
             report_aiops_access_metrics(base_labels, AccessStatus.FAILED, err_msg, AccessErrorType.ACCESS_DATAID)
             raise Exception(err_msg)
         else:
@@ -748,13 +768,19 @@ def access_aiops_by_strategy_id(strategy_id):
         )
         rt_query_config["intelligent_detect"]["status"] = AccessStatus.FAILED
         rt_query_config["intelligent_detect"]["message"] = err_msg
-        save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+        update_strategy_query_config(
+            strategy_id=strategy_id,
+            config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+        )
         report_aiops_access_metrics(base_labels, AccessStatus.FAILED, err_msg, AccessErrorType.METRIC_NOT_SUPPORT)
         raise Exception(err_msg)
 
     # 5. 数据正常接入计算平台后，更新算法接入状态为"运行中"
     rt_query_config["intelligent_detect"]["status"] = AccessStatus.RUNNING
-    save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+    update_strategy_query_config(
+        strategy_id=strategy_id,
+        config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+    )
 
     # 6. 构建和启动智能检测数据流
     # 6.1 构建实时计算节点的sql，用于构建数据流
@@ -832,7 +858,10 @@ def access_aiops_by_strategy_id(strategy_id):
             rt_query_config["intelligent_detect"]["status"] = AccessStatus.RUNNING
             rt_query_config["intelligent_detect"]["retries"] = retries
             rt_query_config["intelligent_detect"]["message"] = err_msg
-            save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+            update_strategy_query_config(
+                strategy_id=strategy_id,
+                config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+            )
             report_aiops_access_metrics(base_labels, AccessStatus.FAILED, err_msg, AccessErrorType.CREATE_FLOW)
         else:
             # 6.5.2 超过最大重试次数后直接失败，更新算法接入状态为"失败"并记录错误信息，且发邮件通知相关人员
@@ -840,7 +869,10 @@ def access_aiops_by_strategy_id(strategy_id):
             logger.exception(err_msg)
             rt_query_config["intelligent_detect"]["status"] = AccessStatus.FAILED
             rt_query_config["intelligent_detect"]["message"] = err_msg
-            save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+            update_strategy_query_config(
+                strategy_id=strategy_id,
+                config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+            )
             report_aiops_access_metrics(base_labels, AccessStatus.FAILED, err_msg, AccessErrorType.CREATE_FLOW)
 
         # 6.5.3 无论是否重试，均直接退出
@@ -877,7 +909,10 @@ def access_aiops_by_strategy_id(strategy_id):
     # 如果是保存后的第一次接入，则清空接入message内容
     if rt_query_config["intelligent_detect"].get("retries", 0) == 0:
         rt_query_config["intelligent_detect"]["message"] = ""
-    save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+    update_strategy_query_config(
+        strategy_id=strategy_id,
+        config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+    )
 
 
 @shared_task(ignore_result=True)
@@ -1239,7 +1274,10 @@ def access_host_anomaly_detect_by_strategy_id(strategy_id: str):
 
     rt_query_config: dict[str, Any] = item["query_configs"][0]
     rt_query_config["intelligent_detect"]["status"] = AccessStatus.RUNNING
-    save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+    update_strategy_query_config(
+        strategy_id=strategy_id,
+        config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+    )
 
     # 3. 构建和启动主机异常检测数据流
     base_labels = {
@@ -1326,7 +1364,10 @@ def access_host_anomaly_detect_by_strategy_id(strategy_id: str):
             rt_query_config["intelligent_detect"]["status"] = AccessStatus.RUNNING
             rt_query_config["intelligent_detect"]["retries"] = retries
             rt_query_config["intelligent_detect"]["message"] = err_msg
-            save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+            update_strategy_query_config(
+                strategy_id=strategy_id,
+                config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+            )
             report_aiops_access_metrics(base_labels, AccessStatus.FAILED, err_msg, AccessErrorType.CREATE_FLOW)
         else:
             # 3.5.2 超过最大重试次数后直接失败，更新算法接入状态为"失败"并记录错误信息，且发邮件通知相关人员
@@ -1334,7 +1375,10 @@ def access_host_anomaly_detect_by_strategy_id(strategy_id: str):
             logger.exception(err_msg)
             rt_query_config["intelligent_detect"]["status"] = AccessStatus.FAILED
             rt_query_config["intelligent_detect"]["message"] = err_msg
-            save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+            update_strategy_query_config(
+                strategy_id=strategy_id,
+                config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+            )
             report_aiops_access_metrics(base_labels, AccessStatus.FAILED, err_msg, AccessErrorType.CREATE_FLOW)
 
         # 3.5.3 无论是否重试，均直接退出
@@ -1365,7 +1409,11 @@ def access_host_anomaly_detect_by_strategy_id(strategy_id: str):
     # 如果是保存后的第一次接入，则清空接入message内容
     if rt_query_config["intelligent_detect"].get("retries", 0) == 0:
         rt_query_config["intelligent_detect"]["message"] = ""
-    save_strategy(bk_biz_id=bk_biz_id, strategy_json=strategy_config, operator="system")
+    update_strategy_query_config(
+        strategy_id=strategy_id,
+        config={"intelligent_detect": rt_query_config["intelligent_detect"]},
+        metric_id=rt_query_config["metric_id"],
+    )
 
 
 @shared_task(ignore_result=True, queue="celery_resource")
