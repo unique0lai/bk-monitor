@@ -8,65 +8,81 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+from copy import deepcopy
 from datetime import datetime
-from functools import reduce
+from typing import Any, cast
 
+from bk_monitor_base.metric_plugin import (
+    CreatePluginVersionParams,
+    MetricPluginRemoteCollectDisableError,
+    MetricPluginStatus,
+    OSType,
+    PluginIDExistsError,
+    PluginIDInvalidError,
+    VersionTuple,
+    check_metric_plugin_id,
+    count_metric_plugin_type,
+    create_metric_plugin_version,
+    debug_nodeman_plugin,
+    delete_metric_plugin,
+    export_metric_plugin_package,
+    get_metric_plugin,
+    get_metric_plugin_supported_os_types,
+    get_nodeman_plugin_debug_log,
+    get_virtual_metric_plugin,
+    list_metric_plugin_deployments,
+    list_metric_plugins,
+    refresh_metric_plugin_metrics,
+    release_metric_plugin_version,
+    stop_nodeman_plugin_debug,
+)
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Count, Q
 from django.utils.translation import gettext_lazy as _
-from rest_framework import permissions, serializers, viewsets
-from rest_framework.authentication import SessionAuthentication
+from rest_framework import permissions, viewsets
 from rest_framework.decorators import action
+from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import Serializer
 
 from bkmonitor.iam import ActionEnum, Permission
 from bkmonitor.iam.drf import BusinessActionPermission, IAMPermission
-from bkmonitor.middlewares.authentication import NoCsrfSessionAuthentication
 from bkmonitor.utils.common_utils import safe_int
 from bkmonitor.utils.request import get_request_tenant_id
 from bkmonitor.utils.time_tools import utc2biz_str
+from bkmonitor.utils.user import get_request_username
 from core.drf_resource import api, resource
-from core.drf_resource.viewsets import ResourceRoute, ResourceViewSet
-from core.errors.api import BKAPIError
 from core.errors.plugin import (
     BizChangedError,
     DeletePermissionDenied,
     EditPermissionDenied,
-    NodeManDeleteError,
-    PluginIDNotExist,
+    PluginIDExist,
+    PluginIDFormatError,
     RelatedItemsExist,
+    RemoteCollectError,
 )
-from monitor_web.models import CollectConfigMeta
-from monitor_web.models.plugin import (
-    CollectorPluginMeta,
-    OperatorSystem,
-    PluginVersionHistory,
-)
-from monitor_web.plugin.constant import BUILT_IN_TAGS, PluginType
-from monitor_web.plugin.manager import PluginManagerFactory
+from monitor_web.plugin.constant import SNMP_V3_AUTH_JSON, DebugStatus, PluginType
 from monitor_web.plugin.manager.base import check_skip_debug
-from monitor_web.plugin.resources import PluginFileUploadResource
+from monitor_web.plugin.metric_json_compat import convert_metric_json_to_legacy
+from monitor_web.plugin.resources import PluginFileUploadResource, SaveMetricResource
 from monitor_web.plugin.serializers import (
+    DataDogSerializer,
+    ExporterSerializer,
+    JmxSerializer,
+    PushgatewaySerializer,
     ReleaseSerializer,
+    ScriptSerializer,
+    SNMPSerializer,
     StartDebugSerializer,
     TaskIdSerializer,
 )
-from monitor_web.plugin.signature import Signature
 
 
 class PermissionMixin:
-    def get_permissions(self):
-        if self.request.method in permissions.SAFE_METHODS:
+    def get_permissions(self) -> list[permissions.BasePermission]:
+        if self.request.method in permissions.SAFE_METHODS:  # type: ignore
             return [BusinessActionPermission([ActionEnum.VIEW_PLUGIN])]
         return [BusinessActionPermission([ActionEnum.MANAGE_PLUGIN])]
-
-
-class CollectorPluginSlz(serializers.ModelSerializer):
-    class Meta:
-        model = CollectorPluginMeta
-        fields = ()
 
 
 def assert_manage_pub_plugin_permission():
@@ -76,47 +92,54 @@ def assert_manage_pub_plugin_permission():
     Permission().is_allowed(action=ActionEnum.MANAGE_PUBLIC_PLUGIN, raise_exception=True)
 
 
-class DataDogPluginViewSet(PermissionMixin, ResourceViewSet):
-    resource_routes = [ResourceRoute("POST", resource.plugin.data_dog_plugin_upload)]
-
-
-class MetricPluginViewSet(PermissionMixin, ResourceViewSet):
-    resource_routes = [ResourceRoute("POST", resource.plugin.save_metric, endpoint="save")]
-
-
-class CollectorPluginViewSet(PermissionMixin, viewsets.ModelViewSet):
-    queryset = CollectorPluginMeta.objects.all()
-    serializer_class = Serializer
-
+class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
     # 使用plugin_id作为key
     lookup_field = "plugin_id"
 
-    def get_queryset(self):
-        """
-        根据租户ID过滤插件
-        """
-        return super().get_queryset().filter(bk_tenant_id=get_request_tenant_id())
+    SERIALIZERS: dict[str, type[Serializer]] = {
+        PluginType.EXPORTER: ExporterSerializer,
+        PluginType.JMX: JmxSerializer,
+        PluginType.SCRIPT: ScriptSerializer,
+        PluginType.PUSHGATEWAY: PushgatewaySerializer,
+        PluginType.DATADOG: DataDogSerializer,
+        PluginType.SNMP: SNMPSerializer,
+    }
 
-    def get_authenticators(self):
-        authenticators = super().get_authenticators()
-        authenticators = [
-            authenticator for authenticator in authenticators if not isinstance(authenticator, SessionAuthentication)
-        ]
-        authenticators.append(NoCsrfSessionAuthentication())
-        return authenticators
+    # 显示的插件类型
+    display_plugin_types = [
+        PluginType.EXPORTER,
+        PluginType.SCRIPT,
+        PluginType.JMX,
+        PluginType.DATADOG,
+        PluginType.PUSHGATEWAY,
+        PluginType.SNMP,
+    ]
 
     def get_permissions(self):
+        """插件接口权限判断"""
+        view_permissions: list[permissions.BasePermission] = []
         try:
-            bk_biz_id = int(self.request.biz_id)
+            bk_biz_id = int(getattr(self.request, "biz_id"))
         except Exception:
             bk_biz_id = 0
         if self.request.method not in permissions.SAFE_METHODS and not bk_biz_id:
             # 业务ID为0是全局插件，使用全局权限判断
-            return [IAMPermission([ActionEnum.MANAGE_PUBLIC_PLUGIN])]
+            view_permissions.append(IAMPermission([ActionEnum.MANAGE_PUBLIC_PLUGIN]))
+            return view_permissions
         return super().get_permissions()
 
     @staticmethod
-    def get_virtual_plugins(plugin_id: str = "", with_detail: bool = False) -> list[dict]:
+    def get_virtual_plugins(plugin_id: str = "", with_detail: bool = False) -> list[dict[str, Any]]:
+        """获取虚拟插件
+
+        Args:
+            plugin_id: 插件ID
+            with_detail: 是否包含详细信息
+
+        Returns:
+            list[dict]: 虚拟插件列表
+        """
+
         plugin_configs = []
         now_time: str = utc2biz_str(datetime.now())
 
@@ -138,16 +161,57 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ModelViewSet):
         }
 
         if with_detail:
-            public_config.update({"stage": PluginVersionHistory.Stage.RELEASE, "signature": ""})
+            public_config.update({"stage": MetricPluginStatus.RELEASE, "signature": ""})
+
+        if plugin_id in ["snmp_v1", "snmp_v2c", "snmp_v3"]:
+            plugin = get_virtual_metric_plugin(bk_tenant_id=cast(str, get_request_tenant_id()), plugin_id=plugin_id)
+            plugin_config = {
+                "plugin_id": plugin_id,
+                "plugin_display_name": plugin.name,
+                "plugin_type": PluginType.SNMP_TRAP,
+                "tag": "",
+                "label": plugin.label,
+                "status": "normal",
+                "logo": "",
+                "collector_json": "",
+                "config_json": {},
+                "metric_json": "",
+                "description_md": "",
+                "config_version": 1,
+                "info_version": 1,
+                "stage": "release",
+                "bk_biz_id": 0,
+                "signature": "",
+                "is_support_remote": True,
+                "is_official": False,
+                "is_safety": True,
+                "create_user": "admin",
+                "update_user": "admin",
+                "os_type_list": [],
+                "create_time": "",
+                "update_time": "",
+                "related_conf_count": 0,
+                "edit_allowed": False,
+            }
+            if with_detail:
+                params = [param.model_dump() for param in plugin.params]
+                if plugin_id == "snmp_v3":
+                    params.insert(
+                        len(params) - 1,
+                        {
+                            "auth_json": deepcopy(SNMP_V3_AUTH_JSON),
+                            "template_auth_json": deepcopy(SNMP_V3_AUTH_JSON),
+                        },
+                    )
+                plugin_config["config_json"] = params
+            plugin_configs.append(plugin_config)
 
         # 腾讯云指标采集插件
         if settings.TENCENT_CLOUD_METRIC_PLUGIN_CONFIG and (
             not plugin_id or plugin_id == settings.TENCENT_CLOUD_METRIC_PLUGIN_ID
         ):
             qcloud_plugin_config = settings.TENCENT_CLOUD_METRIC_PLUGIN_CONFIG
-
             label = qcloud_plugin_config.get("label", "os")
-
             plugin_config = {
                 "plugin_id": settings.TENCENT_CLOUD_METRIC_PLUGIN_ID,
                 "plugin_display_name": _(qcloud_plugin_config["plugin_display_name"]),
@@ -158,6 +222,7 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ModelViewSet):
                 **public_config,
             }
 
+            # 是否包含详细信息
             if with_detail:
                 plugin_config.update(
                     {
@@ -176,146 +241,177 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ModelViewSet):
             plugin_configs.append(plugin_config)
         return plugin_configs
 
-    def list(self, request, *args, **kwargs):
-        bk_tenant_id = get_request_tenant_id()
-        page = int(request.query_params.get("page", 1))
-        page_size = int(request.query_params.get("page_size", 10))
-        bk_biz_id = int(request.query_params.get("bk_biz_id", 0))
-        search_key = request.query_params.get("search_key", "").strip()
-        search_type = request.query_params.get("plugin_type", "").strip()
-        labels = request.query_params.get("labels", "").strip()
-        order = request.query_params.get("order", "").strip()
-        status = request.query_params.get("status")
-        # 是否包含虚拟插件
-        with_virtual = request.query_params.get("with_virtual", "false").lower() == "true"
+    @action(methods=["POST"], detail=False)
+    def upload_file(self, request: Request):
+        result_data = PluginFileUploadResource().request(request.data)
+        return Response(result_data)
 
-        # 过滤插件
-        plugins = self.get_queryset().exclude(plugin_type__in=CollectorPluginMeta.VIRTUAL_PLUGIN_TYPE)
-        if bk_biz_id:
-            plugins = plugins.filter(bk_biz_id__in=[0, bk_biz_id])
-        else:
-            assert_manage_pub_plugin_permission()
-        # 标签过滤
-        if labels:
-            plugins = plugins.filter(label__in=labels.split(","))
+    @action(methods=["POST"], detail=False)
+    def data_dog_plugin_upload(self, request: Request):
+        return Response(resource.plugin.data_dog_plugin_upload.request(request.data))
 
-        # 按插件过滤
-        all_versions = PluginVersionHistory.objects.filter(
-            bk_tenant_id=bk_tenant_id, plugin_id__in=list(plugins.values_list("plugin_id", flat=True))
-        )
+    @action(methods=["POST"], detail=False)
+    def save_metric(self, request: Request):
+        return Response(resource.plugin.save_metric.request(request.data))
 
-        # 关键字搜索
-        if search_key:
-            # 先过滤出插件ID、创建人、更新人包含关键字的插件
-            plugins = plugins.filter(
-                reduce(
-                    lambda x, y: x | y,
-                    [
-                        Q(**{f"{search_item}__icontains": search_key})
-                        for search_item in ["plugin_id", "create_user", "update_user"]
-                    ],
-                )
-            )
-            all_versions = all_versions.filter(
-                Q(plugin_id__in=[plugin.plugin_id for plugin in plugins])
-                | Q(info__plugin_display_name__icontains=search_key)
-            )
+    @action(methods=["POST"], detail=False)
+    def plugin_register(self, request: Request):
+        return Response(resource.plugin.plugin_register.request(request.data))
 
-        # 按插件状态过滤
-        if status:
-            all_versions = all_versions.filter(stage=status)
+    @action(methods=["POST"], detail=False)
+    def save_and_release_plugin(self, request: Request):
+        return Response(resource.plugin.save_and_release_plugin.request(request.data))
 
-        # 获取全量的插件数据（包含外键数据）
-        all_versions = all_versions.select_related("config", "info").defer("info__metric_json", "info__description_md")
+    @action(methods=["GET"], detail=False)
+    def get_reserved_word(self, request: Request):
+        return Response(resource.plugin.get_reserved_word.request(request.query_params))
 
-        # 根据检索出的version重新获取插件数据
-        plugin_dict = {
-            plugin.plugin_id: plugin
-            for plugin in self.get_queryset().filter(plugin_id__in=[version.plugin_id for version in all_versions])
+    @action(methods=["GET"], detail=False)
+    def plugin_upgrade_info(self, request: Request):
+        return Response(resource.plugin.plugin_upgrade_info.request(request.query_params))
+
+    @action(methods=["POST"], detail=False)
+    def process_collector_debug(self, request: Request):
+        return Response(resource.plugin.process_collector_debug.request(request.data))
+
+    def list(self, request: Request) -> Response:
+        """指标插件列表接口
+
+        # 放弃对status字段的过滤
+
+        出参:
+        {
+            "count": {
+                "Exporter": 28,
+                "Script": 58,
+                "JMX": 4,
+                "DataDog": 7,
+                "Pushgateway": 30,
+                "Built-In": 0,
+                "Log": 0,
+                "Process": 0,
+                "SNMP_Trap": 0,
+                "SNMP": 1,
+                "K8S": 0
+            },
+            "list": [
+                {
+                    "plugin_id": "liang_test_09",
+                    "plugin_display_name": "liang_test_09",
+                    "plugin_type": "Script",
+                    "tag": "",
+                    "bk_biz_id": 2,
+                    "related_conf_count": 5,
+                    "status": "normal",
+                    "create_user": "liangling",
+                    "create_time": "2026-01-26 14:46:14",
+                    "update_user": "bondliu",
+                    "update_time": "2026-03-03 11:59:17",
+                    "config_version": 2,
+                    "info_version": 5,
+                    "edit_allowed": true,
+                    "delete_allowed": false,
+                    "export_allowed": 6,
+                    "label_info": {
+                        "first_label": "hosts",
+                        "first_label_name": "\u4e3b\u673a&\u4e91\u5e73\u53f0",
+                        "second_label": "os",
+                        "second_label_name": "\u64cd\u4f5c\u7cfb\u7edf"
+                    },
+                    "logo": "",
+                    "is_official": false,
+                    "is_safety": true
+                }
+            ]
         }
+        """
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        params = request.query_params
 
-        # 取出每个plugin的最新版本进行预缓存
-        plugin_latest_versions: dict[str, PluginVersionHistory] = {}
-        for version in all_versions:
-            version.plugin = plugin_dict[version.plugin_id]
-            # 当前面有一条release版本，后面的一定都是旧版本。debug和unregister不能共存，且只能有一条
-            if version.plugin_id not in plugin_latest_versions or version.is_release:
-                plugin_latest_versions[version.plugin_id] = version
+        page = int(params.get("page", 1))
+        page_size = int(params.get("page_size", 10))
+        bk_biz_id = int(params.get("bk_biz_id", 0))
+        search_key = params.get("search_key", "").strip()
+        search_type = params.get("plugin_type", "").strip()
+        labels = params.get("labels", "").strip()
+        label_filters = [label for label in labels.split(",") if label] or None
+        order = params.get("order", "").strip()
 
-        return_version = list(plugin_latest_versions.values())
-        return_version.sort(key=lambda x: x.update_time, reverse=True)
-        # 排序
-        if order:
-            reverse = False
-            if order.startswith("-"):
-                order = order[1:]
-                reverse = True
-            if order == "status":
-                try:
-                    return_version.sort(key=lambda x: getattr(x, "stage"), reverse=reverse)
-                except KeyError:
-                    pass
-            else:
-                try:
-                    return_version.sort(key=lambda x: getattr(getattr(x, "plugin"), order), reverse=reverse)
-                except KeyError:
-                    pass
+        # 是否包含虚拟插件
+        with_virtual = params.get("with_virtual", "false").lower() == "true"
 
-        type_count = {plugin_type[0]: 0 for plugin_type in CollectorPluginMeta.PLUGIN_TYPE_CHOICES}
-        for version in return_version:
-            type_count[version.plugin.plugin_type] += 1
-
+        # 获取插件类型列表
+        plugin_types: list[str] | None = self.display_plugin_types
         if search_type:
-            return_version = [version for version in return_version if version.plugin.plugin_type == search_type]
+            plugin_types = [search_type]
 
-        # 生成用于查询的新的集合
-        if page != -1:
-            # fmt: off
-            return_version = return_version[(page - 1) * page_size: page * page_size]
-            # fmt: on
+        # 分页参数适配
+        offset, limit = 0, page_size
+        if page == -1:
+            offset = None
+        else:
+            offset = (page - 1) * page_size
 
-        # 生产插件采集的统计值和插件发布版本数量的统计值
-        plugin_ids = list({item.plugin.plugin_id for item in return_version})
-        plugin_queryset = CollectConfigMeta.objects.filter(bk_tenant_id=bk_tenant_id, plugin_id__in=plugin_ids)
-        if bk_biz_id:
-            plugin_queryset = plugin_queryset.filter(bk_biz_id=bk_biz_id)
-        plugin_count_queryset = plugin_queryset.values("plugin_id").annotate(count=Count("plugin_id"))
-        plugin_counts = {item["plugin_id"]: item["count"] for item in plugin_count_queryset}
-        version_count_queryset = (
-            PluginVersionHistory.objects.filter(
-                bk_tenant_id=bk_tenant_id, plugin_id__in=plugin_ids, stage=PluginVersionHistory.Stage.RELEASE
-            )
-            .values("plugin_id")
-            .annotate(count=Count("plugin_id"))
+        # 获取插件列表
+        plugins, _ = list_metric_plugins(
+            bk_tenant_id=bk_tenant_id,
+            bk_biz_ids=[bk_biz_id],
+            labels=label_filters,
+            search=search_key,
+            plugin_types=plugin_types,
+            bk_biz_id_with_global=True,
+            with_deployment_count=True,
+            limit=limit,
+            offset=offset,
+            order=order,
         )
-        version_counts = {item["plugin_id"]: item["count"] for item in version_count_queryset}
+
+        # 统计插件类型数量
+        raw_type_count = count_metric_plugin_type(
+            bk_tenant_id=bk_tenant_id,
+            bk_biz_ids=[bk_biz_id],
+            labels=label_filters,
+            search=search_key,
+            plugin_types=self.display_plugin_types,
+            bk_biz_id_with_global=True,
+        )
+        type_count = {plugin_type: raw_type_count.get(plugin_type, 0) for plugin_type in self.display_plugin_types}
 
         search_list = []
-        for value in return_version:
-            # 提取搜索需要的字段生成新的list
+        for plugin in plugins:
+            # 获取插件版本号
+            config_version = 1
+            debug_version = 1
+            if plugin["release_version"]:
+                config_version = plugin["release_version"].major
+                debug_version = plugin["release_version"].minor
+            elif plugin["debug_version"]:
+                config_version = plugin["debug_version"].major
+                debug_version = plugin["debug_version"].minor
+
             search_list.append(
                 {
-                    "plugin_id": value.plugin.plugin_id,
-                    "plugin_display_name": value.info.plugin_display_name,
-                    "plugin_type": value.plugin.plugin_type,
-                    "tag": value.plugin.tag,
-                    "bk_biz_id": value.plugin.bk_biz_id,
-                    "related_conf_count": plugin_counts.get(value.plugin.plugin_id, 0),
-                    "status": "normal" if value.is_release else "draft",
-                    "create_user": value.plugin.create_user,
-                    "create_time": utc2biz_str(value.plugin.create_time),
-                    "update_user": value.update_user,
-                    "update_time": utc2biz_str(value.update_time),
-                    "config_version": value.config_version,
-                    "info_version": value.info_version,
-                    "edit_allowed": value.plugin.edit_allowed if not value.is_official else False,
+                    "plugin_id": plugin["id"],
+                    "plugin_display_name": plugin["name"],
+                    "plugin_type": plugin["type"],
+                    "tag": "",
+                    "bk_biz_id": plugin["bk_biz_id"],
+                    "related_conf_count": plugin["deployment_count"],
+                    "status": "normal" if plugin["release_version"] else "draft",
+                    "create_user": plugin["created_by"],
+                    "create_time": utc2biz_str(plugin["created_at"]),
+                    "update_user": plugin["updated_by"],
+                    "update_time": utc2biz_str(plugin["updated_at"]),
+                    "config_version": config_version,
+                    "info_version": debug_version,
+                    "edit_allowed": not plugin["is_internal"],
                     # 没有被任何采集关联的插件才可以被删除（旧逻辑使用delete_allowed属性）
-                    "delete_allowed": plugin_counts.get(value.plugin.plugin_id, 0) == 0,
-                    "export_allowed": version_counts.get(value.plugin.plugin_id, 0),
-                    "label_info": resource.commons.get_label_msg(value.plugin.label),
-                    "logo": value.info.logo_content,
-                    "is_official": value.is_official,
-                    "is_safety": value.is_safety,
+                    "delete_allowed": plugin["deployment_count"] == 0,
+                    "export_allowed": int(bool(plugin["release_version"])),
+                    "label_info": resource.commons.get_label_msg(plugin["label"]),
+                    "logo": plugin["logo"],
+                    "is_official": plugin["is_global"],
+                    "is_safety": True,
                 }
             )
 
@@ -327,38 +423,63 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ModelViewSet):
 
         return Response(search_result)
 
-    def retrieve(self, request, *args, **kwargs):
-        if kwargs["plugin_id"] in ["snmp_v1", "snmp_v2c", "snmp_v3"]:
-            plugin_manager = PluginManagerFactory.get_manager(
-                bk_tenant_id=get_request_tenant_id(), plugin=kwargs["plugin_id"], plugin_type=PluginType.SNMP_TRAP
-            )
-            return Response(plugin_manager.get_default_trap_plugin())
+    def retrieve(self, request: Request, plugin_id: str):
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        operator = cast(str, get_request_username())
+        bk_biz_id = int(request.query_params["bk_biz_id"])
 
-        # 腾讯云指标采集插件
-        if kwargs["plugin_id"] == settings.TENCENT_CLOUD_METRIC_PLUGIN_ID:
-            plugins = self.get_virtual_plugins(plugin_id=kwargs["plugin_id"], with_detail=True)
-            if plugins:
-                return Response(plugins[0])
+        # 虚拟插件处理
+        plugins = self.get_virtual_plugins(plugin_id=plugin_id, with_detail=True)
+        if plugins:
+            return Response(plugins[0])
 
-        instance: CollectorPluginMeta = self.get_object()
-        # 刷新metric json
-        instance.refresh_metric_json()
-        return Response(instance.get_plugin_detail())
+        # 其他插件
+        plugin = get_metric_plugin(bk_tenant_id=bk_tenant_id, plugin_id=plugin_id)
+        refresh_metric_plugin_metrics(
+            bk_tenant_id=bk_tenant_id, plugin_id=plugin_id, version=plugin.version, operator=operator
+        )
+        group_result = api.metadata.query_time_series_group(
+            bk_biz_id=0, time_series_group_name=f"{plugin.type}_{plugin.id}".lower()
+        )
+        _, related_conf_count = list_metric_plugin_deployments(
+            bk_tenant_id=bk_tenant_id, bk_biz_ids=[bk_biz_id], plugin_ids=[plugin_id], limit=1, offset=0
+        )
+        return Response(
+            {
+                "plugin_id": plugin.id,
+                "plugin_display_name": plugin.name,
+                "plugin_type": plugin.type,
+                "tag": "",
+                "label": plugin.label,
+                "status": "normal" if plugin.status == MetricPluginStatus.RELEASE else "draft",
+                "logo": plugin.logo,
+                "collector_json": plugin.define,
+                "config_json": [param.model_dump() for param in plugin.params],
+                "enable_field_blacklist": plugin.enable_metric_discovery,
+                "metric_json": convert_metric_json_to_legacy(plugin.metrics),
+                "description_md": plugin.description_md,
+                "config_version": plugin.version.major,
+                "info_version": plugin.version.minor,
+                "stage": plugin.status.value,
+                "bk_biz_id": plugin.bk_biz_id,
+                "signature": "",
+                "is_support_remote": plugin.is_support_remote,
+                "is_official": plugin.is_global,
+                "is_safety": True,
+                "create_user": plugin.created_by,
+                "update_user": plugin.updated_by,
+                "os_type_list": get_metric_plugin_supported_os_types(bk_tenant_id=bk_tenant_id, plugin_id=plugin_id),
+                "create_time": utc2biz_str(plugin.created_at),
+                "update_time": utc2biz_str(plugin.updated_at),
+                "related_conf_count": related_conf_count,
+                "edit_allowed": not plugin.is_internal,
+                "is_split_measurement": bool(group_result),
+            }
+        )
 
-    @action(methods=["POST"], detail=False)
-    def upload_file(self, request, *args, **kwargs):
-        result_data = PluginFileUploadResource().request(request.data)
-        return Response(result_data)
-
-    @action(methods=["GET"], detail=False)
-    def operator_system(self, request, *args, **kwargs):
-        sys_list = OperatorSystem.objects.all()
-        result_list = [{"os_type": item.os_type, "os_type_id": item.os_type_id} for item in sys_list]
-        return Response(result_list)
-
-    def create(self, request, *args, **kwargs):
-        params = request.data
-        bk_biz_id = safe_int(request.data.get("bk_biz_id", 0))
+    def create(self, request: Request):
+        params = cast(dict[str, Any], request.data)
+        bk_biz_id = safe_int(params.get("bk_biz_id", 0))
 
         # 创建全业务插件时,判断当前请求用户是否有权限
         if not bk_biz_id:
@@ -368,213 +489,122 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ModelViewSet):
         return Response(result_data)
 
     @action(methods=["POST"], detail=True)
-    def edit(self, request, *args, **kwargs):
-        """
-        插件编辑接口，两种情况：
-        1. 普通编辑，file_data 参数为空
-        2. 导入覆盖后编辑 file_data 参数不为空
-        """
+    def edit(self, request: Request, plugin_id: str):
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        operator = cast(str, get_request_username())
+        current_plugin = get_metric_plugin(bk_tenant_id=bk_tenant_id, plugin_id=plugin_id)
+        params = cast(dict[str, Any], request.data)
 
-        instance = self.get_object()
-        bk_biz_id = instance.bk_biz_id
-        new_bk_biz_id = int(request.data.get("bk_biz_id", 0))
-        is_changed_biz = bk_biz_id != new_bk_biz_id
         # 不支持单业务之间的切换
+        bk_biz_id = current_plugin.bk_biz_id
+        new_bk_biz_id = int(params.get("bk_biz_id", 0))
+        is_changed_biz = bk_biz_id != new_bk_biz_id
         if bk_biz_id and new_bk_biz_id and is_changed_biz:
             raise BizChangedError
+
         # 涉及全业务插件编辑时,判断当前请求用户是否有权限
         if not (bk_biz_id and new_bk_biz_id):
             assert_manage_pub_plugin_permission()
 
             # 全业务插件 》 单业务插件，判断是否有关联项
             if not bk_biz_id and new_bk_biz_id:
-                collect_config = CollectConfigMeta.objects.filter(
-                    bk_tenant_id=get_request_tenant_id(), plugin_id=instance.plugin_id
+                deployments, _ = list_metric_plugin_deployments(
+                    bk_tenant_id=bk_tenant_id,
+                    bk_biz_ids=None,
+                    plugin_ids=[plugin_id],
                 )
-                if collect_config and [x for x in collect_config if x.bk_biz_id != new_bk_biz_id]:
-                    raise RelatedItemsExist({"msg": _("存在其余业务的关联项")})
+                if [deployment for deployment in deployments if deployment.bk_biz_id != new_bk_biz_id]:
+                    raise RelatedItemsExist({"msg": "存在其余业务的关联项"})
 
-        current_config_version = instance.current_version.config_version
-        current_info_version = instance.current_version.info_version
-
-        plugin_manager = PluginManagerFactory.get_manager(plugin=instance)
-        self.serializer_class = plugin_manager.serializer_class
-        serializer = self.serializer_class(instance, data=request.data, partial=True)
+        serializer_class = self.SERIALIZERS[current_plugin.type]
+        serializer = serializer_class(data=params, partial=True)
         serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
-            plugin_obj = serializer.save()
-            plugin_manager.plugin = plugin_obj
-            version, need_debug = plugin_manager.update_version(serializer.validated_data)
+        validated_request_data = {
+            "plugin_id": plugin_id,
+            "plugin_type": current_plugin.type,
+            "bk_biz_id": new_bk_biz_id,
+            "plugin_display_name": current_plugin.name,
+            "description_md": current_plugin.description_md,
+            "label": current_plugin.label,
+            "logo": current_plugin.logo,
+            "config_json": [param.model_dump() for param in current_plugin.params],
+            "collector_json": current_plugin.define,
+            "metric_json": [metric.model_dump() for metric in current_plugin.metrics],
+            "is_support_remote": current_plugin.is_support_remote,
+            "version_log": current_plugin.version_log,
+            "enable_field_blacklist": current_plugin.enable_metric_discovery,
+        }
+        validated_request_data.update(cast(dict[str, Any], serializer.validated_data))
 
-            # 检查插件的编辑权限
-            if not instance.edit_allowed:
-                if current_config_version != version.config_version or current_info_version != version.info_version:
-                    raise EditPermissionDenied({"plugin_id": instance.plugin_id})
+        with transaction.atomic():
+            try:
+                _, version = create_metric_plugin_version(
+                    bk_tenant_id=bk_tenant_id,
+                    plugin_id=plugin_id,
+                    operator=operator,
+                    params=CreatePluginVersionParams(
+                        name=validated_request_data["plugin_display_name"],
+                        description_md=validated_request_data["description_md"],
+                        label=validated_request_data["label"],
+                        logo=validated_request_data["logo"],
+                        metrics=SaveMetricResource._build_metric_groups(validated_request_data["metric_json"]),
+                        enable_metric_discovery=validated_request_data["enable_field_blacklist"],
+                        params=validated_request_data["config_json"],
+                        define=validated_request_data["collector_json"],
+                        is_support_remote=validated_request_data["is_support_remote"],
+                        version=current_plugin.version if current_plugin.status != MetricPluginStatus.RELEASE else None,
+                        status=MetricPluginStatus.DEBUG,
+                        version_log=validated_request_data["version_log"],
+                    ),
+                )
+            except MetricPluginRemoteCollectDisableError as error:
+                raise RemoteCollectError({"msg": str(error)})
+
+            # 内置插件不能编辑
+            if current_plugin.is_internal and version != current_plugin.version:
+                raise EditPermissionDenied({"plugin_id": plugin_id})
+
+            if version == current_plugin.version:
+                stage = current_plugin.status.value
+                need_debug = current_plugin.status != MetricPluginStatus.RELEASE
+            elif version.major == current_plugin.version.major:
+                release_metric_plugin_version(
+                    bk_tenant_id=bk_tenant_id,
+                    plugin_id=plugin_id,
+                    version=version,
+                    operator=operator,
+                    apply_data_link=False,
+                )
+                stage = MetricPluginStatus.RELEASE.value
+                need_debug = False
+            else:
+                stage = MetricPluginStatus.DEBUG.value
+                need_debug = True
 
         # 若是导入覆盖的插件：判断采集配置是否前后一致，一致则可跳过debug
-        import_plugin_config = request.data.get("import_plugin_config", {})
+        import_plugin_config = params.get("import_plugin_config", {})
         if import_plugin_config:
             rules = [
-                request.data["collector_json"] == import_plugin_config["collector_json"],
-                request.data["config_json"] == import_plugin_config["config_json"],
-                request.data["is_support_remote"] == import_plugin_config["is_support_remote"],
+                params["collector_json"] == import_plugin_config["collector_json"],
+                params["config_json"] == import_plugin_config["config_json"],
+                params["is_support_remote"] == import_plugin_config["is_support_remote"],
             ]
             if all(rules):
                 need_debug = False
 
-        serializer.validated_data["config_version"] = version.config_version
-        serializer.validated_data["info_version"] = version.info_version
-        serializer.validated_data["os_type_list"] = version.os_type_list
-        serializer.validated_data["stage"] = version.stage
-        serializer.validated_data["need_debug"] = check_skip_debug(need_debug)
-        serializer.validated_data["signature"] = Signature(version.signature).dumps2yaml()
-        serializer.validated_data["enable_field_blacklist"] = version.info.enable_field_blacklist
-        return Response(serializer.validated_data)
-
-    @action(methods=["POST"], detail=False)
-    def delete(self, request, *args, **kwargs):
-        param = request.data
-        plugin_ids = param["plugin_ids"]
-        # TODO: 检查是否存在关联项
-        plugins = self.get_queryset().filter(plugin_id__in=plugin_ids)
-        for plugin in plugins:
-            # 检查插件的删除权限
-            if not plugin.delete_allowed:
-                raise DeletePermissionDenied({"plugin_id": plugin.plugin_id})
-
-        with transaction.atomic():
-            for plugin_id in plugin_ids:
-                PluginVersionHistory.origin_objects.filter(
-                    bk_tenant_id=get_request_tenant_id(), plugin_id=plugin_id
-                ).delete()
-
-                plugin = CollectorPluginMeta.origin_objects.filter(
-                    bk_tenant_id=get_request_tenant_id(), plugin_id=plugin_id
-                ).first()
-                if plugin:
-                    plugin.delete()
-
-                try:
-                    api.node_man.delete_plugin(name=plugin.plugin_id)
-                except BKAPIError:
-                    raise NodeManDeleteError
-
-        return Response({"result": True})
-
-    @action(methods=["GET"], detail=False)
-    def tag_options(self, request, *args, **kwargs):
-        tags = [item["tag"] for item in self.queryset.values("tag") if item["tag"]]
-        tags += BUILT_IN_TAGS
-        real_tags = list(set(tags))
-        return Response(real_tags)
-
-    @action(methods=["POST"], detail=False)
-    def import_plugin(self, request, *args, **kwargs):
-        # 导入全业务插件时,判断当前请求用户是否为超级管理员
-        if not request.data.get("bk_biz_id"):
-            assert_manage_pub_plugin_permission()
-        plugin_data = resource.plugin.plugin_import(request.data)
-        return Response(plugin_data)
-
-    @action(methods=["POST"], detail=False)
-    def replace_plugin(self, request, *args, **kwargs):
-        instance = self.get_queryset().get(plugin_id=request.data["plugin_id"])
-        current_config_version = instance.current_version.config_version
-        current_info_version = instance.current_version.info_version
-        plugin_manager = PluginManagerFactory.get_manager(plugin=instance)
-        self.serializer_class = plugin_manager.serializer_class
-        serializer = self.serializer_class(instance, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
-            plugin_obj = serializer.save()
-            plugin_manager.plugin = plugin_obj
-            version, need_debug = plugin_manager.update_version(serializer.validated_data)
-
-            # 检查插件的编辑权限
-            if not instance.edit_allowed:
-                if current_config_version != version.config_version or current_info_version != version.info_version:
-                    raise EditPermissionDenied({"plugin_id": instance.plugin_id})
-
-        serializer.validated_data["config_version"] = version.config_version
-        serializer.validated_data["info_version"] = version.info_version
-        serializer.validated_data["os_type_list"] = version.os_type_list
-        serializer.validated_data["stage"] = version.stage
-        serializer.validated_data["need_debug"] = check_skip_debug(need_debug)
-        serializer.validated_data["signature"] = Signature(version.signature).dumps2yaml()
-        return Response(serializer.validated_data)
-
-    @action(methods=["GET"], detail=True)
-    def export_plugin(self, request, *args, **kwargs):
-        instance: CollectorPluginMeta = self.get_object()
-        plugin_manager = PluginManagerFactory.get_manager(plugin=instance)
-        release_version = instance.release_version
-        if not release_version.is_packaged:
-            with transaction.atomic():
-                register_info = {
-                    "plugin_id": plugin_manager.plugin.plugin_id,
-                    "config_version": release_version.config_version,
-                    "info_version": release_version.info_version,
-                }
-                ret = resource.plugin.plugin_register(**register_info)
-                plugin_manager.release(
-                    config_version=release_version.config_version,
-                    info_version=release_version.info_version,
-                    token=ret["token"],
-                    debug=False,
-                )
-
-        # 刷新metric json
-        instance.refresh_metric_json()
-        return Response({"download_url": plugin_manager.run_export()})
-
-    @action(methods=["GET"], detail=False)
-    def check_id(self, request, *args, **kwargs):
-        return Response(resource.plugin.check_plugin_id(request.query_params))
-
-    @action(methods=["POST"], detail=True)
-    def start_debug(self, request, *args, **kwargs):
-        # 参数校验
-        serializer = StartDebugSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        # 获取plugin_manager
-        instance = self.get_object()
-        plugin_manager = PluginManagerFactory.get_manager(plugin=instance)
-        # 开始调试
-        result = plugin_manager.start_debug(**serializer.validated_data)
-        return Response(result)
-
-    @action(methods=["POST"], detail=True)
-    def stop_debug(self, request, *args, **kwargs):
-        serializer = TaskIdSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        task_id = serializer.validated_data["task_id"]
-        instance = self.get_object()
-        plugin_manager = PluginManagerFactory.get_manager(plugin=instance)
-        result = plugin_manager.stop_debug(task_id)
-        return Response(result)
-
-    @action(methods=["GET"], detail=True)
-    def fetch_debug_log(self, request, *args, **kwargs):
-        serializer = TaskIdSerializer(data=request.query_params)
-        serializer.is_valid(raise_exception=True)
-        task_id = serializer.validated_data["task_id"]
-        instance = self.get_object()
-        plugin_manager = PluginManagerFactory.get_manager(plugin=instance)
-        result = plugin_manager.query_debug(task_id)
-        return Response(result)
-
-    @action(methods=["POST"], detail=True)
-    def release(self, request, *args, **kwargs):
-        serializer = ReleaseSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            plugin = self.get_queryset().get(plugin_id=kwargs.get("plugin_id"))
-        except CollectorPluginMeta.DoesNotExist:
-            raise PluginIDNotExist
-
-        plugin_manager = PluginManagerFactory.get_manager(plugin=plugin)
-        release_version = plugin_manager.release(**serializer.validated_data)
-        return Response(resource.plugin.update_collect_plugin_version(release_version=release_version))
+        response_data = dict(validated_request_data)
+        response_data["config_version"] = version.major
+        response_data["info_version"] = version.minor
+        response_data["os_type_list"] = get_metric_plugin_supported_os_types(
+            bk_tenant_id=bk_tenant_id, plugin_id=plugin_id
+        )
+        response_data["stage"] = stage
+        response_data["need_debug"] = check_skip_debug(need_debug)
+        # TODO: base 侧尚未承接 signature 的持久化与版本联动。
+        # 当前先保留接口字段，继续透传请求值，避免前端协议在这轮迁移里被打断。
+        response_data["signature"] = validated_request_data.get("signature", params.get("signature", ""))
+        response_data["enable_field_blacklist"] = validated_request_data["enable_field_blacklist"]
+        return Response(response_data)
 
     @action(methods=["POST"], detail=False)
     def plugin_import_without_frontend(self, request, *args, **kwargs):
@@ -585,42 +615,227 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ModelViewSet):
         plugin_data = resource.plugin.plugin_import_without_frontend(request.data)
         return Response(plugin_data)
 
+    @action(methods=["POST"], detail=False)
+    def import_plugin(self, request):
+        # 导入全业务插件时,判断当前请求用户是否为超级管理员
+        if not request.data.get("bk_biz_id"):
+            assert_manage_pub_plugin_permission()
+        plugin_data = resource.plugin.plugin_import(request.data)
+        return Response(plugin_data)
 
-class RegisterPluginViewSet(PermissionMixin, ResourceViewSet):
-    resource_routes = [ResourceRoute("POST", resource.plugin.plugin_register)]
+    @action(methods=["GET"], detail=False)
+    def operator_system(self, request: Request):
+        """
+        获取操作系统类型列表
+        出参: [{"os_type": "linux", "os_type_id": 1}]
+        """
+        return Response([{"os_type": os_type.value, "os_type_id": index} for index, os_type in enumerate(OSType)])
 
+    @action(methods=["POST"], detail=False)
+    def delete(self, request: Request):
+        params: dict[str, Any] = cast(dict[str, Any], request.data)
 
-class SaveAndReleasePluginViewSet(PermissionMixin, ResourceViewSet):
-    resource_routes = [ResourceRoute("POST", resource.plugin.save_and_release_plugin)]
+        # 参数提取
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        plugin_ids: list[str] = params["plugin_ids"]
+        bk_biz_id: int = params["bk_biz_id"]
+        username: str = cast(str, get_request_username())
 
+        plugins, _ = list_metric_plugins(
+            bk_tenant_id=bk_tenant_id,
+            plugin_ids=plugin_ids,
+            bk_biz_ids=[bk_biz_id],
+            with_deployment_count=True,
+        )
 
-class GetReservedWordViewSet(PermissionMixin, ResourceViewSet):
-    """
-    获取关键字列表
-    """
+        # 检查插件是否能够删除
+        # 如果插件是内置插件或存在部署项，则不能删除
+        for plugin in plugins:
+            # 内置插件不能删除
+            if plugin["is_internal"]:
+                raise DeletePermissionDenied({"plugin_id": plugin["id"]})
 
-    resource_routes = [ResourceRoute("GET", resource.plugin.get_reserved_word)]
+            # 存在部署项，则不能删除
+            deployment_count = cast(int, plugin["deployment_count"])
+            if deployment_count > 0:
+                raise RelatedItemsExist({"msg": "插件还存在采集配置，无法删除"})
 
+        # 删除插件
+        for plugin in plugins:
+            with transaction.atomic():
+                delete_metric_plugin(bk_tenant_id=bk_tenant_id, plugin_id=plugin["id"], operator=username)
 
-class PluginUpgradeInfoViewSet(PermissionMixin, ResourceViewSet):
-    """
-    获取插件参数配置版本发行历史
-    """
+        return Response({"result": True})
 
-    resource_routes = [ResourceRoute("GET", resource.plugin.plugin_upgrade_info)]
+    @action(methods=["GET"], detail=True)
+    def export_plugin(self, request: Request, plugin_id: str):
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        operator: str = cast(str, get_request_username())
 
+        download_url = export_metric_plugin_package(
+            bk_tenant_id=bk_tenant_id,
+            plugin_id=plugin_id,
+            operator=operator,
+        )
+        return Response({"download_url": download_url})
 
-class PluginTypeViewSet(PermissionMixin, ResourceViewSet):
-    """
-    获取已有的插件类型
-    """
+    @action(methods=["GET"], detail=False)
+    def check_id(self, request, *args, **kwargs):
+        """检查插件ID是否存在
 
-    resource_routes = [ResourceRoute("GET", resource.plugin.plugin_type)]
+        入参: plugin_id: str
+        出参: None | raise PluginIDExist
+        """
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        plugin_id: str = request.query_params["plugin_id"]
 
+        try:
+            check_metric_plugin_id(bk_tenant_id=bk_tenant_id, plugin_id=plugin_id)
+        except PluginIDExistsError:
+            raise PluginIDExist({"msg": plugin_id})
+        except PluginIDInvalidError as e:
+            raise PluginIDFormatError({"msg": str(e)})
 
-class ProcessCollectorDebugViewSet(PermissionMixin, ResourceViewSet):
-    """
-    进程数据采集器
-    """
+        return Response()
 
-    resource_routes = [ResourceRoute("POST", resource.plugin.process_collector_debug)]
+    @action(methods=["POST"], detail=True)
+    def start_debug(self, request, plugin_id: str):
+        """开始插件调试
+
+        入参: StartDebugSerializer
+        出参: str 调试任务ID
+        """
+        bk_tenant_id = cast(str, get_request_tenant_id())
+
+        # 参数校验
+        serializer = StartDebugSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated_data: dict[str, Any] = cast(dict[str, Any], serializer.validated_data)
+
+        config_version: int = validated_data["config_version"]
+        info_version: int = validated_data["info_version"]
+        param: dict[str, Any] = validated_data["param"]
+        host_info: dict[str, Any] = validated_data["host_info"]
+        target_nodes: list[dict[str, Any]] = validated_data["target_nodes"]
+        operator: str = cast(str, get_request_username())
+
+        result = debug_nodeman_plugin(
+            bk_tenant_id=bk_tenant_id,
+            plugin_id=plugin_id,
+            version=VersionTuple(config_version, info_version),
+            collect_params=param["collector"],
+            plugin_params=param["plugin"],
+            collect_host=host_info,
+            target_nodes=target_nodes,
+            operator=operator,
+        )
+        return Response(result["task_id"])
+
+    @action(methods=["POST"], detail=True)
+    def stop_debug(self, request: Request, plugin_id: str):
+        """停止插件调试
+
+        入参: TaskIdSerializer
+        """
+        serializer = TaskIdSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        validated_data: dict[str, Any] = cast(dict[str, Any], serializer.validated_data)
+        task_id: int = validated_data["task_id"]
+        operator: str = cast(str, get_request_username())
+
+        stop_nodeman_plugin_debug(
+            bk_tenant_id=bk_tenant_id,
+            plugin_id=plugin_id,
+            task_id=task_id,
+            operator=operator,
+        )
+        return Response()
+
+    @action(methods=["GET"], detail=True)
+    def fetch_debug_log(self, request: Request, plugin_id: str):
+        """
+        获取插件调试日志
+
+        入参: TaskIdSerializer
+        出参: {
+            "status": "INSTALL", # DebugStatus枚举
+            "log_content": "xxxx",
+            "metric_json": [
+                {
+                    "metric_name": "disk_usage",
+                    "metric_value": 0.8,
+                    "dimensions": [
+                        {
+                            "dimension_name": "disk_name",
+                            "dimension_value": "/data"
+                        }
+                    ]
+                }
+            ],
+            "last_time": "2026-03-01 17:25:00"
+        }
+        """
+        # 参数校验
+        serializer = TaskIdSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # 参数提取
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        validated_data: dict[str, Any] = cast(dict[str, Any], serializer.validated_data)
+        task_id: int = validated_data["task_id"]
+        operator: str = cast(str, get_request_username())
+
+        # 获取调试日志
+        result = get_nodeman_plugin_debug_log(
+            bk_tenant_id=bk_tenant_id,
+            plugin_id=plugin_id,
+            task_id=task_id,
+            operator=operator,
+        )
+
+        # 状态字段转换
+        if result["status"] == "failed":
+            status = DebugStatus.FAILED
+        elif result["status"] == "running":
+            status = DebugStatus.INSTALL
+        elif result["metric_json"]:
+            status = DebugStatus.FETCH_DATA
+        else:
+            status = DebugStatus.SUCCESS
+
+        return Response(
+            {
+                "status": status,
+                "metric_json": result["metric_json"],
+                "last_time": result["last_time"],
+                "log_content": result["log"],
+            }
+        )
+
+    @action(methods=["POST"], detail=True)
+    def release(self, request: Request, plugin_id: str):
+        """发布插件
+
+        # 后续不需要token参数，直接按照版本查询插件md5列表
+
+        入参: ReleaseSerializer {"config_version":2,"info_version":2,"token":["7b0c5b708cd95f55abac85c17f277662"],"bk_biz_id":2}
+        出参: None
+        """
+        serializer = ReleaseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        validated_data: dict[str, Any] = cast(dict[str, Any], serializer.validated_data)
+        bk_tenant_id = cast(str, get_request_tenant_id())
+        config_version: int = validated_data["config_version"]
+        info_version: int = validated_data["info_version"]
+        operator: str = cast(str, get_request_username())
+
+        release_metric_plugin_version(
+            bk_tenant_id=bk_tenant_id,
+            plugin_id=plugin_id,
+            version=VersionTuple(config_version, info_version),
+            operator=operator,
+        )
+        return Response()
