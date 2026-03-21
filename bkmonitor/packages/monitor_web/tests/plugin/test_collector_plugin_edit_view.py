@@ -316,6 +316,112 @@ def test_edit_imported_plugin_can_skip_debug_when_import_config_matches(mocker: 
     assert response.data["need_debug"] is False
 
 
+def test_operator_system_uses_legacy_os_type_ids(mocker: MockerFixture) -> None:
+    expected = [
+        {"os_type": "linux", "os_type_id": "1"},
+        {"os_type": "windows", "os_type_id": "2"},
+        {"os_type": "aix", "os_type_id": "3"},
+        {"os_type": "linux_aarch64", "os_type_id": "4"},
+    ]
+
+    response = CollectorPluginViewSet().operator_system(SimpleNamespace())
+
+    assert response.data == expected
+
+
+def test_start_debug_defaults_target_nodes_to_empty_list(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(
+        data={
+            "bk_biz_id": 2,
+            "config_version": 1,
+            "info_version": 1,
+            "param": {"collector": {"period": "10"}, "plugin": {}},
+            "host_info": {"bk_host_id": 123},
+        }
+    )
+    mocker.patch("monitor_web.plugin.views.get_request_tenant_id", return_value="tenant")
+    mocker.patch("monitor_web.plugin.views.get_request_username", return_value="admin")
+    mocker.patch(
+        "monitor_web.plugin.views.StartDebugSerializer",
+        return_value=SimpleNamespace(
+            validated_data={
+                "config_version": 1,
+                "info_version": 1,
+                "param": {"collector": {"period": "10"}, "plugin": {}},
+                "host_info": {"bk_host_id": 123},
+            },
+            is_valid=lambda raise_exception=True: True,
+        ),
+    )
+    mock_debug = mocker.patch("monitor_web.plugin.views.debug_nodeman_plugin", return_value={"task_id": "task-1"})
+
+    response = CollectorPluginViewSet().start_debug(request, plugin_id="test_plugin")
+
+    assert response.data == {"task_id": "task-1"}
+    assert mock_debug.call_args.kwargs["target_nodes"] == []
+
+
+def test_fetch_debug_log_reads_task_id_from_query_params(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(data={}, query_params={"task_id": 54313798})
+    mocker.patch("monitor_web.plugin.views.get_request_tenant_id", return_value="tenant")
+    mocker.patch("monitor_web.plugin.views.get_request_username", return_value="admin")
+    mocker.patch(
+        "monitor_web.plugin.views.TaskIdSerializer",
+        return_value=SimpleNamespace(
+            validated_data={"task_id": 54313798},
+            is_valid=lambda raise_exception=True: True,
+        ),
+    )
+    mock_log = mocker.patch(
+        "monitor_web.plugin.views.get_nodeman_plugin_debug_log",
+        return_value={
+            "status": "running",
+            "metric_json": [],
+            "last_time": "2026-03-21 18:00:00",
+            "log": "debugging",
+        },
+    )
+
+    response = CollectorPluginViewSet().fetch_debug_log(request, plugin_id="test_plugin")
+
+    assert response.data["status"] == "INSTALL"
+    assert response.data["log_content"] == "debugging"
+    assert mock_log.call_args.kwargs["task_id"] == 54313798
+
+
+def test_fetch_debug_log_prefers_fetch_data_when_metrics_exist(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(data={}, query_params={"task_id": 54314058})
+    mocker.patch("monitor_web.plugin.views.get_request_tenant_id", return_value="tenant")
+    mocker.patch("monitor_web.plugin.views.get_request_username", return_value="admin")
+    mocker.patch(
+        "monitor_web.plugin.views.TaskIdSerializer",
+        return_value=SimpleNamespace(
+            validated_data={"task_id": 54314058},
+            is_valid=lambda raise_exception=True: True,
+        ),
+    )
+    mocker.patch(
+        "monitor_web.plugin.views.get_nodeman_plugin_debug_log",
+        return_value={
+            "status": "running",
+            "metric_json": [
+                {
+                    "metric_name": "disk_usage",
+                    "metric_value": 8,
+                    "dimensions": [{"dimension_name": "disk_name", "dimension_value": "/data"}],
+                }
+            ],
+            "last_time": "2026-03-21 18:49:50",
+            "log": "metric arrived",
+        },
+    )
+
+    response = CollectorPluginViewSet().fetch_debug_log(request, plugin_id="test_plugin")
+
+    assert response.data["status"] == "FETCH_DATA"
+    assert response.data["metric_json"][0]["metric_name"] == "disk_usage"
+
+
 def test_edit_disallowed_plugin_rejects_version_change(mocker: MockerFixture) -> None:
     request_data = build_request_data()
     current_plugin = build_current_plugin(

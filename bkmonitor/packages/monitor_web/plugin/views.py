@@ -52,6 +52,7 @@ from bkmonitor.utils.request import get_request_tenant_id
 from bkmonitor.utils.time_tools import utc2biz_str
 from bkmonitor.utils.user import get_request_username
 from core.drf_resource import api, resource
+from core.drf_resource.viewsets import ResourceRoute, ResourceViewSet
 from core.errors.plugin import (
     BizChangedError,
     DeletePermissionDenied,
@@ -61,7 +62,7 @@ from core.errors.plugin import (
     RelatedItemsExist,
     RemoteCollectError,
 )
-from monitor_web.plugin.constant import SNMP_V3_AUTH_JSON, DebugStatus, PluginType
+from monitor_web.plugin.constant import OS_TYPE_ID_MAP, SNMP_V3_AUTH_JSON, DebugStatus, PluginType
 from monitor_web.plugin.manager.base import check_skip_debug
 from monitor_web.plugin.metric_json_compat import convert_metric_json_to_legacy
 from monitor_web.plugin.resources import PluginFileUploadResource, SaveMetricResource
@@ -245,34 +246,6 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
     def upload_file(self, request: Request):
         result_data = PluginFileUploadResource().request(request.data)
         return Response(result_data)
-
-    @action(methods=["POST"], detail=False)
-    def data_dog_plugin_upload(self, request: Request):
-        return Response(resource.plugin.data_dog_plugin_upload.request(request.data))
-
-    @action(methods=["POST"], detail=False)
-    def save_metric(self, request: Request):
-        return Response(resource.plugin.save_metric.request(request.data))
-
-    @action(methods=["POST"], detail=False)
-    def plugin_register(self, request: Request):
-        return Response(resource.plugin.plugin_register.request(request.data))
-
-    @action(methods=["POST"], detail=False)
-    def save_and_release_plugin(self, request: Request):
-        return Response(resource.plugin.save_and_release_plugin.request(request.data))
-
-    @action(methods=["GET"], detail=False)
-    def get_reserved_word(self, request: Request):
-        return Response(resource.plugin.get_reserved_word.request(request.query_params))
-
-    @action(methods=["GET"], detail=False)
-    def plugin_upgrade_info(self, request: Request):
-        return Response(resource.plugin.plugin_upgrade_info.request(request.query_params))
-
-    @action(methods=["POST"], detail=False)
-    def process_collector_debug(self, request: Request):
-        return Response(resource.plugin.process_collector_debug.request(request.data))
 
     def list(self, request: Request) -> Response:
         """指标插件列表接口
@@ -629,7 +602,7 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
         获取操作系统类型列表
         出参: [{"os_type": "linux", "os_type_id": 1}]
         """
-        return Response([{"os_type": os_type.value, "os_type_id": index} for index, os_type in enumerate(OSType)])
+        return Response([{"os_type": os_type.value, "os_type_id": OS_TYPE_ID_MAP[os_type]} for os_type in OSType])
 
     @action(methods=["POST"], detail=False)
     def delete(self, request: Request):
@@ -716,7 +689,7 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
         info_version: int = validated_data["info_version"]
         param: dict[str, Any] = validated_data["param"]
         host_info: dict[str, Any] = validated_data["host_info"]
-        target_nodes: list[dict[str, Any]] = validated_data["target_nodes"]
+        target_nodes: list[dict[str, Any]] = validated_data.get("target_nodes", [])
         operator: str = cast(str, get_request_username())
 
         result = debug_nodeman_plugin(
@@ -729,7 +702,7 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
             target_nodes=target_nodes,
             operator=operator,
         )
-        return Response(result["task_id"])
+        return Response({"task_id": result["task_id"]})
 
     @action(methods=["POST"], detail=True)
     def stop_debug(self, request: Request, plugin_id: str):
@@ -737,7 +710,7 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
 
         入参: TaskIdSerializer
         """
-        serializer = TaskIdSerializer(data=request.data)
+        serializer = TaskIdSerializer(data=request.query_params or request.data)
         serializer.is_valid(raise_exception=True)
 
         bk_tenant_id = cast(str, get_request_tenant_id())
@@ -778,7 +751,7 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
         }
         """
         # 参数校验
-        serializer = TaskIdSerializer(data=request.data)
+        serializer = TaskIdSerializer(data=request.query_params or request.data)
         serializer.is_valid(raise_exception=True)
 
         # 参数提取
@@ -796,12 +769,14 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
         )
 
         # 状态字段转换
+        # 兼容旧接口语义：一旦已经抓到指标，就应进入 FETCH_DATA 阶段，
+        # 即使 nodeman 调试任务整体仍处于 running。
         if result["status"] == "failed":
             status = DebugStatus.FAILED
-        elif result["status"] == "running":
-            status = DebugStatus.INSTALL
         elif result["metric_json"]:
             status = DebugStatus.FETCH_DATA
+        elif result["status"] == "running":
+            status = DebugStatus.INSTALL
         else:
             status = DebugStatus.SUCCESS
 
@@ -817,8 +792,6 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
     @action(methods=["POST"], detail=True)
     def release(self, request: Request, plugin_id: str):
         """发布插件
-
-        # 后续不需要token参数，直接按照版本查询插件md5列表
 
         入参: ReleaseSerializer {"config_version":2,"info_version":2,"token":["7b0c5b708cd95f55abac85c17f277662"],"bk_biz_id":2}
         出参: None
@@ -837,5 +810,46 @@ class CollectorPluginViewSet(PermissionMixin, viewsets.ViewSet):
             plugin_id=plugin_id,
             version=VersionTuple(config_version, info_version),
             operator=operator,
+            md5_list=validated_data["token"],
         )
         return Response()
+
+
+class DataDogPluginViewSet(PermissionMixin, ResourceViewSet):
+    resource_routes = [ResourceRoute("POST", resource.plugin.data_dog_plugin_upload)]
+
+
+class MetricPluginViewSet(PermissionMixin, ResourceViewSet):
+    resource_routes = [ResourceRoute("POST", resource.plugin.save_metric, endpoint="save")]
+
+
+class RegisterPluginViewSet(PermissionMixin, ResourceViewSet):
+    resource_routes = [ResourceRoute("POST", resource.plugin.plugin_register)]
+
+
+class SaveAndReleasePluginViewSet(PermissionMixin, ResourceViewSet):
+    resource_routes = [ResourceRoute("POST", resource.plugin.save_and_release_plugin)]
+
+
+class GetReservedWordViewSet(PermissionMixin, ResourceViewSet):
+    """
+    获取关键字列表
+    """
+
+    resource_routes = [ResourceRoute("GET", resource.plugin.get_reserved_word)]
+
+
+class PluginUpgradeInfoViewSet(PermissionMixin, ResourceViewSet):
+    """
+    获取插件参数配置版本发行历史
+    """
+
+    resource_routes = [ResourceRoute("GET", resource.plugin.plugin_upgrade_info)]
+
+
+class ProcessCollectorDebugViewSet(PermissionMixin, ResourceViewSet):
+    """
+    进程数据采集器
+    """
+
+    resource_routes = [ResourceRoute("POST", resource.plugin.process_collector_debug)]
