@@ -30,7 +30,6 @@ from bk_monitor_base.domains.uploaded_file.operation import get_file
 from bk_monitor_base.metric_plugin import (
     CreatePluginParams,
     CreatePluginVersionParams,
-    MetricPluginMetricField,
     MetricPluginMetricGroup,
     MetricPluginNotFoundError,
     MetricPluginStatus,
@@ -230,34 +229,14 @@ class SaveMetricResource(Resource):
 
     @staticmethod
     def _build_metric_groups(metric_json: list[dict[str, Any]]) -> list[MetricPluginMetricGroup]:
-        """
-        将前端的 metric_json 转成 bk_monitor_base 的领域模型。
+        """将前端的 metric_json 转成 bk_monitor_base 的领域模型。
 
-        这里同时兼容旧字段 `rule_list` 和 base 侧字段 `rules`，
-        这样前后端协议不用跟着这次迁移一起变更。
+        实际逻辑委托给 ``compat.convert_metric_json_to_base``，
+        保留此方法是为了不改变已有调用方的签名。
         """
-        metric_groups: list[MetricPluginMetricGroup] = []
-        for metric_group in metric_json:
-            metric_groups.append(
-                MetricPluginMetricGroup(
-                    table_name=metric_group["table_name"],
-                    table_desc=metric_group.get("table_desc", ""),
-                    rules=metric_group.get("rule_list") or metric_group.get("rules") or [],
-                    fields=[
-                        MetricPluginMetricField(
-                            name=field["name"],
-                            type=field["type"],
-                            description=field.get("description", ""),
-                            monitor_type=field["monitor_type"],
-                            unit=field.get("unit", "none"),
-                            is_active=field.get("is_active", True),
-                            source_name=field.get("source_name", ""),
-                        )
-                        for field in metric_group.get("fields", [])
-                    ],
-                )
-            )
-        return metric_groups
+        from monitor_web.plugin.compat import convert_metric_json_to_base
+
+        return convert_metric_json_to_base(metric_json)
 
     @staticmethod
     def _validate_metric_limit(plugin_type: str, metric_json: list[dict[str, Any]]) -> None:

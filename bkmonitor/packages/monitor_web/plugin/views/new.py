@@ -64,7 +64,7 @@ from core.errors.plugin import (
 )
 from monitor_web.plugin.constant import OS_TYPE_ID_MAP, SNMP_V3_AUTH_JSON, DebugStatus, PluginType
 from monitor_web.plugin.manager.base import check_skip_debug
-from monitor_web.plugin.metric_json_compat import convert_metric_json_to_legacy
+from monitor_web.plugin.compat import convert_metric_json_to_legacy
 from monitor_web.plugin.resources import PluginFileUploadResource, SaveMetricResource
 from monitor_web.plugin.serializers import (
     DataDogSerializer,
