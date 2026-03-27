@@ -11,7 +11,6 @@ specific language governing permissions and limitations under the License.
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Callable
 from dataclasses import asdict
 from functools import reduce
 from itertools import chain
@@ -19,6 +18,7 @@ from re import Pattern
 from typing import Any
 
 import arrow
+from bk_monitor_base.strategy import get_metric_id
 from django.conf import settings
 from django.db.models import Q
 from django.forms import model_to_dict
@@ -39,7 +39,6 @@ from bkmonitor.data_source import (
 from bkmonitor.data_source.unify_query.query import UnifyQuery
 from bkmonitor.models import BCSCluster, MetricListCache
 from bkmonitor.share.api_auth_resource import ApiAuthResource
-from bk_monitor_base.strategy import get_metric_id
 from bkmonitor.utils.range import load_agg_condition_instance
 from bkmonitor.utils.request import get_request_tenant_id
 from bkmonitor.utils.tenant import bk_biz_id_to_bk_tenant_id
@@ -596,7 +595,7 @@ class UnifyQueryRawResource(ApiAuthResource):
         series_num = serializers.IntegerField(label="查询多少条数据", required=False)
         time_alignment = serializers.BooleanField(label="是否保留最后一个数据点", required=False, default=True)
         null_as_zero = serializers.BooleanField(label="是否将空值转换为0", required=False, default=False)
-        query_method = serializers.CharField(label="查询方法", required=False, default="query_data")
+        query_method = serializers.CharField(label="查询方法", required=False, default="query_data_with_stat")
         unit = serializers.CharField(label="单位", default="", allow_blank=True)
         with_metric = serializers.BooleanField(label="是否返回metric信息", default=True)
         not_time_align = serializers.BooleanField(label="是否不对齐时间窗口", required=False, default=False)
@@ -830,17 +829,12 @@ class UnifyQueryRawResource(ApiAuthResource):
             not_time_align=params.get("not_time_align", False),
         )
 
-        query_method_name = query_method_name or params.get("query_method", "query_data")
-        if query_method_name == "query_data_with_stat":
+        if query_method_name == "query_reference":
+            result = query.query_reference(**query_kwargs)
+            return result, {}
+        else:
             result = query.query_data_with_stat(**query_kwargs)
             return result["series"], result["series_stat"]
-
-        query_method_map: dict[str, Callable[[Any], list[dict]]] = {
-            "query_data": query.query_data,
-            "query_reference": query.query_reference,
-        }
-        query_method: Callable[[Any], list[dict]] = query_method_map.get(query_method_name, query.query_data)
-        return query_method(**query_kwargs), {}
 
     def _perform_query(self, params: dict[str, Any], query_method_name: str | None = None) -> dict[str, Any]:
         # cookies filter
@@ -944,12 +938,9 @@ class UnifyQueryRawResource(ApiAuthResource):
             "series_stat": series_stat,
         }
 
-    def perform_request(self, params):
-        result = self._perform_query(params)
-        return {
-            "series": result["series"],
-            "metrics": result["metrics"],
-        }
+    def perform_request(self, validated_request_data: dict[str, Any]) -> Any:
+        result = self._perform_query(validated_request_data)
+        return {"series": result["series"], "metrics": result["metrics"]}
 
 
 class GraphUnifyQueryResource(UnifyQueryRawResource):
@@ -1193,7 +1184,8 @@ class GraphUnifyQueryResource(UnifyQueryRawResource):
         for config in params["query_configs"]:
             self.fill_custom_metric_method(config)
 
-        raw_query_result = self._perform_query(params, query_method_name="query_data_with_stat")
+        query_method_name = params["query_method"]
+        raw_query_result = self._perform_query(params, query_method_name=query_method_name)
         points = raw_query_result["series"]
         if not points:
             return {"series": [], "metrics": raw_query_result["metrics"]}

@@ -42,7 +42,7 @@ def build_graph_unify_params():
         "type": "range",
         "time_alignment": True,
         "null_as_zero": False,
-        "query_method": "query_data",
+        "query_method": "query_data_with_stat",
         "unit": "",
         "with_metric": True,
         "not_time_align": False,
@@ -149,6 +149,20 @@ class TestGraphUnifyQueryResource:
 
         result = GraphUnifyQueryResource().perform_request(build_graph_unify_params())
 
+        assert result["series"][0]["stat"] == {}
+
+    def test_graph_unify_query_keeps_query_reference_behavior(self, mocker):
+        params = build_graph_unify_params()
+        params["query_method"] = "query_reference"
+        perform_query = mocker.patch.object(
+            GraphUnifyQueryResource,
+            "_perform_query",
+            return_value={"series": [{"_time_": 1774525980000, "_result_": 1}], "metrics": [], "series_stat": {}},
+        )
+
+        result = GraphUnifyQueryResource().perform_request(params)
+
+        perform_query.assert_called_once_with(params, query_method_name="query_reference")
         assert result["series"][0]["stat"] == {}
 
     def test_graph_unify_query_handles_empty_series(self, mocker):
