@@ -126,16 +126,17 @@ class TestUnifyQuery:
 
         assert series_stat == {(((), "_result_")): {"count": [0, 1]}}
 
-    def test_query_data_with_stat_returns_empty_series_stat_for_datasource_query(self, mocker, mock_query_metrics):
+    def test_query_data_with_stat_returns_series_stat_for_datasource_query(self, mocker, mock_query_metrics):
         query = build_unify_query()
         mocker.patch.object(query, "process_data_sources")
         mocker.patch.object(query, "get_observe_labels", return_value={"data_source_label": "bk_monitor"})
         mocker.patch.object(query, "use_unify_query", return_value=False)
-        mocker.patch.object(query, "_query_data_using_datasource", return_value=[{"_result_": 1}])
+        stat = {((("device_name", "/dev/vda1"),), "_result_"): {"count": [0, 1]}}
+        mocker.patch.object(query, "_query_data_using_datasource", return_value=([{"_result_": 1}], stat))
 
         result = query.query_data_with_stat(start_time=1774525980000, end_time=1774526040000)
 
-        assert result == {"series": [{"_result_": 1}], "series_stat": {}}
+        assert result == {"series": [{"_result_": 1}], "series_stat": stat}
 
     def test_query_data_keeps_original_return_type(self, mocker, mock_query_metrics):
         query = build_unify_query()
@@ -149,3 +150,34 @@ class TestUnifyQuery:
         result = query.query_data(start_time=1774525980000, end_time=1774526040000)
 
         assert result == [{"_result_": 1}]
+
+    def test_query_data_using_datasource_with_stat(self, mocker, mock_query_metrics):
+        """当 datasource 提供 query_data_with_stat 时，_query_data_using_datasource 应提取 series_stat。"""
+        query = build_unify_query()
+        datasource = query.data_sources[0]
+        stat = {((("device_name", "/dev/vda1"),), "_result_"): {"count": [0, 61]}}
+        datasource.query_data_with_stat = MagicMock(return_value=([{"_result_": 1, "_time_": 100}], stat))
+        datasource.metrics = []
+
+        data, series_stat = query._query_data_using_datasource(
+            start_time=1774525980000, end_time=1774526040000, with_series_stat=True
+        )
+
+        datasource.query_data_with_stat.assert_called_once()
+        datasource.query_data.assert_not_called()
+        assert series_stat == stat
+
+    def test_query_data_using_datasource_without_stat_falls_back(self, mocker, mock_query_metrics):
+        """当 with_series_stat=False 或 datasource 无 query_data_with_stat 时，走原有 query_data 路径。"""
+        query = build_unify_query()
+        datasource = query.data_sources[0]
+        datasource.query_data = MagicMock(return_value=[{"_result_": 1, "_time_": 100}])
+        datasource.metrics = []
+        del datasource.query_data_with_stat
+
+        data, series_stat = query._query_data_using_datasource(
+            start_time=1774525980000, end_time=1774526040000, with_series_stat=True
+        )
+
+        datasource.query_data.assert_called_once()
+        assert series_stat == {}

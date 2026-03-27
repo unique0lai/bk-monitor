@@ -500,17 +500,26 @@ class UnifyQuery:
         limit: int | None = None,
         slimit: int | None = None,
         offset: int | None = None,
+        with_series_stat: bool = False,
         **kwargs,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict]:
         """
         使用原始数据源进行查询
         """
 
         all_data = []
+        # 多数据源场景下，相同 key 的 stat 会被后者覆盖；当前业务中单次查询通常只有一个数据源
+        all_series_stat: dict = {}
         for datasource in self.data_sources:
-            data = datasource.query_data(
-                start_time=start_time, end_time=end_time, limit=limit, slimit=slimit, offset=offset, **kwargs
-            )
+            if with_series_stat and hasattr(datasource, "query_data_with_stat"):
+                data, stat = datasource.query_data_with_stat(
+                    start_time=start_time, end_time=end_time, limit=limit, slimit=slimit, offset=offset, **kwargs
+                )
+                all_series_stat.update(stat)
+            else:
+                data = datasource.query_data(
+                    start_time=start_time, end_time=end_time, limit=limit, slimit=slimit, offset=offset, **kwargs
+                )
             if len(self.data_sources) == 1:
                 # 如果只有一个指标，就直接将 result 字段当前指标，否则不设置
                 for record in data:
@@ -520,7 +529,7 @@ class UnifyQuery:
                     record["_result_"] = record[metric_field]
             all_data.extend(data)
 
-        return all_data
+        return all_data, all_series_stat
 
     def _query_log_using_datasource(
         self,
@@ -596,8 +605,14 @@ class UnifyQuery:
             try:
                 labels["api"] = "query_api"
                 with metrics.DATASOURCE_QUERY_TIME.labels(**labels).time():
-                    data = self._query_data_using_datasource(
-                        start_time=start_time, end_time=end_time, limit=limit, slimit=slimit, offset=offset, **kwargs
+                    data, series_stat = self._query_data_using_datasource(
+                        start_time=start_time,
+                        end_time=end_time,
+                        limit=limit,
+                        slimit=slimit,
+                        offset=offset,
+                        with_series_stat=with_series_stat,
+                        **kwargs,
                     )
             except Exception as e:
                 exc = e
