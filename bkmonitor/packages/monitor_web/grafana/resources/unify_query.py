@@ -71,7 +71,7 @@ class TimeCompareProcessor:
     """
 
     @classmethod
-    def process_origin_data(cls, params: dict, data: list) -> list:
+    def process_origin_data(cls, params: dict, data: list, series_stat: dict | None = None) -> list:
         time_compare = params["function"].get("time_compare", [])
 
         # 兼容单个和多个时间对比
@@ -106,7 +106,7 @@ class TimeCompareProcessor:
                 expression=params["expression"],
                 functions=params["functions"],
             )
-            extra_data = query.query_data(
+            query_kwargs = dict(
                 start_time=new_params["start_time"],
                 end_time=new_params["end_time"],
                 limit=new_params["limit"],
@@ -114,6 +114,15 @@ class TimeCompareProcessor:
                 down_sample_range=params["down_sample_range"],
                 not_time_align=params.get("not_time_align", False),
             )
+
+            if series_stat is not None:
+                compare_result = query.query_data_with_stat(**query_kwargs)
+                extra_data = compare_result["series"]
+                for (dims, metric_field), stat in compare_result["series_stat"].items():
+                    new_dims = tuple(sorted(list(dims) + [("__time_compare", str(offset_text))]))
+                    series_stat[(new_dims, metric_field)] = stat
+            else:
+                extra_data = query.query_data(**query_kwargs)
 
             # 标记时间对比数据
             for record in extra_data:
@@ -929,8 +938,8 @@ class UnifyQueryRawResource(ApiAuthResource):
             condition_filter = load_agg_condition_instance(params["post_query_filter_dict"])
             points = [point for point in points if condition_filter.is_match(point)]
 
-        # 数据预处理
-        points = TimeCompareProcessor.process_origin_data(params, points)
+        # 数据预处理（传入 series_stat 以便时间对比查询也收集 stat）
+        points = TimeCompareProcessor.process_origin_data(params, points, series_stat)
         metrics = metrics if params["with_metric"] else []
         return {
             "series": points,

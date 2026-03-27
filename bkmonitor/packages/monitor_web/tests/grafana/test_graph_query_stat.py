@@ -8,10 +8,16 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from constants.data_source import DataSourceLabel, DataTypeLabel
-from monitor_web.grafana.resources.unify_query import GraphPromqlQueryResource, GraphUnifyQueryResource
+from monitor_web.grafana.resources.unify_query import (
+    GraphPromqlQueryResource,
+    GraphUnifyQueryResource,
+    TimeCompareProcessor,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -175,3 +181,44 @@ class TestGraphUnifyQueryResource:
         result = GraphUnifyQueryResource().perform_request(build_graph_unify_params())
 
         assert result == {"series": [], "metrics": []}
+
+
+class TestTimeCompareProcessorStat:
+    def test_process_origin_data_merges_time_compare_series_stat(self, mocker):
+        mocker.patch("monitor_web.grafana.resources.unify_query.load_data_source", return_value=MagicMock())
+        mock_query_cls = mocker.patch("monitor_web.grafana.resources.unify_query.UnifyQuery")
+        mock_query_instance = mock_query_cls.return_value
+        mock_query_instance.query_data_with_stat.return_value = {
+            "series": [{"_time_": 1774439580000, "_result_": 2, "bk_target_ip": "127.0.0.1"}],
+            "series_stat": {((("bk_target_ip", "127.0.0.1"),), "_result_"): {"count": [0, 2]}},
+        }
+
+        params = build_graph_unify_params()
+        params["function"] = {"time_compare": ["1d"]}
+
+        data = [{"_time_": 1774525980000, "_result_": 1, "bk_target_ip": "127.0.0.1"}]
+        series_stat = {((("bk_target_ip", "127.0.0.1"),), "_result_"): {"count": [0, 1]}}
+
+        TimeCompareProcessor.process_origin_data(params, data, series_stat)
+
+        assert series_stat[((("bk_target_ip", "127.0.0.1"),), "_result_")] == {"count": [0, 1]}
+        compare_key = ((("__time_compare", "1d"), ("bk_target_ip", "127.0.0.1")), "_result_")
+        assert series_stat[compare_key] == {"count": [0, 2]}
+        assert len(data) == 2
+        assert data[1]["__time_compare"] == "1d"
+
+    def test_process_origin_data_without_series_stat_uses_query_data(self, mocker):
+        mocker.patch("monitor_web.grafana.resources.unify_query.load_data_source", return_value=MagicMock())
+        mock_query_cls = mocker.patch("monitor_web.grafana.resources.unify_query.UnifyQuery")
+        mock_query_instance = mock_query_cls.return_value
+        mock_query_instance.query_data.return_value = [{"_time_": 1774439580000, "_result_": 2}]
+
+        params = build_graph_unify_params()
+        params["function"] = {"time_compare": ["1d"]}
+
+        data = [{"_time_": 1774525980000, "_result_": 1}]
+
+        TimeCompareProcessor.process_origin_data(params, data)
+
+        mock_query_instance.query_data.assert_called_once()
+        mock_query_instance.query_data_with_stat.assert_not_called()
