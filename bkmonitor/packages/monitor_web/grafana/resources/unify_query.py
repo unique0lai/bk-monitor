@@ -817,7 +817,32 @@ class UnifyQueryRawResource(ApiAuthResource):
             for dimension_tuple in list(dimension_tuples_set)[:series_num]
         ]
 
-    def perform_request(self, params):
+    def _query_time_series_data(
+        self, query: UnifyQuery, params: dict[str, Any], time_alignment: bool, query_method_name: str | None = None
+    ) -> tuple[list[dict], dict]:
+        query_kwargs = dict(
+            start_time=params["start_time"] * 1000,
+            end_time=params["end_time"] * 1000,
+            limit=params["limit"],
+            slimit=params["slimit"],
+            down_sample_range=params["down_sample_range"],
+            time_alignment=time_alignment,
+            not_time_align=params.get("not_time_align", False),
+        )
+
+        query_method_name = query_method_name or params.get("query_method", "query_data")
+        if query_method_name == "query_data_with_stat":
+            result = query.query_data_with_stat(**query_kwargs)
+            return result["series"], result["series_stat"]
+
+        query_method_map: dict[str, Callable[[Any], list[dict]]] = {
+            "query_data": query.query_data,
+            "query_reference": query.query_reference,
+        }
+        query_method: Callable[[Any], list[dict]] = query_method_map.get(query_method_name, query.query_data)
+        return query_method(**query_kwargs), {}
+
+    def _perform_query(self, params: dict[str, Any], query_method_name: str | None = None) -> dict[str, Any]:
         # cookies filter
         cookies_filter = get_cookies_filter()
         if cookies_filter:
@@ -860,7 +885,7 @@ class UnifyQueryRawResource(ApiAuthResource):
 
         # 查询目标实例
         if not self.get_target_instance(params):
-            return {"series": [], "metrics": metrics}
+            return {"series": [], "metrics": metrics, "series_stat": {}}
 
         # 维度top/bottom排序
         params = RankProcessor.process_params(params)
@@ -903,21 +928,7 @@ class UnifyQueryRawResource(ApiAuthResource):
         )
         safe_push_to_gateway(registry=OPERATION_REGISTRY)
 
-        query_method_map: dict[str, Callable[[Any], list[dict]]] = {
-            "query_data": query.query_data,
-            "query_reference": query.query_reference,
-        }
-        query_method: Callable[[Any], list[dict]] = query_method_map.get(params.get("query_method"), query.query_data)
-
-        points = query_method(
-            start_time=params["start_time"] * 1000,
-            end_time=params["end_time"] * 1000,
-            limit=params["limit"],
-            slimit=params["slimit"],
-            down_sample_range=params["down_sample_range"],
-            time_alignment=time_alignment,
-            not_time_align=params.get("not_time_align", False),
-        )
+        points, series_stat = self._query_time_series_data(query, params, time_alignment, query_method_name)
 
         # 如果存在数据后过滤条件，则进行过滤
         if params.get("post_query_filter_dict"):
@@ -930,6 +941,14 @@ class UnifyQueryRawResource(ApiAuthResource):
         return {
             "series": points,
             "metrics": metrics,
+            "series_stat": series_stat,
+        }
+
+    def perform_request(self, params):
+        result = self._perform_query(params)
+        return {
+            "series": result["series"],
+            "metrics": result["metrics"],
         }
 
 
@@ -974,7 +993,7 @@ class GraphUnifyQueryResource(UnifyQueryRawResource):
                 metric_functions[custom_method_config["function"]["id"]] = custom_method_config["function"]
         config["functions"] = list(metric_functions.values())
 
-    def data_format(self, params, data):
+    def data_format(self, params, data, series_stat=None):
         """
         转换为Grafana TimeSeries的格式
         :param params: 请求参数
@@ -990,6 +1009,7 @@ class GraphUnifyQueryResource(UnifyQueryRawResource):
         """
 
         dimension_fields = set(chain(*(query_config["group_by"] for query_config in params["query_configs"])))
+        series_stat = series_stat or {}
 
         formatted_data = defaultdict(dict)
 
@@ -1074,6 +1094,7 @@ class GraphUnifyQueryResource(UnifyQueryRawResource):
                     "metric_field": metric_tuple[0],
                     "datapoints": value,
                     "alias": metric_tuple[0],
+                    "stat": series_stat.get((dimensions, metric_tuple[0]), {}),
                     "type": "bar" if is_bar else "line",
                 }
                 if stack:
@@ -1172,15 +1193,16 @@ class GraphUnifyQueryResource(UnifyQueryRawResource):
         for config in params["query_configs"]:
             self.fill_custom_metric_method(config)
 
-        raw_query_result = super().perform_request(params)
+        raw_query_result = self._perform_query(params, query_method_name="query_data_with_stat")
         points = raw_query_result["series"]
         if not points:
-            return raw_query_result
+            return {"series": [], "metrics": raw_query_result["metrics"]}
 
         metrics = raw_query_result["metrics"]
+        series_stat = raw_query_result.get("series_stat", {})
 
         # 数据格式化
-        series = self.data_format(params, points)
+        series = self.data_format(params, points, series_stat)
 
         # 数据后处理
         series = TimeCompareProcessor.process_formatted_data(params, series)
@@ -1326,6 +1348,7 @@ class GraphPromqlQueryResource(Resource):
                 ),
                 "dimensions": dict(zip(s["group_keys"], s["group_values"])),
                 "datapoints": [[v[1], v[0]] for v in s["values"]],
+                "stat": s.get("stat") or {},
             }
             result.append(series)
         return result
