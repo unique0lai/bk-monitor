@@ -258,7 +258,11 @@ def _build_impact_scope(issue_id: str, aggregate_dimensions: list[str] | None = 
                         dim_cluster_display = _format_cluster_display(d.get("display_value", ""), str(v))
 
             # ── 关键字段提取 ──────────────────────────────────────────────────
-            target_type = hit_dict.get("target_type") or dim_map.get("target_type", "")
+            target_type = (
+                hit_dict.get("target_type")
+                or dim_map.get("target_type", "")
+                or hit_dict.get("event", {}).get("target_type", "")
+            )
             target = dim_map.get("target", "")
             host_key = str(
                 hit_dict.get("bk_host_id")
