@@ -99,7 +99,10 @@ def _process_single_issue(issue: IssueDocument):
     alert_count = int(result.aggregations.alert_count.value or 0)
     last_alert_time = result.aggregations.max_begin_time.value or issue.last_alert_time
 
-    agg_dims: list[str] = (issue.aggregate_config or {}).get("aggregate_dimensions", [])
+    agg_config = issue.aggregate_config
+    if hasattr(agg_config, "to_dict"):
+        agg_config = agg_config.to_dict()
+    agg_dims: list[str] = (agg_config or {}).get("aggregate_dimensions", [])
     impact_scope = _build_impact_scope(issue.id, aggregate_dimensions=agg_dims)
 
     now = int(time.time())
