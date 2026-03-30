@@ -97,7 +97,9 @@ def _process_single_issue(issue: IssueDocument):
 
     result = alert_search.execute()
     alert_count = int(result.aggregations.alert_count.value or 0)
-    last_alert_time = result.aggregations.max_begin_time.value or issue.last_alert_time
+    # ES date aggregations always return milliseconds; IssueDocument uses epoch_second → divide by 1000
+    raw_max = result.aggregations.max_begin_time.value
+    last_alert_time = int(raw_max / 1000) if raw_max else issue.last_alert_time
 
     agg_config = issue.aggregate_config
     if hasattr(agg_config, "to_dict"):
