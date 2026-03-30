@@ -132,10 +132,14 @@ def _process_single_issue(issue: IssueDocument):
     )
     try:
         IssueDocument.bulk_create([update_doc], action=BulkActionType.UPDATE)
-    except Exception:
-        logger.exception(
-            "[issue] sync_issue_alert_stats: UPDATE failed, strategy(%s) issue(%s)", issue.strategy_id, issue.id
+    except Exception as e:
+        logger.error(
+            "[issue] sync_issue_alert_stats: UPDATE failed, strategy(%s) issue(%s): %s",
+            issue.strategy_id,
+            issue.id,
+            e,
         )
+        raise
 
 
 def _backfill_unlinked_alerts(issue: IssueDocument):
