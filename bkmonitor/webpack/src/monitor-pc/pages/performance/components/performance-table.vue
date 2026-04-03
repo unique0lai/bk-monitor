@@ -1093,7 +1093,14 @@ export default class PerformanceTable extends Vue<MonitorVue> {
   cellClassName({ column }) {
     const id = column.property;
     const columnData = this.columns[id];
-    return columnData?.headerPreIcon ? 'has-header-pre-icon' : '';
+    const classNames = [];
+    if (columnData?.headerPreIcon) {
+      classNames.push('has-header-pre-icon');
+    }
+    if (['cpu_usage', 'disk_in_use', 'io_util', 'mem_usage', 'psc_mem_usage'].includes(id)) {
+      classNames.push('usage-progress-cell');
+    }
+    return classNames.join(' ');
   }
 
   public sort({ prop, order }: ISort) {
@@ -1317,6 +1324,28 @@ $processColors: #ea3636 #c4c6cc #63656e;
       font-size: 12px;
       line-height: 16px;
       color: $defaultFontColor;
+    }
+
+    .bk-table td.usage-progress-cell {
+      > .cell {
+        overflow: visible;
+      }
+
+      > .cell > div {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+      }
+
+      .rate-name {
+        margin: 0;
+      }
+
+      .bk-progress {
+        width: 100%;
+        margin: 0;
+      }
     }
 
     .process-module {
