@@ -106,7 +106,11 @@ from monitor_web.plugin.serializers import (
     SNMPSerializer,
     SNMPTrapSerializer,
 )
-from monitor_web.plugin.signature import Signature
+from bk_monitor_base.metric_plugin import (
+    dump_plugin_signature_to_yaml,
+    parse_plugin_signature_from_yaml,
+    verify_plugin_signature,
+)
 from utils import count_md5
 
 logger = logging.getLogger(__name__)
@@ -560,11 +564,10 @@ class PluginImportResource(Resource):
         if not signature_path:
             return ""
 
-        try:
-            return Signature().load_from_yaml(filename_dict[signature_path]).dumps2python()
-        except Exception as err:
-            logger.exception("[ImportPlugin] %s - signature error: %s", plugin_id, err)
-            return ""
+        result = parse_plugin_signature_from_yaml(filename_dict[signature_path])
+        if not result:
+            logger.warning("[ImportPlugin] %s - signature parse returned empty", plugin_id)
+        return result or ""
 
     @staticmethod
     def get_os_type_list(filename_dict: dict[Path, bytes]) -> list[str]:
@@ -764,21 +767,51 @@ class PluginImportResource(Resource):
             "plugin_type": imported_meta["plugin_type"],
             "tag": imported_meta["tag"],
             "label": imported_meta["label"],
-            "signature": Signature(imported_version["signature"]).dumps2yaml(),
+            "signature": dump_plugin_signature_to_yaml(imported_version["signature"]),
             "config_version": imported_version["config_version"],
             "info_version": imported_version["info_version"],
             "version_log": imported_version["version_log"],
             "is_official": cls._is_imported_plugin_official(imported_meta),
-            # TODO: 当前拆平后不再保留旧的临时版本适配对象，因此这里先固定返回 False。
-            # 旧的 safety 签名判定依赖以下字段共同生成消息：
-            # 1. plugin.plugin_type / plugin.tag
-            # 2. config.config_json / collector_json / is_support_remote / debug_flag / diff_fields / file_config
-            # 3. info.info2dict()
-            # 4. version_log / os_type_list / version
-            # 后续如需恢复签名校验，应基于这些扁平字段直接重建签名消息，而不是重新引入旧形状对象。
-            "is_safety": False,
+            "is_safety": cls._check_imported_is_safety(imported_meta, imported_config, imported_info, imported_version),
             "related_conf_count": 0,
         }
+
+    @classmethod
+    def _check_imported_is_safety(
+        cls,
+        imported_meta: dict[str, Any],
+        imported_config: dict[str, Any],
+        imported_info: dict[str, Any],
+        imported_version: dict[str, Any],
+    ) -> bool:
+        """基于导入的扁平字段构造临时 MetricPlugin 并调用 verify_plugin_signature 判断 is_safety。"""
+        from bk_monitor_base.domains.metric_plugin.define import MetricPlugin, MetricPluginParams, VersionTuple
+
+        signature_dict = imported_version.get("signature", {})
+        if not signature_dict or not isinstance(signature_dict, dict):
+            return False
+
+        try:
+            params = [MetricPluginParams(**p) for p in (imported_config.get("config_json") or [])]
+            plugin = MetricPlugin(
+                bk_tenant_id="default",
+                bk_biz_id=0,
+                id=imported_meta.get("plugin_id", ""),
+                type=imported_meta.get("plugin_type", ""),
+                name=imported_info.get("plugin_display_name", ""),
+                description_md=imported_info.get("description_md", ""),
+                params=params,
+                define=imported_config.get("collector_json", {}),
+                is_support_remote=imported_config.get("is_support_remote", False),
+                version_log=imported_version.get("version_log", ""),
+                version=VersionTuple(
+                    imported_version.get("config_version", 1), imported_version.get("info_version", 0)
+                ),
+            )
+            os_type_list = imported_version.get("os_type_list", ["linux"])
+            return verify_plugin_signature(plugin, os_type_list, signature_dict, "safety")
+        except Exception:
+            return False
 
     @classmethod
     def check_conflict_mes(
@@ -1299,7 +1332,8 @@ class PluginImportWithoutFrontendResource(PluginImportResource):
                 raise ExportImportError({"msg": "导入插件id与table_id不一致"})
         if create_params["logo"]:
             create_params["logo"] = ",".join(["data:image/png;base64", create_params["logo"].decode("utf8")])
-        create_params["signature"] = create_params["signature"].decode("utf8")
+        if isinstance(create_params["signature"], bytes):
+            create_params["signature"] = create_params["signature"].decode("utf8")
         if create_params["plugin_type"] == PluginType.SCRIPT:
             for k, v in create_params["collector_json"].items():
                 v["script_content_base64"] = v["script_content_base64"].decode("utf8")
