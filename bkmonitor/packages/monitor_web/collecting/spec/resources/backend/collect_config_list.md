@@ -127,7 +127,10 @@ def perform_request(self, validated_data):
 2. **need_upgrade 检测**：比较 `deployment.plugin_version` 与 `plugin.release_version`
 3. **空间/业务权限过滤**：`SpaceApi` 和 `data_source_by_space_uid` 逻辑保留 SaaS 层
 4. **cache_data 缓存**：旧版的 `error_instance_count` / `total_instance_count` 来自 `cache_data`
-5. **搜索/排序**：旧版有复杂的 status/task_status/need_upgrade/fuzzy 搜索，base 列表 API 不直接支持
+5. **搜索/排序分层**：
+   - `status`（运行态）与 `fuzzy` 已下推到 base 列表 API
+   - `task_status` 中的 `PREPARING/DEPLOYING/STARTING/STOPPING/STOPPED` 已翻译为 base 原子状态下推
+   - `task_status=SUCCESS/WARNING/FAILED` 与 `need_upgrade` 仍由 SaaS 层结合实例统计/版本信息补充过滤
 
 ### 风险点
 - Base `list_metric_plugin_deployments()` 过滤能力有限（仅支持 bk_biz_ids / plugin_types / plugin_ids），旧版复杂搜索需 SaaS 层补充

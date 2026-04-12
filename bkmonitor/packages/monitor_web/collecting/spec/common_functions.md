@@ -129,81 +129,24 @@ def convert_deployment_to_legacy(
 
 **描述**：`"1.10"` → `VersionTuple(1, 10)`
 
-### 0.6 status() 结果转换（⚠️ 高复杂度）
+### 0.6 ~~status() 结果转换~~（✅ 已由 Base 完成，无需 compat 层转换）
 
-> **这是 compat 层最复杂的部分。** Base 的 `installer.status()` 与旧版在结构、字段、语义上均有重大差异。
-> 详见 `base_capability_mapping.md § 4.5`。
-
-#### `convert_base_status_to_legacy(raw_status, deployment, version, plugin, diff=True) -> list[dict]`
-
-**描述**：将 Base `installer.status()` 的返回结果转换为旧版 `NodeManInstaller.status(diff)` 的格式。
-
-**核心处理步骤**：
-
-1. **提取实例列表**：从 base 的 `[{node_name, node_type, child}]` 中提取所有实例
-2. **实例字段补充/转换**：
-   - 补充 `task_id`（从 deployment.related_params）
-   - 补充 `plugin_version`（从 version.plugin_version）
-   - 转换 `log` 字段（base 返回错误日志文本，旧版返回阶段名）
-   - 转换 `status`（根据 deployment.status 推断 last_operation，RUNNING→STARTING/STOPPING）
-   - 重命名 `related_node_ids` → `scope_ids`
-3. **diff 逻辑**（仅 diff=True）：
-   - 获取上一部署版本的 target_nodes
-   - 计算 ADD/UPDATE/RETRY 节点分类
-   - 将实例按差异类型分组
-4. **节点结构转换**：
-   - base `node_name` → 旧版 `node_path`
-   - 补充 `label_name`（diff 类型）、`is_label`
-   - 按 target_node_type 分别处理 TOPO/HOST/DYNAMIC_GROUP/TEMPLATE 场景
-
-**使用的 Resource**：
-- `CollectTargetStatusResource`（diff=True，最复杂场景）
-- `CollectRunningStatusResource`（diff=False）
-- `CollectInstanceStatusResource`（diff=False）
-- `CollectTargetStatusTopoResource`（消费 diff=False 的结果）
-
-#### `_compute_node_diff(current_nodes, previous_nodes, node_type) -> dict`
-
-**描述**：计算两个版本之间目标节点的差异。
-
-```python
-def _compute_node_diff(current_nodes, previous_nodes, node_type):
-    """
-    Returns:
-        {
-            "ADD": [新增的节点],
-            "REMOVE": [删除的节点],
-            "UPDATE": [变更的节点],
-            "RETRY": [未变的节点],
-        }
-    """
-```
-
-**对应旧版逻辑**：`DeploymentConfigVersion.show_diff()` → `diff_result["nodes"]`
-
-#### `_convert_instance_status(instance, deployment_status) -> dict`
-
-**描述**：将 base 返回的单个实例转换为旧版格式，包括状态映射和字段补充。
-
-```python
-def _convert_instance_status(instance: dict, deployment_status: str) -> dict:
-    """
-    关键转换：
-    - instance["status"] RUNNING/PENDING → STARTING/STOPPING（根据 deployment_status 推断）
-    - instance["log"]：base 返回错误日志文本 → 旧版返回 "步骤名-子步骤名"
-    - 补充 instance["task_id"]、instance["plugin_version"]
-    - instance["related_node_ids"] → instance["scope_ids"]
-    """
-```
-
-#### `_regroup_by_node_type(instances, node_type, target_nodes, diff_groups) -> list[dict]`
-
-**描述**：根据 target_node_type 将实例重新分组为旧版格式。
-
-- **HOST**：所有主机归到单一 "主机" 节点，按 diff 类型拆分
-- **TOPO**：按拓扑路径分组（需调用 CMDB 获取拓扑链路）
-- **DYNAMIC_GROUP**：按动态分组分组
-- **SERVICE_TEMPLATE / SET_TEMPLATE**：先转换模板→拓扑节点，再分组
+> ~~**这是 compat 层最复杂的部分。**~~ ✅ Base 的 `NodemanInstaller.status(diff)` 已直接返回
+> 旧版兼容格式（含 `node_path`/`label_name`/`is_label`/`task_id`/`plugin_version` 等所有旧版字段），
+> SaaS 层 **不需要做任何格式转换**，直接使用 `installer.status(diff=...)` 的返回值即可。
+>
+> Base 内部已实现以下旧版逻辑：
+> - `_get_legacy_node_diff()` → 节点差异计算（ADD/REMOVE/UPDATE/RETRY）
+> - `_build_legacy_status_groups()` → 按节点类型分组（TOPO/HOST/DYNAMIC_GROUP/TEMPLATE）
+> - `_process_instance_result()` → 实例字段转换（task_id, plugin_version, log, status, scope_ids）
+> - `_convert_legacy_instance_status()` → 实例状态转换（STARTING/STOPPING）
+> - `_build_status_output_instance()` → 移除内部字段后输出
+>
+> 因此以下函数 **不再需要在 SaaS compat 层实现**：
+> - ~~`convert_base_status_to_legacy()`~~
+> - ~~`_compute_node_diff()`~~
+> - ~~`_convert_instance_status()`~~
+> - ~~`_regroup_by_node_type()`~~
 
 ---
 

@@ -115,14 +115,15 @@ collecting/
 
 ### 4.3 status.py（状态查询）
 
-> ⚠️ **status() 是新旧差异最大的区域**，详见 [base_capability_mapping.md § 4.5](./base_capability_mapping.md)
+> ✅ Base `NodemanInstaller.status(diff)` 已完整实现旧版兼容格式，status 类 Resource 适配复杂度已降至 🟢 低。
+> 详见 [base_capability_mapping.md § 4.5](./base_capability_mapping.md)
 
 | # | Resource | HTTP 端点 | 暴露渠道 | 适配复杂度 | Base 对应 |
 |---|---------|----------|---------|-----------|----------|
-| 24 | CollectTargetStatusResource | GET status | 🌐🔗 | 🔴 高 | Base 无 diff 模式，需 SaaS 层包装版本差异比对 |
-| 25 | CollectRunningStatusResource | GET running_status | 🌐🔗 | 🟡 中 | diff=False 场景，节点结构/字段名需转换 |
-| 26 | CollectInstanceStatusResource | GET collect_instance_status | 🌐🔗🔧 | 🟡 中 | 被 `datalink` 模块内部调用 |
-| 27 | CollectTargetStatusTopoResource | - | 🔧 | 🟡 中 | 仅被 `FrontendTargetStatusTopoResource` 内部调用 |
+| 24 | CollectTargetStatusResource | GET status | 🌐🔗 | 🟢 低 | ✅ `installer.status(diff=True)` 直接可用 |
+| 25 | CollectRunningStatusResource | GET running_status | 🌐🔗 | 🟢 低 | ✅ `installer.status(diff=False)` 直接可用 |
+| 26 | CollectInstanceStatusResource | GET collect_instance_status | 🌐🔗🔧 | 🟢 低 | ✅ `installer.status(diff=False)` + 被 `datalink` 模块内部调用 |
+| 27 | CollectTargetStatusTopoResource | - | 🔧 | 🟢 低 | ✅ 消费 status(diff=False) 结果 + SaaS NoData 检测 |
 | 28 | UpdateConfigInstanceCountResource | - | ⚠️ | 🟢 低 | 未找到调用者，疑似废弃 |
 
 ### 4.4 toolkit.py（运维工具）
