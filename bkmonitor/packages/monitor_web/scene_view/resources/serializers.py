@@ -55,11 +55,7 @@ class CustomMetricBaseRequestSerializer(serializers.Serializer):
         # 3. 补充 result_table_id
         validated_data["result_table_id"] = result_table_id
 
-        # 4. 如果提供了 apm_service_name，则补充 scope_prefix（用于后续过滤）
-        if validated_data.get("apm_service_name"):
-            validated_data["scope_prefix"] = validated_data["apm_service_name"] + "||"
-
-        # 5. 补充 is_apm_scenario
+        # 4. 补充 is_apm_scenario
         validated_data["is_apm_scenario"] = apm_app_name and data.get("apm_service_name")
 
         return validated_data

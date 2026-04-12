@@ -53,6 +53,7 @@ from bkmonitor.models import (
     UserGroup,
 )
 from bkmonitor.models.strategy import AlgorithmChoiceConfig
+from bkmonitor.strategy.new_strategy import Strategy
 from bkmonitor.utils.cache import CacheType
 from bkmonitor.utils.request import get_request_tenant_id, get_request_username, get_source_app
 from bkmonitor.utils.tenant import bk_biz_id_to_bk_tenant_id
@@ -1929,7 +1930,50 @@ class SaveStrategyV2Resource(Resource):
         self.validate_realtime_kafka(strategy)
         self.validate_cmdb_level(strategy)
         self.validate_upgrade_user_groups(strategy)
+        # # issue_config 处理：依赖 params key 存在性区分字段缺失（不操作）vs 显式 null（删除）
+        # if "issue_config" in params:
+        #     strategy._issue_config_in_request = True
+        #     # strategy.issue_config 已由 Strategy(**params) 经 Serializer 反序列化设置
+        #     if strategy.issue_config:
+        #         self.validate_issue_config(strategy)
         return save_strategy(bk_biz_id=validated_request_data["bk_biz_id"], strategy_json=strategy, operator=operator)
+
+    @classmethod
+    def validate_issue_config(cls, strategy: Strategy):
+        """校验 issue_config 的跨模型约束 + 字段级合法性。
+
+        - alert_levels 必须为 [1,2,3] 的非空子集（与 StrategyIssueConfig.clean() 保持一致）
+        - aggregate_dimensions 必须是策略 public_dimensions 的子集
+        - conditions.key 必须属于生效维度集合
+
+        直接从 strategy.public_dimensions 计算，不依赖 strategy.id 或缓存，
+        新建策略（id=0）也能正确校验。
+        """
+        from bkmonitor.models.issue import StrategyIssueConfigService
+
+        ic = strategy.issue_config
+
+        # alert_levels：非空且只含 1/2/3
+        if not ic.alert_levels or not set(ic.alert_levels).issubset({1, 2, 3}):
+            raise ValidationError(detail=_("alert_levels 必须为 [1,2,3] 的非空子集"))
+
+        public_dims = set(strategy.public_dimensions)
+
+        if ic.aggregate_dimensions:
+            invalid = set(ic.aggregate_dimensions) - public_dims
+            if invalid:
+                raise ValidationError(
+                    detail=_(
+                        "aggregate_dimensions 包含策略公共维度之外的字段: {invalid}，"
+                        "当前策略 public_dimensions 为: {public_dims}"
+                    ).format(invalid=invalid, public_dims=public_dims)
+                )
+
+        effective_dims = set(ic.aggregate_dimensions) if ic.aggregate_dimensions else public_dims
+        try:
+            StrategyIssueConfigService.validate_conditions(ic.conditions, effective_dims)
+        except ValueError as e:
+            raise ValidationError(detail=str(e))
 
 
 class UpdatePartialStrategyV2Resource(Resource):
@@ -2658,10 +2702,38 @@ class ListIntelligentModelsResource(Resource):
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
         algorithm = serializers.ChoiceField(required=True, label="算法类型", choices=AlgorithmModel.AIOPS_ALGORITHMS)
 
-    def perform_request(self, validated_request_data: dict[str, Any]) -> list[dict[str, Any]]:
-        bk_biz_id: int = validated_request_data["bk_biz_id"]
-        algorithm: str = validated_request_data["algorithm"]
-        plans: QuerySet[AlgorithmChoiceConfig] = AlgorithmChoiceConfig.objects.filter(algorithm=algorithm)
+    @staticmethod
+    def _get_plans(algorithm):
+        plans = AlgorithmChoiceConfig.objects.filter(algorithm=algorithm)
+        if not plans.exists():
+            if algorithm == AlgorithmModel.AlgorithmChoices.MultivariateAnomalyDetection:
+                return AlgorithmChoiceConfig.objects.filter(
+                    algorithm=AlgorithmModel.AlgorithmChoices.HostAnomalyDetection
+                )
+            if algorithm == AlgorithmModel.AlgorithmChoices.HostAnomalyDetection:
+                return AlgorithmChoiceConfig.objects.filter(
+                    algorithm=AlgorithmModel.AlgorithmChoices.MultivariateAnomalyDetection
+                )
+        return plans
+
+    @staticmethod
+    def _resolve_default_plan_id(plans, default_plan_id):
+        if not default_plan_id:
+            return None
+
+        for plan in plans:
+            if plan.id == default_plan_id:
+                return plan.id
+
+        for plan in plans:
+            if isinstance(plan.config, dict) and plan.config.get("bkbase_plan_id") == default_plan_id:
+                return plan.id
+        return None
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        algorithm = validated_request_data["algorithm"]
+        plans = list(self._get_plans(algorithm))
 
         # 判断该算法是否在ai设置中，如果在ai设置中则需要挑选出开启默认配置的plan_id进行赋值
         default_plan_id: int | None = None
@@ -2673,14 +2745,17 @@ class ListIntelligentModelsResource(Resource):
             if algorithm == AlgorithmModel.AlgorithmChoices.IntelligentDetect:
                 config = ai_setting.kpi_anomaly_detection
                 is_enabled = True
-            # 多指标异常检测
-            elif algorithm == AlgorithmModel.AlgorithmChoices.MultivariateAnomalyDetection:
+            # 主机多指标异常检测兼容历史枚举值
+            elif algorithm in (
+                AlgorithmModel.AlgorithmChoices.MultivariateAnomalyDetection,
+                AlgorithmModel.AlgorithmChoices.HostAnomalyDetection,
+            ):
                 config = ai_setting.multivariate_anomaly_detection.host
                 is_enabled = config.is_enabled
 
             # 判断如果如果是开启的话，从配置中拿到默认的plan_id
             if is_enabled:
-                default_plan_id = config.to_dict().get("default_plan_id")
+                default_plan_id = self._resolve_default_plan_id(plans, config.to_dict().get("default_plan_id"))
 
         model_list: list[dict[str, Any]] = []
         for plan in plans:

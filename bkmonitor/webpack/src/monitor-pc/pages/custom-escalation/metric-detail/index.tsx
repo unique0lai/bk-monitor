@@ -85,6 +85,7 @@ export default class NewMetricView extends tsc<object> {
       return {
         name: item.metric_name,
         scope_name: item.scope_name,
+        field_id: item.field_id,
       };
     });
   }

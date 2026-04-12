@@ -16,6 +16,7 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
+from bkmonitor.utils.alert_drilling import normalize_histogram_quantile_group_by
 from bkmonitor.utils.request import get_request_tenant_id
 from constants.data_source import DataSourceLabel, DataTypeLabel
 from core.drf_resource import Resource, api, resource
@@ -58,8 +59,6 @@ class GetCustomTsMetricGroups(Resource):
             "group_id": params["time_series_group_id"],
             "include_metrics": True,
         }
-        if params.get("scope_prefix"):
-            request_params["scope_name"] = params["scope_prefix"]
         metadata_result = api.metadata.query_time_series_scope(**request_params)
 
         # 转换数据结构
@@ -67,9 +66,6 @@ class GetCustomTsMetricGroups(Resource):
         for scope_data in metadata_result:
             scope_id = scope_data.get("scope_id")
             scope_name = scope_data.get("scope_name", "")
-            # 去除 scope_prefix 前缀
-            if params.get("scope_prefix") and scope_name.startswith(params["scope_prefix"]):
-                scope_name = scope_name[len(params["scope_prefix"]) :]
             metric_list = scope_data.get("metric_list", [])
             dimension_config = scope_data.get("dimension_config", {})
 
@@ -88,21 +84,11 @@ class GetCustomTsMetricGroups(Resource):
                 if field_config.get("hidden", False) or field_config.get("disabled", False):
                     continue
 
-                # 构建维度列表
-                dimensions = []
-                for dimension_name in metric_data.get("tag_list", []):
-                    dim_config = dimension_config.get(dimension_name, {})
-                    # 如果维度隐藏，则不展示
-                    if dim_config.get("hidden", False):
-                        continue
-                    dimensions.append({"name": dimension_name, "alias": dim_config.get("alias", dimension_name)})
-
                 metrics.append(
                     {
                         "field_id": metric_data.get("field_id"),
                         "metric_name": metric_name,
                         "alias": field_config.get("alias", ""),
-                        "dimensions": dimensions,
                     }
                 )
 
@@ -130,6 +116,65 @@ class GetCustomTsMetricGroups(Resource):
         return {"metric_groups": metric_groups}
 
 
+class GetCustomTsMetricAggInfo(Resource):
+    """
+    获取指标聚合信息（维度交集和并集）
+    """
+
+    class RequestSerializer(CustomMetricBaseRequestSerializer):
+        metric_ids = serializers.ListField(label=_("指标 ID 列表"), child=serializers.IntegerField(), allow_empty=False)
+
+    def perform_request(self, params: dict) -> dict:
+        # 调用 query_time_series_metric 获取指定指标详情
+        metric_ids = params["metric_ids"]
+        conditions = [
+            {"key": "field_id", "values": [str(mid) for mid in metric_ids], "search_type": "exact"},
+        ]
+        request_params = {
+            "group_id": params["time_series_group_id"],
+            "page": 1,
+            "page_size": -1,  # 获取所有数据
+            "conditions": conditions,
+        }
+        result = api.metadata.query_time_series_metric(**request_params)
+        metric_list = result.get("metrics", [])
+        scope_ids = list(
+            dict.fromkeys(metric_data.get("scope", {}).get("id") for metric_data in metric_list if metric_data.get("scope", {}).get("id"))
+        )
+
+        # 计算维度交集和并集
+        all_tag_sets = [set(m.get("tag_list", [])) for m in metric_list]
+        if all_tag_sets:
+            common_dims = set.intersection(*all_tag_sets)
+            all_dims = set.union(*all_tag_sets)
+        else:
+            common_dims = set()
+            all_dims = set()
+
+        # 获取 scope 维度配置（用于别名）
+        scope_request_params = {
+            "group_id": params["time_series_group_id"],
+            "scope_ids": scope_ids,
+            "include_metrics": False,
+        }
+        scope_result = api.metadata.query_time_series_scope(**scope_request_params)
+
+        # 构建维度别名映射
+        dim_alias_map: dict[str, str] = {}
+        for scope_data in scope_result:
+            for dim_name, dim_config in scope_data.get("dimension_config", {}).items():
+                alias = dim_config.get("alias") or ""
+                if dim_name not in dim_alias_map or (not dim_alias_map[dim_name] and alias):
+                    dim_alias_map[dim_name] = alias
+
+        return {
+            "common_dimensions": [
+                {"name": d, "alias": dim_alias_map[d] if d in dim_alias_map else d} for d in sorted(common_dims)
+            ],
+            "all_dimensions": [{"name": d, "alias": dim_alias_map[d] if d in dim_alias_map else d} for d in sorted(all_dims)],
+        }
+
+
 class GetCustomTsDimensionValues(Resource):
     """
     获取自定义时序维度值
@@ -143,19 +188,7 @@ class GetCustomTsDimensionValues(Resource):
         dimension = serializers.CharField(label=_("维度"))
         start_time = serializers.IntegerField(label=_("开始时间"))
         end_time = serializers.IntegerField(label=_("结束时间"))
-        metrics = serializers.ListField(label=_("指标"), child=serializers.JSONField())
-
-        def validate(self, attrs):
-            metrics_list = []
-            for _metrics in attrs.get("metrics", []):
-                if isinstance(_metrics, str):
-                    metrics_list.append(_metrics)
-                else:
-                    s = self.MetricSerializer(data=_metrics)
-                    s.is_valid(raise_exception=True)
-                    metrics_list.append(s.validated_data["name"])
-            attrs["metrics"] = metrics_list
-            return super().validate(attrs)
+        metrics = MetricSerializer(label=_("指标"), many=True, default=list)
 
     def perform_request(self, params: dict) -> list[dict]:
         # 如果指标为空，则返回空列表
@@ -175,11 +208,13 @@ class GetCustomTsDimensionValues(Resource):
             )
             data_label = table.data_label.split(",")[0]
 
+        metric_names = [metric["name"] for metric in params["metrics"]]
+
         # 构建指标名称匹配部分
-        if len(params["metrics"]) == 1:
-            metric_match = f'__name__="bkmonitor:{data_label}:{params["metrics"][0]}"'
+        if len(metric_names) == 1:
+            metric_match = f'__name__="bkmonitor:{data_label}:{metric_names[0]}"'
         else:
-            metric_match = f'__name__=~"bkmonitor:{data_label}:({"|".join(params["metrics"])})"'
+            metric_match = f'__name__=~"bkmonitor:{data_label}:({"|".join(metric_names)})"'
 
         # 如果是 APM 场景，添加额外的标签过滤
         label_filters = []
@@ -222,6 +257,7 @@ class GetCustomTsGraphConfig(Resource):
         class GroupBySerializer(serializers.Serializer):
             field = serializers.CharField(label=_("聚合维度"))
             split = serializers.BooleanField(label=_("是否拆分"), default=False)
+            is_manual = serializers.BooleanField(label=_("是否自定义输入"), default=False)
 
         class ConditionSerializer(serializers.Serializer):
             key = serializers.CharField(label=_("字段名"))
@@ -229,11 +265,7 @@ class GetCustomTsGraphConfig(Resource):
             value = serializers.ListField(label=_("值"))
             condition = serializers.ChoiceField(choices=["and", "or"], label=_("条件"), default="and")
 
-        class MetricSerializer(serializers.Serializer):
-            scope_name = serializers.CharField(label=_("分组名称"), allow_blank=True, default="")
-            name = serializers.CharField(label=_("指标名称"))
-
-        metrics = serializers.ListField(label=_("查询的指标"), default=[])
+        metric_ids = serializers.ListField(label=_("指标 ID 列表"), child=serializers.IntegerField(), default=list)
         where = ConditionSerializer(label=_("过滤条件"), many=True, allow_empty=True, default=list)
         group_by = GroupBySerializer(label=_("聚合维度"), many=True, allow_empty=True, default=list)
         common_conditions = serializers.ListField(label=_("常用维度过滤"), default=list)
@@ -241,18 +273,6 @@ class GetCustomTsGraphConfig(Resource):
         compare = CompareSerializer(label=_("对比配置"), default={})
         start_time = serializers.IntegerField(label=_("开始时间"))
         end_time = serializers.IntegerField(label=_("结束时间"))
-
-        def validate(self, attrs):
-            metrics_list = []
-            for _metrics in attrs.get("metrics", []):
-                if isinstance(_metrics, str):
-                    metrics_list.append(_metrics)
-                else:
-                    s = self.MetricSerializer(data=_metrics)
-                    s.is_valid(raise_exception=True)
-                    metrics_list.append(s.validated_data["name"])
-            attrs["metrics"] = metrics_list
-            return super().validate(attrs)
 
     class ResponseSerializer(serializers.Serializer):
         class GroupSerializer(serializers.Serializer):
@@ -312,8 +332,14 @@ class GetCustomTsGraphConfig(Resource):
         if compare_config and compare_config.get("type") == "time" and compare_config.get("offset"):
             function = {"time_compare": compare_config["offset"]}
 
-        # 非拆图维度
-        non_split_dimensions = [x["field"] for x in params.get("group_by", []) if not x["split"]]
+        non_split_dimensions: list[str] = []  # 非拆图维度
+        manual_dimensions: list[str] = []  # 用户自定义输入的维度
+        for _dimension_dict in params.get("group_by", []):
+            if _dimension_dict["split"]:
+                continue
+            non_split_dimensions.append(_dimension_dict["field"])
+            if _dimension_dict["is_manual"]:
+                manual_dimensions.append(_dimension_dict["field"])
 
         # 根据拆图维度分组
         groups: list[dict] = []
@@ -356,8 +382,8 @@ class GetCustomTsGraphConfig(Resource):
                     "data_label": data_label.split(",")[0],
                     "data_source_label": DataSourceLabel.CUSTOM,
                     "data_type_label": DataTypeLabel.TIME_SERIES,
-                    # 只使用指标的维度
-                    "group_by": list(set(non_split_dimensions) & all_metric_dimensions),
+                    # 使用指标的维度 + 用户自定义输入的维度
+                    "group_by": list(set(non_split_dimensions) & all_metric_dimensions | set(manual_dimensions)),
                     # TODO: 考虑也按指标的维度过滤
                     "where": params.get("where", []),
                     "functions": functions + metric.get("function", []),
@@ -525,12 +551,15 @@ class GetCustomTsGraphConfig(Resource):
 
         # 维度排序
         dimensions = sorted(dimensions)
+        is_manual_dimensions: list[str] = [x["field"] for x in params.get("group_by", []) if x["is_manual"]]
 
         # 根据metrics的维度与待查询维度的交集，确定查询的维度
         dimensions_to_metrics = defaultdict(list)
         for metric in metrics:
             # 从 metadata 的指标中获取维度
-            metric_dimensions = tuple(d for d in dimensions if d in metric.get("dimensions", []))
+            metric_dimensions = tuple(
+                d for d in dimensions if d in metric.get("dimensions", []) or d in is_manual_dimensions
+            )
             dimensions_to_metrics[metric_dimensions].append(metric["name"])
 
         series_metrics = defaultdict(set)
@@ -560,7 +589,7 @@ class GetCustomTsGraphConfig(Resource):
 
     def perform_request(self, params: dict) -> dict:
         # 如果指标为空，则返回空列表
-        if not params["metrics"]:
+        if not params["metric_ids"]:
             return {"groups": []}
 
         is_apm_scenario = params.get("is_apm_scenario")
@@ -578,67 +607,62 @@ class GetCustomTsGraphConfig(Resource):
                 .first()
             )
 
-        # 从 metadata 获取指标分组列表
-        request_params = {
+        # 从 metadata 获取 scope（不含指标，仅用于维度配置）
+        scope_request_params = {
             "group_id": params["time_series_group_id"],
-            "include_metrics": True,
+            "include_metrics": False,
         }
-        if params.get("scope_prefix"):
-            request_params["scope_name"] = params["scope_prefix"]
-        metadata_result = api.metadata.query_time_series_scope(**request_params)
+        metadata_result = api.metadata.query_time_series_scope(**scope_request_params)
 
-        # 构建指标字典和维度字典
-        metrics_list = []
+        # 收集维度别名
         dimension_names: dict[str, str] = {}
-
-        # 构建请求的指标集合
-        requested_metrics = set(params["metrics"])
-
+        dimension_hidden: set[str] = set()
         for scope_data in metadata_result:
-            metric_list = scope_data.get("metric_list", [])
             dimension_config = scope_data.get("dimension_config", {})
-
-            # 收集维度名称
             for dimension_name, dim_config in dimension_config.items():
-                if not dim_config.get("hidden", False):
+                if dim_config.get("hidden", False):
+                    dimension_hidden.add(dimension_name)
+                else:
                     dimension_names[dimension_name] = dim_config.get("alias", dimension_name)
 
-            # 收集指标信息
-            for metric_data in metric_list:
-                metric_name = metric_data.get("metric_name", "")
-                field_config = metric_data.get("field_config", {})
-                scope_name = metric_data.get("field_scope", "")
+        # 通过 query_time_series_metric 精确获取指定指标（使用 field_id 精确匹配）
+        requested_metric_ids = set(params["metric_ids"])
+        conditions = [
+            {"key": "field_id", "values": [str(mid) for mid in requested_metric_ids], "search_type": "exact"},
+        ]
+        metric_result = api.metadata.query_time_series_metric(
+            group_id=params["time_series_group_id"],
+            page=1,
+            page_size=-1, # 获取所有指标
+            conditions=conditions,
+        )
 
-                # 只处理请求的指标
-                if metric_name not in requested_metrics:
-                    continue
+        # 构建指标列表
+        metrics_list = []
 
-                # 如果指标隐藏或禁用，则跳过
-                if field_config.get("hidden", False) or field_config.get("disabled", False):
-                    continue
+        for metric_data in metric_result.get("metrics", []):
+            metric_name = metric_data.get("name", "")
+            field_config = metric_data.get("field_config", {})
+            scope_name = metric_data.get("field_scope", "")
 
-                # 收集指标的维度（排除隐藏的维度）
-                dimensions = [
-                    dimension_name
-                    for dimension_name in metric_data.get("tag_list", [])
-                    if not dimension_config.get(dimension_name, {}).get("hidden", False)
-                ]
+            # 如果指标隐藏或禁用，则跳过
+            if field_config.get("hidden", False) or field_config.get("disabled", False):
+                continue
 
-                # 去除 scope_prefix 前缀
-                if params.get("scope_prefix") and scope_name.startswith(params["scope_prefix"]):
-                    scope_name = scope_name[len(params["scope_prefix"]) :]
+            # 收集指标的维度（排除隐藏的维度）
+            dimensions = [dim_name for dim_name in metric_data.get("tag_list", []) if dim_name not in dimension_hidden]
 
-                metrics_list.append(
-                    {
-                        "name": metric_name,
-                        "alias": field_config.get("alias", ""),
-                        "dimensions": dimensions,
-                        "aggregate_method": field_config.get("aggregate_method", "AVG"),
-                        "function": field_config.get("function", []),
-                        "unit": field_config.get("unit", ""),
-                        "scope_name": scope_name,
-                    }
-                )
+            metrics_list.append(
+                {
+                    "name": metric_name,
+                    "alias": field_config.get("alias", ""),
+                    "dimensions": dimensions,
+                    "aggregate_method": field_config.get("aggregate_method", "AVG"),
+                    "function": field_config.get("function", []),
+                    "unit": field_config.get("unit", ""),
+                    "scope_name": scope_name,
+                }
+            )
 
         compare_config = params.get("compare", {})
         if not compare_config or compare_config.get("type") == "time":
@@ -717,6 +741,28 @@ class GraphDrillDownResource(Resource):
                         attrs["interval"] = int(attrs["interval"]) * 60
                     except ValueError:
                         pass
+
+                # 过滤掉无效的 where 条件
+                validated_where = []
+                for condition in attrs.get("where", []):
+                    if not isinstance(condition, dict):
+                        continue
+                    value = condition.get("value")
+                    # 过滤掉 value 为 None、空列表或只包含 None 的列表
+                    if value is None:
+                        continue
+                    if isinstance(value, list):
+                        # 移除列表中的 None，如果移除后列表为空则跳过该条件
+                        filtered_value = [v for v in value if v is not None]
+                        if not filtered_value:
+                            continue
+                        # 创建新字典，避免修改原对象
+                        validated_condition = {**condition, "value": filtered_value}
+                        validated_where.append(validated_condition)
+                    else:
+                        validated_where.append(condition)
+
+                attrs["where"] = validated_where
                 return attrs
 
         bk_biz_id = serializers.IntegerField(label=_("业务 ID"))
@@ -786,7 +832,10 @@ class GraphDrillDownResource(Resource):
 
     def perform_request(self, params: dict) -> list:
         for item in params["query_configs"]:
-            item["group_by"] = params["group_by"]
+            # 浅拷贝 group_by，避免发生共享引用被污染的问题
+            item["group_by"] = list(params["group_by"])
+            normalize_histogram_quantile_group_by(item)
+
         result = resource.grafana.graph_unify_query(params)
 
         dimensions_values: dict[tuple[tuple[str, str]], dict] = defaultdict(

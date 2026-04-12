@@ -178,13 +178,16 @@ class NewMetricChart extends CommonSimpleChart {
   downSampleRange = 'auto';
   // 图表是否在视图范围内
   chartIntoView = false;
+
+  /** 组件是否正在销毁中 */
+  isBeforeDestroying = false;
+
   get yAxisNeedUnitGetter() {
     return this.yAxisNeedUnit ?? true;
   }
 
-  /** 指标列表 */
-  get currentSelectedMetricList() {
-    return customEscalationViewStore.currentSelectedMetricList;
+  get aggInfoData() {
+    return customEscalationViewStore.aggInfoData;
   }
 
   get viewWidth() {
@@ -221,7 +224,7 @@ class NewMetricChart extends CommonSimpleChart {
       if (v) {
         this.observerChart();
       }
-    })
+    });
   }
 
   observerChart() {
@@ -427,13 +430,19 @@ class NewMetricChart extends CommonSimpleChart {
     return transformSeries;
   }
 
-  convertJsonObject(obj, name: string) {
-    const dimensions = this.currentSelectedMetricList.find(ele => ele.metric_name === name)?.dimensions;
+  convertJsonObject(obj) {
+    // const dimensions = this.currentSelectedMetricList.find(ele => ele.metric_name === name)?.dimensions;
+    const dimensions = this.aggInfoData.all_dimensions;
     const keys = Object.keys(obj);
     const parts = [];
     for (const key of keys) {
       const info = dimensions.find(item => item.name === key);
-      parts.push(`${info.alias || info.name}=${obj[key]}`);
+      // 可能存在自定义输入维度的情况
+      if (info) {
+        parts.push(`${info.alias || info.name}=${obj[key]}`);
+        continue;
+      }
+      parts.push(`${key}=${obj[key]}`);
     }
     const separator = '|';
     return parts.join(separator);
@@ -456,7 +465,7 @@ class NewMetricChart extends CommonSimpleChart {
     const { dimensions = {}, dimensions_translation = {}, time_offset } = set;
     const { metric = {} } = item;
     const timeOffset = time_offset ? `${this.formatTimeStr(time_offset)}` : '';
-    const output = this.convertJsonObject({ ...dimensions, ...dimensions_translation }, metric.name);
+    const output = this.convertJsonObject({ ...dimensions, ...dimensions_translation });
     const outputStr = output ? `${output}` : '';
     if (!timeOffset && !outputStr) {
       return metric.alias || metric.name;
@@ -494,6 +503,7 @@ class NewMetricChart extends CommonSimpleChart {
    */
   @Debounce(300)
   async getPanelData(start_time?: string, end_time?: string) {
+    if (this.isBeforeDestroying) return;
     this.legendData = [];
     this.legendSorts = [];
     this.initialized = false;
@@ -523,6 +533,7 @@ class NewMetricChart extends CommonSimpleChart {
       const variablesService = new VariablesService({
         ...this.viewOptions,
         ...this.customScopedVars,
+        ...(customEscalationViewStore.isIntervalAuto ? { interval: customEscalationViewStore.autoIntervalSec } : {}),
       });
 
       const list = this.panel.targets.map(item => {
@@ -542,13 +553,14 @@ class NewMetricChart extends CommonSimpleChart {
         if (primaryKey) {
           paramsArr.push(primaryKey);
         }
-
         paramsArr.push({
           ...newParams,
           unify_query_param: {
             ...newParams.unify_query_param,
           },
-          down_sample_range: this.downSampleRangeComputed(this.downSampleRange, [startTime, endTime]),
+          ...(customEscalationViewStore.isIntervalAuto
+            ? {}
+            : { down_sample_range: this.downSampleRangeComputed(this.downSampleRange, [startTime, endTime]) }),
         });
         return graphUnifyQuery(...paramsArr, {
           cancelToken: new CancelToken((cb: () => void) => this.cancelTokens.push(cb)),
@@ -605,7 +617,6 @@ class NewMetricChart extends CommonSimpleChart {
           seriesResult.map(item => ({
             name: item.name,
             cursor: 'auto',
-            // biome-ignore lint/style/noCommaOperator: <explanation>
             data: item.datapoints.reduce((pre, cur) => (pre.push(cur.reverse()), pre), []),
             stack: item.stack || random(10),
             unit: this.panel.options?.unit || item.unit,
@@ -770,7 +781,12 @@ class NewMetricChart extends CommonSimpleChart {
   generateRandomDashboardId() {
     return Math.random().toString(36).substr(2, 9);
   }
-  getCopyPanel() {
+  /**
+   * @description: 跳转新增策略不需要functions中bottom和top，会导致添加的策略无法产生告警
+   * @param {boolean} isAddStrategy 是否新增策略
+   * @return {*}
+   */
+  getCopyPanel(isAddStrategy = false) {
     const [startTime, endTime] = this.handleTime();
     let copyPanel = JSON.parse(JSON.stringify(this.panel));
     const targets = copyPanel.targets.map(item => ({
@@ -781,6 +797,9 @@ class NewMetricChart extends CommonSimpleChart {
         query_configs: item.query_configs.map(config => ({
           ...config,
           interval: this.viewOptions?.interval || 'auto',
+          functions: isAddStrategy
+            ? config.functions?.filter(f => !['bottom', 'top'].includes(f.id))
+            : config.functions,
         })),
       },
     }));
@@ -824,7 +843,7 @@ class NewMetricChart extends CommonSimpleChart {
       }
       case 'strategy': {
         // 新增策略
-        const copyPanel = this.getCopyPanel();
+        const copyPanel = this.getCopyPanel(true);
         this.handleAddStrategy(copyPanel as any, null, {}, true);
         break;
       }
@@ -875,7 +894,7 @@ class NewMetricChart extends CommonSimpleChart {
    * @return {*}
    */
   handleAllMetricClick() {
-    const copyPanel = this.getCopyPanel();
+    const copyPanel = this.getCopyPanel(true);
     this.handleAddStrategy(copyPanel as any, null, {}, true);
   }
   /**
@@ -884,12 +903,13 @@ class NewMetricChart extends CommonSimpleChart {
    * @return {*}
    */
   handleMetricClick(metric: IExtendMetricData) {
-    const copyPanel: PanelModel = this.getCopyPanel();
+    const copyPanel: PanelModel = this.getCopyPanel(true);
     this.handleAddStrategy(copyPanel, metric, {});
   }
   /** 获取当前指标的维度列表长度 */
-  getDimensionsLen(name: string) {
-    const dimensions = this.currentSelectedMetricList.find(ele => ele.metric_name === name)?.dimensions || [];
+  getDimensionsLen() {
+    // const dimensions = this.currentSelectedMetricList.find(ele => ele.metric_name === name)?.dimensions || [];
+    const dimensions = this.aggInfoData.all_dimensions || [];
     return dimensions.length || 0;
   }
 
@@ -917,7 +937,8 @@ class NewMetricChart extends CommonSimpleChart {
             >
               {this.panel.targets.map((target, ind) => {
                 const dimensionsName = target?.metric?.name;
-                const dimensionsLen = this.getDimensionsLen(dimensionsName);
+                // const dimensionsLen = this.getDimensionsLen(dimensionsName);
+                const dimensionsLen = this.getDimensionsLen();
                 return (
                   <li
                     key={dimensionsName}
@@ -936,7 +957,8 @@ class NewMetricChart extends CommonSimpleChart {
           </bk-dropdown-menu>
         );
       }
-      const dimensionsLen = this.getDimensionsLen(this.panel?.targets[0]?.metric?.name || '--');
+      // const dimensionsLen = this.getDimensionsLen(this.panel?.targets[0]?.metric?.name || '--');
+      const dimensionsLen = this.getDimensionsLen();
       /** 判断是否有维度可以下钻 */
       const isDrillDisabled = item.id === 'drillDown' && dimensionsLen === 0;
       return (
@@ -980,6 +1002,9 @@ class NewMetricChart extends CommonSimpleChart {
       }
       this.$emit('zrMouseover', { value: axesInfo[0].value });
     }
+  }
+  beforeDestroy() {
+    this.isBeforeDestroying = true;
   }
   render() {
     return (

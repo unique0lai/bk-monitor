@@ -53,7 +53,6 @@ const ACTION_TABLE_COLUMNS = [
     title: window.i18n.t('空间名'),
     is_default: true,
     is_locked: true,
-    minWidth: 100,
     width: 100,
     sorter: false,
     fixed: 'left',
@@ -142,6 +141,7 @@ const ACTION_TABLE_COLUMNS = [
     is_default: true,
     is_locked: false,
     ellipsis: true,
+    width: 260,
   },
 ] as const;
 
@@ -399,12 +399,16 @@ export class ActionService extends AlarmService<AlarmType.ACTION> {
   }
   async getAnalysisTopNData(
     params: Partial<CommonFilterParams>,
-    isAll = false
+    isAll = false,
+    options?: RequestOptions
   ): Promise<AnalysisTopNDataResponse<AnalysisFieldAggItem>> {
-    const data = await actionTopN({
-      ...params,
-      size: isAll ? 100 : 10,
-    }).catch(() => ({
+    const data = await actionTopN(
+      {
+        ...params,
+        size: isAll ? 100 : 10,
+      },
+      options
+    ).catch(() => ({
       doc_count: 0,
       fields: [],
     }));
@@ -434,12 +438,15 @@ export class ActionService extends AlarmService<AlarmType.ACTION> {
       }));
     return data;
   }
-  async getQuickFilterList(params: Partial<CommonFilterParams>): Promise<QuickFilterItem[]> {
-    const data = await searchAction({
-      ...params,
-      show_overview: true, // 是否展示概览
-      show_aggs: true, // 是否展示聚合
-    })
+  async getQuickFilterList(params: Partial<CommonFilterParams>, options?: RequestOptions): Promise<QuickFilterItem[]> {
+    const data = await searchAction(
+      {
+        ...params,
+        show_overview: true, // 是否展示概览
+        show_aggs: true, // 是否展示聚合
+      },
+      options
+    )
       .then(({ aggs, overview }) => {
         return [
           {

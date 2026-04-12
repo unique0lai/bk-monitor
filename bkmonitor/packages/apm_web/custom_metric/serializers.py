@@ -38,7 +38,4 @@ class BaseRequestSerializer(serializers.Serializer):
         # 2. 调用父类的 to_internal_value
         validated_data = super().to_internal_value(data)
 
-        # 3. 补充 scope_prefix
-        validated_data["scope_prefix"] = validated_data["service_name"] + "||"
-
         return validated_data

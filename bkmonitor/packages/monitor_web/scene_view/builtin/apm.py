@@ -115,9 +115,11 @@ def discover_caller_callee(
         logger.info("[apm][discover_caller_callee] node not found: %s / %s / %s", bk_biz_id, app_name, service_name)
         return discover_result
 
-    server_config: dict[str, Any] | None = ServiceHandler.get_rpc_service_config_or_none(
-        node
-    ) or get_rpc_service_config_from_metric_or_none(bk_biz_id, app_name, table_id, service_name)
+    system: dict[str, Any] = ServiceHandler.get_system(node)
+    if system.get("is_support_call_analysis"):
+        server_config: dict[str, Any] | None = MetricTemporality.get_metric_config(system["temporality"])
+    else:
+        server_config = get_rpc_service_config_from_metric_or_none(bk_biz_id, app_name, table_id, service_name)
     if not server_config:
         return discover_result
 
@@ -248,6 +250,14 @@ class ApmBuiltinProcessor(BuiltinProcessor):
 
         builtin_view = f"{view.scene_id}-{view.id}"
         view_config = cls.builtin_views[builtin_view]
+
+        # APM自定义指标 V2: 根据白名单判断是否展示，需在 only_simple_info 提前返回之前设置
+        if builtin_view == "apm_service-service-default-custom_metric_v2":
+            view_config = {
+                **view_config,
+                "hidden": f"{bk_biz_id}-{app_name}" not in settings.APM_CUSTOM_METRIC_V2_ENABLED_LIST,
+            }
+
         if params.get("only_simple_info") and builtin_view not in cls.NEED_RENDER_IF_ONLY_SIMPLE_INFO:
             # ViewList 不需要渲染数据，直接返回。
             return view_config
