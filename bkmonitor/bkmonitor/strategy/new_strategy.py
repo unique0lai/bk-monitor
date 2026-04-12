@@ -2049,8 +2049,13 @@ class Strategy(AbstractConfig):
                 else:
                     rt_query_config[field] = value
 
-            rt_query_config["rt_query_config_id"] = query_config["id"]
-            item_config["rt_query_config"] = rt_query_config
+            # frontend和backend两种格式
+            if config_type == "frontend":
+                rt_query_config.pop("id", None)
+                item_config.update(rt_query_config)
+            else:
+                rt_query_config["rt_query_config_id"] = query_config["id"]
+                item_config["rt_query_config"] = rt_query_config
 
             item_list.append(item_config)
 
