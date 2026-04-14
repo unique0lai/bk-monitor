@@ -204,7 +204,7 @@ def test_compose_doris_storage_binding_config(create_or_delete_records):
         '"namespace":"bkmonitor","kind":"ResultTable"},"storage":{"name":"doris-default","namespace":"bkmonitor",'
         '"kind":"Doris"},"storage_config":{"table_type":"primary_table","is_profiling":false,'
         '"unique_partition_table":true,"db":"mapleleaf_2","table":"bkm_1001_bkmonitor_time_series_50010_2",'
-        '"storage_keys":["time"],"json_fields":["dimensions"],"field_config_group":{"search_en":["log"]},'
+        '"storage_keys":["time"],"json_fields":["dimensions"],"field_config_group":{"search_en":["log"]},"original_json_fields":[],'
         '"expires":"7d","flush_timeout":null}}}'
     )
 
@@ -213,6 +213,7 @@ def test_compose_doris_storage_binding_config(create_or_delete_records):
         storage_keys=["time"],
         json_fields=["dimensions"],
         field_config_group={"search_en": ["log"]},
+        original_json_fields=[],
         expires="7d",
         flush_timeout=None,
     )
@@ -226,7 +227,7 @@ def test_compose_doris_storage_binding_config(create_or_delete_records):
         '"kind":"ResultTable"},"storage":{"name":"doris-default","tenant":"system","namespace":"bkmonitor",'
         '"kind":"Doris"},"storage_config":{"table_type":"primary_table","is_profiling":false,'
         '"unique_partition_table":true,"db":"mapleleaf_111","table":"bkm_1001_bkmonitor_time_series_50010_111",'
-        '"storage_keys":["time"],"json_fields":["dimensions"],"field_config_group":{"search_en":["log"]},'
+        '"storage_keys":["time"],"json_fields":["dimensions"],"field_config_group":{"search_en":["log"]},"original_json_fields":[],'
         '"expires":"7d","flush_timeout":null}}}'
     )
 
@@ -235,6 +236,7 @@ def test_compose_doris_storage_binding_config(create_or_delete_records):
         storage_keys=["time"],
         json_fields=["dimensions"],
         field_config_group={"search_en": ["log"]},
+        original_json_fields=[],
         expires="7d",
         flush_timeout=None,
     )
