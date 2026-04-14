@@ -823,18 +823,27 @@ class DorisStorageBindingConfig(DataLinkResourceConfigBase):
         {
             "kind": "DorisBinding",
             "metadata": {
-                "labels": {"bk_biz_id": "{{monitor_biz_id}}"}},
+                {% if tenant %}
+                "tenant": "{{ tenant }}",
+                {% endif %}
+                "labels": {"bk_biz_id": "{{monitor_biz_id}}"},
                 "name": "{{name}}",
                 "namespace": "{{namespace}}"
             },
             "spec": {
                 "data": {
                     "name": "{{name}}",
+                    {% if tenant %}
+                    "tenant": "{{ tenant }}",
+                    {% endif %}
                     "namespace": "{{namespace}}",
                     "kind": "ResultTable"
                 },
                 "storage": {
                     "name": "{{storage_cluster_name}}",
+                    {% if tenant %}
+                    "tenant": "{{ tenant }}",
+                    {% endif %}
                     "namespace": "{{namespace}}",
                     "kind": "Doris"
                 },
@@ -866,6 +875,11 @@ class DorisStorageBindingConfig(DataLinkResourceConfigBase):
             "expires": expires,
             "flush_timeout": json.dumps(flush_timeout),
         }
+
+        # 现阶段仅在多租户模式下添加tenant字段
+        if settings.ENABLE_MULTI_TENANT_MODE:
+            render_params["tenant"] = self.bk_tenant_id
+
         return utils.compose_config(
             tpl=tpl,
             render_params=render_params,
