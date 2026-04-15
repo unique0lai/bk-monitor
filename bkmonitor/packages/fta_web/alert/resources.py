@@ -2385,7 +2385,7 @@ class StrategySnapshotResource(Resource):
             is_enabled = current_strategy["is_enabled"]
             current_update_time = arrow.get(current_strategy["update_time"])
             strategy_update_time = arrow.get(strategy_config["update_time"])
-            if current_update_time.int_timestamp != strategy_update_time.int_timestamp:
+            if current_update_time.timestamp != strategy_update_time.timestamp:
                 changed_status = self.ConfigChangedStatus.UPDATED
         except StrategyNotExistError:
             changed_status = self.ConfigChangedStatus.DELETED
