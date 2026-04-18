@@ -24,7 +24,7 @@ from itertools import chain
 from typing import Any
 
 import arrow
-from bk_monitor_base.strategy import get_strategy, parse_metric_id
+from bk_monitor_base.strategy import StrategyNotExistError, get_strategy, parse_metric_id
 from django.conf import settings
 from django.core.cache import cache
 from django.db.models import Count
@@ -673,7 +673,10 @@ class AlertDetailResource(Resource):
         return result
 
     @staticmethod
-    def clean_graph_panel_where(graph_panel: dict) -> None:
+    def clean_graph_panel_where(graph_panel: dict | None) -> None:
+        if not graph_panel:
+            return
+
         for target in graph_panel.get("targets", []):
             for query_config in target.get("data", {}).get("query_configs", []):
                 query_config["where"] = clean_where_conditions(query_config.get("where", []))
@@ -2378,19 +2381,19 @@ class StrategySnapshotResource(Resource):
         changed_status = self.ConfigChangedStatus.UNCHANGED
         current_strategy = None
         try:
-            current_strategy = get_strategy(bk_biz_id=alert.bk_biz_id, strategy_id=strategy_config["id"])
+            current_strategy = get_strategy(bk_biz_id=alert.event.bk_biz_id, strategy_id=strategy_config["id"])
             is_enabled = current_strategy["is_enabled"]
             current_update_time = arrow.get(current_strategy["update_time"])
             strategy_update_time = arrow.get(strategy_config["update_time"])
-            if current_update_time.int_timestamp != strategy_update_time.int_timestamp:
+            if current_update_time.timestamp != strategy_update_time.timestamp:
                 changed_status = self.ConfigChangedStatus.UPDATED
-        except StrategyModel.DoesNotExist:
+        except StrategyNotExistError:
             changed_status = self.ConfigChangedStatus.DELETED
 
         if current_strategy and "intelligent_detect" in strategy_config["items"][0]["query_configs"][0]:
             if not strategy_config["items"][0]["query_configs"][0]["intelligent_detect"].get("use_sdk", False):
                 # AIOPS算法在告警检测时会对query_config本身进行修改导致查询配置无法还原，此时直接使用最新的query_config
-                strategy_config["items"][0]["query_configs"][0] = current_strategy.items[0].query_configs[0].to_dict()
+                strategy_config["items"][0]["query_configs"][0] = current_strategy["items"][0]["query_configs"][0]
 
         strategy_config.update(strategy_status=changed_status)
         strategy_config["create_time"] = utc2datetime(strategy_config["create_time"])
