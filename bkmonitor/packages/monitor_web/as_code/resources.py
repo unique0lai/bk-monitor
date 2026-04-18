@@ -221,15 +221,6 @@ class ExportConfigResource(Resource):
         for action in all_actions:
             action_ids[action.name] = action.pk
 
-        # 配置生成
-        # 所有的策略需要非告警状态采集内置策略才可以导出
-        filters: list[FilterCondition] = [{"key": "source", "operator": "neq", "values": [DATALINK_SOURCE]}]
-        if rule_ids is not None:
-            filters.append({"key": "id", "operator": "eq", "values": rule_ids})
-        if app is not None:
-            filters.append({"key": "app", "operator": "eq", "values": [app]})
-        strategy_configs = list_strategy(bk_biz_id=bk_biz_id, conditions=filters)["data"]
-
         # 转换为AsCode配置
         parser = StrategyConfigParser(
             bk_biz_id=bk_biz_id,
