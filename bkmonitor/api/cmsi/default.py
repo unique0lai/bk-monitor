@@ -560,7 +560,7 @@ class SendRtx(CheckCMSIResource):
     发送RTX消息
     """
 
-    action = "send_rtx"
+    action = "v1/send_rtx/"
     method = "POST"
 
     class RequestSerializer(serializers.Serializer):
