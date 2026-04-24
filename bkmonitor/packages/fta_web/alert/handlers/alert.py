@@ -60,6 +60,7 @@ from fta_web.alert.handlers.translator import (
     MetricTranslator,
     PluginTranslator,
     StrategyTranslator,
+    TopoNodeTranslator,
 )
 from fta_web.alert.utils import is_include_promql
 
@@ -1639,12 +1640,18 @@ class AlertQueryHandler(BaseBizQueryHandler):
         return event
 
     def top_n(self, fields: list, size=10, translators: dict = None, char_add_quotes=True):
+        if self.authorized_bizs is not None:
+            bk_biz_ids = self.authorized_bizs
+        else:
+            bk_biz_ids = self.bk_biz_ids
+
         translators = {
-            "metric": MetricTranslator(name_format="{name} ({id})", bk_biz_ids=self.bk_biz_ids),
+            "metric": MetricTranslator(name_format="{name} ({id})", bk_biz_ids=bk_biz_ids),
             "bk_biz_id": BizTranslator(),
             "strategy_id": StrategyTranslator(),
             "category": CategoryTranslator(),
             "plugin_id": PluginTranslator(),
+            "bk_topo_node": TopoNodeTranslator(bk_biz_ids=bk_biz_ids), # noqa
         }
 
         result = super().top_n(fields, size, translators, char_add_quotes)
