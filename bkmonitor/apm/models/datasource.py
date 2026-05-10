@@ -694,6 +694,7 @@ class TraceDataSource(ApmDataSourceConfigBase):
         ("string", "keyword"): "string",
         ("timestamp", "date"): "long",
     }
+    LEGACY_OPTION_ENABLE_V4_TRACING_DATA_LINK = "enable_v4_tracing_data_link"
 
     index_set_id = models.IntegerField("索引集id", null=True)
     index_set_name = models.CharField("索引集名称", max_length=512, null=True)
@@ -789,12 +790,26 @@ class TraceDataSource(ApmDataSourceConfigBase):
             )
         return rules
 
-    def _should_enable_bkdata_datalink(self) -> bool:
+    def _should_enable_bkdata_datalink(self, table_id: str, bk_tenant_id: str) -> bool:
         """判断 Trace RT 是否应接入 BKBase V4 链路。
 
         全局开关只决定新建默认行为；已接入 V4 的 RT 后续更新需要保留配置，避免隐式回退。
         """
-        return self.is_bkbase_v4_link() or settings.ENABLE_TRACING_BKDATA
+        return (
+            self.is_bkbase_v4_link()
+            or settings.ENABLE_TRACING_BKDATA
+            or self._has_legacy_v4_tracing_datalink_option(table_id=table_id, bk_tenant_id=bk_tenant_id)
+        )
+
+    @classmethod
+    def _has_legacy_v4_tracing_datalink_option(cls, table_id: str, bk_tenant_id: str) -> bool:
+        """兼容 3.11 Trace 专用 V4 option，命中后升级为日志 V4 通用配置。"""
+        enabled_option = metadata_models.ResultTableOption.objects.filter(
+            bk_tenant_id=bk_tenant_id,
+            table_id=table_id,
+            name=cls.LEGACY_OPTION_ENABLE_V4_TRACING_DATA_LINK,
+        ).first()
+        return bool(enabled_option and enabled_option.get_value())
 
     def is_bkbase_v4_link(self) -> bool:
         """判断当前 Trace 数据源是否已经使用 BKBase V4 链路。"""
@@ -865,7 +880,7 @@ class TraceDataSource(ApmDataSourceConfigBase):
             bk_biz_id = self.bk_biz_id
             bk_tenant_id = bk_biz_id_to_bk_tenant_id(self.bk_biz_id)
 
-        use_bkbase_v4_link = self._should_enable_bkdata_datalink()
+        use_bkbase_v4_link = self._should_enable_bkdata_datalink(table_id=table_id, bk_tenant_id=bk_tenant_id)
         params = {
             "bk_data_id": self.bk_data_id,
             # 必须为 库名.表名
