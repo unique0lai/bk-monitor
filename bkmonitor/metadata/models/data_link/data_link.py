@@ -539,12 +539,15 @@ class DataLink(models.Model):
 
             vm_storage_ins, _ = VMStorageBindingConfig.objects.update_or_create(
                 name=bkbase_vmrt_name,
-                vm_cluster_name=storage_cluster_name,
                 data_link_name=self.data_link_name,
                 namespace=self.namespace,
                 bk_biz_id=bk_biz_id,
                 bk_tenant_id=self.bk_tenant_id,
-                defaults={"table_id": table_id, "bkbase_result_table_name": bkbase_vmrt_name},
+                defaults={
+                    "table_id": table_id,
+                    "bkbase_result_table_name": bkbase_vmrt_name,
+                    "vm_cluster_name": storage_cluster_name,
+                },
             )
 
             sink_item = {
@@ -648,16 +651,18 @@ class DataLink(models.Model):
                 # 创建VM Storage绑定配置
                 vm_storage_ins, _ = VMStorageBindingConfig.objects.update_or_create(
                     name=usage_vmrt_name,
-                    vm_cluster_name=storage_cluster_name,
                     data_link_name=self.data_link_name,
                     namespace=self.namespace,
                     bk_biz_id=bk_biz_id,
                     bk_tenant_id=self.bk_tenant_id,
-                    defaults={"table_id": usage_monitor_table_id, "bkbase_result_table_name": usage_vmrt_name},
+                    defaults={
+                        "table_id": usage_monitor_table_id,
+                        "bkbase_result_table_name": usage_vmrt_name,
+                        "vm_cluster_name": storage_cluster_name,
+                    },
                 )
                 vm_storage_ins_cmdb, _ = VMStorageBindingConfig.objects.update_or_create(
                     name=usage_cmdb_level_vmrt_name,
-                    vm_cluster_name=storage_cluster_name,
                     data_link_name=self.data_link_name,
                     namespace=self.namespace,
                     bk_biz_id=bk_biz_id,
@@ -665,6 +670,7 @@ class DataLink(models.Model):
                     defaults={
                         "table_id": usage_monitor_cmdb_table_id,
                         "bkbase_result_table_name": usage_cmdb_level_vmrt_name,
+                        "vm_cluster_name": storage_cluster_name,
                     },
                 )
 
@@ -818,12 +824,15 @@ class DataLink(models.Model):
                 )
                 vm_storage_ins, _ = VMStorageBindingConfig.objects.update_or_create(
                     name=usage_vmrt_name,
-                    vm_cluster_name=storage_cluster_name,
                     data_link_name=self.data_link_name,
                     namespace=self.namespace,
                     bk_biz_id=bk_biz_id,
                     bk_tenant_id=self.bk_tenant_id,
-                    defaults={"table_id": usage_monitor_table_id, "bkbase_result_table_name": usage_vmrt_name},
+                    defaults={
+                        "table_id": usage_monitor_table_id,
+                        "bkbase_result_table_name": usage_vmrt_name,
+                        "vm_cluster_name": storage_cluster_name,
+                    },
                 )
 
                 config_list.extend([vm_table_id_ins.compose_config(), vm_storage_ins.compose_config()])
@@ -1024,12 +1033,15 @@ class DataLink(models.Model):
             )
             vm_storage_ins, _ = VMStorageBindingConfig.objects.update_or_create(
                 name=bkbase_vmrt_name,
-                vm_cluster_name=storage_cluster_name,
                 data_link_name=self.data_link_name,
                 namespace=self.namespace,
                 bk_biz_id=bk_biz_id,
                 bk_tenant_id=self.bk_tenant_id,
-                defaults={"table_id": table_id, "bkbase_result_table_name": bkbase_vmrt_name},
+                defaults={
+                    "table_id": table_id,
+                    "bkbase_result_table_name": bkbase_vmrt_name,
+                    "vm_cluster_name": storage_cluster_name,
+                },
             )
 
         configs = [
@@ -1203,12 +1215,15 @@ class DataLink(models.Model):
             )
             vm_storage_ins, _ = VMStorageBindingConfig.objects.update_or_create(
                 name=bkbase_vmrt_name,
-                vm_cluster_name=storage_cluster_name,
                 data_link_name=self.data_link_name,
                 namespace=self.namespace,
                 bk_biz_id=bk_biz_id,
                 bk_tenant_id=self.bk_tenant_id,
-                defaults={"table_id": table_id, "bkbase_result_table_name": bkbase_vmrt_name},
+                defaults={
+                    "table_id": table_id,
+                    "bkbase_result_table_name": bkbase_vmrt_name,
+                    "vm_cluster_name": storage_cluster_name,
+                },
             )
             sinks = [
                 {
@@ -1280,12 +1295,15 @@ class DataLink(models.Model):
             )
             vm_storage_ins, _ = VMStorageBindingConfig.objects.update_or_create(
                 name=bkbase_vmrt_name,
-                vm_cluster_name=storage_cluster_name,
                 data_link_name=self.data_link_name,
                 namespace=self.namespace,
                 bk_biz_id=bk_biz_id,
                 bk_tenant_id=self.bk_tenant_id,
-                defaults={"table_id": table_id, "bkbase_result_table_name": bkbase_vmrt_name},
+                defaults={
+                    "table_id": table_id,
+                    "bkbase_result_table_name": bkbase_vmrt_name,
+                    "vm_cluster_name": storage_cluster_name,
+                },
             )
             sink_item = {
                 "kind": DataLinkKind.VMSTORAGEBINDING.value,
