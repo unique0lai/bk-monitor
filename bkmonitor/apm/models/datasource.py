@@ -254,6 +254,15 @@ class ApmDataSourceConfigBase(models.Model):
         if not option:
             # 关闭
             obj.stop(bk_biz_id, app_name)
+            return
+
+        obj.apply_datalink()
+
+    def apply_datalink(self) -> None:
+        """应用数据链路。
+
+        默认数据源类型无需额外处理，子类可覆写以接入 metadata 数据链路。
+        """
 
     def _apply_exclusive_datasource(self, **options) -> None:
         """独占模式"""
@@ -672,6 +681,13 @@ class TraceDataSource(ApmDataSourceConfigBase):
     def to_json(self):
         return {**super().to_json(), "index_set_id": self.index_set_id}
 
+    def _build_result_table_option(self) -> dict[str, Any]:
+        """构建结果表 option，按开关声明 APM Trace V4 数据链路。"""
+        option = dict(TRACE_RESULT_TABLE_OPTION)
+        if settings.ENABLE_TRACING_BKDATA:
+            option["enable_v4_tracing_data_link"] = True
+        return option
+
     def to_link_info(self) -> dict[str, Any]:
         """导出链路元数据字典（含 Trace 特有字段）。"""
         info = super().to_link_info()
@@ -690,6 +706,23 @@ class TraceDataSource(ApmDataSourceConfigBase):
         super().reset_link_info()
         self.index_set_id = None
         self.index_set_name = None
+
+    def apply_datalink(self) -> None:
+        """委托 metadata 层 ResultTable.apply_datalink() 处理 Trace 链路路由。
+
+        APM 创建结果表时使用 is_sync_db=False，不会自动触发 metadata 的数据链路逻辑。
+        这里在 APM 数据源流程结束后显式触发，并兼容共享 Trace 数据源的全局结果表租户。
+        """
+        from metadata.models import ResultTable
+
+        bk_tenant_id = DEFAULT_TENANT_ID if self.is_shared else bk_biz_id_to_bk_tenant_id(self.bk_biz_id)
+        try:
+            result_table = ResultTable.objects.get(bk_tenant_id=bk_tenant_id, table_id=self.result_table_id)
+        except ResultTable.DoesNotExist:
+            logger.warning("apply_datalink: ResultTable not found for table_id=%s, skip", self.result_table_id)
+            return
+
+        result_table.apply_datalink()
 
     @property
     def table_id(self) -> str:
@@ -748,7 +781,7 @@ class TraceDataSource(ApmDataSourceConfigBase):
             "is_time_field_only": True,
             "bk_biz_id": bk_biz_id,
             "label": "application_check",
-            "option": TRACE_RESULT_TABLE_OPTION,
+            "option": self._build_result_table_option(),
             "time_option": {
                 "es_type": "date",
                 "es_format": "epoch_millis",

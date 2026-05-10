@@ -246,3 +246,111 @@ def apply_event_group_datalink(bk_tenant_id: str, table_id: str):
             ds.bk_data_id,
         )
         ds.delete_consul_config()
+
+
+@app.task(ignore_result=True, queue="celery_metadata_task_worker")
+def apply_apm_datalink(bk_tenant_id: str, table_id: str) -> None:
+    """创建或更新 APM Tracing V4 数据链路。
+
+    APM Trace 使用 ResultTableOption.OPTION_ENABLE_V4_TRACING_DATA_LINK 控制是否走 BKBase V4 链路。
+    Clean 规则由 DataLink.compose_apm_configs 基于结果表字段动态生成。
+    """
+    result_table = ResultTable.objects.get(bk_tenant_id=bk_tenant_id, table_id=table_id)
+    datasource_result_table = DataSourceResultTable.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).last()
+    if not datasource_result_table:
+        raise ValueError(f"apply_apm_datalink: tenant({bk_tenant_id}) {table_id} related datasource not found")
+
+    datasource: DataSource = DataSource.objects.get(
+        bk_tenant_id=bk_tenant_id, bk_data_id=datasource_result_table.bk_data_id
+    )
+    data_source_created_from = datasource.created_from
+
+    enabled_v4_datalink_option = ResultTableOption.objects.filter(
+        bk_tenant_id=bk_tenant_id,
+        table_id=table_id,
+        name=ResultTableOption.OPTION_ENABLE_V4_TRACING_DATA_LINK,
+    ).first()
+    enabled_v4_datalink = enabled_v4_datalink_option and enabled_v4_datalink_option.get_value()
+    if not enabled_v4_datalink:
+        if data_source_created_from != DataIdCreatedFromSystem.BKGSE.value:
+            raise ValueError(f"apply_apm_datalink: tenant({bk_tenant_id}) {table_id} cannot switch back to transfer")
+        return
+
+    if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value:
+        datasource.register_to_bkbase(bk_biz_id=result_table.bk_biz_id, namespace="bklog")
+
+    bkbase_result_table = BkBaseResultTable.objects.filter(bk_tenant_id=bk_tenant_id, monitor_table_id=table_id).first()
+    if not bkbase_result_table:
+        if result_table.bk_biz_id < 0:
+            bk_biz_id_str = f"space_{-result_table.bk_biz_id}"
+        else:
+            bk_biz_id_str = str(result_table.bk_biz_id)
+
+        random_str = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+        data_link_name = f"bklog_{bk_biz_id_str}_{random_str}"
+        while DataLink.objects.filter(data_link_name=data_link_name).exists():
+            random_str = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+            data_link_name = f"bklog_{bk_biz_id_str}_{random_str}"
+
+        datalink = DataLink.objects.create(
+            bk_tenant_id=bk_tenant_id,
+            data_link_name=data_link_name,
+            namespace="bklog",
+            data_link_strategy=DataLink.BK_APM,
+            bk_data_id=datasource.bk_data_id,
+            table_ids=[table_id],
+        )
+    else:
+        datalink = DataLink.objects.get(
+            bk_tenant_id=bk_tenant_id,
+            data_link_name=bkbase_result_table.data_link_name,
+            namespace="bklog",
+        )
+        update_fields: list[str] = []
+        if datalink.bk_data_id != datasource.bk_data_id:
+            datalink.bk_data_id = datasource.bk_data_id
+            update_fields.append("bk_data_id")
+        if datalink.table_ids != [table_id]:
+            datalink.table_ids = [table_id]
+            update_fields.append("table_ids")
+        if update_fields:
+            datalink.save(update_fields=update_fields)
+
+    datalink.apply_data_link(bk_biz_id=result_table.bk_biz_id, data_source=datasource, table_id=table_id)
+
+    es_binding_config = ESStorageBindingConfig.objects.filter(
+        bk_tenant_id=bk_tenant_id, data_link_name=datalink.data_link_name
+    ).first()
+    if es_binding_config:
+        es_storage = ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).first()
+        if not es_storage:
+            logger.info(
+                "apply_apm_datalink: tenant(%s) %s es storage binding config delete, data_link_name->[%s]",
+                bk_tenant_id,
+                table_id,
+                datalink.data_link_name,
+            )
+            es_binding_config.delete_config()
+
+    doris_binding_config = DorisStorageBindingConfig.objects.filter(
+        bk_tenant_id=bk_tenant_id, data_link_name=datalink.data_link_name
+    ).first()
+    if doris_binding_config:
+        doris_storage = DorisStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).first()
+        if not doris_storage:
+            logger.info(
+                "apply_apm_datalink: tenant(%s) %s doris storage binding config delete, data_link_name->[%s]",
+                bk_tenant_id,
+                table_id,
+                datalink.data_link_name,
+            )
+            doris_binding_config.delete_config()
+
+    if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value:
+        logger.info(
+            "apply_apm_datalink: tenant(%s) %s datasource created_from change to bkdata, clean consul config for datasource->[%s]",
+            bk_tenant_id,
+            table_id,
+            datasource.bk_data_id,
+        )
+        datasource.delete_consul_config()
