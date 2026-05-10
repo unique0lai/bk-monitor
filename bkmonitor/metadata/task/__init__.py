@@ -10,4 +10,3 @@ specific language governing permissions and limitations under the License.
 
 from .custom_report import *  # noqa
 from .config_refresh import *  # noqa
-from .datalink import *  # noqa

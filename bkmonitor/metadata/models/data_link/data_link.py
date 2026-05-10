@@ -127,7 +127,6 @@ class DataLink(models.Model):
     SYSTEM_PROC_PORT = "system_proc_port"  # 系统进程端口链路
     BASE_EVENT_V1 = "base_event_v1"  # 基础事件链路
     BK_LOG = "bk_log"  # 日志链路
-    BK_APM = "bk_apm"  # APM Tracing链路
 
     DATA_LINK_STRATEGY_CHOICES = (
         (BK_STANDARD_V2_EVENT, "标准自定义事件链路"),
@@ -141,7 +140,6 @@ class DataLink(models.Model):
         (SYSTEM_PROC_PERF, "系统进程性能链路"),
         (SYSTEM_PROC_PORT, "系统进程端口链路"),
         (BK_LOG, "日志链路"),
-        (BK_APM, "APM Tracing数据链路"),
     )
 
     # 各个套餐所需要的链路资源
@@ -161,7 +159,6 @@ class DataLink(models.Model):
         SYSTEM_PROC_PERF: [ResultTableConfig, VMStorageBindingConfig, DataBusConfig],
         SYSTEM_PROC_PORT: [ResultTableConfig, VMStorageBindingConfig, DataBusConfig],
         BK_LOG: [ResultTableConfig, ESStorageBindingConfig, DorisStorageBindingConfig, DataBusConfig],
-        BK_APM: [ResultTableConfig, ESStorageBindingConfig, DataBusConfig],
         BK_STANDARD_V2_EVENT: [ResultTableConfig, ESStorageBindingConfig, DataBusConfig],
     }
 
@@ -177,7 +174,6 @@ class DataLink(models.Model):
         SYSTEM_PROC_PORT: ClusterInfo.TYPE_VM,
         BK_LOG: ClusterInfo.TYPE_ES,
         BK_STANDARD_V2_EVENT: ClusterInfo.TYPE_ES,
-        BK_APM: ClusterInfo.TYPE_ES,
     }
 
     DATABUS_TRANSFORMER_FORMAT = {
@@ -231,7 +227,6 @@ class DataLink(models.Model):
                 self.compose_system_proc_configs, data_link_strategy=DataLink.SYSTEM_PROC_PORT
             ),
             DataLink.BK_LOG: self.compose_log_configs,
-            DataLink.BK_APM: self.compose_apm_configs,
             DataLink.BK_STANDARD_V2_EVENT: self.compose_custom_event_configs,
         }
         return switcher[self.data_link_strategy](*args, **kwargs)
@@ -336,210 +331,6 @@ class DataLink(models.Model):
             config_list,
         )
         return config_list
-
-    # APM Tracing 链路外层字段，不参与 iter_item 规则生成。
-    APM_OUTER_FIELDS = {
-        "iterationIndex",
-        "__ext",
-        "bk_host_id",
-        "cloudId",
-        "gseIndex",
-        "path",
-        "serverIp",
-        "dtEventTimeStamp",
-        "time",
-        "log",
-    }
-
-    # APM 字段类型映射：(bkm_type, es_type) -> EtlConfig output_type。
-    APM_FIELD_TYPE_MAP = {
-        ("object", "object"): "dict",
-        ("long", "long"): "long",
-        ("nested", "nested"): "nested",
-        ("int", "integer"): "long",
-        ("string", "keyword"): "string",
-        ("timestamp", "date"): "long",
-    }
-
-    # APM Trace ES 唯一字段列表。
-    APM_ES_UNIQUE_FIELD_LIST = ["trace_id", "span_id", "parent_span_id", "start_time", "end_time", "span_name"]
-
-    def compose_apm_configs(
-        self,
-        bk_biz_id: int,
-        data_source: "DataSource",
-        table_id: str,
-    ) -> list[dict[str, Any]]:
-        """生成 APM Tracing V4 数据链路配置。
-
-        APM 的 Clean 规则从 DataSource.to_json() 的 field_list 动态生成，并复用当前日志链路的
-        DataBusConfig / ESStorageBindingConfig 配置模型。
-        """
-        logger.info(
-            "compose_apm_configs: data_link_name->[%s],bk_biz_id->[%s],data_source->[%s],table_id->[%s]",
-            self.data_link_name,
-            bk_biz_id,
-            data_source,
-            table_id,
-        )
-
-        bkbase_data_name = utils.compose_bkdata_data_id_name(data_source.data_name)
-        es_storage = ESStorage.objects.filter(bk_tenant_id=self.bk_tenant_id, table_id=table_id).first()
-        if not es_storage:
-            raise ValueError("compose_apm_configs: lack ES storage config")
-
-        with transaction.atomic():
-            fields = generate_result_table_field_list(table_id=table_id, bk_tenant_id=self.bk_tenant_id)
-
-            result_table, _ = ResultTableConfig.objects.update_or_create(
-                bk_tenant_id=self.bk_tenant_id,
-                bk_biz_id=bk_biz_id,
-                namespace=self.namespace,
-                data_link_name=self.data_link_name,
-                name=self.data_link_name,
-                defaults={"table_id": table_id},
-            )
-
-            binding, _ = ESStorageBindingConfig.objects.update_or_create(
-                bk_tenant_id=self.bk_tenant_id,
-                bk_biz_id=bk_biz_id,
-                namespace=self.namespace,
-                data_link_name=self.data_link_name,
-                name=self.data_link_name,
-                defaults={
-                    "es_cluster_name": es_storage.storage_cluster.cluster_name,
-                    "timezone": es_storage.time_zone,
-                    "table_id": table_id,
-                    "bkbase_result_table_name": self.data_link_name,
-                },
-            )
-
-            index_name = table_id.replace(".", "_")
-            write_alias = f"write_%Y%m%d_{index_name}"
-            binding_config = binding.compose_config(
-                storage_cluster_name=es_storage.storage_cluster.cluster_name,
-                write_alias_format=write_alias,
-                unique_field_list=self.APM_ES_UNIQUE_FIELD_LIST,
-            )
-
-            databus_sinks = [
-                {
-                    "kind": DataLinkKind.ESSTORAGEBINDING.value,
-                    "name": binding.name,
-                    "namespace": self.namespace,
-                }
-            ]
-            if settings.ENABLE_MULTI_TENANT_MODE:
-                databus_sinks[0]["tenant"] = self.bk_tenant_id
-
-            databus, _ = DataBusConfig.objects.update_or_create(
-                bk_tenant_id=self.bk_tenant_id,
-                bk_biz_id=bk_biz_id,
-                namespace=self.namespace,
-                data_link_name=self.data_link_name,
-                name=self.data_link_name,
-                data_id_name=bkbase_data_name,
-                defaults={
-                    "bk_data_id": data_source.bk_data_id,
-                    "sink_names": [f"{sink['kind']}:{sink['name']}" for sink in databus_sinks],
-                },
-            )
-
-            config_list = [
-                result_table.compose_config(fields=fields),
-                binding_config,
-                databus.compose_log_config(sinks=databus_sinks, rules=self._build_apm_clean_rules(data_source)),
-            ]
-
-        logger.info(
-            "compose_apm_configs: data_link_name->[%s] composed configs successfully,config_list->[%s]",
-            self.data_link_name,
-            config_list,
-        )
-        return config_list
-
-    @staticmethod
-    def _build_apm_clean_rules(data_source: "DataSource") -> list[dict[str, Any]]:
-        """构建 APM Tracing 的 Clean 清洗规则。"""
-        ds_json = data_source.to_json(is_consul_config=False, with_rt_info=True)
-        if not ds_json.get("result_table_list"):
-            raise ValueError("DataSource.to_json() 返回的 result_table_list 为空")
-
-        rt_info = ds_json["result_table_list"][0]
-        field_list = rt_info.get("field_list", [])
-        if not field_list:
-            raise ValueError("result_table_list[0].field_list 为空，无法生成 Clean 规则")
-
-        rules = [
-            {
-                "input_id": "__raw_data",
-                "output_id": "json_data",
-                "operator": {"type": "json_de"},
-            },
-            {
-                "input_id": "json_data",
-                "output_id": "items",
-                "operator": {
-                    "type": "get",
-                    "key_index": [{"type": "key", "value": "items"}],
-                },
-            },
-            {
-                "input_id": "items",
-                "output_id": "iter_item",
-                "operator": {"type": "iter"},
-            },
-            {
-                "input_id": "json_data",
-                "output_id": "time",
-                "operator": {
-                    "type": "assign",
-                    "key_index": "time",
-                    "output_type": "long",
-                    "alias": "time",
-                    "in_place_time_parsing": {
-                        "from": {"format": "Unix Timestamp", "zone": None},
-                        "to": "millis",
-                        "interval_format": None,
-                        "now_if_parse_failed": True,
-                    },
-                },
-            },
-        ]
-
-        for field in field_list:
-            field_name = field.get("field_name", "")
-            if not field_name or field_name in DataLink.APM_OUTER_FIELDS or field.get("is_disabled"):
-                continue
-
-            bkm_type = field.get("type", "string")
-            es_type = field.get("option", {}).get("es_type", "keyword")
-            output_type = DataLink.APM_FIELD_TYPE_MAP.get((bkm_type, es_type))
-            if output_type is None:
-                logger.warning(
-                    "_build_apm_clean_rules: unmapped type combo (bkm_type=%s, es_type=%s) for field '%s', "
-                    "falling back to 'string'",
-                    bkm_type,
-                    es_type,
-                    field_name,
-                )
-                output_type = "string"
-
-            rules.append(
-                {
-                    "input_id": "iter_item",
-                    "output_id": field_name,
-                    "operator": {
-                        "type": "assign",
-                        "key_index": field_name,
-                        "output_type": output_type,
-                        "alias": field.get("description") or field.get("alias_name") or field_name,
-                        "default_value": None,
-                    },
-                }
-            )
-
-        return rules
 
     def compose_log_configs(
         self,
