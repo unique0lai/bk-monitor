@@ -15,7 +15,12 @@ import time
 
 from rest_framework import serializers
 
-from bkmonitor.documents.issue import IssueActivityDocument, IssueDocument, IssueDocumentWriteError, IssueNotFoundError
+from bkmonitor.documents.issue import (
+    IssueActivityDocument,
+    IssueDocument,
+    IssueDocumentWriteError,
+    IssueNotFoundError,
+)
 from bkmonitor.utils.request import get_request_username
 from bkmonitor.utils.thread_backend import ThreadPool
 from constants.issue import IssuePriority, IssueStatus
@@ -698,6 +703,44 @@ class AddIssueFollowUpResource(Resource):
             )
 
         return _run_batch(validated_request_data["issues"], _action)
+
+
+class EditIssueFollowUpResource(Resource):
+    """编辑跟进评论"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(label="业务ID")
+        issue_id = IssueIDField(label="Issue ID")
+        activity_id = serializers.CharField(label="评论活动 ID", min_length=1)
+        content = serializers.CharField(label="编辑后的内容", min_length=1)
+
+    def perform_request(self, validated_request_data):
+        operator = get_request_username()
+        return api.issue.edit_follow_up(
+            bk_biz_id=validated_request_data["bk_biz_id"],
+            issue_id=validated_request_data["issue_id"],
+            activity_id=validated_request_data["activity_id"],
+            content=validated_request_data["content"],
+            operator=operator,
+        )
+
+
+class RenameIssueResource(Resource):
+    """重命名 Issue"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(label="业务ID")
+        issue_id = IssueIDField(label="Issue ID")
+        new_name = serializers.CharField(label="Issue 名称", min_length=1, max_length=256)
+
+    def perform_request(self, validated_request_data):
+        operator = get_request_username()
+        return api.issue.rename(
+            bk_biz_id=validated_request_data["bk_biz_id"],
+            issue_id=validated_request_data["issue_id"],
+            new_name=validated_request_data["new_name"],
+            operator=operator,
+        )
 
 
 class ListIssueActivitiesResource(Resource):
