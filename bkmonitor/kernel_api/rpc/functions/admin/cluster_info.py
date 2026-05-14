@@ -179,14 +179,13 @@ def _build_alias_count_summary(client: Any, warnings: list[dict[str, Any]]) -> d
     aliases = _run_es_overview_query(
         "alias count",
         warnings,
-        lambda: client.cat.aliases(format="json", params={"h": "alias,index", "request_timeout": 10}),
+        lambda: client.cat.aliases(format="json", params={"h": "alias", "request_timeout": 10}),
     )
     if not isinstance(aliases, list):
         return {"count": None, "relation_count": None, "index_count": None}
 
     alias_names = {str(alias.get("alias")) for alias in aliases if isinstance(alias, dict) and alias.get("alias")}
-    index_names = {str(alias.get("index")) for alias in aliases if isinstance(alias, dict) and alias.get("index")}
-    return {"count": len(alias_names), "relation_count": len(aliases), "index_count": len(index_names)}
+    return {"count": len(alias_names), "relation_count": len(aliases), "index_count": None}
 
 
 def _build_es_cluster_overview(

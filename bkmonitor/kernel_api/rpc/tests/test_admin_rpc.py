@@ -309,9 +309,9 @@ def test_es_cluster_overview_uses_lightweight_alias_count_query():
             allocation=Mock(return_value=[{"disk.total": "100", "disk.used": "40", "disk.avail": "60"}]),
             aliases=Mock(
                 return_value=[
-                    {"alias": "write_20260514_system_cpu", "index": "v2_system_cpu_20260514_0"},
-                    {"alias": "system_cpu_read", "index": "v2_system_cpu_20260514_0"},
-                    {"alias": "system_cpu_read", "index": "v2_system_cpu_20260513_0"},
+                    {"alias": "write_20260514_system_cpu"},
+                    {"alias": "system_cpu_read"},
+                    {"alias": "system_cpu_read"},
                 ]
             ),
         ),
@@ -328,9 +328,9 @@ def test_es_cluster_overview_uses_lightweight_alias_count_query():
         data, warnings = _build_es_cluster_overview(cluster, "system")
 
     assert warnings == []
-    assert data["aliases"] == {"count": 2, "relation_count": 3, "index_count": 2}
+    assert data["aliases"] == {"count": 2, "relation_count": 3, "index_count": None}
     client.cat.allocation.assert_called_once()
-    client.cat.aliases.assert_called_once_with(format="json", params={"h": "alias,index", "request_timeout": 10})
+    client.cat.aliases.assert_called_once_with(format="json", params={"h": "alias", "request_timeout": 10})
     client.indices.get_alias.assert_not_called()
 
 
