@@ -23,6 +23,7 @@ from . import (
     result_table,
     storage,
     tenant,
+    uptime_check,
 )
 
 __all__ = [
@@ -40,4 +41,5 @@ __all__ = [
     "result_table",
     "storage",
     "tenant",
+    "uptime_check",
 ]
