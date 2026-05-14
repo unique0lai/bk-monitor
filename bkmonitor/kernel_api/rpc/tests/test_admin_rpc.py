@@ -66,6 +66,7 @@ def test_admin_rpc_functions_registered_by_builtin_loader():
         "admin.es_storage.detail",
         "admin.es_storage.runtime_overview",
         "admin.es_storage.sample",
+        "admin.es_storage.rotate_aliases",
         "admin.query_route.query",
         "admin.query_route.refresh",
         "admin.doris_storage.list",
@@ -78,6 +79,10 @@ def test_admin_rpc_functions_registered_by_builtin_loader():
         "admin.kafka_storage.detail",
         "admin.bkbase_result_table.list",
         "admin.bkbase_result_table.detail",
+        "admin.custom_report.list",
+        "admin.custom_report.detail",
+        "admin.custom_report.metric_list",
+        "admin.custom_report.refresh_metrics",
         "admin.api_auth_token.list",
         "admin.api_auth_token.detail",
         "admin.api_auth_token.create",
@@ -571,12 +576,21 @@ def test_kafka_sample_function_registered():
     assert "bk_data_id" in detail["params_schema"]
 
 
+def test_custom_report_refresh_metrics_function_registered():
+    detail = KernelRPCRegistry.get_function_detail("admin.custom_report.refresh_metrics")
+    assert detail is not None
+    assert detail["func_name"] == "admin.custom_report.refresh_metrics"
+    assert "write" in detail["description"]
+    assert "expired_time" in detail["params_schema"]
+
+
 def test_es_storage_functions_registered():
     for func_name in [
         "admin.es_storage.list",
         "admin.es_storage.detail",
         "admin.es_storage.runtime_overview",
         "admin.es_storage.sample",
+        "admin.es_storage.rotate_aliases",
     ]:
         detail = KernelRPCRegistry.get_function_detail(func_name)
         assert detail is not None
@@ -585,6 +599,9 @@ def test_es_storage_functions_registered():
     runtime_detail = KernelRPCRegistry.get_function_detail("admin.es_storage.runtime_overview")
     assert "inspect" in runtime_detail["description"]
     assert "table_id" in runtime_detail["params_schema"]
+    rotate_detail = KernelRPCRegistry.get_function_detail("admin.es_storage.rotate_aliases")
+    assert "write" in rotate_detail["description"]
+    assert "traceback" in rotate_detail["description"]
 
 
 def test_storage_functions_registered():
