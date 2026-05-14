@@ -40,6 +40,7 @@ from kernel_api.rpc.functions.admin.storage import (
     _serialize_bkbase_item,
     _serialize_doris_storage,
 )
+from kernel_api.rpc.functions.admin.uptime_check import _summarize_subscription
 from kernel_api.rpc.registry import KernelRPCRegistry
 
 
@@ -88,11 +89,63 @@ def test_admin_rpc_functions_registered_by_builtin_loader():
         "admin.api_auth_token.create",
         "admin.api_auth_token.update",
         "admin.api_auth_token.delete",
+        "admin.uptime_check.node_list",
+        "admin.uptime_check.node_detail",
+        "admin.uptime_check.task_list",
+        "admin.uptime_check.task_detail",
     } <= func_names
 
     detail = KernelRPCRegistry.get_function_detail("admin.result_table.detail")
     assert detail is not None
     assert detail["params_schema"]["include"].find("fields") != -1
+
+
+def test_uptime_check_subscription_summary_extracts_effective_data_id():
+    relation = {
+        "subscription_id": 123,
+        "bk_biz_id": 2,
+        "create_time": "2026-05-14 10:00:00",
+        "update_time": "2026-05-14 10:10:00",
+    }
+    subscription_info = {
+        "id": 123,
+        "enable": True,
+        "category": "once",
+        "plugin_name": "bkmonitorbeat",
+        "scope": {"object_type": "HOST"},
+        "target_hosts": [{"bk_host_id": 1}],
+        "steps": [
+            {
+                "id": "bkmonitorbeat_http",
+                "type": "PLUGIN",
+                "config": {"plugin_name": "bkmonitorbeat", "plugin_version": "1.31.0"},
+                "params": {
+                    "context": {
+                        "tasks": [
+                            {
+                                "period": "60s",
+                                "task_id": 135,
+                                "bk_biz_id": 52,
+                                "target_host_list": ["30.167.62.75"],
+                            }
+                        ],
+                        "period": "60s",
+                        "data_id": "1009",
+                        "task_id": 135,
+                        "bk_biz_id": 52,
+                        "headers": [{"key": "Authorization", "value": "secret"}],
+                    }
+                },
+            }
+        ],
+    }
+
+    summary = _summarize_subscription(subscription_info, relation)
+
+    assert summary["data_ids"] == [1009]
+    assert summary["steps"][0]["data_ids"] == [1009]
+    assert summary["steps"][0]["context_summary"]["tasks_samples"][0]["task_id"] == 135
+    assert "headers" not in summary["steps"][0]["context_summary"]
 
 
 def test_api_auth_token_serializer_keeps_api_token_fields():
