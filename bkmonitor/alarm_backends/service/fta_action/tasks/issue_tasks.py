@@ -252,7 +252,7 @@ def _backfill_unlinked_alerts_for_strategy(strategy_id: str):
     # 三种 None 退化场景，全部按 len 降序匹配：
     #   (a) 策略缓存 miss / Redis 异常
     #   (b) issue_config 缺失（策略已禁用 Issue 聚合，但仍有历史活跃 Issue）—— 此处 None 而非 ()，
-    #       否则空 tuple 会被当作"live=catch-all"让 catch-all group 永远优先（v1.6 review 发现的 bug）
+    #       否则空 tuple 会被当作"live=catch-all"让 catch-all group 永远优先错绑
     #   (c) 任何其他异常
     live_agg_dims_tuple: tuple | None = None
     try:
@@ -315,28 +315,40 @@ def _backfill_unlinked_alerts_for_strategy(strategy_id: str):
     )
 
     # Step 3: 内存分发（live 优先 + 时间边界 + len 降序 fallback）
+    # 不预跳过空 data_dimensions：catch-all group (agg_dims_tuple=()) 不读 data_dimensions
+    # 仍能命中；具体 group 缺维度时 gen_issue_fingerprint 返回 None 自然跳到下一个 group。
+    # 第三方告警 / FTA 告警虽缺 origin_alarm，仍可被 catch-all Issue backfill。
     total = 0
     skipped_time = 0
+    skipped_no_match = 0
     for hits in _iter_alert_hit_batches(base_search):
         update_docs = []
         for hit in hits:
-            alert_dims = _extract_alert_dimensions(hit)
+            data_dimensions = _extract_origin_data_dimensions(hit)
             try:
                 alert_begin = int(getattr(hit, "begin_time", 0) or 0)
             except (TypeError, ValueError):
                 alert_begin = 0
 
+            matched = False
             for agg_dims_tuple, fp_map in sorted_groups:
-                fp = gen_issue_fingerprint(strategy_id_int, list(agg_dims_tuple), alert_dims)
+                fp = gen_issue_fingerprint(strategy_id_int, list(agg_dims_tuple), data_dimensions)
                 if not fp or fp not in fp_map:
                     continue
                 issue_id, issue_ct = fp_map[fp]
                 # 时间边界：alert 必须晚于 Issue 出生，否则跳过（即使 break——避免回退到更通用 group 错绑）
                 if alert_begin and issue_ct and alert_begin < issue_ct:
                     skipped_time += 1
+                    matched = True  # 视为已命中（不再 fallback 到 broader group 错绑）
                     break
                 update_docs.append(AlertDocument(id=hit.id, issue_id=issue_id))
+                matched = True
                 break
+
+            if not matched:
+                # 遍历完所有 group 都没命中 fingerprint：维度凑不齐（含 origin_alarm 缺失）
+                # 且无 catch-all group 兜底
+                skipped_no_match += 1
 
         if not update_docs:
             continue
@@ -347,36 +359,41 @@ def _backfill_unlinked_alerts_for_strategy(strategy_id: str):
             logger.exception("[issue] backfill failed, strategy(%s)", strategy_id)
             return
 
-    if total or skipped_time:
+    if total or skipped_time or skipped_no_match:
         logger.info(
-            "[issue] strategy(%s) backfilled %d unlinked alerts, skipped_time=%d "
+            "[issue] strategy(%s) backfilled %d unlinked alerts, skipped_time=%d skipped_no_match=%d "
             "(%d active issues, %d agg-dim groups, live_priority=%s)",
             strategy_id,
             total,
             skipped_time,
+            skipped_no_match,
             sum(len(m) for m in grouped_fp_map.values()),
             len(grouped_fp_map),
             live_agg_dims_tuple is not None,
         )
 
 
-def _extract_alert_dimensions(hit) -> dict:
-    """从 ES hit 提取 AlertDocument.dimensions 为 {key: value} dict。
+def _extract_origin_data_dimensions(hit) -> dict:
+    """从 ES alert hit 提取 ``event.extra_info.origin_alarm.data.dimensions``。
 
-    与 IssueAggregationProcessor._get_alert_dimensions 对齐，保证两侧 fingerprint 计算一致。
+    与 IssueAggregationProcessor._get_origin_data_dimensions 对齐，保证 backfill 反算与
+    process 主路径使用同源 dimensions + 同款 count_md5 算法。任一层缺失返回空 dict
+    （第三方告警 / FTA 告警可能缺 origin_alarm 结构）。
     """
-    result: dict = {}
-    raw = hit.to_dict().get("dimensions") or []
-    for dim in raw:
-        if isinstance(dim, dict):
-            key = dim.get("key", "")
-            value = dim.get("value", "")
-        else:
-            key = getattr(dim, "key", "")
-            value = getattr(dim, "value", "")
-        if key:
-            result[key] = value
-    return result
+
+    def _to_dict(node):
+        if node is None:
+            return {}
+        if hasattr(node, "to_dict"):
+            node = node.to_dict()
+        return node if isinstance(node, dict) else {}
+
+    raw = _to_dict(hit)
+    event = _to_dict(raw.get("event"))
+    extra_info = _to_dict(event.get("extra_info"))
+    origin_alarm = _to_dict(extra_info.get("origin_alarm"))
+    data = _to_dict(origin_alarm.get("data"))
+    return _to_dict(data.get("dimensions"))
 
 
 def _allowed_scope_keys(aggregate_dimensions: list[str]) -> set[str] | None:
