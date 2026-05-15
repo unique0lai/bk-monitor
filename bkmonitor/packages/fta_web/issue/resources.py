@@ -9,6 +9,7 @@ specific language governing permissions and limitations under the License.
 """
 
 import logging
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -23,7 +24,7 @@ from bkmonitor.documents.issue import (
 )
 from bkmonitor.utils.request import get_request_username
 from bkmonitor.utils.thread_backend import ThreadPool
-from constants.issue import IssuePriority, IssueStatus
+from constants.issue import IssuePriority, IssueStatus, IssueActivityType
 from core.drf_resource import Resource, api, resource
 from fta_web.alert.handlers.alert import AlertQueryHandler
 from fta_web.alert.utils import slice_time_interval
@@ -855,3 +856,53 @@ class ExportIssueResource(Resource):
             raise ValueError("未找到符合条件的 Issue，无法导出")
 
         return resource.export_import.export_package(json_list_data=issue_list)
+
+
+class ListRecentAssigneesResource(Resource):
+    """获取最近经常指派的负责人列表（基于指派事件聚合）"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_ids = serializers.ListField(
+            label="业务ID列表", child=serializers.IntegerField(), required=True, allow_empty=False
+        )
+        recent_days = serializers.IntegerField(label="最近天数", min_value=1, max_value=30, default=7)
+
+    def perform_request(self, validated_request_data):
+        bk_biz_ids = validated_request_data["bk_biz_ids"]
+        recent_days = validated_request_data["recent_days"]
+
+        # 业务权限校验：仅保留当前用户有权限的业务
+        authorized_bizs = IssueQueryHandler.parse_biz_item(bk_biz_ids)[0]
+        if not authorized_bizs:
+            return []
+        authorized_biz_ids = [str(b) for b in authorized_bizs]
+
+        end_time = int(time.time())
+        start_time = end_time - recent_days * 86400
+
+        # 基于活动日志查询指派事件
+        search = (
+            IssueActivityDocument.search(start_time=start_time, end_time=end_time)
+            .filter("range", time={"gte": start_time, "lte": end_time})
+            .filter("term", activity_type=IssueActivityType.ASSIGNEE_CHANGE)
+            .filter("terms", bk_biz_id=authorized_biz_ids)
+        )
+
+        # terms 聚合：按 to_value 分组（to_value 存储逗号分隔的负责人列表）
+        search.aggs.bucket("assignees", "terms", field="to_value", size=500, order={"_count": "desc"})
+        search = search.params(size=0, track_total_hits=False)
+
+        result = search.execute()
+
+        # to_value 是逗号分隔的字符串（如 "user1,user2"），拆分后重新统计频次
+        counter = Counter()
+        if result.aggs:
+            for bucket in result.aggs.assignees.buckets:
+                if not bucket.key:
+                    continue
+                for assignee in bucket.key.split(","):
+                    assignee = assignee.strip()
+                    if assignee:
+                        counter[assignee] += bucket.doc_count
+
+        return [username for username, _ in counter.most_common(100)]
