@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -15,12 +14,34 @@ from enum import Enum
 DEFAULT_EVALUATION_INTERVAL = "60s"
 DEFAULT_RULE_TYPE = "prometheus"
 
+RECORD_RULE_V4_BKBASE_NAMESPACE = "bkbase"
+RECORD_RULE_V4_BKMONITOR_NAMESPACE = "bkmonitor"
+RECORD_RULE_V4_DEFAULT_TENANT = "default"
+RECORD_RULE_V4_DEFAULT_REFRESH_INTERVAL = 3600
+RECORD_RULE_V4_INTERVAL_CHOICES = ("1min", "2min", "5min", "10min")
+
 
 class RecordRuleStatus(Enum):
     """预计算状态"""
 
     CREATED = "created"
     RUNNING = "running"
+    DELETED = "deleted"
+
+
+class RecordRuleV4InputType(Enum):
+    """V4 预计算输入类型"""
+
+    QUERY_TS = "query_ts"
+    PROMQL = "promql"
+
+
+class RecordRuleV4Status(Enum):
+    """V4 预计算状态"""
+
+    CREATED = "created"
+    RUNNING = "running"
+    FAILED = "failed"
     DELETED = "deleted"
 
 
