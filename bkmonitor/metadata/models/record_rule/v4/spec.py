@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import Any, cast
 
 from django.db import transaction
 
@@ -113,7 +113,8 @@ class RecordRuleV4SpecBuilder:
     def normalize_record_payload(self, record: RecordRuleV4RecordInput) -> dict[str, Any]:
         """归一化单条用户 record，并校验输入类型。"""
 
-        normalized = RecordRuleV4SpecRecord.normalize_record_payload(copy.deepcopy(record))
+        record_payload = cast(dict[str, Any], copy.deepcopy(dict(record)))
+        normalized = RecordRuleV4SpecRecord.normalize_record_payload(record_payload)
         RecordRuleV4.validate_input_type(normalized["input_type"])
         return normalized
 

@@ -373,10 +373,11 @@ class RecordRuleV4Resolver:
 
         normalized_configs: list[dict[str, Any]] = []
         for query_config in query_configs:
-            normalized = dict(copy.deepcopy(query_config))
+            normalized: dict[str, Any] = dict(copy.deepcopy(query_config))
+            interval_unit = normalized.get("interval_unit") or "s"
             normalized["interval"] = self.normalize_interval_to_seconds(
                 normalized.get("interval"),
-                normalized.get("interval_unit") or "s",
+                str(interval_unit),
             )
             normalized_configs.append(normalized)
         return normalized_configs
