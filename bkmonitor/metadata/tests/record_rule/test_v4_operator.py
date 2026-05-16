@@ -250,6 +250,7 @@ def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, ex
     assert len({flow.flow_name for flow in flows}) == 2
     assert all(len(flow.flow_name) <= 50 for flow in flows)
     assert all(flow.records.count() == 1 for flow in flows)
+    assert set(rule.latest_resolved.records.values_list("flow_id", flat=True)) == {flow.pk for flow in flows}
 
     first_source_node = get_source_nodes(flows[0].flow_config)[0]
     assert first_source_node["data"]["name"] == SOURCE_BKBASE_TABLE_NAME

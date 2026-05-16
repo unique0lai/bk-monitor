@@ -313,38 +313,17 @@ class Migration(migrations.Migration):
                 "unique_together": {("resolved", "flow_key")},
             },
         ),
-        migrations.CreateModel(
-            name="RecordRuleV4FlowRecord",
-            fields=[
-                ("id", models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-                ("creator", models.CharField(max_length=64, verbose_name="创建者")),
-                ("created_at", models.DateTimeField(auto_now_add=True, verbose_name="创建时间")),
-                ("updater", models.CharField(max_length=64, verbose_name="更新者")),
-                ("updated_at", models.DateTimeField(auto_now=True, verbose_name="更新时间")),
-                (
-                    "flow",
-                    models.ForeignKey(
-                        on_delete=models.deletion.CASCADE,
-                        related_name="records",
-                        to="metadata.recordrulev4flow",
-                        verbose_name="Flow",
-                    ),
-                ),
-                (
-                    "resolved_record",
-                    models.OneToOneField(
-                        on_delete=models.deletion.CASCADE,
-                        related_name="flow_record",
-                        to="metadata.recordrulev4resolvedrecord",
-                        verbose_name="解析记录",
-                    ),
-                ),
-            ],
-            options={
-                "verbose_name": "V4 预计算 Flow 记录关系",
-                "verbose_name_plural": "V4 预计算 Flow 记录关系",
-                "unique_together": {("flow", "resolved_record")},
-            },
+        migrations.AddField(
+            model_name="recordrulev4resolvedrecord",
+            name="flow",
+            field=models.ForeignKey(
+                blank=True,
+                null=True,
+                on_delete=models.deletion.SET_NULL,
+                related_name="records",
+                to="metadata.recordrulev4flow",
+                verbose_name="归属 Flow",
+            ),
         ),
         migrations.CreateModel(
             name="RecordRuleV4Event",

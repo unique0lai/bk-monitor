@@ -884,13 +884,22 @@ class RecordRuleV4ResolvedRecord(BaseModelWithTime):
     if TYPE_CHECKING:
         resolved_id: int
         spec_record_id: int
-        flow_record: RecordRuleV4FlowRecord
+        flow_id: int | None
+        flow: RecordRuleV4Flow | None
 
     resolved = models.ForeignKey(
         RecordRuleV4Resolved, verbose_name="解析快照", related_name="records", on_delete=models.CASCADE
     )
     spec_record = models.ForeignKey(
         RecordRuleV4SpecRecord, verbose_name="用户声明记录", related_name="resolved_records", on_delete=models.CASCADE
+    )
+    flow = models.ForeignKey(
+        "RecordRuleV4Flow",
+        verbose_name="归属 Flow",
+        related_name="records",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
     )
     record_key = models.CharField("内部稳定记录ID", max_length=64)
     identity_hash = models.CharField("记录身份指纹", max_length=64)
@@ -966,7 +975,7 @@ class RecordRuleV4Flow(BaseModelWithTime):
     if TYPE_CHECKING:
         rule_id: int
         resolved_id: int
-        records: models.QuerySet[RecordRuleV4FlowRecord]
+        records: models.QuerySet[RecordRuleV4ResolvedRecord]
 
     rule = models.ForeignKey(RecordRuleV4, verbose_name="预计算规则组", related_name="flows", on_delete=models.CASCADE)
     resolved = models.ForeignKey(
@@ -995,27 +1004,6 @@ class RecordRuleV4Flow(BaseModelWithTime):
         self.flow_status = flow_status
         self.last_observed_at = now()
         self.save(update_fields=["flow_status", "last_observed_at", "updated_at"])
-
-
-class RecordRuleV4FlowRecord(BaseModelWithTime):
-    """Flow 与 resolved record 的归属关系。"""
-
-    if TYPE_CHECKING:
-        flow_id: int
-        resolved_record_id: int
-
-    flow = models.ForeignKey(RecordRuleV4Flow, verbose_name="Flow", related_name="records", on_delete=models.CASCADE)
-    resolved_record = models.OneToOneField(
-        RecordRuleV4ResolvedRecord,
-        verbose_name="解析记录",
-        related_name="flow_record",
-        on_delete=models.CASCADE,
-    )
-
-    class Meta:
-        verbose_name = "V4 预计算 Flow 记录关系"
-        verbose_name_plural = "V4 预计算 Flow 记录关系"
-        unique_together = (("flow", "resolved_record"),)
 
 
 class RecordRuleV4Event(BaseModelWithTime):

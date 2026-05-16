@@ -33,7 +33,6 @@ from metadata.models.record_rule.v4.models import (
     RecordRuleV4Deployment,
     RecordRuleV4Event,
     RecordRuleV4Flow,
-    RecordRuleV4FlowRecord,
     RecordRuleV4Resolved,
     RecordRuleV4Spec,
     now,
@@ -195,12 +194,11 @@ class DeploymentRunner:
             },
         )
         for record in flow_plan.resolved_records:
-            # 同一 resolved record 只能归属一个 Flow，update_or_create 允许
-            # 未来部署策略调整或分组逻辑变化时重新绑定归属关系。
-            RecordRuleV4FlowRecord.objects.update_or_create(
-                resolved_record=record,
-                defaults={"flow": flow, "creator": self.actor, "updater": self.actor},
-            )
+            # 同一 resolved record 只能归属一个 Flow。策略或分组逻辑变化时，
+            # 直接改写 record.flow 即可，不需要额外的关系实体。
+            record.flow = flow
+            record.updater = self.actor
+            record.save(update_fields=["flow", "updater", "updated_at"])
         return flow
 
     def get_applied_flows(self) -> list[RecordRuleV4Flow]:
