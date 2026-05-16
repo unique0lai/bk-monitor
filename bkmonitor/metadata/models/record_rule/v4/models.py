@@ -872,7 +872,6 @@ class RecordRuleV4ResolvedRecord(BaseModelWithTime):
         resolved_id: int
         spec_record_id: int
         flow_id: int | None
-        flow: RecordRuleV4Flow | None
 
     resolved = models.ForeignKey(
         RecordRuleV4Resolved, verbose_name="解析快照", related_name="records", on_delete=models.CASCADE
