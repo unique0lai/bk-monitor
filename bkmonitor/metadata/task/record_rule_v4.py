@@ -10,21 +10,22 @@ specific language governing permissions and limitations under the License.
 
 import logging
 
-from metadata.models.record_rule.constants import RecordRuleV4Status
+from metadata.models.record_rule.constants import RecordRuleV4DesiredStatus
 from metadata.models.record_rule.v4 import RecordRuleV4
+from metadata.models.record_rule.v4.operator import RecordRuleV4Operator
 
 logger = logging.getLogger("metadata")
 
 
 def refresh_record_rule_v4():
     """定期检查并刷新 V4 预计算任务"""
-    rules = RecordRuleV4.objects.filter(status=RecordRuleV4Status.RUNNING.value)
+    rules = RecordRuleV4.objects.exclude(desired_status=RecordRuleV4DesiredStatus.DELETED.value)
     logger.info("refresh_record_rule_v4: start refresh, count->[%s]", rules.count())
     for rule in rules.iterator():
-        if not rule.is_refresh_due():
+        if not rule.should_refresh():
             continue
         try:
-            changed = rule.refresh_if_changed(auto_apply=rule.auto_refresh)
+            changed = RecordRuleV4Operator(rule, source="scheduler").reconcile(auto_apply=rule.auto_refresh)
             logger.info("refresh_record_rule_v4: rule_id->[%s], changed->[%s]", rule.pk, changed)
         except Exception as err:  # pylint: disable=broad-except
             logger.exception("refresh_record_rule_v4: refresh failed, rule_id->[%s], error->[%s]", rule.pk, err)

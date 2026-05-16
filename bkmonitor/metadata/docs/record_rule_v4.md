@@ -173,7 +173,7 @@ V4 预计算支持两种用户输入方式，分别对应 unify-query 的两个 
 - `data` 中直查 VM 场景通常返回 `storage_type`、`metricql`、`result_table_id`。
 - 非直查场景如果底层存储未实现预览体，`data` 可能为空数组。
 - 只要 `route_info` 非空，即使 `data: []` 也表示解析和路由预览成功。
-- 失败时返回 `trace_id` 与 `error`，调用方应记录两者，方便回溯 unify-query 日志。
+- 失败时响应可能包含 `trace_id` 与 `error`；本模块不持久化 `trace_id`，仅记录错误文本。
 
 ## V4 Flow 配置
 
@@ -261,180 +261,186 @@ DELETE /v4/namespaces/bkbase/flows/{flow_name}/
 
 ## 新预计算表
 
-建议新增独立的 V4 预计算表，避免把 V3 `RecordRule` 的 BkSQL、V3 flow id、旧节点配置语义继续塞进同一张表。
+V4 按 group 建模：用户看到的是一个预计算组，组内可以包含多条逻辑 record；底层可以按策略展开成一条或多条 bkbase Flow。输出侧先按 group 生成一个统一的 `table_id` 和 `dst_vm_table_id`，多条 Flow 也写入这个 group 输出 VMRT。
 
-建议字段：
+| 模型 | 事实源 | 说明 |
+| --- | --- | --- |
+| `RecordRuleV4` | group 当前指针 | 保存空间、租户、`group_name`、统一输出 RT、generation、聚合状态、锁、当前 spec / latest resolved / latest deployment / applied deployment |
+| `RecordRuleV4Spec` | 用户输入快照 | 保存 group 原始完整配置、期望状态、部署策略、用户声明版本 |
+| `RecordRuleV4SpecRecord` | 用户输入中的单条 record | 保存内部稳定 `record_key`、`identity_hash`、查询输入、输出指标名、labels、interval |
+| `RecordRuleV4Resolved` | 实时解析快照 | 保存一次 unify-query check 后的 group 语义结果，是否可更新以本层 `content_hash` 为准 |
+| `RecordRuleV4ResolvedRecord` | 单条 record 的解析结果 | 保存 `metricql`、`src_vm_table_ids`、`route_info`、目标 VM storage 信息 |
+| `RecordRuleV4Flow` | 目标 Flow 实体 | 保存某份 resolved 下生成的目标 Flow、`flow_key`、`flow_name`、Flow config、实际观测状态 |
+| `RecordRuleV4FlowRecord` | Flow 与 resolved record 关系 | 表达一个 Flow 包含哪些 resolved record，同一 resolved record 只能归属一个 Flow |
+| `RecordRuleV4Deployment` | 执行批次 | 保存本次需要执行的 create/update/delete plan、策略、下发状态 |
+| `RecordRuleV4Event` | 事件流水 | 保存用户操作、resolve、deployment plan、apply、flow action、flow observe 的结构化历史 |
 
-| 字段 | 说明 |
-| --- | --- |
-| `space_type` / `space_id` / `bk_tenant_id` | 空间与租户 |
-| `record_name` | 用户侧预计算名称 |
-| `table_id` | metadata 侧逻辑 RT |
-| `dst_vm_table_id` | V4 recording rule 输出 RT |
-| `input_type` | `promql` 或 `query_ts` |
-| `input_config` | 用户原始输入 |
-| `check_result` | unify-query check 响应快照，至少保留 `data`、`route_info`、`trace_id` |
-| `metricql` | 从 `data[].metricql` 提取的最终计算表达式 |
-| `src_vm_table_ids` | 从 `route_info` / `data[].result_table_id` 汇总出的源 VM RT |
-| `metric_name` | 输出指标名 |
-| `labels` | recording rule 附加标签 |
-| `interval` | 计算周期，限定为 `1min`、`2min`、`5min`、`10min` |
-| `vm_storage_name` | 输出 VM storage 名称 |
-| `flow_name` | V4 flow 名称 |
-| `flow_config` | 下发到 `/v4/apply/` 的完整配置 |
-| `status` | `created`、`running`、`failed`、`deleted` 等 |
-| `last_error` | 最近一次创建、更新或删除失败信息 |
-| `last_check_time` | 最近一次调用 unify-query check 的时间 |
-| `last_refresh_time` | 最近一次刷新 V4 flow 的时间 |
-| `auto_refresh` | 是否允许周期任务在检测到变更后自动刷新 flow |
-| `has_change` | 是否存在待更新变更；`auto_refresh=false` 时周期任务只更新该标记，不自动刷新 flow |
+索引约束：
 
-索引建议：
-
-- `(bk_tenant_id, space_type, space_id, record_name)` 唯一。
 - `(bk_tenant_id, table_id)` 唯一。
-- `(bk_tenant_id, flow_name)` 唯一。
+- `(bk_tenant_id, dst_vm_table_id)` 唯一。
+- `group_name` 不唯一，内部名称由可读片段加随机后缀生成。
+- `RecordRuleV4Flow` 通过 `(resolved, flow_key)` 保证同一 resolved 下逻辑 Flow 身份稳定。
 
 ## 模块设计
 
-### 核心模型
+### 三层配置
 
-核心逻辑围绕 `metadata/models/record_rule/v4.py` 中的 `RecordRuleV4` 收敛，避免把 V4 预计算的状态和编排逻辑拆散。
+V4 的核心是区分三种配置，避免后续排查时混成一团：
 
-`RecordRuleV4` 建议负责：
+1. 用户输入配置：`RecordRuleV4Spec` + `RecordRuleV4SpecRecord`，记录用户提交的原始 group 配置。
+2. 实时解析配置：`RecordRuleV4Resolved` + `RecordRuleV4ResolvedRecord`，记录当前路由、MetricQL、源 VMRT 范围。
+3. 落地部署配置：`RecordRuleV4Flow` + `RecordRuleV4Deployment`，Flow 保存目标资源定义，Deployment 的 `plan_config` 与 Event 记录这次要 create/update/delete 哪些 Flow。
 
-- 保存用户原始输入、check 响应快照、当前生效的 `metricql`、`src_vm_table_ids`、输出 RT、flow 名称、flow config、状态和错误信息。
-- 根据 `input_type` / `input_config` 调用 `api.unify_query.check_query_ts` 或 `api.unify_query.check_query_ts_by_promql`。
-- 从 check 响应中提取并标准化 `metricql`、`src_vm_table_ids`、`route_info`。
-- 创建或更新输出 RT、字段和 VM 存储记录。
-- 生成 V4 Flow 配置。
-- 调用 `api.bkdata.apply_data_link` 创建或更新 V4 flow。
-- 调用 `api.bkdata.delete_data_link` 删除 V4 flow。
-- 在 `refresh_if_changed` 中完成漂移检查和有变更刷新。
+是否需要刷新计算任务只比较最新 resolved 语义结果，不比较最终生成的 `flow_config`。这样底层 Flow 模板、默认字段或 `operation_config` 规则变化时，不会把所有任务误判成可更新。
 
-推荐方法边界：
+### Record Key
+
+每条逻辑 record 都有内部稳定 `record_key`。
+
+- JSON/API 模式可以显式传入 `record_key`，用于准确表达“修改这条记录”。
+- SCode 模式不应把 key 暴露给用户，后端使用 `identity_hash` 匹配上一份 spec record 并继承旧 `record_key`。
+- 当前 identity 由 `record_name`、`input_type`、`metric_name` 计算；同一 spec 内不允许重复 identity。
+- `content_hash` 用完整 record 内容计算，用来判断同一个 `record_key` 的输入是否变化。
+
+### 状态模型
+
+`RecordRuleV4` 是声明式 API 的入口，bkbase Flow 是被 reconcile 的外部资源。
+
+| 状态层 | 字段 | 含义 |
+| --- | --- | --- |
+| 声明状态 | `RecordRuleV4.desired_status` | 用户希望 group 处于 `running`、`stopped` 或 `deleted` |
+| 解析状态 | `Resolved` condition | 当前 spec 是否成功解析为 resolved |
+| 部署计划 | `RecordRuleV4.latest_deployment` | 最近一次由 resolved 展开的部署计划 |
+| 下发状态 | `RecordRuleV4Deployment.apply_status` / `flow_action.*` event | 某份部署计划及其 Flow action 是否成功执行 |
+| 实际状态 | `FlowHealthy` condition / `RecordRuleV4Flow.flow_status` | bkbase Flow 观测结果，简化为 `ok`、`abnormal`、`not_found` |
+| 聚合状态 | `RecordRuleV4.status` | 给列表展示使用的状态，不作为唯一事实源 |
+| 配置差异 | `RecordRuleV4.update_available` | latest deployment 尚未成为 applied deployment |
+
+典型状态差异：
+
+- apply/delete 接口失败：latest deployment `apply_status=failed`，`update_available=true`，applied deployment 仍指向最后一次成功配置。
+- Flow 任务异常：applied deployment 成功，但 `FlowHealthy=false` 且 reason 为 `abnormal` 或 `not_found`。
+- check 发现路由或 MetricQL 漂移：生成新的 resolved 和 deployment；如果 `auto_refresh=false`，只标记 `update_available=true`，不自动 apply。
+- 删除失败：`desired_status=deleted` 但删除 Flow 失败，记录保持可见；只有 delete deployment 成功后聚合 `status=deleted`。
+
+### 部署策略
+
+首期支持两种 deployment strategy：
+
+- `per_record`：每条 resolved record 展开成一个 Flow，便于后续调度和故障隔离。
+- `single_flow`：整个 group 展开成一个 Flow，Flow 内包含多条 recording rule config。
+
+无论哪种策略，group 只生成一个输出 `table_id` 和一个 `dst_vm_table_id`。Flow 名称由 group 可读片段、record/flow 提示和稳定随机段组成，长度控制在 50 字符以内。
+
+### 核心方法
+
+`metadata/models/record_rule/v4/models.py` 放模型、状态推导、名称生成、事件校验：
 
 ```python
 class RecordRuleV4(BaseModelWithTime):
-    @classmethod
-    def create_rule(cls, ...): ...
-
-    def run_check(self) -> dict: ...
-    def build_runtime_config(self, check_result: dict) -> dict: ...
-    def compose_flow_config(self, runtime_config: dict) -> dict: ...
-    def apply_flow(self) -> None: ...
-    def delete_flow(self) -> None: ...
-    def refresh_if_changed(self, auto_apply: bool | None = None) -> bool: ...
+    def use_spec(self, spec: RecordRuleV4Spec) -> None: ...
+    def use_resolved(self, resolved: RecordRuleV4Resolved) -> None: ...
+    def use_deployment(self, deployment: RecordRuleV4Deployment) -> None: ...
+    def mark_deployment_applied(self, deployment: RecordRuleV4Deployment) -> None: ...
+    def sync_phase(self) -> None: ...
+    def should_refresh(self, refresh_interval: int) -> bool: ...
 ```
+
+`metadata/models/record_rule/v4/operator.py` 负责串联流程：
+
+- `create`：创建 group、生成首个 spec、resolve、plan deployment，并按参数 apply。
+- `update_spec`：处理用户配置、启停、删除和策略变更。
+- `manual_refresh`：用户主动检查，只 resolve + plan，不自动下发。
+- `reconcile`：后台任务入口，先 resolve，再按 `auto_refresh` 决定是否 apply。
+- `apply`：创建输出 RT/VM 记录，按 plan 中的 Flow action 逐个 apply/delete。
+- `refresh_flow_health`：观测 applied deployment 对应 Flow 的实际状态。
+
+具体职责拆分：
+
+- `RecordRuleV4SpecBuilder`：创建 spec / spec record，并处理 `record_key` 继承。
+- `RecordRuleV4Resolver`：调用 unify-query，将 spec 解析为 resolved。
+- `DeploymentStrategy`：将 resolved records 展开成目标 Flow，支持 `per_record` / `single_flow`。
+- `DeploymentRunner`：基于目标 Flow 与 applied Flow 生成 plan，执行 plan，并记录事件。
 
 ### Resource 门面
 
-在 `metadata/resources/record_rule.py` 新增对外 Resource，作为增删改查和手动刷新入口。Resource 只做参数校验、权限上下文整理和调用模型方法，不直接拼 flow 或调用 bkbase。
+后续在 `metadata/resources/record_rule.py` 新增对外 Resource。Resource 只做参数校验、权限上下文整理和调用 operator，不直接拼 Flow 或调用 bkbase。
+
+所有对外 Resource 统一要求携带：
+
+- `bk_tenant_id`
+- `bk_biz_id` / `space_uid` 二选一
+
+返回值中也要补充 `bk_biz_id`、`space_uid`，便于上层继续做权限控制。
 
 建议首期 Resource：
 
 | Resource | 作用 |
 | --- | --- |
-| `CreateRecordRuleV4Resource` | 创建 V4 预计算规则，内部调用 `RecordRuleV4.create_rule` |
-| `ModifyRecordRuleV4Resource` | 修改规则输入、interval、metric_name、labels 等配置，触发重新 check 和 flow 刷新 |
-| `DeleteRecordRuleV4Resource` | 删除或停用规则，内部调用 `delete_flow` 并更新状态 |
-| `GetRecordRuleV4Resource` | 查询单条规则详情，包含当前 check/flow 状态 |
+| `CreateRecordRuleV4Resource` | 创建 V4 预计算 group |
+| `ModifyRecordRuleV4Resource` | 修改 group 配置、records、启停、策略 |
+| `DeleteRecordRuleV4Resource` | 声明删除并触发 delete deployment |
+| `GetRecordRuleV4Resource` | 查询单条 group 详情 |
 | `ListRecordRuleV4Resource` | 按空间、状态、名称列表查询 |
-| `RefreshRecordRuleV4Resource` | 手动触发 `refresh_if_changed` |
-
-同时在 `metadata/resources/__init__.py` 中导出：
-
-```python
-from .record_rule import *  # noqa
-```
+| `RefreshRecordRuleV4Resource` | 手动触发 `manual_refresh`，只检查并标记可更新 |
 
 ### API 封装复用
 
-`api/bkdata/default.py` 已有 V4 apply / delete 通用封装，V4 recording rule 不需要新增专用 API Resource：
+`api/bkdata/default.py` 已有 V4 apply / delete 通用封装，V4 recording rule 不需要新增专用 bkdata API Resource：
 
 - `ApplyDataLink` -> `POST /v4/apply/`
 - `DeleteDataLink` -> `DELETE /v4/namespaces/{namespace}/{kind}/{name}/`
 
-调用方式保持通用资源语义：
-
-```python
-api.bkdata.apply_data_link(config=[flow_config])
-api.bkdata.delete_data_link(
-    bk_tenant_id=bk_tenant_id,
-    namespace="bkbase",
-    kind="flows",
-    name=flow_name,
-)
-```
-
 ### 定时任务
 
-在 `metadata/task/record_rule_v4.py` 放周期任务薄壳，只负责扫描和触发：
+在 `metadata/task/record_rule_v4.py` 放周期任务薄壳：
 
 ```python
 def refresh_record_rule_v4():
-    for rule in RecordRuleV4.objects.filter(status=RecordRuleV4Status.RUNNING.value):
-        if rule.is_refresh_due():
-            rule.refresh_if_changed(auto_apply=rule.auto_refresh)
+    for rule in RecordRuleV4.objects.exclude(desired_status=RecordRuleV4DesiredStatus.DELETED.value):
+        if rule.should_refresh():
+            RecordRuleV4Operator(rule, source="scheduler").reconcile(auto_apply=rule.auto_refresh)
 ```
 
-任务层不解析 check、不拼 flow、不直接调用 bkbase，便于保持业务逻辑只在 `RecordRuleV4` 中维护。
+任务层不解析 check、不拼 Flow、不直接调用 bkbase，便于保持业务流程集中在 `RecordRuleV4Operator` 中维护。
 
-## 开发计划
+## 生命周期
 
-1. API 层
-   - 已补 `api.unify_query.check_query_ts` 和 `api.unify_query.check_query_ts_by_promql`。
-   - 补充单元测试，覆盖两个 resource 的 path、序列化字段和请求体透传。
+1. create
+   - 生成 group 输出 `table_id` / `dst_vm_table_id`。
+   - 创建 `RecordRuleV4Spec` 和多条 `RecordRuleV4SpecRecord`。
+   - 逐条调用 unify-query check，生成 `RecordRuleV4Resolved` 和 `RecordRuleV4ResolvedRecord`。
+   - 按策略生成目标 Flow 和 deployment plan。
+   - 可选立即 apply，成功后 `applied_deployment=latest_deployment`。
 
-2. 元数据模型
-   - 新增 `metadata/models/record_rule/v4.py` 和 migration。
-   - 明确状态枚举、输入类型枚举、interval 枚举。
-   - 复用现有 RT / field / AccessVMRecord 创建能力，但不复用 V3 `bk_sql_config` 字段语义。
+2. update records
+   - 创建新 spec 和新的 spec records。
+   - 未传 `record_key` 的 record 尝试按 `identity_hash` 继承旧 key。
+   - 重新 resolve。
+   - 如果 resolved 语义不变，不重新规划 Flow，也不因为 Flow 模板变化触发全量刷新。
 
-3. Metadata Resource
-   - 新增 `metadata/resources/record_rule.py`。
-   - 暴露创建、修改、删除、详情、列表、手动刷新 Resource。
-   - 在 `metadata/resources/__init__.py` 导出新 resource。
+3. stop/start
+   - 只推进 spec generation 和 desired status。
+   - 不重新调用 unify-query。
+   - 基于已有 resolved 重新规划 deployment，Flow config 中更新 `desired_status`。
 
-4. 解析与校验服务
-   - 按 `input_type` 调用对应 unify-query check API。
-   - 要求 `route_info` 非空；VM 直查场景要求能得到至少一个 `metricql`。
-   - 校验所有源 RT 都有 VM storage。
-   - 从源 RT 中排除当前预计算自身的 `table_id` / `dst_vm_table_id`。
-   - 校验输出 `metric_name`、`labels`、`interval` 合法。
-   - 记录 `trace_id`，失败时把 unify-query 原始错误写入 `last_error`。
+4. manual refresh
+   - 对当前 spec 重新 check。
+   - 如果 resolved 变化，生成新的 resolved 和 deployment，标记 `update_available=true`。
+   - 不自动下发。
 
-5. 输出 RT 预定义
-   - 根据空间和预计算名称生成稳定 `table_id`。
-   - 创建 ResultTable、ResultTableField、AccessVMRecord。
-   - 输出 RT 要在创建 V4 flow 前完成定义。
+5. reconcile
+   - 周期任务会扫描非 deleted group。
+   - resolve 无变化时只更新 `last_check_time`。
+   - resolve 有变化且 `auto_refresh=true` 时自动 apply。
+   - resolve 有变化且 `auto_refresh=false` 时只标记可更新。
 
-6. V4 Flow 编排
-   - 为每个源 VM RT 生成 `VmSourceNode`。
-   - 用 check 返回的 `metricql` 生成 `RecordingRuleNode.config[].expr`。
-   - `output` 指向提前定义的输出 RT。
-   - `storage` 使用目标空间对应 VM cluster。
-   - `operation_config` 先固定为默认配置。
-   - 复用 `api.bkdata.apply_data_link` / `api.bkdata.delete_data_link`，不新增 bkdata 专用接口。
+6. delete
+   - 将 desired status 置为 `deleted`。
+   - 基于 applied deployment 对应的 Flow 生成 delete action。
+   - 所有 Flow 删除成功后才设置 `deleted_at` 和聚合 `status=deleted`。
 
-7. 生命周期
-   - create: 解析预览 -> 建 RT -> 建记录 -> apply flow。
-   - start/update: 首期可按重新 apply 或删除重建实现，待确认 V4 API 是否支持原地更新。
-   - delete: 删除 V4 flow，按需要保留或禁用 metadata 记录。
-   - retry: 基于表内 `flow_config` 与 `check_result` 支持幂等重试。
-   - refresh: 定期重新执行 unify-query check，重新计算 `metricql`、`src_vm_table_ids` 与 flow config；如果和当前记录一致，则只更新检查时间，不刷新计算任务。
-
-8. 定期检查刷新
-   - 由于路由、存储、RT、VM 集群等配置可能变化，`check_result.data[].metricql` 和 `src_vm_table_ids` 都不是永久稳定值。
-   - 新增周期任务扫描运行中的 V4 预计算规则，按原始 `input_type` / `input_config` 重新调用 check 接口。
-   - 所有 `running` 规则都会被周期任务扫描。
-   - 比对范围至少包括 `metricql`、`src_vm_table_ids`、目标 VM storage、生成后的 `flow_config`。
-   - 比对无变化时，不调用 V4 apply / delete，不重启 flow，只更新 `last_check_time`。
-   - 比对有变化且 `auto_refresh=true` 时，按更新策略刷新 V4 flow，并写回新的 `check_result`、`metricql`、`src_vm_table_ids`、`flow_config`、`last_refresh_time`，同时将 `has_change` 置为 `false`。
-   - 比对有变化但 `auto_refresh=false` 时，不覆盖当前生效配置，不刷新 flow，只将 `has_change` 置为 `true`，表示存在可手动更新的状态。
-   - check 失败时不应覆盖现有可运行配置，只记录 `last_error` 和 `trace_id`，等待下一轮重试或人工处理。
-
-9. 对外查询集成
-   - 将 V4 预计算输出 RT 纳入空间路由缓存。
-   - 将输出指标补入指标列表能力。
-   - 明确与现有 `get_record_rule_metrics_by_biz_id` 的兼容策略，是扩展函数还是新增 V4 查询函数。
+7. flow observe
+   - 查询 applied deployment 对应的 Flow。
+   - 单个 Flow 状态记录在 `RecordRuleV4Flow`，group 汇总到 `FlowHealthy` condition。

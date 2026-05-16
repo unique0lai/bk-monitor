@@ -1,0 +1,288 @@
+"""
+Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
+Copyright (C) 2017-2025 Tencent. All rights reserved.
+Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+from typing import Any
+
+from django.db import models, transaction
+
+from core.drf_resource import api
+from metadata.models.record_rule.constants import RecordRuleV4DesiredStatus, RecordRuleV4InputType
+from metadata.models.record_rule.v4.models import (
+    CONDITION_FALSE,
+    CONDITION_RESOLVED,
+    CONDITION_TRUE,
+    CONDITION_UPDATE_AVAILABLE,
+    RecordRuleV4,
+    RecordRuleV4Event,
+    RecordRuleV4Resolved,
+    RecordRuleV4ResolvedRecord,
+    RecordRuleV4Spec,
+    RecordRuleV4SpecRecord,
+    now,
+    stable_hash,
+)
+
+logger = logging.getLogger("metadata")
+
+
+class RecordRuleV4Resolver:
+    """将当前 spec 解析为 resolved 快照。"""
+
+    def __init__(self, rule: RecordRuleV4, source: str = "system", operator: str = "") -> None:
+        self.rule = rule
+        self.source = source
+        self.operator = operator
+
+    @property
+    def actor(self) -> str:
+        return self.operator or self.source
+
+    def reload_rule(self, for_update: bool = False) -> RecordRuleV4:
+        queryset = RecordRuleV4.objects
+        if for_update:
+            queryset = queryset.select_for_update()
+        self.rule = queryset.get(pk=self.rule.pk)
+        return self.rule
+
+    def resolve_current(self, force: bool = False) -> RecordRuleV4Resolved | None:
+        self.reload_rule()
+        spec = self.rule.current_spec
+        if spec is None:
+            self.rule.set_condition(CONDITION_RESOLVED, CONDITION_FALSE, "SpecMissing", "current spec is missing")
+            self.rule.last_error = "current spec is missing"
+            self.rule.sync_phase()
+            self.rule.save()
+            RecordRuleV4Event.record_resolve_failed(
+                self.rule, source=self.source, operator=self.operator, message=self.rule.last_error
+            )
+            return None
+
+        if spec.desired_status == RecordRuleV4DesiredStatus.DELETED.value:
+            return None
+
+        try:
+            runtime_records = [
+                self.build_runtime_record(record) for record in spec.records.order_by("source_index", "id")
+            ]
+        except Exception as err:
+            if not self.is_spec_current(spec):
+                return None
+            self.rule.last_error = str(err)
+            self.rule.last_check_time = now()
+            self.rule.set_condition(CONDITION_RESOLVED, CONDITION_FALSE, "ResolveFailed", str(err))
+            self.rule.sync_phase()
+            self.rule.save()
+            RecordRuleV4Event.record_resolve_failed(
+                self.rule,
+                spec=spec,
+                source=self.source,
+                operator=self.operator,
+                message=str(err),
+            )
+            logger.exception("RecordRuleV4 resolve failed, id: %s", self.rule.pk)
+            return None
+
+        if not self.is_spec_current(spec):
+            return None
+
+        resolved_config = {"records": [record["resolved_payload"] for record in runtime_records]}
+        content_hash = stable_hash(resolved_config)
+
+        with transaction.atomic():
+            self.reload_rule(for_update=True)
+            if self.rule.current_spec_id != spec.pk or self.rule.generation != spec.generation:
+                return None
+
+            latest_resolved = self.rule.latest_resolved
+            if not force and latest_resolved and latest_resolved.content_hash == content_hash:
+                self.rule.last_error = ""
+                self.rule.last_check_time = now()
+                if (
+                    self.rule.applied_deployment_id
+                    and self.rule.applied_deployment_id == self.rule.latest_deployment_id
+                ):
+                    self.rule.observed_generation = max(self.rule.observed_generation, spec.generation)
+                    self.rule.update_available = False
+                    self.rule.set_condition(CONDITION_UPDATE_AVAILABLE, CONDITION_FALSE, "ResolvedUnchanged")
+                self.rule.set_condition(CONDITION_RESOLVED, CONDITION_TRUE, "Unchanged")
+                self.rule.sync_phase()
+                self.rule.save()
+                RecordRuleV4Event.record_resolve_unchanged(
+                    self.rule,
+                    spec,
+                    latest_resolved,
+                    source=self.source,
+                    operator=self.operator,
+                )
+                return latest_resolved
+
+            resolved = RecordRuleV4Resolved.objects.create(
+                rule=self.rule,
+                spec=spec,
+                generation=spec.generation,
+                resolve_version=self.next_resolve_version(spec),
+                resolved_config=resolved_config,
+                content_hash=content_hash,
+                source=self.source,
+                creator=self.actor,
+                updater=self.actor,
+            )
+            for runtime_record in runtime_records:
+                spec_record = runtime_record["spec_record"]
+                RecordRuleV4ResolvedRecord.objects.create(
+                    resolved=resolved,
+                    spec_record=spec_record,
+                    record_key=spec_record.record_key,
+                    identity_hash=spec_record.identity_hash,
+                    content_hash=runtime_record["content_hash"],
+                    source_index=spec_record.source_index,
+                    metricql=runtime_record["metricql"],
+                    src_vm_table_ids=runtime_record["src_vm_table_ids"],
+                    route_info=runtime_record["route_info"],
+                    vm_cluster_id=runtime_record["vm_cluster_id"],
+                    vm_storage_name=runtime_record["vm_storage_name"],
+                    creator=self.actor,
+                    updater=self.actor,
+                )
+            self.rule.use_resolved(resolved)
+            RecordRuleV4Event.record_resolve_changed(
+                self.rule,
+                spec,
+                resolved,
+                source=self.source,
+                operator=self.operator,
+            )
+            return resolved
+
+    def is_spec_current(self, spec: RecordRuleV4Spec) -> bool:
+        self.reload_rule()
+        return self.rule.current_spec_id == spec.pk and self.rule.generation == spec.generation
+
+    def build_runtime_record(self, spec_record: RecordRuleV4SpecRecord) -> dict[str, Any]:
+        check_result = self.run_check(spec_record)
+        route_info = check_result.get("route_info") or []
+        data = check_result.get("data") or []
+        if not route_info:
+            raise ValueError(f"unify-query check route_info is empty, record_key: {spec_record.record_key}")
+
+        metricql = self.extract_metricql(data)
+        if not metricql:
+            raise ValueError(f"unify-query check metricql is empty, record_key: {spec_record.record_key}")
+
+        src_vm_table_ids = self.normalize_src_vm_table_ids(self.extract_src_vm_table_ids(data, route_info))
+        if not src_vm_table_ids:
+            raise ValueError(f"unify-query check src vm table ids is empty, record_key: {spec_record.record_key}")
+
+        vm_storage_info = self.get_vm_storage_info()
+        resolved_payload = {
+            "record_key": spec_record.record_key,
+            "metricql": metricql,
+            "src_vm_table_ids": src_vm_table_ids,
+            "route_info": route_info,
+            "vm_cluster_id": vm_storage_info["cluster_id"],
+            "vm_storage_name": vm_storage_info["cluster_name"],
+        }
+        return {
+            "spec_record": spec_record,
+            "metricql": metricql,
+            "src_vm_table_ids": src_vm_table_ids,
+            "route_info": route_info,
+            "vm_cluster_id": vm_storage_info["cluster_id"],
+            "vm_storage_name": vm_storage_info["cluster_name"],
+            "resolved_payload": resolved_payload,
+            "content_hash": stable_hash(resolved_payload),
+        }
+
+    def run_check(self, spec_record: RecordRuleV4SpecRecord) -> dict[str, Any]:
+        params: dict[str, Any] = copy.deepcopy(spec_record.input_config or {})
+        if spec_record.input_type == RecordRuleV4InputType.QUERY_TS.value:
+            params.setdefault("space_uid", self.rule.space_uid)
+            result = api.unify_query.check_query_ts(bk_tenant_id=self.rule.bk_tenant_id, **params)
+        elif spec_record.input_type == RecordRuleV4InputType.PROMQL.value:
+            result = api.unify_query.check_query_ts_by_promql(bk_tenant_id=self.rule.bk_tenant_id, **params)
+        else:
+            raise ValueError(f"unsupported input_type: {spec_record.input_type}")
+        return result or {}
+
+    def next_resolve_version(self, spec: RecordRuleV4Spec) -> int:
+        latest = RecordRuleV4Resolved.objects.filter(rule=self.rule, spec=spec).order_by("-resolve_version").first()
+        return 1 if latest is None else latest.resolve_version + 1
+
+    @staticmethod
+    def extract_metricql(data: list[dict[str, Any]]) -> list[str]:
+        metricql: list[str] = []
+        for item in data:
+            value = item.get("metricql")
+            if value and value not in metricql:
+                metricql.append(value)
+        return metricql
+
+    @staticmethod
+    def extract_src_vm_table_ids(data: list[dict[str, Any]], route_info: list[dict[str, Any]]) -> list[str]:
+        table_ids: list[str] = []
+        for item in data:
+            result_table_id = item.get("result_table_id") or []
+            if isinstance(result_table_id, str):
+                result_table_id = [result_table_id]
+            for table_id in result_table_id:
+                if table_id and table_id not in table_ids:
+                    table_ids.append(table_id)
+        for item in route_info:
+            table_id = item.get("table_id")
+            if table_id and table_id not in table_ids:
+                table_ids.append(table_id)
+        return sorted(table_ids)
+
+    def normalize_src_vm_table_ids(self, table_ids: list[str]) -> list[str]:
+        from metadata import models as metadata_models
+
+        exclude_table_ids = {self.rule.table_id, self.rule.dst_vm_table_id}
+        vm_records = metadata_models.AccessVMRecord.objects.filter(bk_tenant_id=self.rule.bk_tenant_id).filter(
+            models.Q(vm_result_table_id__in=table_ids) | models.Q(result_table_id__in=table_ids)
+        )
+        vm_map: dict[str, str] = {}
+        for record in vm_records:
+            vm_map[record.vm_result_table_id] = record.vm_result_table_id
+            vm_map[record.result_table_id] = record.vm_result_table_id
+
+        result: list[str] = []
+        missing: list[str] = []
+        for table_id in table_ids:
+            vm_table_id = vm_map.get(table_id)
+            if not vm_table_id:
+                missing.append(table_id)
+                continue
+            if table_id in exclude_table_ids or vm_table_id in exclude_table_ids:
+                logger.info(
+                    "RecordRuleV4 normalize_src_vm_table_ids: skip self reference table_id->[%s], "
+                    "vm_table_id->[%s], rule_table_id->[%s]",
+                    table_id,
+                    vm_table_id,
+                    self.rule.table_id,
+                )
+                continue
+            if vm_table_id not in result:
+                result.append(vm_table_id)
+        if missing:
+            raise ValueError(f"source result tables are not access vm storage: {missing}")
+        return sorted(result)
+
+    def get_vm_storage_info(self) -> dict[str, Any]:
+        from metadata.models.vm import utils as vm_utils
+
+        return vm_utils.get_vm_cluster_id_name(
+            bk_tenant_id=self.rule.bk_tenant_id,
+            space_type=self.rule.space_type,
+            space_id=self.rule.space_id,
+        )

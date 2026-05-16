@@ -37,12 +37,58 @@ class RecordRuleV4InputType(Enum):
 
 
 class RecordRuleV4Status(Enum):
-    """V4 预计算状态"""
+    """V4 预计算聚合状态"""
 
     CREATED = "created"
+    PENDING = "pending"
     RUNNING = "running"
+    STOPPED = "stopped"
+    OUTDATED = "outdated"
+    DELETING = "deleting"
     FAILED = "failed"
     DELETED = "deleted"
+
+
+class RecordRuleV4DesiredStatus(Enum):
+    """V4 预计算期望状态"""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+    DELETED = "deleted"
+
+
+class RecordRuleV4ApplyStatus(Enum):
+    """V4 预计算配置下发状态"""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class RecordRuleV4DeploymentStrategy(Enum):
+    """V4 预计算物理下发策略"""
+
+    PER_RECORD = "per_record"
+    SINGLE_FLOW = "single_flow"
+
+
+class RecordRuleV4FlowActionType(Enum):
+    """V4 预计算 Flow 执行动作类型。
+
+    动作本身不独立成表，只作为 deployment plan 和 event detail 中的结构化枚举。
+    """
+
+    CREATE = "create"
+    UPDATE = "update"
+    DELETE = "delete"
+
+
+class RecordRuleV4FlowStatus(Enum):
+    """V4 Flow 实际观测状态"""
+
+    OK = "ok"
+    ABNORMAL = "abnormal"
+    NOT_FOUND = "not_found"
 
 
 class BkDataFlowStatus(Enum):
