@@ -13,14 +13,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from metadata.models.record_rule.v4.models import RecordRuleV4
+    from metadata.models.record_rule.v4.models import RecordRuleV4, RecordRuleV4Spec
 
 
 class RecordRuleV4OutputResources:
     """维护 V4 recording rule 输出侧 metadata。
 
     ResultTable / AccessVMRecord 是 group 级资源，应该在 RecordRuleV4 创建
-    后立刻准备好；指标字段则依赖 resolved/flow 展开结果，由部署执行前按需补齐。
+    后立刻准备好；指标字段随着 spec 创建和变更按 metric_name 追加维护。
     """
 
     @classmethod
@@ -73,7 +73,7 @@ class RecordRuleV4OutputResources:
 
     @staticmethod
     def ensure_metric_fields(rule: RecordRuleV4, metric_names: list[str]) -> None:
-        """按部署展开结果补齐输出指标字段。"""
+        """补齐输出指标字段；字段删除不在这里处理。"""
 
         from metadata import models as metadata_models
 
@@ -89,3 +89,10 @@ class RecordRuleV4OutputResources:
                     "is_config_by_user": True,
                 },
             )
+
+    @classmethod
+    def ensure_spec_metric_fields(cls, rule: RecordRuleV4, spec: RecordRuleV4Spec) -> None:
+        """按 spec records 的 metric_name 补齐输出字段。"""
+
+        metric_names = list(spec.records.order_by("source_index", "id").values_list("metric_name", flat=True))
+        cls.ensure_metric_fields(rule, metric_names)

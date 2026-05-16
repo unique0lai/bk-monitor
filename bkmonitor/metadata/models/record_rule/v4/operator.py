@@ -145,6 +145,7 @@ class RecordRuleV4Operator:
                 deployment_strategy=deployment_strategy,
             )
             rule.use_spec(spec)
+            RecordRuleV4OutputResources.ensure_spec_metric_fields(rule, spec)
             RecordRuleV4Event.record_user_create(rule, spec, source=source, operator=operator)
 
         resolved = instance.resolver.resolve_current(force=True)
@@ -254,6 +255,7 @@ class RecordRuleV4Operator:
                     deployment_strategy=next_strategy,
                 )
                 self.rule.use_spec(spec)
+                RecordRuleV4OutputResources.ensure_spec_metric_fields(self.rule, spec)
                 RecordRuleV4Event.record_user_spec_changed(
                     self.rule,
                     spec,

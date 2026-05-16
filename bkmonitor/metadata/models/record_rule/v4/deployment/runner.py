@@ -39,7 +39,6 @@ from metadata.models.record_rule.v4.models import (
     now,
     stable_hash,
 )
-from metadata.models.record_rule.v4.output import RecordRuleV4OutputResources
 
 logger = logging.getLogger("metadata")
 
@@ -264,12 +263,6 @@ class DeploymentRunner:
         current_flow: RecordRuleV4Flow | None = None
         try:
             actions = deployment.plan_config.get("actions") or []
-            if any(action["action_type"] != RecordRuleV4FlowActionType.DELETE.value for action in actions):
-                # RT / VM 映射在 group 创建时已经准备好；这里仅按本次
-                # deployment 展开的指标名补齐字段。
-                RecordRuleV4OutputResources.ensure_metric_fields(
-                    self.rule, self.extract_output_metric_names_from_deployment(deployment)
-                )
             for action in actions:
                 if action["action_key"] in succeeded_action_keys:
                     continue
@@ -432,22 +425,6 @@ class DeploymentRunner:
             and self.rule.current_spec_id == deployment.spec_id
             and self.rule.generation == deployment.generation
         )
-
-    @staticmethod
-    def extract_output_metric_names_from_deployment(deployment: RecordRuleV4Deployment) -> list[str]:
-        """从 deployment 涉及的 Flow 配置中提取输出指标名。"""
-
-        names: list[str] = []
-        flow_ids = [action["flow_id"] for action in deployment.plan_config.get("actions") or []]
-        for flow in RecordRuleV4Flow.objects.filter(pk__in=flow_ids):
-            for node in flow.flow_config.get("spec", {}).get("nodes", []):
-                if node.get("kind") != "RecordingRuleNode":
-                    continue
-                for item in node.get("config") or []:
-                    metric_name = item.get("metric_name")
-                    if metric_name and metric_name not in names:
-                        names.append(metric_name)
-        return names
 
     def apply_flow(self, flow_config: dict[str, Any]) -> Any:
         """调用 bkbase v4 apply 接口创建或更新 Flow。"""

@@ -289,7 +289,7 @@ def test_create_allows_duplicate_group_name_with_random_output_names(v4_base_dat
     assert first.dst_vm_table_id != second.dst_vm_table_id
 
 
-def test_create_prepares_output_rt_and_vm_record_before_apply(v4_base_data, external_api):
+def test_create_prepares_output_metadata_before_apply(v4_base_data, external_api):
     rule = create_rule(apply_immediately=False)
 
     assert models.ResultTable.objects.filter(table_id=rule.table_id, bk_tenant_id=TENANT_ID).exists()
@@ -299,7 +299,11 @@ def test_create_prepares_output_rt_and_vm_record_before_apply(v4_base_data, exte
         bk_tenant_id=TENANT_ID,
         vm_cluster_id=v4_base_data.cluster.cluster_id,
     ).exists()
-    assert not models.ResultTableField.objects.filter(table_id=rule.table_id, bk_tenant_id=TENANT_ID).exists()
+    assert models.ResultTableField.objects.filter(
+        table_id=rule.table_id,
+        bk_tenant_id=TENANT_ID,
+        field_name="cpu_usage_avg",
+    ).exists()
     external_api.apply_data_link.assert_not_called()
 
 
@@ -503,6 +507,11 @@ def test_apply_skips_stale_deployment_before_calling_bkbase(v4_base_data, extern
         raw_config={"records": [build_record(metric_name="cpu_usage_v2")]},
         apply_immediately=False,
     )
+    assert models.ResultTableField.objects.filter(
+        table_id=rule.table_id,
+        bk_tenant_id=TENANT_ID,
+        field_name="cpu_usage_v2",
+    ).exists()
     external_api.apply_data_link.reset_mock()
 
     ok = RecordRuleV4Operator(rule, source="manual", operator="admin").apply(stale_deployment)
