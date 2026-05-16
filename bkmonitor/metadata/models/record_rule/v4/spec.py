@@ -11,7 +11,6 @@ specific language governing permissions and limitations under the License.
 from __future__ import annotations
 
 import copy
-import logging
 from typing import Any, cast
 
 from django.db import transaction
@@ -26,8 +25,6 @@ from metadata.models.record_rule.v4.models import (
     stable_hash,
 )
 from metadata.models.record_rule.v4.types import RecordRuleV4RecordInput
-
-logger = logging.getLogger("metadata")
 
 
 class RecordRuleV4SpecBuilder:
@@ -98,7 +95,6 @@ class RecordRuleV4SpecBuilder:
                     spec=spec,
                     source_index=source_index,
                     record_key=record["record_key"],
-                    identity_hash=record["identity_hash"],
                     content_hash=record["content_hash"],
                     input_type=record["input_type"],
                     input_config=record["input_config"],
@@ -131,55 +127,64 @@ class RecordRuleV4SpecBuilder:
     def assign_record_keys(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """为 records 分配稳定 record_key。
 
-        API 模式可以显式传 record_key；SCode 等隐藏 key 的模式则按
-        identity_hash 继承上一版 record_key，避免轻微内容修改导致 Flow
-        身份整体变化。
+        API 模式可以显式传 record_key。隐藏 key 的模式无法提供业务侧稳定 ID，
+        只能用启发式匹配上一版记录：先比较 input_config，再退回比较 metric_name。
+        匹配不到时生成新的 record_key。
         """
 
         previous_records = []
         if self.rule.current_spec_id:
             previous_records = list(self.rule.current_spec.records.all())
-        previous_by_key = {record.record_key: record for record in previous_records}
-        previous_by_identity = {record.identity_hash: record for record in previous_records}
 
         seen_keys: set[str] = set()
-        seen_identity: set[str] = set()
         result: list[dict[str, Any]] = []
         for record in records:
-            identity_hash = stable_hash(RecordRuleV4SpecRecord.identity_payload(record))
-            if identity_hash in seen_identity:
-                raise ValueError(f"duplicate record identity in group: {record['metric_name']}")
-            seen_identity.add(identity_hash)
-
             explicit_key = record.get("record_key") or ""
             if explicit_key:
                 record_key = explicit_key
-            elif identity_hash in previous_by_identity:
-                # 用户不传 key 时，稳定身份相同就继承旧 key。
-                record_key = previous_by_identity[identity_hash].record_key
+            elif previous_record := self.match_previous_record(previous_records, seen_keys, record):
+                record_key = previous_record.record_key
             else:
                 record_key = generate_record_key()
 
             if record_key in seen_keys:
                 raise ValueError(f"duplicate record_key in group: {record_key}")
-            if (
-                explicit_key
-                and explicit_key in previous_by_key
-                and previous_by_key[explicit_key].identity_hash != identity_hash
-            ):
-                logger.info(
-                    "RecordRuleV4 spec record identity changed, rule_id: %s, record_key: %s",
-                    self.rule.pk,
-                    explicit_key,
-                )
             seen_keys.add(record_key)
 
             next_record = dict(record)
             next_record["record_key"] = record_key
-            next_record["identity_hash"] = identity_hash
             next_record["content_hash"] = stable_hash(self.record_content_payload(record))
             result.append(next_record)
         return result
+
+    @staticmethod
+    def match_previous_record(
+        previous_records: list[RecordRuleV4SpecRecord],
+        used_record_keys: set[str],
+        record: dict[str, Any],
+    ) -> RecordRuleV4SpecRecord | None:
+        """为未显式传 key 的 record 匹配上一版记录。
+
+        input_config 相等说明查询声明本身没有变化，优先继承该记录的 key；
+        如果查询声明已经变化，再用 metric_name 做弱匹配。used_record_keys
+        确保重复 metric_name 或重复 input_config 时不会复用同一个旧 key。
+        """
+
+        for previous_record in previous_records:
+            if (
+                previous_record.record_key not in used_record_keys
+                and previous_record.input_config == record["input_config"]
+            ):
+                return previous_record
+
+        for previous_record in previous_records:
+            if (
+                previous_record.record_key not in used_record_keys
+                and previous_record.metric_name == record["metric_name"]
+            ):
+                return previous_record
+
+        return None
 
     @staticmethod
     def dump_spec_records(spec: RecordRuleV4Spec) -> list[RecordRuleV4RecordInput]:

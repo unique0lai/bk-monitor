@@ -791,7 +791,7 @@ class RecordRuleV4Spec(BaseModelWithTime):
 class RecordRuleV4SpecRecord(BaseModelWithTime):
     """Spec 中的一条逻辑 record。
 
-    record_key 是内部稳定 ID。JSON 模式可以显式传入，SCode 模式不外传 key 时通过 identity_hash 继承。
+    record_key 是内部稳定 ID。JSON 模式可以显式传入；不外传 key 的模式按 input_config / metric_name 继承。
     """
 
     if TYPE_CHECKING:
@@ -802,7 +802,6 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
         RecordRuleV4Spec, verbose_name="用户声明快照", related_name="records", on_delete=models.CASCADE
     )
     record_key = models.CharField("内部稳定记录ID", max_length=64)
-    identity_hash = models.CharField("记录身份指纹", max_length=64)
     content_hash = models.CharField("记录内容指纹", max_length=64)
     source_index = models.IntegerField("原始顺序", default=0)
 
@@ -814,7 +813,7 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
     class Meta:
         verbose_name = "V4 预计算用户声明记录"
         verbose_name_plural = "V4 预计算用户声明记录"
-        unique_together = (("spec", "record_key"), ("spec", "identity_hash"))
+        unique_together = (("spec", "record_key"),)
         ordering = ("source_index", "id")
 
     @staticmethod
@@ -827,15 +826,6 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
             "input_config": record["input_config"],
             "metric_name": record["metric_name"],
             "labels": normalize_labels(record.get("labels")),
-        }
-
-    @staticmethod
-    def identity_payload(record: dict[str, Any]) -> dict[str, Any]:
-        """返回用于跨版本继承 record_key 的稳定身份字段。"""
-
-        return {
-            "input_type": record["input_type"],
-            "metric_name": record["metric_name"],
         }
 
 
@@ -899,7 +889,6 @@ class RecordRuleV4ResolvedRecord(BaseModelWithTime):
         on_delete=models.SET_NULL,
     )
     record_key = models.CharField("内部稳定记录ID", max_length=64)
-    identity_hash = models.CharField("记录身份指纹", max_length=64)
     content_hash = models.CharField("解析记录内容指纹", max_length=64)
     source_index = models.IntegerField("原始顺序", default=0)
 

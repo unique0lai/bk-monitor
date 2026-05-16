@@ -170,7 +170,6 @@ class RecordRuleV4Resolver:
                     resolved=resolved,
                     spec_record=spec_record,
                     record_key=spec_record.record_key,
-                    identity_hash=spec_record.identity_hash,
                     content_hash=runtime_record["content_hash"],
                     source_index=spec_record.source_index,
                     metricql=runtime_record["metricql"],

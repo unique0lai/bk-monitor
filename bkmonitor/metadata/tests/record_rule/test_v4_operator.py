@@ -475,7 +475,7 @@ def test_create_prepares_output_metadata_before_apply(v4_base_data, external_api
     external_api.apply_data_link.assert_not_called()
 
 
-def test_spec_record_key_is_inherited_by_identity_when_input_key_is_hidden(v4_base_data, external_api):
+def test_spec_record_key_falls_back_to_metric_name_when_input_key_is_hidden(v4_base_data, external_api):
     rule = create_rule(apply_immediately=False)
     original_record = rule.current_spec.records.get()
 
@@ -489,8 +489,35 @@ def test_spec_record_key_is_inherited_by_identity_when_input_key_is_hidden(v4_ba
     rule.refresh_from_db()
     next_record = rule.current_spec.records.get()
     assert next_record.record_key == original_record.record_key
-    assert next_record.identity_hash == original_record.identity_hash
+    assert next_record.input_type == original_record.input_type
+    assert next_record.metric_name == original_record.metric_name
     assert next_record.content_hash != original_record.content_hash
+
+
+def test_spec_record_key_prefers_input_config_when_metric_name_repeats(v4_base_data, external_api):
+    config_a = build_query_config()
+    config_b = {**build_query_config(), "step": "5m"}
+    records = [
+        build_record(metric_name="cpu_usage_avg", input_config=config_a),
+        build_record(metric_name="cpu_usage_avg", input_config=config_b),
+    ]
+    rule = create_rule(records=records, apply_immediately=False)
+    original_records = list(rule.current_spec.records.order_by("source_index"))
+
+    swapped_records = [
+        build_record(metric_name="cpu_usage_avg", input_config=config_b),
+        build_record(metric_name="cpu_usage_avg", input_config=config_a),
+    ]
+    RecordRuleV4Operator(rule, source="manual", operator="admin").update_spec(
+        records=swapped_records,
+        raw_config={"records": swapped_records},
+        apply_immediately=False,
+    )
+
+    rule.refresh_from_db()
+    next_records = list(rule.current_spec.records.order_by("source_index"))
+    assert next_records[0].record_key == original_records[1].record_key
+    assert next_records[1].record_key == original_records[0].record_key
 
 
 def test_run_check_dispatches_promql_input_to_promql_api(v4_base_data, external_api):
@@ -853,11 +880,14 @@ def test_refresh_flow_health_maps_each_flow_status_to_group_condition(v4_base_da
     assert rule.get_condition(CONDITION_FLOW_HEALTHY)["reason"] == RecordRuleV4FlowStatus.NOT_FOUND.value
 
 
-def test_duplicate_record_identity_is_rejected(v4_base_data, external_api):
+def test_duplicate_metric_name_is_allowed(v4_base_data, external_api):
     duplicated = [
         build_record(metric_name="cpu_usage_avg"),
         build_record(metric_name="cpu_usage_avg"),
     ]
 
-    with pytest.raises(ValueError):
-        create_rule(records=duplicated, apply_immediately=False)
+    rule = create_rule(records=duplicated, apply_immediately=False)
+
+    records = list(rule.current_spec.records.order_by("source_index"))
+    assert [record.metric_name for record in records] == ["cpu_usage_avg", "cpu_usage_avg"]
+    assert records[0].record_key != records[1].record_key
