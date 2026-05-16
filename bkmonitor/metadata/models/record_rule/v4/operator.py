@@ -149,19 +149,32 @@ class RecordRuleV4Operator:
     ) -> RecordRuleV4:
         spec: RecordRuleV4Spec | None = None
         records_changed = False
-        status_or_strategy_changed = False
+        definition_changed = False
+        runtime_desired_status: str | None = None
+        runtime_desired_status_changed = False
 
         with transaction.atomic():
             self.reload_rule(for_update=True)
             current_spec = self.require_current_spec()
-            next_records = (
+            next_records: list[dict[str, Any]] = (
                 RecordRuleV4SpecBuilder.dump_spec_records(current_spec)
                 if records is RecordRuleV4.UNSET
                 else list(records)
             )
             next_raw_config = current_spec.raw_config if raw_config is RecordRuleV4.UNSET else dict(raw_config)
+            requested_desired_status = None if desired_status is RecordRuleV4.UNSET else str(desired_status)
+            if requested_desired_status is not None:
+                RecordRuleV4.validate_desired_status(requested_desired_status)
+            runtime_desired_status = (
+                requested_desired_status
+                if requested_desired_status
+                in {RecordRuleV4DesiredStatus.RUNNING.value, RecordRuleV4DesiredStatus.STOPPED.value}
+                else None
+            )
             next_desired_status = (
-                current_spec.desired_status if desired_status is RecordRuleV4.UNSET else str(desired_status)
+                RecordRuleV4DesiredStatus.DELETED.value
+                if requested_desired_status == RecordRuleV4DesiredStatus.DELETED.value
+                else current_spec.desired_status
             )
             next_strategy = (
                 current_spec.deployment_strategy
@@ -176,16 +189,24 @@ class RecordRuleV4Operator:
                 self.rule.auto_refresh = bool(auto_refresh)
 
             records_changed = records is not RecordRuleV4.UNSET or raw_config is not RecordRuleV4.UNSET
-            status_or_strategy_changed = (
+            definition_changed = (
                 next_desired_status != current_spec.desired_status or next_strategy != current_spec.deployment_strategy
             )
+            runtime_desired_status_changed = (
+                runtime_desired_status is not None and runtime_desired_status != self.rule.desired_status
+            )
+            if runtime_desired_status_changed and runtime_desired_status:
+                self.rule.set_desired_status(runtime_desired_status)
+                RecordRuleV4Event.record_user_desired_status_changed(
+                    self.rule, source=self.source, operator=self.operator
+                )
 
             changed_fields: list[str] = []
             if records_changed:
                 changed_fields.append("records")
             if raw_config is not RecordRuleV4.UNSET:
                 changed_fields.append("raw_config")
-            if next_desired_status != current_spec.desired_status:
+            if requested_desired_status == RecordRuleV4DesiredStatus.DELETED.value:
                 changed_fields.append("desired_status")
             if next_strategy != current_spec.deployment_strategy:
                 changed_fields.append("deployment_strategy")
@@ -197,22 +218,23 @@ class RecordRuleV4Operator:
                     RecordRuleV4Event.record_user_auto_refresh_changed(
                         self.rule, source=self.source, operator=self.operator
                     )
-                return self.rule
-
-            spec = self.spec_builder.create_spec(
-                records=next_records,
-                raw_config=copy.deepcopy(next_raw_config),
-                desired_status=next_desired_status,
-                deployment_strategy=next_strategy,
-            )
-            self.rule.use_spec(spec)
-            RecordRuleV4Event.record_user_spec_changed(
-                self.rule,
-                spec,
-                source=self.source,
-                operator=self.operator,
-                changed_fields=changed_fields,
-            )
+                if not runtime_desired_status_changed:
+                    return self.rule
+            else:
+                spec = self.spec_builder.create_spec(
+                    records=next_records,
+                    raw_config=copy.deepcopy(next_raw_config),
+                    desired_status=next_desired_status,
+                    deployment_strategy=next_strategy,
+                )
+                self.rule.use_spec(spec)
+                RecordRuleV4Event.record_user_spec_changed(
+                    self.rule,
+                    spec,
+                    source=self.source,
+                    operator=self.operator,
+                    changed_fields=changed_fields,
+                )
 
         if records_changed and spec.desired_status != RecordRuleV4DesiredStatus.DELETED.value:
             previous_resolved_id = self.rule.latest_resolved_id
@@ -220,12 +242,14 @@ class RecordRuleV4Operator:
             self.reload_rule()
             if resolved and resolved.pk != previous_resolved_id:
                 self.deployment_runner.plan_for_spec(spec=spec, resolved=resolved)
-        elif status_or_strategy_changed:
+        elif definition_changed:
             self.deployment_runner.plan_for_spec(spec=spec, resolved=self.rule.latest_resolved)
 
         self.reload_rule()
         if apply_immediately and self.rule.update_available:
             self.apply()
+        elif apply_immediately and runtime_desired_status_changed and runtime_desired_status:
+            self.deployment_runner.apply_desired_status(runtime_desired_status)
         self.reload_rule()
         return self.rule
 

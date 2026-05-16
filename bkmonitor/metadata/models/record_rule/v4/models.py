@@ -57,6 +57,7 @@ EVENT_STATUS_SKIPPED = "skipped"
 EVENT_TYPE_USER_CREATE = "user.create"
 EVENT_TYPE_USER_SPEC_CHANGED = "user.spec_changed"
 EVENT_TYPE_USER_AUTO_REFRESH_CHANGED = "user.auto_refresh_changed"
+EVENT_TYPE_USER_DESIRED_STATUS_CHANGED = "user.desired_status_changed"
 EVENT_TYPE_OPERATION_SKIPPED = "operation.skipped"
 EVENT_TYPE_RESOLVE_CHANGED = "resolve.changed"
 EVENT_TYPE_RESOLVE_UNCHANGED = "resolve.unchanged"
@@ -110,6 +111,15 @@ EVENT_DEFINITIONS: dict[str, dict[str, Any]] = {
         "flow": EVENT_RELATION_FORBIDDEN,
         "reasons": {""},
         "detail_keys": {"auto_refresh"},
+    },
+    EVENT_TYPE_USER_DESIRED_STATUS_CHANGED: {
+        "statuses": {EVENT_STATUS_SUCCEEDED},
+        "spec": EVENT_RELATION_FORBIDDEN,
+        "resolved": EVENT_RELATION_FORBIDDEN,
+        "deployment": EVENT_RELATION_FORBIDDEN,
+        "flow": EVENT_RELATION_FORBIDDEN,
+        "reasons": {""},
+        "detail_keys": {"desired_status"},
     },
     EVENT_TYPE_OPERATION_SKIPPED: {
         "statuses": {EVENT_STATUS_SKIPPED},
@@ -471,7 +481,8 @@ class RecordRuleV4(BaseModelWithTime):
     def use_spec(self, spec: RecordRuleV4Spec) -> None:
         self.current_spec = spec
         self.generation = spec.generation
-        self.desired_status = spec.desired_status
+        if spec.desired_status == RecordRuleV4DesiredStatus.DELETED.value:
+            self.desired_status = spec.desired_status
         self.update_available = True
         self.set_condition(CONDITION_UPDATE_AVAILABLE, CONDITION_TRUE, "SpecChanged")
         self.sync_phase()
@@ -532,6 +543,14 @@ class RecordRuleV4(BaseModelWithTime):
                 "updated_at",
             ]
         )
+
+    def set_desired_status(self, desired_status: str) -> None:
+        self.validate_desired_status(desired_status)
+        self.desired_status = desired_status
+        if desired_status != RecordRuleV4DesiredStatus.DELETED.value:
+            self.deleted_at = None
+        self.sync_phase()
+        self.save(update_fields=["desired_status", "deleted_at", "status", "updated_at"])
 
     def mark_deployment_applied(self, deployment: RecordRuleV4Deployment) -> None:
         self.applied_deployment = deployment
@@ -975,6 +994,17 @@ class RecordRuleV4Event(BaseModelWithTime):
             source=source,
             operator=operator,
             detail={"auto_refresh": rule.auto_refresh},
+        )
+
+    @classmethod
+    def record_user_desired_status_changed(cls, rule: RecordRuleV4, source: str, operator: str) -> RecordRuleV4Event:
+        return cls.record(
+            rule=rule,
+            event_type=EVENT_TYPE_USER_DESIRED_STATUS_CHANGED,
+            status=EVENT_STATUS_SUCCEEDED,
+            source=source,
+            operator=operator,
+            detail={"desired_status": rule.desired_status},
         )
 
     @classmethod

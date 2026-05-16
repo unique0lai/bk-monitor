@@ -418,9 +418,11 @@ def test_reconcile_applies_changed_resolved_when_auto_refresh_is_enabled(v4_base
     external_api.apply_data_link.assert_called_once()
 
 
-def test_stop_generates_deployment_from_existing_resolved_without_running_check(v4_base_data, external_api):
+def test_stop_updates_runtime_status_without_new_spec_resolved_or_plan(v4_base_data, external_api):
     rule = create_rule()
+    previous_spec_id = rule.current_spec_id
     previous_resolved_id = rule.latest_resolved_id
+    previous_deployment_id = rule.latest_deployment_id
     external_api.check_query_ts.reset_mock()
     external_api.apply_data_link.reset_mock()
 
@@ -430,11 +432,13 @@ def test_stop_generates_deployment_from_existing_resolved_without_running_check(
 
     rule.refresh_from_db()
     flow = rule.latest_resolved.flows.get()
-    assert rule.generation == 2
-    assert rule.observed_generation == 2
+    assert rule.generation == 1
+    assert rule.observed_generation == 1
+    assert rule.current_spec_id == previous_spec_id
     assert rule.latest_resolved_id == previous_resolved_id
-    assert rule.latest_deployment.resolved_id == previous_resolved_id
+    assert rule.latest_deployment_id == previous_deployment_id
     assert rule.desired_status == RecordRuleV4DesiredStatus.STOPPED.value
+    assert flow.desired_status == RecordRuleV4DesiredStatus.STOPPED.value
     assert flow.flow_config["spec"]["desired_status"] == RecordRuleV4DesiredStatus.STOPPED.value
     assert rule.status == RecordRuleV4Status.STOPPED.value
     external_api.check_query_ts.assert_not_called()

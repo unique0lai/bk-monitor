@@ -10,6 +10,7 @@ specific language governing permissions and limitations under the License.
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 
 from django.conf import settings
@@ -56,8 +57,7 @@ class DeploymentStrategy(ABC):
                 "flow_key": flow_key,
                 "flow_name": flow_name,
                 "record_hashes": [record.content_hash for record in records],
-                "desired_status": spec.desired_status,
-                "flow_config": flow_config,
+                "flow_config": self.strip_runtime_status(flow_config),
             }
         )
         return FlowPlan(
@@ -148,6 +148,12 @@ class DeploymentStrategy(ABC):
             },
             "status": None,
         }
+
+    @staticmethod
+    def strip_runtime_status(flow_config: dict) -> dict:
+        pure_config = copy.deepcopy(flow_config)
+        pure_config.get("spec", {}).pop("desired_status", None)
+        return pure_config
 
 
 class PerRecordDeploymentStrategy(DeploymentStrategy):

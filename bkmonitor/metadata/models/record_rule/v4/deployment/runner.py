@@ -26,6 +26,7 @@ from metadata.models.record_rule.v4.deployment.strategy import get_deployment_st
 from metadata.models.record_rule.v4.models import (
     CONDITION_FALSE,
     CONDITION_FLOW_HEALTHY,
+    CONDITION_UNKNOWN,
     CONDITION_RECONCILED,
     CONDITION_TRUE,
     RecordRuleV4,
@@ -78,7 +79,9 @@ class DeploymentRunner:
                 self.rule.use_deployment(deployment)
             return deployment
 
-        plan_config = plan.to_config(desired_status=spec.desired_status, resolved_content_hash=resolved.content_hash)
+        plan_config = plan.to_config(
+            desired_status=self.rule.desired_status, resolved_content_hash=resolved.content_hash
+        )
         content_hash = stable_hash(plan_config)
         latest_deployment = self.rule.latest_deployment
         if latest_deployment and latest_deployment.content_hash == content_hash:
@@ -159,9 +162,9 @@ class DeploymentRunner:
                 "strategy": spec.deployment_strategy,
                 "table_id": self.rule.table_id,
                 "dst_vm_table_id": self.rule.dst_vm_table_id,
-                "flow_config": flow_plan.flow_config,
+                "flow_config": self.with_desired_status(flow_plan.flow_config, self.rule.desired_status),
                 "content_hash": flow_plan.content_hash,
-                "desired_status": spec.desired_status,
+                "desired_status": self.rule.desired_status,
                 "creator": self.actor,
                 "updater": self.actor,
             },
@@ -220,6 +223,7 @@ class DeploymentRunner:
 
         RecordRuleV4Event.record_apply_started(self.rule, deployment, source=self.source, operator=self.operator)
         succeeded_action_keys = self.get_succeeded_action_keys(deployment)
+        current_flow: RecordRuleV4Flow | None = None
         try:
             actions = deployment.plan_config.get("actions") or []
             if any(action["action_type"] != RecordRuleV4FlowActionType.DELETE.value for action in actions):
@@ -227,8 +231,8 @@ class DeploymentRunner:
             for action in actions:
                 if action["action_key"] in succeeded_action_keys:
                     continue
-                flow = RecordRuleV4Flow.objects.get(pk=action["flow_id"])
-                self.execute_action(deployment, flow, action)
+                current_flow = RecordRuleV4Flow.objects.get(pk=action["flow_id"])
+                self.execute_action(deployment, current_flow, action)
         except Exception as err:
             deployment.mark_apply_failed(err)
             is_current = self.is_deployment_current(deployment)
@@ -244,7 +248,7 @@ class DeploymentRunner:
                 source=self.source,
                 operator=self.operator,
                 message=str(err),
-                flow=flow if "flow" in locals() else None,
+                flow=current_flow,
                 stale=not is_current,
             )
             logger.exception(
@@ -281,7 +285,11 @@ class DeploymentRunner:
             if action_type == RecordRuleV4FlowActionType.DELETE.value:
                 self.delete_flow(flow.flow_name, ignore_not_found=True)
             else:
-                self.apply_flow(action["flow_config_snapshot"])
+                flow_config = self.with_desired_status(action["flow_config_snapshot"], self.rule.desired_status)
+                self.apply_flow(flow_config)
+                flow.desired_status = self.rule.desired_status
+                flow.flow_config = flow_config
+                flow.save(update_fields=["desired_status", "flow_config", "updated_at"])
         except Exception as err:
             RecordRuleV4Event.record_flow_action_result(
                 self.rule,
@@ -305,6 +313,52 @@ class DeploymentRunner:
             source=self.source,
             operator=self.operator,
         )
+
+    def apply_desired_status(self, desired_status: str) -> bool:
+        self.reload_rule()
+        deployment = self.rule.applied_deployment
+        if deployment is None:
+            self.rule.sync_phase()
+            self.rule.save(update_fields=["status", "updated_at"])
+            return True
+
+        current_flow: RecordRuleV4Flow | None = None
+        try:
+            for flow in deployment.resolved.flows.all():
+                current_flow = flow
+                flow_config = self.with_desired_status(flow.flow_config, desired_status)
+                self.apply_flow(flow_config)
+                flow.desired_status = desired_status
+                flow.flow_config = flow_config
+                flow.save(update_fields=["desired_status", "flow_config", "updated_at"])
+        except Exception as err:
+            self.rule.last_error = str(err)
+            self.rule.set_condition(CONDITION_RECONCILED, CONDITION_FALSE, "DesiredStatusApplyFailed", str(err))
+            self.rule.sync_phase()
+            self.rule.save(update_fields=["last_error", "conditions", "status", "updated_at"])
+            RecordRuleV4Event.record_apply_failed(
+                self.rule,
+                deployment,
+                source=self.source,
+                operator=self.operator,
+                message=str(err),
+                flow=current_flow,
+            )
+            logger.exception("RecordRuleV4 apply desired status failed, id: %s", self.rule.pk)
+            return False
+
+        self.rule.last_error = ""
+        self.rule.set_condition(CONDITION_RECONCILED, CONDITION_TRUE, "DesiredStatusApplied")
+        self.rule.set_condition(CONDITION_FLOW_HEALTHY, CONDITION_UNKNOWN, "ApplySubmitted")
+        self.rule.sync_phase()
+        self.rule.save(update_fields=["last_error", "conditions", "status", "updated_at"])
+        return True
+
+    @staticmethod
+    def with_desired_status(flow_config: dict[str, Any], desired_status: str) -> dict[str, Any]:
+        next_config = copy.deepcopy(flow_config)
+        next_config.setdefault("spec", {})["desired_status"] = desired_status
+        return next_config
 
     @staticmethod
     def get_succeeded_action_keys(deployment: RecordRuleV4Deployment) -> set[str]:

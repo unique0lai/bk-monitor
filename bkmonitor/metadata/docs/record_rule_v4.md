@@ -421,9 +421,10 @@ def refresh_record_rule_v4():
    - 如果 resolved 语义不变，不重新规划 Flow，也不因为 Flow 模板变化触发全量刷新。
 
 3. stop/start
-   - 只推进 spec generation 和 desired status。
+   - 只更新 `RecordRuleV4.desired_status`，不生成新的 spec / resolved / deployment。
    - 不重新调用 unify-query。
-   - 基于已有 resolved 重新规划 deployment，Flow config 中更新 `desired_status`。
+   - 直接基于 applied deployment 对应的 Flow 下发新的 `desired_status`。
+   - Flow 计算内容指纹不包含运行态 `desired_status`，避免启停导致后续 plan 被误判为计算定义变化。
 
 4. manual refresh
    - 对当前 spec 重新 check。
