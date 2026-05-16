@@ -294,13 +294,11 @@ class CheckQueryTsResource(UnifyQueryAPIResource):
         step = serializers.CharField(required=False)
         order_by = serializers.ListField(child=serializers.CharField(), required=False, default=list)
         space_uid = serializers.CharField(allow_blank=True, allow_null=True, required=False)
-        down_sample_range = serializers.CharField(allow_blank=True, required=False)
         timezone = serializers.CharField(required=False)
         instant = serializers.BooleanField(required=False, default=False)
         reference = serializers.BooleanField(required=False, default=False)
         not_time_align = serializers.BooleanField(required=False, default=False)
         limit = serializers.IntegerField(required=False, default=0)
-        add_dimensions = serializers.ListField(required=False, default=list)
 
 
 class CheckQueryTsByPromqlResource(UnifyQueryAPIResource):

@@ -518,7 +518,16 @@ def test_run_check_converts_structured_query_config_to_query_ts(v4_base_data, ex
     assert kwargs["step"] == "60s"
     assert kwargs["order_by"] == ["-time"]
     assert kwargs["metric_merge"] == "a / b"
-    assert kwargs["down_sample_range"] == "7s"
+    for skipped_field in (
+        "down_sample_range",
+        "timezone",
+        "instant",
+        "reference",
+        "not_time_align",
+        "limit",
+        "add_dimensions",
+    ):
+        assert skipped_field not in kwargs
 
     first_query, second_query = kwargs["query_list"]
     assert first_query["table_id"] == "system.disk"

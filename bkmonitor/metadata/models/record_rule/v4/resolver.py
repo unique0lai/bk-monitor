@@ -282,7 +282,7 @@ class RecordRuleV4Resolver:
             raise ValueError("structured query input_config requires query_configs")
 
         # load_data_source + UnifyQuery 是 SaaS 查询配置到 QueryTs 的既有真值源；
-        # resolver 只负责补齐 check 场景需要的时间、空间和可选预览参数。
+        # resolver 只负责补齐 check 场景需要的时间和空间参数。
         data_sources = []
         for query_config in query_configs:
             data_source_class = load_data_source(query_config["data_source_label"], query_config["data_type_label"])
@@ -306,24 +306,10 @@ class RecordRuleV4Resolver:
             end_time=self.normalize_timestamp_to_milliseconds(input_config["end_time"]),
             time_alignment=False,
             order_by=input_config.get("order_by"),
-            not_time_align=bool(input_config.get("not_time_align", False)),
         )
         params.pop("bk_tenant_id", None)
+        params.pop("not_time_align", None)
         params["space_uid"] = self.rule.space_uid
-
-        # check/query/ts 只做解析预览，但这些字段会影响生成的 MetricQL；
-        # 仅透传结构化输入里明确给出的预览参数。
-        for field in (
-            "down_sample_range",
-            "timezone",
-            "instant",
-            "reference",
-            "not_time_align",
-            "limit",
-            "add_dimensions",
-        ):
-            if field in input_config:
-                params[field] = copy.deepcopy(input_config[field])
         return params
 
     def normalize_structured_query_configs(self, query_configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
