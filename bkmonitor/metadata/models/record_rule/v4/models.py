@@ -305,8 +305,6 @@ class RecordRuleV4(BaseModelWithTime):
     Spec / Resolved / Deployment；因此 flow 模板变化不会直接影响 group 是否可更新。
     """
 
-    UNSET = object()
-
     if TYPE_CHECKING:
         current_spec_id: int | None
         latest_resolved_id: int | None

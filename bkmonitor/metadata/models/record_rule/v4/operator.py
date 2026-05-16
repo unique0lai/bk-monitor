@@ -158,11 +158,11 @@ class RecordRuleV4Operator:
     def update_spec(
         self,
         *,
-        records: list[dict[str, Any]] | object = RecordRuleV4.UNSET,
-        raw_config: dict[str, Any] | object = RecordRuleV4.UNSET,
-        desired_status: str | object = RecordRuleV4.UNSET,
-        deployment_strategy: str | object = RecordRuleV4.UNSET,
-        auto_refresh: bool | object = RecordRuleV4.UNSET,
+        records: list[dict[str, Any]] | None = None,
+        raw_config: dict[str, Any] | None = None,
+        desired_status: str | None = None,
+        deployment_strategy: str | None = None,
+        auto_refresh: bool | None = None,
         apply_immediately: bool = True,
     ) -> RecordRuleV4:
         """更新用户声明或运行态。
@@ -184,12 +184,10 @@ class RecordRuleV4Operator:
             # 先把所有输入归一成下一份声明需要的候选值，后面再判断哪些是真正
             # 的定义态变更，哪些只是运行态启停。
             next_records: list[dict[str, Any]] = (
-                RecordRuleV4SpecBuilder.dump_spec_records(current_spec)
-                if records is RecordRuleV4.UNSET
-                else list(records)
+                RecordRuleV4SpecBuilder.dump_spec_records(current_spec) if records is None else list(records)
             )
-            next_raw_config = current_spec.raw_config if raw_config is RecordRuleV4.UNSET else dict(raw_config)
-            requested_desired_status = None if desired_status is RecordRuleV4.UNSET else str(desired_status)
+            next_raw_config = current_spec.raw_config if raw_config is None else dict(raw_config)
+            requested_desired_status = None if desired_status is None else str(desired_status)
             if requested_desired_status is not None:
                 RecordRuleV4.validate_desired_status(requested_desired_status)
             # running/stopped 只属于运行态；deleted 会进入声明态，用来生成
@@ -206,18 +204,14 @@ class RecordRuleV4Operator:
                 else current_spec.desired_status
             )
             next_strategy = (
-                current_spec.deployment_strategy
-                if deployment_strategy is RecordRuleV4.UNSET
-                else str(deployment_strategy)
+                current_spec.deployment_strategy if deployment_strategy is None else str(deployment_strategy)
             )
 
-            auto_refresh_changed = (
-                auto_refresh is not RecordRuleV4.UNSET and bool(auto_refresh) != self.rule.auto_refresh
-            )
+            auto_refresh_changed = auto_refresh is not None and bool(auto_refresh) != self.rule.auto_refresh
             if auto_refresh_changed:
                 self.rule.auto_refresh = bool(auto_refresh)
 
-            records_changed = records is not RecordRuleV4.UNSET or raw_config is not RecordRuleV4.UNSET
+            records_changed = records is not None or raw_config is not None
             definition_changed = (
                 next_desired_status != current_spec.desired_status or next_strategy != current_spec.deployment_strategy
             )
@@ -234,7 +228,7 @@ class RecordRuleV4Operator:
             changed_fields: list[str] = []
             if records_changed:
                 changed_fields.append("records")
-            if raw_config is not RecordRuleV4.UNSET:
+            if raw_config is not None:
                 changed_fields.append("raw_config")
             if requested_desired_status == RecordRuleV4DesiredStatus.DELETED.value:
                 changed_fields.append("desired_status")
@@ -269,13 +263,13 @@ class RecordRuleV4Operator:
                 )
 
         # 事务外执行外部 check / plan，避免长时间持有数据库行锁。
-        if records_changed and spec.desired_status != RecordRuleV4DesiredStatus.DELETED.value:
+        if spec and records_changed and spec.desired_status != RecordRuleV4DesiredStatus.DELETED.value:
             previous_resolved_id = self.rule.latest_resolved_id
             resolved = self.refresh_resolved(force=False)
             self.reload_rule()
             if resolved and resolved.pk != previous_resolved_id:
                 self.deployment_runner.plan_for_spec(spec=spec, resolved=resolved)
-        elif definition_changed:
+        elif spec and definition_changed:
             self.deployment_runner.plan_for_spec(spec=spec, resolved=self.rule.latest_resolved)
 
         self.reload_rule()
