@@ -363,12 +363,17 @@ class RecordRuleV4Resolver:
 
     def normalize_structured_query_configs(
         self, query_configs: list[StructuredQueryConfigInput]
-    ) -> list[StructuredQueryConfigInput]:
-        """归一化 SaaS query_configs，使其满足 DataSource 构造参数约定。"""
+    ) -> list[dict[str, Any]]:
+        """归一化 SaaS query_configs，使其满足 DataSource 构造参数约定。
 
-        normalized_configs: list[StructuredQueryConfigInput] = []
+        返回值刻意使用普通 dict：TypedDict 描述的是 API 入参形态，
+        DataSource 构造函数接收的是运行时 kwargs，两者不应该继续绑定，
+        否则静态检查会在 **kwargs 展开时误报字段类型不兼容。
+        """
+
+        normalized_configs: list[dict[str, Any]] = []
         for query_config in query_configs:
-            normalized = copy.deepcopy(query_config)
+            normalized = dict(copy.deepcopy(query_config))
             normalized["interval"] = self.normalize_interval_to_seconds(
                 normalized.get("interval"),
                 normalized.get("interval_unit") or "s",
