@@ -100,7 +100,6 @@ class RecordRuleV4SpecBuilder:
                     record_key=record["record_key"],
                     identity_hash=record["identity_hash"],
                     content_hash=record["content_hash"],
-                    record_name=record["record_name"],
                     input_type=record["input_type"],
                     input_config=record["input_config"],
                     metric_name=record["metric_name"],
@@ -123,7 +122,6 @@ class RecordRuleV4SpecBuilder:
         """返回参与单条 record 内容指纹计算的字段。"""
 
         return {
-            "record_name": record["record_name"],
             "input_type": record["input_type"],
             "input_config": record["input_config"],
             "metric_name": record["metric_name"],
@@ -150,7 +148,7 @@ class RecordRuleV4SpecBuilder:
         for record in records:
             identity_hash = stable_hash(RecordRuleV4SpecRecord.identity_payload(record))
             if identity_hash in seen_identity:
-                raise ValueError(f"duplicate record identity in group: {record['record_name']}")
+                raise ValueError(f"duplicate record identity in group: {record['metric_name']}")
             seen_identity.add(identity_hash)
 
             explicit_key = record.get("record_key") or ""
@@ -192,7 +190,6 @@ class RecordRuleV4SpecBuilder:
             records.append(
                 {
                     "record_key": record.record_key,
-                    "record_name": record.record_name,
                     "input_type": record.input_type,
                     "input_config": copy.deepcopy(record.input_config),
                     "metric_name": record.metric_name,

@@ -10,7 +10,7 @@ specific language governing permissions and limitations under the License.
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, NotRequired, Required, TypedDict
 
 
 class CheckQueryTsInput(TypedDict, total=False):
@@ -44,19 +44,18 @@ class CheckQueryPromQLInput(TypedDict, total=False):
     bk_biz_ids: list[str]
 
 
-class RecordRuleV4RecordInput(TypedDict, total=False):
+class RecordRuleV4RecordInput(TypedDict):
     """Operator.create/update_spec 接收的单条预计算 record。
 
-    必填字段由模型层继续校验：record_name、input_type、input_config、metric_name。
+    必填字段由模型层继续校验：input_type、input_config、metric_name。
     record_key 仅用于显式维持记录身份；SCode 等模式不传时会按 identity_hash 继承。
     """
 
-    record_key: str
-    record_name: str
-    input_type: str
-    input_config: RecordRuleV4InputConfig
-    metric_name: str
-    labels: list[dict[str, str]]
+    input_type: Required[str]
+    input_config: Required[RecordRuleV4InputConfig]
+    metric_name: Required[str]
+    record_key: NotRequired[str]
+    labels: NotRequired[list[dict[str, str]]]
 
 
 class StructuredQueryMetricInput(TypedDict, total=False):

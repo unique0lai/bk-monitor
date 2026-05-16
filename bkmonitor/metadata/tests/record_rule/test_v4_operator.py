@@ -215,7 +215,6 @@ def build_structured_query_config() -> dict:
 
 def build_record(
     *,
-    record_name: str = "cpu_usage",
     metric_name: str = "cpu_usage_avg",
     input_type: str = RecordRuleV4InputType.QUERY_TS.value,
     input_config: dict | None = None,
@@ -223,7 +222,6 @@ def build_record(
     record_key: str = "",
 ) -> dict:
     record = {
-        "record_name": record_name,
         "input_type": input_type,
         "input_config": input_config or build_query_config(),
         "metric_name": metric_name,
@@ -276,8 +274,8 @@ def get_source_nodes(flow_config: dict) -> list[dict]:
 
 def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, external_api):
     records = [
-        build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
-        build_record(record_name="cpu_total", metric_name="cpu_total_sum"),
+        build_record(metric_name="cpu_usage_avg"),
+        build_record(metric_name="cpu_total_sum"),
     ]
 
     rule = create_rule(records=records)
@@ -352,8 +350,8 @@ def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, ex
 
 def test_single_flow_strategy_groups_records_into_one_flow(v4_base_data, external_api):
     records = [
-        build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
-        build_record(record_name="cpu_total", metric_name="cpu_total_sum"),
+        build_record(metric_name="cpu_usage_avg"),
+        build_record(metric_name="cpu_total_sum"),
     ]
     strategy_config = {
         "strategy": RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value,
@@ -398,8 +396,8 @@ def test_group_interval_and_labels_merge_into_resolved_and_flow(v4_base_data, ex
 
 def test_update_deployment_strategy_replans_without_resolve(v4_base_data, external_api):
     records = [
-        build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
-        build_record(record_name="cpu_total", metric_name="cpu_total_sum"),
+        build_record(metric_name="cpu_usage_avg"),
+        build_record(metric_name="cpu_total_sum"),
     ]
     rule = create_rule(records=records)
     previous_resolved_id = rule.latest_resolved_id
@@ -497,7 +495,6 @@ def test_spec_record_key_is_inherited_by_identity_when_input_key_is_hidden(v4_ba
 
 def test_run_check_dispatches_promql_input_to_promql_api(v4_base_data, external_api):
     record = build_record(
-        record_name="cpu_promql",
         input_type=RecordRuleV4InputType.PROMQL.value,
         input_config={"promql": "sum(cpu_usage)", "start": "1", "end": "2"},
         metric_name="cpu_usage_sum",
@@ -521,7 +518,6 @@ def test_run_check_dispatches_promql_input_to_promql_api(v4_base_data, external_
 
 def test_promql_check_uses_default_time_range(v4_base_data, external_api):
     record = build_record(
-        record_name="cpu_promql",
         input_type=RecordRuleV4InputType.PROMQL.value,
         input_config={"promql": "sum(cpu_usage)"},
         metric_name="cpu_usage_sum",
@@ -737,8 +733,8 @@ def test_stop_updates_runtime_status_without_new_spec_resolved_or_plan(v4_base_d
 
 def test_delete_creates_delete_actions_for_applied_flows(v4_base_data, external_api):
     records = [
-        build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
-        build_record(record_name="cpu_total", metric_name="cpu_total_sum"),
+        build_record(metric_name="cpu_usage_avg"),
+        build_record(metric_name="cpu_total_sum"),
     ]
     rule = create_rule(records=records)
     applied_flow_names = sorted(rule.applied_deployment.resolved.flows.values_list("flow_name", flat=True))
@@ -859,8 +855,8 @@ def test_refresh_flow_health_maps_each_flow_status_to_group_condition(v4_base_da
 
 def test_duplicate_record_identity_is_rejected(v4_base_data, external_api):
     duplicated = [
-        build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
-        build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
+        build_record(metric_name="cpu_usage_avg"),
+        build_record(metric_name="cpu_usage_avg"),
     ]
 
     with pytest.raises(ValueError):

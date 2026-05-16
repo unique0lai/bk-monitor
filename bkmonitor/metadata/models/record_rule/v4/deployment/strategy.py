@@ -189,7 +189,7 @@ class PerRecordDeploymentStrategy(DeploymentStrategy):
             # record_key 本身带随机段，用它生成稳定可读的 Flow 名称。
             suffix = record.record_key.rsplit("_", 1)[-1]
             flow_name = RecordRuleV4.compose_flow_name(
-                rule.group_name, record.spec_record.record_name, random_suffix=suffix
+                rule.group_name, record.spec_record.metric_name, random_suffix=suffix
             )
             flows.append(
                 self.compose_flow_plan(

@@ -806,7 +806,6 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
     content_hash = models.CharField("记录内容指纹", max_length=64)
     source_index = models.IntegerField("原始顺序", default=0)
 
-    record_name = models.CharField("预计算记录名称", max_length=128)
     input_type = models.CharField("输入类型", max_length=32)
     input_config = JsonField("用户原始输入", default=dict)
     metric_name = models.CharField("输出指标名", max_length=128)
@@ -824,7 +823,6 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
 
         return {
             "record_key": record.get("record_key") or "",
-            "record_name": record["record_name"],
             "input_type": record["input_type"],
             "input_config": record["input_config"],
             "metric_name": record["metric_name"],
@@ -836,7 +834,6 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
         """返回用于跨版本继承 record_key 的稳定身份字段。"""
 
         return {
-            "record_name": record["record_name"],
             "input_type": record["input_type"],
             "metric_name": record["metric_name"],
         }

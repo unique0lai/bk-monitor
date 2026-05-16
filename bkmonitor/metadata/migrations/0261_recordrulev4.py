@@ -104,7 +104,6 @@ class Migration(migrations.Migration):
                 ("identity_hash", models.CharField(max_length=64, verbose_name="记录身份指纹")),
                 ("content_hash", models.CharField(max_length=64, verbose_name="记录内容指纹")),
                 ("source_index", models.IntegerField(default=0, verbose_name="原始顺序")),
-                ("record_name", models.CharField(max_length=128, verbose_name="预计算记录名称")),
                 ("input_type", models.CharField(max_length=32, verbose_name="输入类型")),
                 ("input_config", bkmonitor.utils.db.fields.JsonField(default=dict, verbose_name="用户原始输入")),
                 ("metric_name", models.CharField(max_length=128, verbose_name="输出指标名")),
