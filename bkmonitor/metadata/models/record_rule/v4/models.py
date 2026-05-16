@@ -14,7 +14,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from django.db import models
@@ -288,6 +288,17 @@ class RecordRuleV4(BaseModelWithTime):
     """
 
     UNSET = object()
+
+    if TYPE_CHECKING:
+        current_spec_id: int | None
+        latest_resolved_id: int | None
+        latest_deployment_id: int | None
+        applied_deployment_id: int | None
+        specs: models.QuerySet[RecordRuleV4Spec]
+        resolved: models.QuerySet[RecordRuleV4Resolved]
+        deployments: models.QuerySet[RecordRuleV4Deployment]
+        flows: models.QuerySet[RecordRuleV4Flow]
+        events: models.QuerySet[RecordRuleV4Event]
 
     space_type = models.CharField("空间类型", max_length=64)
     space_id = models.CharField("空间ID", max_length=128)
@@ -633,6 +644,12 @@ class RecordRuleV4(BaseModelWithTime):
 class RecordRuleV4Spec(BaseModelWithTime):
     """用户提交的 group 原始配置快照。"""
 
+    if TYPE_CHECKING:
+        rule_id: int
+        records: models.QuerySet[RecordRuleV4SpecRecord]
+        resolved: models.QuerySet[RecordRuleV4Resolved]
+        deployments: models.QuerySet[RecordRuleV4Deployment]
+
     rule = models.ForeignKey(RecordRuleV4, verbose_name="预计算规则组", related_name="specs", on_delete=models.CASCADE)
     generation = models.IntegerField("用户声明版本")
     raw_config = JsonField("用户原始完整配置", default=dict)
@@ -658,6 +675,10 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
 
     record_key 是内部稳定 ID。JSON 模式可以显式传入，SCode 模式不外传 key 时通过 identity_hash 继承。
     """
+
+    if TYPE_CHECKING:
+        spec_id: int
+        resolved_records: models.QuerySet[RecordRuleV4ResolvedRecord]
 
     spec = models.ForeignKey(
         RecordRuleV4Spec, verbose_name="用户声明快照", related_name="records", on_delete=models.CASCADE
@@ -707,6 +728,13 @@ class RecordRuleV4Resolved(BaseModelWithTime):
     该层只描述 unify-query 解析出来的语义结果，不包含最终 Flow 模板。是否可更新只比较本层 content_hash。
     """
 
+    if TYPE_CHECKING:
+        rule_id: int
+        spec_id: int
+        records: models.QuerySet[RecordRuleV4ResolvedRecord]
+        deployments: models.QuerySet[RecordRuleV4Deployment]
+        flows: models.QuerySet[RecordRuleV4Flow]
+
     rule = models.ForeignKey(
         RecordRuleV4, verbose_name="预计算规则组", related_name="resolved", on_delete=models.CASCADE
     )
@@ -730,6 +758,11 @@ class RecordRuleV4Resolved(BaseModelWithTime):
 
 class RecordRuleV4ResolvedRecord(BaseModelWithTime):
     """Resolved 中的一条逻辑 record 解析结果。"""
+
+    if TYPE_CHECKING:
+        resolved_id: int
+        spec_record_id: int
+        flow_record: RecordRuleV4FlowRecord
 
     resolved = models.ForeignKey(
         RecordRuleV4Resolved, verbose_name="解析快照", related_name="records", on_delete=models.CASCADE
@@ -757,6 +790,11 @@ class RecordRuleV4ResolvedRecord(BaseModelWithTime):
 
 class RecordRuleV4Deployment(BaseModelWithTime):
     """将 resolved 语义快照展开成可下发的物理部署计划。"""
+
+    if TYPE_CHECKING:
+        rule_id: int
+        spec_id: int
+        resolved_id: int
 
     rule = models.ForeignKey(
         RecordRuleV4, verbose_name="预计算规则组", related_name="deployments", on_delete=models.CASCADE
@@ -797,6 +835,11 @@ class RecordRuleV4Deployment(BaseModelWithTime):
 class RecordRuleV4Flow(BaseModelWithTime):
     """某份 resolved 下的目标 Flow 实体。"""
 
+    if TYPE_CHECKING:
+        rule_id: int
+        resolved_id: int
+        records: models.QuerySet[RecordRuleV4FlowRecord]
+
     rule = models.ForeignKey(RecordRuleV4, verbose_name="预计算规则组", related_name="flows", on_delete=models.CASCADE)
     resolved = models.ForeignKey(
         RecordRuleV4Resolved, verbose_name="解析快照", related_name="flows", on_delete=models.CASCADE
@@ -827,6 +870,10 @@ class RecordRuleV4Flow(BaseModelWithTime):
 class RecordRuleV4FlowRecord(BaseModelWithTime):
     """Flow 与 resolved record 的归属关系。"""
 
+    if TYPE_CHECKING:
+        flow_id: int
+        resolved_record_id: int
+
     flow = models.ForeignKey(RecordRuleV4Flow, verbose_name="Flow", related_name="records", on_delete=models.CASCADE)
     resolved_record = models.OneToOneField(
         RecordRuleV4ResolvedRecord,
@@ -843,6 +890,13 @@ class RecordRuleV4FlowRecord(BaseModelWithTime):
 
 class RecordRuleV4Event(BaseModelWithTime):
     """严格枚举的 V4 预计算事件流。"""
+
+    if TYPE_CHECKING:
+        rule_id: int
+        spec_id: int | None
+        resolved_id: int | None
+        deployment_id: int | None
+        flow_id: int | None
 
     rule = models.ForeignKey(RecordRuleV4, verbose_name="预计算规则组", related_name="events", on_delete=models.CASCADE)
     spec = models.ForeignKey(
