@@ -428,6 +428,23 @@ def test_update_deployment_strategy_replans_without_resolve(v4_base_data, extern
     external_api.apply_data_link.assert_not_called()
 
 
+def test_update_raw_config_alone_does_not_create_spec(v4_base_data, external_api):
+    rule = create_rule(apply_immediately=False)
+    current_spec_id = rule.current_spec_id
+    current_generation = rule.generation
+    external_api.check_query_ts.reset_mock()
+
+    updated = RecordRuleV4Operator(rule, source="manual", operator="admin").update_spec(
+        raw_config={"records": [], "from": "ui_snapshot"},
+        apply_immediately=False,
+    )
+
+    updated.refresh_from_db()
+    assert updated.current_spec_id == current_spec_id
+    assert updated.generation == current_generation
+    external_api.check_query_ts.assert_not_called()
+
+
 def test_create_allows_duplicate_group_name_with_random_output_names(v4_base_data, external_api):
     first = create_rule(apply_immediately=False)
     second = create_rule(apply_immediately=False)

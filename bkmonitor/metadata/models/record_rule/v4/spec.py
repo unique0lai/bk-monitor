@@ -57,8 +57,9 @@ class RecordRuleV4SpecBuilder:
     ) -> RecordRuleV4Spec:
         """创建一份新的 spec 快照和对应的 spec records。
 
-        raw_config 只记录调用方原始完整配置，便于审计和回显；spec record
-        才是 resolver 消费的规范输入，避免同一层存在两份执行真值源。
+        raw_config 只记录调用方原始完整配置，便于审计和回显；它不参与
+        spec 语义指纹。spec record 才是 resolver 消费的规范输入，
+        避免同一层存在两份执行真值源。
         """
 
         RecordRuleV4.validate_desired_status(desired_status)
@@ -71,7 +72,6 @@ class RecordRuleV4SpecBuilder:
         # 都不应该混入这一层。
         content_payload = {
             "records": [self.record_content_payload(record) for record in normalized_records],
-            "raw_config": raw_config,
             "interval": interval,
             "labels": group_labels,
             "deployment_strategy": deployment_strategy_config,

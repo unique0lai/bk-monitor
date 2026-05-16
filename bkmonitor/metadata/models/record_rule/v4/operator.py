@@ -68,6 +68,32 @@ class RecordRuleV4Operator:
     def deployment_runner(self) -> DeploymentRunner:
         return DeploymentRunner(self.rule, source=self.source, operator=self.operator)
 
+    @staticmethod
+    def compose_raw_config_snapshot(
+        *,
+        records: list[RecordRuleV4RecordInput],
+        interval: str,
+        labels: list[dict[str, Any]],
+        deployment_strategy: dict[str, Any],
+        desired_status: str,
+        raw_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """生成 spec.raw_config 快照。
+
+        raw_config 是调用方的原始完整配置，只有在 spec 因规范字段变化而
+        新建时才会被保存；调用方不传时落一个由规范字段组成的最小快照。
+        """
+
+        if raw_config is not None:
+            return copy.deepcopy(raw_config)
+        return {
+            "records": copy.deepcopy(records),
+            "interval": interval,
+            "labels": copy.deepcopy(labels),
+            "deployment_strategy": copy.deepcopy(deployment_strategy),
+            "desired_status": desired_status,
+        }
+
     def reload_rule(self, for_update: bool = False) -> RecordRuleV4:
         """重新加载 rule；需要互斥写入时可带行锁。"""
 
@@ -123,8 +149,8 @@ class RecordRuleV4Operator:
         """创建 group，并按 create -> resolve -> plan -> apply 的顺序初始化。
 
         raw_config 是调用方提交的完整原始配置快照，主要用于审计、回显和
-        触发声明版本变更；执行链路仍只消费 records / interval / labels /
-        deployment_strategy 这些已经拆出来的规范字段。
+        排查；执行链路只消费 records / interval / labels /
+        deployment_strategy 这些规范字段。
         """
 
         deployment_strategy_config = normalize_deployment_strategy(deployment_strategy)
@@ -159,13 +185,14 @@ class RecordRuleV4Operator:
             # 这样 spec.raw_config 永远可用于回看“用户当时提交了什么”。
             spec = instance.spec_builder.create_spec(
                 records=records,
-                raw_config=raw_config
-                or {
-                    "records": records,
-                    "interval": interval,
-                    "labels": group_labels,
-                    "deployment_strategy": deployment_strategy_config,
-                },
+                raw_config=cls.compose_raw_config_snapshot(
+                    records=records,
+                    interval=interval,
+                    labels=group_labels,
+                    deployment_strategy=deployment_strategy_config,
+                    desired_status=RecordRuleV4DesiredStatus.RUNNING.value,
+                    raw_config=raw_config,
+                ),
                 interval=interval,
                 labels=group_labels,
                 deployment_strategy=deployment_strategy_config,
@@ -197,12 +224,11 @@ class RecordRuleV4Operator:
     ) -> RecordRuleV4:
         """更新用户声明或运行态。
 
-        records/raw_config/interval/labels/deployment_strategy/delete 会进入新的
+        records/interval/labels/deployment_strategy/delete 会进入新的
         spec/resolved/plan 链路；running/stopped 只改变运行态 desired_status，
         并直接下发到已 applied 的 Flow，不推进 generation。
-        raw_config 本身不是 resolver 的输入真值源，只是用户完整配置快照；
-        当调用方只更新 raw_config 时，会生成新 spec 记录这次声明变更，
-        但 resolved 是否变化仍由规范化 records 等字段决定。
+        raw_config 本身不是 resolver 的输入真值源，只在创建新 spec 时
+        作为原始配置快照保存；单独传 raw_config 不会推进 generation。
         """
 
         spec: RecordRuleV4Spec | None = None
@@ -219,23 +245,15 @@ class RecordRuleV4Operator:
             next_records: list[RecordRuleV4RecordInput] = (
                 RecordRuleV4SpecBuilder.dump_spec_records(current_spec) if records is None else list(records)
             )
-            next_raw_config = copy.deepcopy(current_spec.raw_config) if raw_config is None else dict(raw_config)
-            if records is not None and raw_config is None:
-                next_raw_config["records"] = copy.deepcopy(next_records)
             next_interval = current_spec.interval if interval is None else str(interval)
             if interval is not None:
                 RecordRuleV4.validate_interval(next_interval)
-                next_raw_config["interval"] = next_interval
             next_labels = copy.deepcopy(current_spec.labels) if labels is None else normalize_labels(labels)
-            if labels is not None:
-                next_raw_config["labels"] = copy.deepcopy(next_labels)
             next_deployment_strategy = (
                 copy.deepcopy(current_spec.deployment_strategy)
                 if deployment_strategy is None
                 else normalize_deployment_strategy(deployment_strategy)
             )
-            if deployment_strategy is not None:
-                next_raw_config["deployment_strategy"] = copy.deepcopy(next_deployment_strategy)
             requested_desired_status = None if desired_status is None else str(desired_status)
             if requested_desired_status is not None:
                 RecordRuleV4.validate_desired_status(requested_desired_status)
@@ -257,7 +275,7 @@ class RecordRuleV4Operator:
             if auto_refresh_changed:
                 self.rule.auto_refresh = bool(auto_refresh)
 
-            records_changed = records is not None or raw_config is not None
+            records_changed = records is not None
             interval_changed = interval is not None and next_interval != current_spec.interval
             labels_changed = labels is not None and next_labels != current_spec.labels
             deployment_strategy_changed = (
@@ -277,8 +295,6 @@ class RecordRuleV4Operator:
             changed_fields: list[str] = []
             if records_changed:
                 changed_fields.append("records")
-            if raw_config is not None:
-                changed_fields.append("raw_config")
             if interval_changed:
                 changed_fields.append("interval")
             if labels_changed:
@@ -302,7 +318,14 @@ class RecordRuleV4Operator:
                 # generation 和后续 resolved 对比。
                 spec = self.spec_builder.create_spec(
                     records=next_records,
-                    raw_config=copy.deepcopy(next_raw_config),
+                    raw_config=self.compose_raw_config_snapshot(
+                        records=next_records,
+                        interval=next_interval,
+                        labels=next_labels,
+                        deployment_strategy=next_deployment_strategy,
+                        desired_status=next_desired_status,
+                        raw_config=raw_config,
+                    ),
                     interval=next_interval,
                     labels=next_labels,
                     deployment_strategy=next_deployment_strategy,
