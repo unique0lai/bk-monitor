@@ -82,12 +82,21 @@ class DeploymentStrategy(ABC):
     ) -> dict:
         """拼装 bkbase V4 Flow 配置。"""
 
-        # 一个 Flow 可以消费多个源 VM RT，因此先按 RT 去重生成 VmSourceNode。
-        src_vm_table_ids = sorted({table_id for record in records for table_id in record.src_vm_table_ids})
+        # 一个 Flow 可以消费多个源 RT；这里使用 resolve 阶段固化的 bkbase ResultTableConfig.name。
+        src_result_table_names = sorted(
+            {
+                config["bkbase_result_table_name"]
+                for record in records
+                for config in record.src_result_table_configs
+                if config.get("bkbase_result_table_name")
+            }
+        )
+        if not src_result_table_names:
+            raise ValueError("resolved record src_result_table_configs is empty")
         source_nodes: list[dict] = []
         source_names: list[str] = []
-        for index, table_id in enumerate(src_vm_table_ids):
-            name = "vm_source" if len(src_vm_table_ids) == 1 else f"vm_source_{index + 1}"
+        for index, result_table_name in enumerate(src_result_table_names):
+            name = "vm_source" if len(src_result_table_names) == 1 else f"vm_source_{index + 1}"
             source_names.append(name)
             source_nodes.append(
                 {
@@ -97,7 +106,7 @@ class DeploymentStrategy(ABC):
                         "kind": "ResultTable",
                         "tenant": RECORD_RULE_V4_DEFAULT_TENANT,
                         "namespace": RECORD_RULE_V4_BKMONITOR_NAMESPACE,
-                        "name": table_id,
+                        "name": result_table_name,
                     },
                 }
             )

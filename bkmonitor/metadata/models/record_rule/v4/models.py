@@ -386,9 +386,15 @@ class RecordRuleV4(BaseModelWithTime):
 
     @property
     def bk_biz_id(self) -> int:
-        if self.space_type == SpaceTypes.BKCC.value:
-            return int(self.space_id)
-        return space_uid_to_bk_biz_id(self.space_uid)
+        return self.resolve_bk_biz_id(self.space_type, self.space_id)
+
+    @staticmethod
+    def resolve_bk_biz_id(space_type: str, space_id: str) -> int:
+        """根据空间信息解析权限和 DataLink 侧使用的业务 ID。"""
+
+        if space_type == SpaceTypes.BKCC.value:
+            return int(space_id)
+        return space_uid_to_bk_biz_id(f"{space_type}__{space_id}")
 
     @classmethod
     def compose_table_id(cls, group_name: str, random_suffix: str | None = None) -> str:
@@ -402,15 +408,6 @@ class RecordRuleV4(BaseModelWithTime):
         component_length = max(1, RECORD_RULE_V4_MAX_GENERATED_NAME_LENGTH - reserved)
         group_slug = _safe_component(group_name, component_length, "group")
         return f"{prefix}_{group_slug}_{suffix}{RECORD_RULE_V4_TABLE_ID_SUFFIX}"
-
-    @classmethod
-    def compose_dst_vm_table_id(cls, table_id: str) -> str:
-        """生成 group 输出表对应的 VM RT。"""
-
-        name = utils.compose_rule_table_id(table_id)
-        if len(name) <= RECORD_RULE_V4_MAX_GENERATED_NAME_LENGTH:
-            return name
-        return name[:RECORD_RULE_V4_MAX_GENERATED_NAME_LENGTH].rstrip("_")
 
     @classmethod
     def compose_flow_name(
@@ -847,6 +844,7 @@ class RecordRuleV4ResolvedRecord(BaseModelWithTime):
 
     metricql = JsonField("MetricQL列表", default=list)
     src_vm_table_ids = JsonField("源 VM 结果表列表", default=list)
+    src_result_table_configs = JsonField("源结果表配置列表", default=list)
     route_info = JsonField("路由信息", default=list)
     vm_cluster_id = models.IntegerField("VM 集群 ID", null=True, blank=True)
     vm_storage_name = models.CharField("VM 存储名称", max_length=128, blank=True, default="")

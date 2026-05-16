@@ -38,6 +38,7 @@ from metadata.models.record_rule.v4 import (
     RecordRuleV4Event,
 )
 from metadata.models.record_rule.v4.operator import RecordRuleV4Operator
+from metadata.models.record_rule.v4.output import RecordRuleV4OutputResources
 from metadata.models.record_rule.v4.resolver import RecordRuleV4Resolver
 
 pytestmark = pytest.mark.django_db(databases="__all__")
@@ -48,6 +49,7 @@ SPACE_ID = "2"
 GROUP_NAME = "rr_cpu_group"
 SOURCE_TABLE_ID = "system.cpu_summary"
 SOURCE_VM_TABLE_ID = "2_system_cpu_summary"
+SOURCE_BKBASE_TABLE_NAME = "bkbase_system_cpu_summary"
 METRICQL = 'avg by (bk_target_ip) ({bk_biz_id="2", result_table_id="system.cpu_summary", __name__="usage"})'
 CHANGED_METRICQL = f"sum({METRICQL})"
 
@@ -78,6 +80,14 @@ def v4_base_data(settings):
         bk_base_data_id=100,
         vm_result_table_id=SOURCE_VM_TABLE_ID,
         vm_cluster_id=cluster.cluster_id,
+    )
+    models.ResultTableConfig.objects.create(
+        bk_tenant_id=TENANT_ID,
+        namespace=RECORD_RULE_V4_BKMONITOR_NAMESPACE,
+        name=SOURCE_BKBASE_TABLE_NAME,
+        data_link_name=SOURCE_BKBASE_TABLE_NAME,
+        table_id=SOURCE_TABLE_ID,
+        bk_biz_id=int(SPACE_ID),
     )
     return SimpleNamespace(cluster=cluster)
 
@@ -205,6 +215,10 @@ def get_recording_rule_node(flow_config: dict) -> dict:
     raise AssertionError("RecordingRuleNode not found")
 
 
+def get_source_nodes(flow_config: dict) -> list[dict]:
+    return [node for node in flow_config["spec"]["nodes"] if node["kind"] == "VmSourceNode"]
+
+
 def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, external_api):
     records = [
         build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
@@ -231,6 +245,8 @@ def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, ex
     assert all(len(flow.flow_name) <= 50 for flow in flows)
     assert all(flow.records.count() == 1 for flow in flows)
 
+    first_source_node = get_source_nodes(flows[0].flow_config)[0]
+    assert first_source_node["data"]["name"] == SOURCE_BKBASE_TABLE_NAME
     first_node = get_recording_rule_node(flows[0].flow_config)
     assert first_node["inputs"] == ["vm_source"]
     assert first_node["output"] == rule.dst_vm_table_id
@@ -244,7 +260,19 @@ def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, ex
 
     assert external_api.check_query_ts.call_count == 2
     assert external_api.apply_data_link.call_count == 2
+    first_resolved_record = rule.latest_resolved.records.order_by("id").first()
+    assert first_resolved_record.src_result_table_configs == [
+        {
+            "result_table_id": SOURCE_TABLE_ID,
+            "vm_result_table_id": SOURCE_VM_TABLE_ID,
+            "bkbase_result_table_name": SOURCE_BKBASE_TABLE_NAME,
+        }
+    ]
     assert models.ResultTable.objects.filter(table_id=rule.table_id, bk_tenant_id=TENANT_ID).exists()
+    output_config = models.ResultTableConfig.objects.get(table_id=rule.table_id, bk_tenant_id=TENANT_ID)
+    assert output_config.name == RecordRuleV4OutputResources.compose_result_table_config_name(rule.table_id)
+    assert rule.dst_vm_table_id == f"{output_config.datalink_biz_ids.data_biz_id}_{output_config.name}"
+    assert output_config.bkbase_table_id == rule.dst_vm_table_id
     assert models.ResultTableField.objects.filter(
         table_id=rule.table_id,
         bk_tenant_id=TENANT_ID,
@@ -272,10 +300,12 @@ def test_single_flow_strategy_groups_records_into_one_flow(v4_base_data, externa
     rule = create_rule(records=records, strategy=RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value)
 
     flow = rule.latest_resolved.flows.get()
+    source_node = get_source_nodes(flow.flow_config)[0]
     recording_rule_node = get_recording_rule_node(flow.flow_config)
     assert rule.latest_resolved.records.count() == 2
     assert flow.flow_key == "group"
     assert flow.records.count() == 2
+    assert source_node["data"]["name"] == SOURCE_BKBASE_TABLE_NAME
     assert [item["metric_name"] for item in recording_rule_node["config"]] == ["cpu_usage_avg", "cpu_total_sum"]
     assert external_api.apply_data_link.call_count == 1
 
@@ -293,6 +323,11 @@ def test_create_prepares_output_metadata_before_apply(v4_base_data, external_api
     rule = create_rule(apply_immediately=False)
 
     assert models.ResultTable.objects.filter(table_id=rule.table_id, bk_tenant_id=TENANT_ID).exists()
+    output_config = models.ResultTableConfig.objects.get(table_id=rule.table_id, bk_tenant_id=TENANT_ID)
+    assert output_config.name == RecordRuleV4OutputResources.compose_result_table_config_name(rule.table_id)
+    assert output_config.data_link_name == output_config.name
+    assert output_config.bkbase_table_id == rule.dst_vm_table_id
+    assert rule.dst_vm_table_id == f"{output_config.datalink_biz_ids.data_biz_id}_{output_config.name}"
     assert models.AccessVMRecord.objects.filter(
         result_table_id=rule.table_id,
         vm_result_table_id=rule.dst_vm_table_id,
@@ -535,6 +570,23 @@ def test_resolve_failure_keeps_last_applied_deployment(v4_base_data, external_ap
     assert rule.last_error == "unify-query unavailable"
     assert rule.get_condition(CONDITION_RESOLVED)["status"] == CONDITION_FALSE
     assert rule.status == RecordRuleV4Status.FAILED.value
+
+
+def test_resolve_fails_when_source_result_table_config_missing(v4_base_data, external_api):
+    models.ResultTableConfig.objects.filter(
+        bk_tenant_id=TENANT_ID,
+        namespace=RECORD_RULE_V4_BKMONITOR_NAMESPACE,
+        table_id=SOURCE_TABLE_ID,
+    ).delete()
+
+    rule = create_rule(apply_immediately=False)
+
+    rule.refresh_from_db()
+    assert rule.latest_resolved_id is None
+    assert rule.latest_deployment_id is None
+    assert rule.get_condition(CONDITION_RESOLVED)["status"] == CONDITION_FALSE
+    assert "ResultTableConfig" in rule.last_error
+    external_api.apply_data_link.assert_not_called()
 
 
 def test_self_referenced_precalculated_vm_table_is_excluded_from_source(v4_base_data, external_api):

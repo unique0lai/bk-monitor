@@ -180,6 +180,10 @@ class Migration(migrations.Migration):
                     "src_vm_table_ids",
                     bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="源 VM 结果表列表"),
                 ),
+                (
+                    "src_result_table_configs",
+                    bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="源结果表配置列表"),
+                ),
                 ("route_info", bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="路由信息")),
                 ("vm_cluster_id", models.IntegerField(blank=True, null=True, verbose_name="VM 集群 ID")),
                 (

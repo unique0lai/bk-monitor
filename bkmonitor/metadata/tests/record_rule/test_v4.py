@@ -37,6 +37,7 @@ from metadata.models.record_rule.v4 import (
     RecordRuleV4Spec,
     stable_hash,
 )
+from metadata.models.record_rule.v4.output import RecordRuleV4OutputResources
 
 pytestmark = pytest.mark.django_db(databases="__all__")
 
@@ -140,7 +141,7 @@ def test_compose_names_keep_hint_random_suffix_and_short_length():
         group_name="cpu-usage.with/slashes-and-very-long-name",
         random_suffix="abcdef12",
     )
-    dst_vm_table_id = RecordRuleV4.compose_dst_vm_table_id(table_id)
+    result_table_config_name = RecordRuleV4OutputResources.compose_result_table_config_name(table_id)
     flow_name = RecordRuleV4.compose_flow_name(
         group_name="cpu-usage.with/slashes-and-very-long-name",
         flow_hint="record:cpu-total",
@@ -148,11 +149,11 @@ def test_compose_names_keep_hint_random_suffix_and_short_length():
     )
 
     assert len(table_id) <= 50
-    assert len(dst_vm_table_id) <= 50
+    assert len(result_table_config_name) <= 40
     assert len(flow_name) <= 50
     assert table_id.startswith("bkprecal_cpu_usage")
     assert table_id.endswith("_abcdef12.__default__")
-    assert "abcdef12" in dst_vm_table_id
+    assert result_table_config_name.startswith("bkm_bkprecal_cpu_usage")
     assert "abcdef12" in flow_name
 
 

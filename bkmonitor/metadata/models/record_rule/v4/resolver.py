@@ -17,7 +17,10 @@ from typing import Any
 from django.db import models, transaction
 
 from core.drf_resource import api
-from metadata.models.record_rule.constants import RecordRuleV4DesiredStatus, RecordRuleV4InputType
+from metadata.models.record_rule.constants import (
+    RecordRuleV4DesiredStatus,
+    RecordRuleV4InputType,
+)
 from metadata.models.record_rule.v4.models import (
     CONDITION_FALSE,
     CONDITION_RESOLVED,
@@ -164,6 +167,7 @@ class RecordRuleV4Resolver:
                     source_index=spec_record.source_index,
                     metricql=runtime_record["metricql"],
                     src_vm_table_ids=runtime_record["src_vm_table_ids"],
+                    src_result_table_configs=runtime_record["src_result_table_configs"],
                     route_info=runtime_record["route_info"],
                     vm_cluster_id=runtime_record["vm_cluster_id"],
                     vm_storage_name=runtime_record["vm_storage_name"],
@@ -200,6 +204,7 @@ class RecordRuleV4Resolver:
         src_vm_table_ids = self.normalize_src_vm_table_ids(self.extract_src_vm_table_ids(data, route_info))
         if not src_vm_table_ids:
             raise ValueError(f"unify-query check src vm table ids is empty, record_key: {spec_record.record_key}")
+        src_result_table_configs = self.resolve_src_result_table_configs(src_vm_table_ids)
 
         # 输出 VM storage 跟当前空间相关，而不是从单条查询结果里推导。
         vm_storage_info = self.get_vm_storage_info()
@@ -207,6 +212,7 @@ class RecordRuleV4Resolver:
             "record_key": spec_record.record_key,
             "metricql": metricql,
             "src_vm_table_ids": src_vm_table_ids,
+            "src_result_table_configs": src_result_table_configs,
             "route_info": route_info,
             "vm_cluster_id": vm_storage_info["cluster_id"],
             "vm_storage_name": vm_storage_info["cluster_name"],
@@ -215,6 +221,7 @@ class RecordRuleV4Resolver:
             "spec_record": spec_record,
             "metricql": metricql,
             "src_vm_table_ids": src_vm_table_ids,
+            "src_result_table_configs": src_result_table_configs,
             "route_info": route_info,
             "vm_cluster_id": vm_storage_info["cluster_id"],
             "vm_storage_name": vm_storage_info["cluster_name"],
@@ -307,6 +314,57 @@ class RecordRuleV4Resolver:
         if missing:
             raise ValueError(f"source result tables are not access vm storage: {missing}")
         return sorted(result)
+
+    def resolve_src_result_table_configs(self, vm_table_ids: list[str]) -> list[dict[str, str]]:
+        """把源 VMRT 固化成 bkbase ResultTableConfig.name 快照。"""
+
+        from metadata import models as metadata_models
+
+        result: list[dict[str, str]] = []
+        missing_access_records: list[str] = []
+        missing_result_table_configs: list[str] = []
+        for vm_table_id in vm_table_ids:
+            access_record = (
+                metadata_models.AccessVMRecord.objects.filter(
+                    bk_tenant_id=self.rule.bk_tenant_id,
+                    vm_result_table_id=vm_table_id,
+                )
+                .order_by("-id")
+                .first()
+            )
+            if access_record is None:
+                missing_access_records.append(vm_table_id)
+                continue
+
+            result_table_configs = metadata_models.ResultTableConfig.objects.filter(
+                bk_tenant_id=self.rule.bk_tenant_id,
+                table_id=access_record.result_table_id,
+            ).order_by("-last_modify_time", "-id")
+            config_count = result_table_configs.count()
+            result_table_config = result_table_configs.first()
+            if result_table_config is None:
+                missing_result_table_configs.append(access_record.result_table_id)
+                continue
+            if config_count > 1:
+                logger.warning(
+                    "RecordRuleV4 resolve_src_result_table_configs: got multiple ResultTableConfig, "
+                    "table_id->[%s], selected name->[%s]",
+                    access_record.result_table_id,
+                    result_table_config.name,
+                )
+            result.append(
+                {
+                    "result_table_id": access_record.result_table_id,
+                    "vm_result_table_id": access_record.vm_result_table_id,
+                    "bkbase_result_table_name": result_table_config.name,
+                }
+            )
+
+        if missing_access_records:
+            raise ValueError(f"source vm result tables are not found in AccessVMRecord: {missing_access_records}")
+        if missing_result_table_configs:
+            raise ValueError(f"source result tables are not found in ResultTableConfig: {missing_result_table_configs}")
+        return result
 
     def get_vm_storage_info(self) -> dict[str, Any]:
         """获取当前空间 recording rule 输出要写入的 VM storage。"""

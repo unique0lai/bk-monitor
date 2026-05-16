@@ -121,6 +121,12 @@ class RecordRuleV4Operator:
         RecordRuleV4.validate_deployment_strategy(deployment_strategy)
         bk_tenant_id = bk_tenant_id or space_uid_to_bk_tenant_id(f"{space_type}__{space_id}")
         table_id = RecordRuleV4.compose_table_id(group_name)
+        result_table_config_name = RecordRuleV4OutputResources.compose_result_table_config_name(table_id)
+        dst_vm_table_id = RecordRuleV4OutputResources.compose_vm_result_table_id(
+            bk_tenant_id=bk_tenant_id,
+            bk_biz_id=RecordRuleV4.resolve_bk_biz_id(space_type, space_id),
+            result_table_config_name=result_table_config_name,
+        )
 
         with transaction.atomic():
             rule = RecordRuleV4.objects.create(
@@ -129,7 +135,7 @@ class RecordRuleV4Operator:
                 space_id=space_id,
                 group_name=group_name,
                 table_id=table_id,
-                dst_vm_table_id=RecordRuleV4.compose_dst_vm_table_id(table_id),
+                dst_vm_table_id=dst_vm_table_id,
                 auto_refresh=auto_refresh,
                 creator=operator or source,
                 updater=operator or source,
