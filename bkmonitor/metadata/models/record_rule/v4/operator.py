@@ -18,7 +18,6 @@ from django.db import transaction
 
 from bkmonitor.utils.tenant import space_uid_to_bk_tenant_id
 from metadata.models.record_rule.constants import (
-    RecordRuleV4DeploymentStrategy,
     RecordRuleV4DesiredStatus,
     RecordRuleV4FlowStatus,
 )
@@ -29,6 +28,7 @@ from metadata.models.record_rule.v4.models import (
     RecordRuleV4Event,
     RecordRuleV4Resolved,
     RecordRuleV4Spec,
+    normalize_deployment_strategy,
     normalize_labels,
 )
 from metadata.models.record_rule.v4.output import RecordRuleV4OutputResources
@@ -114,14 +114,14 @@ class RecordRuleV4Operator:
         labels: list[dict[str, Any]] | None = None,
         bk_tenant_id: str | None = None,
         auto_refresh: bool = True,
-        deployment_strategy: str = RecordRuleV4DeploymentStrategy.PER_RECORD.value,
+        deployment_strategy: str | dict[str, Any] | None = None,
         source: str = "user",
         operator: str = "",
         apply_immediately: bool = True,
     ) -> RecordRuleV4:
         """创建 group，并按 create -> resolve -> plan -> apply 的顺序初始化。"""
 
-        RecordRuleV4.validate_deployment_strategy(deployment_strategy)
+        deployment_strategy_config = normalize_deployment_strategy(deployment_strategy)
         RecordRuleV4.validate_interval(interval)
         group_labels = normalize_labels(labels)
         bk_tenant_id = bk_tenant_id or space_uid_to_bk_tenant_id(f"{space_type}__{space_id}")
@@ -141,7 +141,6 @@ class RecordRuleV4Operator:
                 group_name=group_name,
                 table_id=table_id,
                 dst_vm_table_id=dst_vm_table_id,
-                deployment_strategy=deployment_strategy,
                 auto_refresh=auto_refresh,
                 creator=operator or source,
                 updater=operator or source,
@@ -152,9 +151,16 @@ class RecordRuleV4Operator:
             instance = cls(rule, source=source, operator=operator)
             spec = instance.spec_builder.create_spec(
                 records=records,
-                raw_config=raw_config or {"records": records, "interval": interval, "labels": group_labels},
+                raw_config=raw_config
+                or {
+                    "records": records,
+                    "interval": interval,
+                    "labels": group_labels,
+                    "deployment_strategy": deployment_strategy_config,
+                },
                 interval=interval,
                 labels=group_labels,
+                deployment_strategy=deployment_strategy_config,
                 desired_status=RecordRuleV4DesiredStatus.RUNNING.value,
             )
             rule.use_spec(spec)
@@ -176,15 +182,16 @@ class RecordRuleV4Operator:
         raw_config: dict[str, Any] | None = None,
         interval: str | None = None,
         labels: list[dict[str, Any]] | None = None,
+        deployment_strategy: str | dict[str, Any] | None = None,
         desired_status: str | None = None,
         auto_refresh: bool | None = None,
         apply_immediately: bool = True,
     ) -> RecordRuleV4:
         """更新用户声明或运行态。
 
-        records/raw_config/interval/labels/delete 会进入新的 spec/resolved/plan
-        链路；running/stopped 只改变运行态 desired_status，并直接下发到已
-        applied 的 Flow，不推进 generation。
+        records/raw_config/interval/labels/deployment_strategy/delete 会进入新的
+        spec/resolved/plan 链路；running/stopped 只改变运行态 desired_status，
+        并直接下发到已 applied 的 Flow，不推进 generation。
         """
 
         spec: RecordRuleV4Spec | None = None
@@ -211,6 +218,13 @@ class RecordRuleV4Operator:
             next_labels = copy.deepcopy(current_spec.labels) if labels is None else normalize_labels(labels)
             if labels is not None:
                 next_raw_config["labels"] = copy.deepcopy(next_labels)
+            next_deployment_strategy = (
+                copy.deepcopy(current_spec.deployment_strategy)
+                if deployment_strategy is None
+                else normalize_deployment_strategy(deployment_strategy)
+            )
+            if deployment_strategy is not None:
+                next_raw_config["deployment_strategy"] = copy.deepcopy(next_deployment_strategy)
             requested_desired_status = None if desired_status is None else str(desired_status)
             if requested_desired_status is not None:
                 RecordRuleV4.validate_desired_status(requested_desired_status)
@@ -235,7 +249,10 @@ class RecordRuleV4Operator:
             records_changed = records is not None or raw_config is not None
             interval_changed = interval is not None and next_interval != current_spec.interval
             labels_changed = labels is not None and next_labels != current_spec.labels
-            definition_changed = next_desired_status != current_spec.desired_status
+            deployment_strategy_changed = (
+                deployment_strategy is not None and next_deployment_strategy != current_spec.deployment_strategy
+            )
+            definition_changed = next_desired_status != current_spec.desired_status or deployment_strategy_changed
             runtime_desired_status_changed = (
                 runtime_desired_status is not None and runtime_desired_status != self.rule.desired_status
             )
@@ -255,6 +272,8 @@ class RecordRuleV4Operator:
                 changed_fields.append("interval")
             if labels_changed:
                 changed_fields.append("labels")
+            if deployment_strategy_changed:
+                changed_fields.append("deployment_strategy")
             if requested_desired_status == RecordRuleV4DesiredStatus.DELETED.value:
                 changed_fields.append("desired_status")
 
@@ -275,6 +294,7 @@ class RecordRuleV4Operator:
                     raw_config=copy.deepcopy(next_raw_config),
                     interval=next_interval,
                     labels=next_labels,
+                    deployment_strategy=next_deployment_strategy,
                     desired_status=next_desired_status,
                 )
                 self.rule.use_spec(spec)

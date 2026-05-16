@@ -188,7 +188,7 @@ def build_record(
 def create_rule(
     *,
     records: list[dict] | None = None,
-    strategy: str = RecordRuleV4DeploymentStrategy.PER_RECORD.value,
+    strategy: str | dict | None = None,
     interval: str = "1min",
     labels: list[dict] | None = None,
     auto_refresh: bool = True,
@@ -196,6 +196,7 @@ def create_rule(
 ) -> RecordRuleV4:
     records = records or [build_record()]
     group_labels = labels or []
+    strategy = strategy or RecordRuleV4DeploymentStrategy.PER_RECORD.value
     return RecordRuleV4Operator.create(
         bk_tenant_id=TENANT_ID,
         space_type=SPACE_TYPE,
@@ -304,13 +305,18 @@ def test_single_flow_strategy_groups_records_into_one_flow(v4_base_data, externa
         build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
         build_record(record_name="cpu_total", metric_name="cpu_total_sum"),
     ]
+    strategy_config = {
+        "strategy": RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value,
+        "options": {"unit": "pytest"},
+    }
 
-    rule = create_rule(records=records, strategy=RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value)
+    rule = create_rule(records=records, strategy=strategy_config)
 
     flow = rule.latest_resolved.flows.get()
     source_node = get_source_nodes(flow.flow_config)[0]
     recording_rule_node = get_recording_rule_node(flow.flow_config)
-    assert rule.deployment_strategy == RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value
+    assert rule.current_spec.deployment_strategy == strategy_config
+    assert rule.latest_deployment.plan_config["strategy"] == strategy_config
     assert rule.latest_resolved.records.count() == 2
     assert flow.flow_key == "group"
     assert flow.strategy == RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value
@@ -338,6 +344,38 @@ def test_group_interval_and_labels_merge_into_resolved_and_flow(v4_base_data, ex
     assert resolved_record.labels == expected_labels
     assert recording_rule_node["config"][0]["interval"] == "5min"
     assert recording_rule_node["config"][0]["labels"] == expected_labels
+
+
+def test_update_deployment_strategy_replans_without_resolve(v4_base_data, external_api):
+    records = [
+        build_record(record_name="cpu_usage", metric_name="cpu_usage_avg"),
+        build_record(record_name="cpu_total", metric_name="cpu_total_sum"),
+    ]
+    rule = create_rule(records=records)
+    previous_resolved_id = rule.latest_resolved_id
+    strategy_config = {"strategy": RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value, "options": {"unit": "pytest"}}
+    external_api.check_query_ts.reset_mock()
+    external_api.apply_data_link.reset_mock()
+
+    RecordRuleV4Operator(rule, source="manual", operator="admin").update_spec(
+        deployment_strategy=strategy_config,
+        apply_immediately=False,
+    )
+
+    rule.refresh_from_db()
+    action_types = sorted(action["action_type"] for action in rule.latest_deployment.plan_config["actions"])
+    assert rule.latest_resolved_id == previous_resolved_id
+    assert rule.current_spec.deployment_strategy == strategy_config
+    assert rule.latest_deployment.strategy == RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value
+    assert rule.latest_deployment.plan_config["strategy"] == strategy_config
+    assert action_types == [
+        RecordRuleV4FlowActionType.CREATE.value,
+        RecordRuleV4FlowActionType.DELETE.value,
+        RecordRuleV4FlowActionType.DELETE.value,
+    ]
+    assert rule.update_available is True
+    external_api.check_query_ts.assert_not_called()
+    external_api.apply_data_link.assert_not_called()
 
 
 def test_create_allows_duplicate_group_name_with_random_output_names(v4_base_data, external_api):

@@ -21,6 +21,7 @@ from metadata.models.record_rule.v4.models import (
     RecordRuleV4Spec,
     RecordRuleV4SpecRecord,
     generate_record_key,
+    normalize_deployment_strategy,
     normalize_labels,
     stable_hash,
 )
@@ -49,6 +50,7 @@ class RecordRuleV4SpecBuilder:
         records: list[dict[str, Any]],
         raw_config: dict[str, Any],
         interval: str,
+        deployment_strategy: str | dict[str, Any] | None,
         desired_status: str,
         labels: list[dict[str, Any]] | None = None,
     ) -> RecordRuleV4Spec:
@@ -57,6 +59,7 @@ class RecordRuleV4SpecBuilder:
         RecordRuleV4.validate_desired_status(desired_status)
         RecordRuleV4.validate_interval(interval)
         group_labels = normalize_labels(labels)
+        deployment_strategy_config = normalize_deployment_strategy(deployment_strategy)
         normalized_records = [self.normalize_record_payload(record) for record in records]
         generation = self.rule.generation + 1
         # spec content_hash 表达用户声明内容；resolved 漂移和 Flow 模板变化
@@ -66,6 +69,7 @@ class RecordRuleV4SpecBuilder:
             "raw_config": raw_config,
             "interval": interval,
             "labels": group_labels,
+            "deployment_strategy": deployment_strategy_config,
             "desired_status": desired_status,
         }
 
@@ -76,6 +80,7 @@ class RecordRuleV4SpecBuilder:
                 raw_config=copy.deepcopy(raw_config),
                 interval=interval,
                 labels=copy.deepcopy(group_labels),
+                deployment_strategy=copy.deepcopy(deployment_strategy_config),
                 desired_status=desired_status,
                 content_hash=stable_hash(content_payload),
                 source=self.source,

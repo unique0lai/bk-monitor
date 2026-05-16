@@ -50,7 +50,6 @@ def create_rule(**overrides) -> RecordRuleV4:
         "group_name": "cpu-group",
         "table_id": "bkprecal_cpu_group_abcd1234.__default__",
         "dst_vm_table_id": "vm_bkprecal_cpu_group_abcd1234",
-        "deployment_strategy": RecordRuleV4DeploymentStrategy.PER_RECORD.value,
         "creator": "pytest",
         "updater": "pytest",
     }
@@ -65,8 +64,16 @@ def create_spec(rule: RecordRuleV4, **overrides) -> RecordRuleV4Spec:
         "raw_config": {"records": []},
         "interval": "1min",
         "labels": [],
+        "deployment_strategy": {"strategy": RecordRuleV4DeploymentStrategy.PER_RECORD.value, "options": {}},
         "desired_status": RecordRuleV4DesiredStatus.RUNNING.value,
-        "content_hash": stable_hash({"records": [], "interval": "1min", "labels": []}),
+        "content_hash": stable_hash(
+            {
+                "records": [],
+                "interval": "1min",
+                "labels": [],
+                "deployment_strategy": {"strategy": RecordRuleV4DeploymentStrategy.PER_RECORD.value, "options": {}},
+            }
+        ),
         "source": "pytest",
         "operator": "tester",
         "creator": "tester",
@@ -101,7 +108,7 @@ def create_deployment(
         "resolved": resolved,
         "generation": spec.generation,
         "deployment_version": 1,
-        "strategy": rule.deployment_strategy,
+        "strategy": spec.deployment_strategy_name,
         "content_hash": "deployment-hash",
         "plan_config": {"actions": []},
         "source": "pytest",

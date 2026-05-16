@@ -280,6 +280,36 @@ def merge_labels(group_labels: list[dict[str, Any]], record_labels: list[dict[st
     return [{key: value} for key, value in merged.items()]
 
 
+def get_deployment_strategy_name(deployment_strategy: str | dict[str, Any] | None) -> str:
+    """从部署策略配置中取出策略名称。"""
+
+    if deployment_strategy is None:
+        return RecordRuleV4DeploymentStrategy.PER_RECORD.value
+    if isinstance(deployment_strategy, str):
+        return deployment_strategy
+    if isinstance(deployment_strategy, dict):
+        return str(deployment_strategy.get("strategy") or RecordRuleV4DeploymentStrategy.PER_RECORD.value)
+    raise ValueError("deployment_strategy must be string or dict")
+
+
+def normalize_deployment_strategy(deployment_strategy: str | dict[str, Any] | None) -> dict[str, Any]:
+    """归一化部署策略配置，预留 options 结构给后续策略参数。"""
+
+    strategy = get_deployment_strategy_name(deployment_strategy)
+    if strategy not in {item.value for item in RecordRuleV4DeploymentStrategy}:
+        raise ValueError(f"unsupported deployment_strategy: {strategy}")
+
+    if isinstance(deployment_strategy, dict):
+        options = deployment_strategy.get("options") or {}
+        if not isinstance(options, dict):
+            raise ValueError("deployment_strategy.options must be dict")
+        result = dict(deployment_strategy)
+        result["strategy"] = strategy
+        result["options"] = dict(options)
+        return result
+    return {"strategy": strategy, "options": {}}
+
+
 def now() -> datetime:
     """统一封装当前时间，方便模型方法和测试保持同一入口。"""
 
@@ -345,9 +375,6 @@ class RecordRuleV4(BaseModelWithTime):
     group_name = models.CharField("预计算组名称", max_length=128)
     table_id = models.CharField("结果表名", max_length=128)
     dst_vm_table_id = models.CharField("VM 结果表RT", max_length=128)
-    deployment_strategy = models.CharField(
-        "部署策略", max_length=32, default=RecordRuleV4DeploymentStrategy.PER_RECORD.value
-    )
 
     generation = models.IntegerField("用户声明版本", default=0)
     observed_generation = models.IntegerField("已成功下发的声明版本", default=0)
@@ -691,7 +718,6 @@ class RecordRuleV4(BaseModelWithTime):
             "group_name": self.group_name,
             "table_id": self.table_id,
             "dst_vm_table_id": self.dst_vm_table_id,
-            "deployment_strategy": self.deployment_strategy,
             "generation": self.generation,
             "observed_generation": self.observed_generation,
             "current_spec_id": self.current_spec_id,
@@ -721,9 +747,8 @@ class RecordRuleV4(BaseModelWithTime):
             raise ValueError(f"unsupported desired_status: {desired_status}")
 
     @staticmethod
-    def validate_deployment_strategy(strategy: str) -> None:
-        if strategy not in {item.value for item in RecordRuleV4DeploymentStrategy}:
-            raise ValueError(f"unsupported deployment_strategy: {strategy}")
+    def validate_deployment_strategy(strategy: str | dict[str, Any] | None) -> None:
+        normalize_deployment_strategy(strategy)
 
 
 class RecordRuleV4Spec(BaseModelWithTime):
@@ -740,6 +765,7 @@ class RecordRuleV4Spec(BaseModelWithTime):
     raw_config = JsonField("用户原始完整配置", default=dict)
     interval = models.CharField("计算周期", max_length=16, default="1min")
     labels = JsonField("组级附加标签", default=list)
+    deployment_strategy = JsonField("部署策略配置", default=dict)
     desired_status = models.CharField("期望状态", max_length=32, default=RecordRuleV4DesiredStatus.RUNNING.value)
     content_hash = models.CharField("配置内容指纹", max_length=64)
     source = models.CharField("来源", max_length=32, default="user")
@@ -754,6 +780,12 @@ class RecordRuleV4Spec(BaseModelWithTime):
         """按用户输入顺序返回 spec records。"""
 
         return list(self.records.order_by("source_index", "id"))
+
+    @property
+    def deployment_strategy_name(self) -> str:
+        """返回当前 spec 的部署策略名称。"""
+
+        return get_deployment_strategy_name(self.deployment_strategy)
 
 
 class RecordRuleV4SpecRecord(BaseModelWithTime):

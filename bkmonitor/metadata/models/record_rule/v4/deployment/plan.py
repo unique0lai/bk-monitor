@@ -63,7 +63,7 @@ class DeploymentPlanAction:
 class DeploymentPlan:
     """完整部署计划，包含目标 Flow 快照和本次需要执行的动作。"""
 
-    strategy: str
+    strategy: dict[str, Any]
     actions: list[DeploymentPlanAction]
     target_flows: list[RecordRuleV4Flow]
 
