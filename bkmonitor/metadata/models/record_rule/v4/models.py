@@ -323,6 +323,9 @@ class RecordRuleV4(BaseModelWithTime):
     group_name = models.CharField("预计算组名称", max_length=128)
     table_id = models.CharField("结果表名", max_length=128)
     dst_vm_table_id = models.CharField("VM 结果表RT", max_length=128)
+    deployment_strategy = models.CharField(
+        "部署策略", max_length=32, default=RecordRuleV4DeploymentStrategy.PER_RECORD.value
+    )
 
     generation = models.IntegerField("用户声明版本", default=0)
     observed_generation = models.IntegerField("已成功下发的声明版本", default=0)
@@ -666,6 +669,7 @@ class RecordRuleV4(BaseModelWithTime):
             "group_name": self.group_name,
             "table_id": self.table_id,
             "dst_vm_table_id": self.dst_vm_table_id,
+            "deployment_strategy": self.deployment_strategy,
             "generation": self.generation,
             "observed_generation": self.observed_generation,
             "current_spec_id": self.current_spec_id,
@@ -713,9 +717,6 @@ class RecordRuleV4Spec(BaseModelWithTime):
     generation = models.IntegerField("用户声明版本")
     raw_config = JsonField("用户原始完整配置", default=dict)
     desired_status = models.CharField("期望状态", max_length=32, default=RecordRuleV4DesiredStatus.RUNNING.value)
-    deployment_strategy = models.CharField(
-        "部署策略", max_length=32, default=RecordRuleV4DeploymentStrategy.PER_RECORD.value
-    )
     content_hash = models.CharField("配置内容指纹", max_length=64)
     source = models.CharField("来源", max_length=32, default="user")
     operator = models.CharField("操作人", max_length=128, blank=True, default="")

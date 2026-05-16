@@ -302,8 +302,11 @@ def test_single_flow_strategy_groups_records_into_one_flow(v4_base_data, externa
     flow = rule.latest_resolved.flows.get()
     source_node = get_source_nodes(flow.flow_config)[0]
     recording_rule_node = get_recording_rule_node(flow.flow_config)
+    assert rule.deployment_strategy == RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value
     assert rule.latest_resolved.records.count() == 2
     assert flow.flow_key == "group"
+    assert flow.strategy == RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value
+    assert rule.latest_deployment.strategy == RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value
     assert flow.records.count() == 2
     assert source_node["data"]["name"] == SOURCE_BKBASE_TABLE_NAME
     assert [item["metric_name"] for item in recording_rule_node["config"]] == ["cpu_usage_avg", "cpu_total_sum"]

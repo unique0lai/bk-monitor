@@ -136,6 +136,7 @@ class RecordRuleV4Operator:
                 group_name=group_name,
                 table_id=table_id,
                 dst_vm_table_id=dst_vm_table_id,
+                deployment_strategy=deployment_strategy,
                 auto_refresh=auto_refresh,
                 creator=operator or source,
                 updater=operator or source,
@@ -148,7 +149,6 @@ class RecordRuleV4Operator:
                 records=records,
                 raw_config=raw_config or {"records": records},
                 desired_status=RecordRuleV4DesiredStatus.RUNNING.value,
-                deployment_strategy=deployment_strategy,
             )
             rule.use_spec(spec)
             RecordRuleV4OutputResources.ensure_spec_metric_fields(rule, spec)
@@ -168,15 +168,14 @@ class RecordRuleV4Operator:
         records: list[dict[str, Any]] | None = None,
         raw_config: dict[str, Any] | None = None,
         desired_status: str | None = None,
-        deployment_strategy: str | None = None,
         auto_refresh: bool | None = None,
         apply_immediately: bool = True,
     ) -> RecordRuleV4:
         """更新用户声明或运行态。
 
-        records/raw_config/deployment_strategy/delete 会进入新的 spec/resolved/plan
-        链路；running/stopped 只改变运行态 desired_status，并直接下发到已
-        applied 的 Flow，不推进 generation。
+        records/raw_config/delete 会进入新的 spec/resolved/plan 链路；
+        running/stopped 只改变运行态 desired_status，并直接下发到已 applied
+        的 Flow，不推进 generation。
         """
 
         spec: RecordRuleV4Spec | None = None
@@ -210,18 +209,13 @@ class RecordRuleV4Operator:
                 if requested_desired_status == RecordRuleV4DesiredStatus.DELETED.value
                 else current_spec.desired_status
             )
-            next_strategy = (
-                current_spec.deployment_strategy if deployment_strategy is None else str(deployment_strategy)
-            )
 
             auto_refresh_changed = auto_refresh is not None and bool(auto_refresh) != self.rule.auto_refresh
             if auto_refresh_changed:
                 self.rule.auto_refresh = bool(auto_refresh)
 
             records_changed = records is not None or raw_config is not None
-            definition_changed = (
-                next_desired_status != current_spec.desired_status or next_strategy != current_spec.deployment_strategy
-            )
+            definition_changed = next_desired_status != current_spec.desired_status
             runtime_desired_status_changed = (
                 runtime_desired_status is not None and runtime_desired_status != self.rule.desired_status
             )
@@ -239,8 +233,6 @@ class RecordRuleV4Operator:
                 changed_fields.append("raw_config")
             if requested_desired_status == RecordRuleV4DesiredStatus.DELETED.value:
                 changed_fields.append("desired_status")
-            if next_strategy != current_spec.deployment_strategy:
-                changed_fields.append("deployment_strategy")
 
             if not changed_fields:
                 if auto_refresh_changed:
@@ -258,7 +250,6 @@ class RecordRuleV4Operator:
                     records=next_records,
                     raw_config=copy.deepcopy(next_raw_config),
                     desired_status=next_desired_status,
-                    deployment_strategy=next_strategy,
                 )
                 self.rule.use_spec(spec)
                 RecordRuleV4OutputResources.ensure_spec_metric_fields(self.rule, spec)

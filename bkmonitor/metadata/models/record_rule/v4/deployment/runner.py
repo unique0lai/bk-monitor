@@ -114,7 +114,7 @@ class DeploymentRunner:
             resolved=resolved,
             generation=spec.generation,
             deployment_version=self.next_deployment_version(resolved),
-            strategy=spec.deployment_strategy,
+            strategy=self.rule.deployment_strategy,
             content_hash=content_hash,
             plan_config=plan_config,
             source=self.source,
@@ -158,12 +158,12 @@ class DeploymentRunner:
             if flow.flow_key not in target_by_key:
                 actions.append(self.build_action(RecordRuleV4FlowActionType.DELETE.value, flow))
 
-        return DeploymentPlan(strategy=spec.deployment_strategy, actions=actions, target_flows=target_flows)
+        return DeploymentPlan(strategy=self.rule.deployment_strategy, actions=actions, target_flows=target_flows)
 
     def persist_target_flows(self, spec: RecordRuleV4Spec, resolved: RecordRuleV4Resolved) -> list[RecordRuleV4Flow]:
         """按部署策略生成并持久化目标 Flow 实体。"""
 
-        strategy = get_deployment_strategy(spec.deployment_strategy)
+        strategy = get_deployment_strategy(self.rule.deployment_strategy)
         flow_plans = strategy.build_flows(rule=self.rule, spec=spec, resolved=resolved)
         flows: list[RecordRuleV4Flow] = []
         for flow_plan in flow_plans:
@@ -182,7 +182,7 @@ class DeploymentRunner:
             defaults={
                 "rule": self.rule,
                 "flow_name": flow_plan.flow_name,
-                "strategy": spec.deployment_strategy,
+                "strategy": self.rule.deployment_strategy,
                 "table_id": self.rule.table_id,
                 "dst_vm_table_id": self.rule.dst_vm_table_id,
                 "flow_config": self.with_desired_status(flow_plan.flow_config, self.rule.desired_status),
@@ -193,8 +193,8 @@ class DeploymentRunner:
             },
         )
         for record in flow_plan.resolved_records:
-            # 同一 resolved record 只能归属一个 Flow，update_or_create 允许部署
-            # 策略变化时重新绑定归属关系。
+            # 同一 resolved record 只能归属一个 Flow，update_or_create 允许
+            # 未来部署策略调整或分组逻辑变化时重新绑定归属关系。
             RecordRuleV4FlowRecord.objects.update_or_create(
                 resolved_record=record,
                 defaults={"flow": flow, "creator": self.actor, "updater": self.actor},

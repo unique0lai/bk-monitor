@@ -48,12 +48,10 @@ class RecordRuleV4SpecBuilder:
         records: list[dict[str, Any]],
         raw_config: dict[str, Any],
         desired_status: str,
-        deployment_strategy: str,
     ) -> RecordRuleV4Spec:
         """创建一份新的 spec 快照和对应的 spec records。"""
 
         RecordRuleV4.validate_desired_status(desired_status)
-        RecordRuleV4.validate_deployment_strategy(deployment_strategy)
         normalized_records = [self.normalize_record_payload(record) for record in records]
         generation = self.rule.generation + 1
         # spec content_hash 表达用户声明内容；resolved 漂移和 Flow 模板变化
@@ -62,7 +60,6 @@ class RecordRuleV4SpecBuilder:
             "records": [self.record_content_payload(record) for record in normalized_records],
             "raw_config": raw_config,
             "desired_status": desired_status,
-            "deployment_strategy": deployment_strategy,
         }
 
         with transaction.atomic():
@@ -71,7 +68,6 @@ class RecordRuleV4SpecBuilder:
                 generation=generation,
                 raw_config=copy.deepcopy(raw_config),
                 desired_status=desired_status,
-                deployment_strategy=deployment_strategy,
                 content_hash=stable_hash(content_payload),
                 source=self.source,
                 operator=self.operator,
