@@ -122,9 +122,9 @@ class DeploymentStrategy(ABC):
                 recording_rule_config.append(
                     {
                         "expr": expr,
-                        "interval": spec_record.interval,
+                        "interval": resolved_record.resolved.spec.interval,
                         "metric_name": metric_name,
-                        "labels": spec_record.labels,
+                        "labels": resolved_record.labels,
                     }
                 )
 

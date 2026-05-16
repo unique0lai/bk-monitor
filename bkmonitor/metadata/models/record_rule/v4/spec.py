@@ -21,6 +21,7 @@ from metadata.models.record_rule.v4.models import (
     RecordRuleV4Spec,
     RecordRuleV4SpecRecord,
     generate_record_key,
+    normalize_labels,
     stable_hash,
 )
 
@@ -47,11 +48,15 @@ class RecordRuleV4SpecBuilder:
         *,
         records: list[dict[str, Any]],
         raw_config: dict[str, Any],
+        interval: str,
         desired_status: str,
+        labels: list[dict[str, Any]] | None = None,
     ) -> RecordRuleV4Spec:
         """创建一份新的 spec 快照和对应的 spec records。"""
 
         RecordRuleV4.validate_desired_status(desired_status)
+        RecordRuleV4.validate_interval(interval)
+        group_labels = normalize_labels(labels)
         normalized_records = [self.normalize_record_payload(record) for record in records]
         generation = self.rule.generation + 1
         # spec content_hash 表达用户声明内容；resolved 漂移和 Flow 模板变化
@@ -59,6 +64,8 @@ class RecordRuleV4SpecBuilder:
         content_payload = {
             "records": [self.record_content_payload(record) for record in normalized_records],
             "raw_config": raw_config,
+            "interval": interval,
+            "labels": group_labels,
             "desired_status": desired_status,
         }
 
@@ -67,6 +74,8 @@ class RecordRuleV4SpecBuilder:
                 rule=self.rule,
                 generation=generation,
                 raw_config=copy.deepcopy(raw_config),
+                interval=interval,
+                labels=copy.deepcopy(group_labels),
                 desired_status=desired_status,
                 content_hash=stable_hash(content_payload),
                 source=self.source,
@@ -86,18 +95,16 @@ class RecordRuleV4SpecBuilder:
                     input_config=record["input_config"],
                     metric_name=record["metric_name"],
                     labels=record["labels"],
-                    interval=record["interval"],
                     creator=self.actor,
                     updater=self.actor,
                 )
         return spec
 
     def normalize_record_payload(self, record: dict[str, Any]) -> dict[str, Any]:
-        """归一化单条用户 record，并校验输入类型和周期。"""
+        """归一化单条用户 record，并校验输入类型。"""
 
         normalized = RecordRuleV4SpecRecord.normalize_record_payload(copy.deepcopy(record))
         RecordRuleV4.validate_input_type(normalized["input_type"])
-        RecordRuleV4.validate_interval(normalized["interval"])
         return normalized
 
     @staticmethod
@@ -110,7 +117,6 @@ class RecordRuleV4SpecBuilder:
             "input_config": record["input_config"],
             "metric_name": record["metric_name"],
             "labels": record["labels"],
-            "interval": record["interval"],
         }
 
     def assign_record_keys(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -180,7 +186,6 @@ class RecordRuleV4SpecBuilder:
                     "input_config": copy.deepcopy(record.input_config),
                     "metric_name": record.metric_name,
                     "labels": copy.deepcopy(record.labels),
-                    "interval": record.interval,
                 }
             )
         return records

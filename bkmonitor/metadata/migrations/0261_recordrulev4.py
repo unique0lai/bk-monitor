@@ -70,6 +70,8 @@ class Migration(migrations.Migration):
                 ("updated_at", models.DateTimeField(auto_now=True, verbose_name="更新时间")),
                 ("generation", models.IntegerField(verbose_name="用户声明版本")),
                 ("raw_config", bkmonitor.utils.db.fields.JsonField(default=dict, verbose_name="用户原始完整配置")),
+                ("interval", models.CharField(default="1min", max_length=16, verbose_name="计算周期")),
+                ("labels", bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="组级附加标签")),
                 ("desired_status", models.CharField(default="running", max_length=32, verbose_name="期望状态")),
                 ("content_hash", models.CharField(max_length=64, verbose_name="配置内容指纹")),
                 ("source", models.CharField(default="user", max_length=32, verbose_name="来源")),
@@ -107,7 +109,6 @@ class Migration(migrations.Migration):
                 ("input_config", bkmonitor.utils.db.fields.JsonField(default=dict, verbose_name="用户原始输入")),
                 ("metric_name", models.CharField(max_length=128, verbose_name="输出指标名")),
                 ("labels", bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="附加标签")),
-                ("interval", models.CharField(default="1min", max_length=16, verbose_name="计算周期")),
                 (
                     "spec",
                     models.ForeignKey(
@@ -176,6 +177,7 @@ class Migration(migrations.Migration):
                 ("content_hash", models.CharField(max_length=64, verbose_name="解析记录内容指纹")),
                 ("source_index", models.IntegerField(default=0, verbose_name="原始顺序")),
                 ("metricql", bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="MetricQL列表")),
+                ("labels", bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="合并附加标签")),
                 (
                     "src_vm_table_ids",
                     bkmonitor.utils.db.fields.JsonField(default=list, verbose_name="源 VM 结果表列表"),

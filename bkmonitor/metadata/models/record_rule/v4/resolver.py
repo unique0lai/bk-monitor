@@ -32,6 +32,7 @@ from metadata.models.record_rule.v4.models import (
     RecordRuleV4ResolvedRecord,
     RecordRuleV4Spec,
     RecordRuleV4SpecRecord,
+    merge_labels,
     now,
     stable_hash,
 )
@@ -166,6 +167,7 @@ class RecordRuleV4Resolver:
                     content_hash=runtime_record["content_hash"],
                     source_index=spec_record.source_index,
                     metricql=runtime_record["metricql"],
+                    labels=runtime_record["labels"],
                     src_vm_table_ids=runtime_record["src_vm_table_ids"],
                     src_result_table_configs=runtime_record["src_result_table_configs"],
                     route_info=runtime_record["route_info"],
@@ -205,12 +207,15 @@ class RecordRuleV4Resolver:
         if not src_vm_table_ids:
             raise ValueError(f"unify-query check src vm table ids is empty, record_key: {spec_record.record_key}")
         src_result_table_configs = self.resolve_src_result_table_configs(src_vm_table_ids)
+        labels = merge_labels(spec_record.spec.labels, spec_record.labels)
 
         # 输出 VM storage 跟当前空间相关，而不是从单条查询结果里推导。
         vm_storage_info = self.get_vm_storage_info()
         resolved_payload = {
             "record_key": spec_record.record_key,
             "metricql": metricql,
+            "labels": labels,
+            "interval": spec_record.spec.interval,
             "src_vm_table_ids": src_vm_table_ids,
             "src_result_table_configs": src_result_table_configs,
             "route_info": route_info,
@@ -220,6 +225,7 @@ class RecordRuleV4Resolver:
         return {
             "spec_record": spec_record,
             "metricql": metricql,
+            "labels": labels,
             "src_vm_table_ids": src_vm_table_ids,
             "src_result_table_configs": src_result_table_configs,
             "route_info": route_info,

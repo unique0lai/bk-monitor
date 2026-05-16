@@ -258,6 +258,28 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def normalize_labels(labels: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """归一化 labels，保持对 bkbase recording rule 所需的 list[dict] 结构。"""
+
+    result: list[dict[str, Any]] = []
+    for label in labels or []:
+        if not isinstance(label, dict):
+            raise ValueError("label item must be dict")
+        if label:
+            result.append(dict(label))
+    return result
+
+
+def merge_labels(group_labels: list[dict[str, Any]], record_labels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """合并 group / record 两层 labels，record 级同名 key 覆盖 group 级。"""
+
+    merged: dict[str, Any] = {}
+    for label in [*normalize_labels(group_labels), *normalize_labels(record_labels)]:
+        for key, value in label.items():
+            merged[str(key)] = value
+    return [{key: value} for key, value in merged.items()]
+
+
 def now() -> datetime:
     """统一封装当前时间，方便模型方法和测试保持同一入口。"""
 
@@ -716,6 +738,8 @@ class RecordRuleV4Spec(BaseModelWithTime):
     rule = models.ForeignKey(RecordRuleV4, verbose_name="预计算规则组", related_name="specs", on_delete=models.CASCADE)
     generation = models.IntegerField("用户声明版本")
     raw_config = JsonField("用户原始完整配置", default=dict)
+    interval = models.CharField("计算周期", max_length=16, default="1min")
+    labels = JsonField("组级附加标签", default=list)
     desired_status = models.CharField("期望状态", max_length=32, default=RecordRuleV4DesiredStatus.RUNNING.value)
     content_hash = models.CharField("配置内容指纹", max_length=64)
     source = models.CharField("来源", max_length=32, default="user")
@@ -755,7 +779,6 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
     input_config = JsonField("用户原始输入", default=dict)
     metric_name = models.CharField("输出指标名", max_length=128)
     labels = JsonField("附加标签", default=list)
-    interval = models.CharField("计算周期", max_length=16, default="1min")
 
     class Meta:
         verbose_name = "V4 预计算用户声明记录"
@@ -773,8 +796,7 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
             "input_type": record["input_type"],
             "input_config": record["input_config"],
             "metric_name": record["metric_name"],
-            "labels": record.get("labels") or [],
-            "interval": record.get("interval") or "1min",
+            "labels": normalize_labels(record.get("labels")),
         }
 
     @staticmethod
@@ -844,6 +866,7 @@ class RecordRuleV4ResolvedRecord(BaseModelWithTime):
     source_index = models.IntegerField("原始顺序", default=0)
 
     metricql = JsonField("MetricQL列表", default=list)
+    labels = JsonField("合并附加标签", default=list)
     src_vm_table_ids = JsonField("源 VM 结果表列表", default=list)
     src_result_table_configs = JsonField("源结果表配置列表", default=list)
     route_info = JsonField("路由信息", default=list)

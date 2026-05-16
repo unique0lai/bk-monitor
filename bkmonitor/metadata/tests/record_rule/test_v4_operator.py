@@ -170,6 +170,7 @@ def build_record(
     metric_name: str = "cpu_usage_avg",
     input_type: str = RecordRuleV4InputType.QUERY_TS.value,
     input_config: dict | None = None,
+    labels: list[dict] | None = None,
     record_key: str = "",
 ) -> dict:
     record = {
@@ -177,8 +178,7 @@ def build_record(
         "input_type": input_type,
         "input_config": input_config or build_query_config(),
         "metric_name": metric_name,
-        "labels": [{"scenario": "pytest"}],
-        "interval": "1min",
+        "labels": [{"scenario": "pytest"}] if labels is None else labels,
     }
     if record_key:
         record["record_key"] = record_key
@@ -189,17 +189,22 @@ def create_rule(
     *,
     records: list[dict] | None = None,
     strategy: str = RecordRuleV4DeploymentStrategy.PER_RECORD.value,
+    interval: str = "1min",
+    labels: list[dict] | None = None,
     auto_refresh: bool = True,
     apply_immediately: bool = True,
 ) -> RecordRuleV4:
     records = records or [build_record()]
+    group_labels = labels or []
     return RecordRuleV4Operator.create(
         bk_tenant_id=TENANT_ID,
         space_type=SPACE_TYPE,
         space_id=SPACE_ID,
         group_name=GROUP_NAME,
         records=records,
-        raw_config={"records": records},
+        raw_config={"records": records, "interval": interval, "labels": group_labels},
+        interval=interval,
+        labels=group_labels,
         deployment_strategy=strategy,
         auto_refresh=auto_refresh,
         source="pytest",
@@ -250,6 +255,8 @@ def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, ex
     first_node = get_recording_rule_node(flows[0].flow_config)
     assert first_node["inputs"] == ["vm_source"]
     assert first_node["output"] == rule.dst_vm_table_id
+    assert first_node["config"][0]["interval"] == rule.current_spec.interval
+    assert first_node["config"][0]["labels"] == [{"scenario": "pytest"}]
     assert first_node["storage"] == {
         "kind": "VmStorage",
         "tenant": RECORD_RULE_V4_DEFAULT_TENANT,
@@ -261,6 +268,7 @@ def test_create_group_with_two_records_applies_per_record_flows(v4_base_data, ex
     assert external_api.check_query_ts.call_count == 2
     assert external_api.apply_data_link.call_count == 2
     first_resolved_record = rule.latest_resolved.records.order_by("id").first()
+    assert first_resolved_record.labels == [{"scenario": "pytest"}]
     assert first_resolved_record.src_result_table_configs == [
         {
             "result_table_id": SOURCE_TABLE_ID,
@@ -311,6 +319,25 @@ def test_single_flow_strategy_groups_records_into_one_flow(v4_base_data, externa
     assert source_node["data"]["name"] == SOURCE_BKBASE_TABLE_NAME
     assert [item["metric_name"] for item in recording_rule_node["config"]] == ["cpu_usage_avg", "cpu_total_sum"]
     assert external_api.apply_data_link.call_count == 1
+
+
+def test_group_interval_and_labels_merge_into_resolved_and_flow(v4_base_data, external_api):
+    record = build_record(labels=[{"scenario": "record"}, {"owner": "record"}])
+
+    rule = create_rule(
+        records=[record],
+        interval="5min",
+        labels=[{"scenario": "group"}, {"env": "prod"}],
+    )
+
+    resolved_record = rule.latest_resolved.records.get()
+    recording_rule_node = get_recording_rule_node(rule.latest_resolved.flows.get().flow_config)
+    expected_labels = [{"scenario": "record"}, {"env": "prod"}, {"owner": "record"}]
+    assert rule.current_spec.interval == "5min"
+    assert rule.current_spec.labels == [{"scenario": "group"}, {"env": "prod"}]
+    assert resolved_record.labels == expected_labels
+    assert recording_rule_node["config"][0]["interval"] == "5min"
+    assert recording_rule_node["config"][0]["labels"] == expected_labels
 
 
 def test_create_allows_duplicate_group_name_with_random_output_names(v4_base_data, external_api):
@@ -402,6 +429,29 @@ def test_manual_refresh_only_marks_update_available(v4_base_data, external_api):
     assert rule.latest_deployment_id != applied_deployment_id
     assert rule.update_available is True
     assert rule.status == RecordRuleV4Status.PENDING.value
+    external_api.apply_data_link.assert_not_called()
+
+
+def test_update_group_interval_and_labels_replans_without_record_changes(v4_base_data, external_api):
+    rule = create_rule()
+    previous_spec_id = rule.current_spec_id
+    previous_resolved_id = rule.latest_resolved_id
+    external_api.apply_data_link.reset_mock()
+
+    RecordRuleV4Operator(rule, source="manual", operator="admin").update_spec(
+        interval="5min",
+        labels=[{"env": "prod"}],
+        apply_immediately=False,
+    )
+
+    rule.refresh_from_db()
+    assert rule.current_spec_id != previous_spec_id
+    assert rule.latest_resolved_id != previous_resolved_id
+    assert rule.current_spec.interval == "5min"
+    assert rule.current_spec.labels == [{"env": "prod"}]
+    assert rule.latest_resolved.records.get().labels == [{"env": "prod"}, {"scenario": "pytest"}]
+    assert rule.latest_deployment.plan_config["actions"][0]["action_type"] == RecordRuleV4FlowActionType.UPDATE.value
+    assert rule.update_available is True
     external_api.apply_data_link.assert_not_called()
 
 
