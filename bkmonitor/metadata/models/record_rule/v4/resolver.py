@@ -273,13 +273,11 @@ class RecordRuleV4Resolver:
         from bkmonitor.data_source.data_source import load_data_source
         from bkmonitor.data_source.unify_query.query import UnifyQuery
 
-        if "start_time" not in input_config or "end_time" not in input_config:
-            raise ValueError("structured query input_config requires start_time and end_time")
-
         bk_biz_id = int(input_config.get("bk_biz_id") or self.rule.bk_biz_id)
         query_configs = self.normalize_structured_query_configs(input_config.get("query_configs") or [])
         if not query_configs:
             raise ValueError("structured query input_config requires query_configs")
+        start_time, end_time = self.resolve_structured_query_check_time_range(input_config)
 
         # load_data_source + UnifyQuery 是 SaaS 查询配置到 QueryTs 的既有真值源；
         # resolver 只负责补齐 check 场景需要的时间和空间参数。
@@ -302,15 +300,33 @@ class RecordRuleV4Resolver:
             bk_tenant_id=self.rule.bk_tenant_id,
         )
         params = unify_query.get_unify_query_params(
-            start_time=self.normalize_timestamp_to_milliseconds(input_config["start_time"]),
-            end_time=self.normalize_timestamp_to_milliseconds(input_config["end_time"]),
+            start_time=start_time,
+            end_time=end_time,
             time_alignment=False,
             order_by=input_config.get("order_by"),
         )
         params.pop("bk_tenant_id", None)
-        params.pop("not_time_align", None)
         params["space_uid"] = self.rule.space_uid
         return params
+
+    def resolve_structured_query_check_time_range(self, input_config: dict[str, Any]) -> tuple[int, int]:
+        """生成 check 接口需要的时间范围。
+
+        recording rule 的最终 MetricQL 不应依赖用户查询窗口；这里保留用户
+        显式传入的时间仅用于复现预览，缺省时统一使用最近一小时满足
+        unify-query check 的请求格式。
+        """
+
+        start_time = input_config.get("start_time")
+        end_time = input_config.get("end_time")
+        if start_time not in (None, "") and end_time not in (None, ""):
+            return (
+                self.normalize_timestamp_to_milliseconds(start_time),
+                self.normalize_timestamp_to_milliseconds(end_time),
+            )
+
+        default_end_time = int(now().timestamp() * 1000)
+        return default_end_time - 3600 * 1000, default_end_time
 
     def normalize_structured_query_configs(self, query_configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """归一化 SaaS query_configs，使其满足 DataSource 构造参数约定。"""

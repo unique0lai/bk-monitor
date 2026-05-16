@@ -518,12 +518,12 @@ def test_run_check_converts_structured_query_config_to_query_ts(v4_base_data, ex
     assert kwargs["step"] == "60s"
     assert kwargs["order_by"] == ["-time"]
     assert kwargs["metric_merge"] == "a / b"
+    assert kwargs["not_time_align"] is False
     for skipped_field in (
         "down_sample_range",
         "timezone",
         "instant",
         "reference",
-        "not_time_align",
         "limit",
         "add_dimensions",
     ):
@@ -546,6 +546,21 @@ def test_run_check_converts_structured_query_config_to_query_ts(v4_base_data, ex
     assert second_query["table_id"] == "system.cpu_summary"
     assert second_query["field_name"] == "usage"
     assert second_query["reference_name"] == "b"
+
+
+def test_structured_query_config_uses_default_check_time_range(v4_base_data, external_api):
+    input_config = build_structured_query_config()
+    input_config.pop("start_time")
+    input_config.pop("end_time")
+    record = build_record(input_config=input_config)
+    rule = create_rule(records=[record], apply_immediately=False)
+    spec_record = rule.current_spec.records.get()
+    external_api.check_query_ts.reset_mock()
+
+    RecordRuleV4Resolver(rule, source="manual").run_check(spec_record)
+
+    _, kwargs = external_api.check_query_ts.call_args
+    assert int(kwargs["end_time"]) - int(kwargs["start_time"]) == 3600
 
 
 def test_manual_refresh_only_marks_update_available(v4_base_data, external_api):
