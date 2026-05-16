@@ -34,6 +34,7 @@ from metadata.models.record_rule.v4.models import (
 from metadata.models.record_rule.v4.output import RecordRuleV4OutputResources
 from metadata.models.record_rule.v4.resolver import RecordRuleV4Resolver
 from metadata.models.record_rule.v4.spec import RecordRuleV4SpecBuilder
+from metadata.models.record_rule.v4.types import RecordRuleV4RecordInput
 
 T = TypeVar("T")
 
@@ -108,7 +109,7 @@ class RecordRuleV4Operator:
         space_type: str,
         space_id: str,
         group_name: str,
-        records: list[dict[str, Any]],
+        records: list[RecordRuleV4RecordInput],
         raw_config: dict[str, Any] | None = None,
         interval: str = "1min",
         labels: list[dict[str, Any]] | None = None,
@@ -178,7 +179,7 @@ class RecordRuleV4Operator:
     def update_spec(
         self,
         *,
-        records: list[dict[str, Any]] | None = None,
+        records: list[RecordRuleV4RecordInput] | None = None,
         raw_config: dict[str, Any] | None = None,
         interval: str | None = None,
         labels: list[dict[str, Any]] | None = None,
@@ -205,7 +206,7 @@ class RecordRuleV4Operator:
             current_spec = self.require_current_spec()
             # 先把所有输入归一成下一份声明需要的候选值，后面再判断哪些是真正
             # 的定义态变更，哪些只是运行态启停。
-            next_records: list[dict[str, Any]] = (
+            next_records: list[RecordRuleV4RecordInput] = (
                 RecordRuleV4SpecBuilder.dump_spec_records(current_spec) if records is None else list(records)
             )
             next_raw_config = copy.deepcopy(current_spec.raw_config) if raw_config is None else dict(raw_config)

@@ -238,15 +238,135 @@ class RecordRuleV4Resolver:
     def run_check(self, spec_record: RecordRuleV4SpecRecord) -> dict[str, Any]:
         """根据输入类型调用 unify-query 的预览接口。"""
 
-        params: dict[str, Any] = copy.deepcopy(spec_record.input_config or {})
         if spec_record.input_type == RecordRuleV4InputType.QUERY_TS.value:
+            params = self.build_check_query_ts_params(spec_record.input_config or {})
             params.setdefault("space_uid", self.rule.space_uid)
             result = api.unify_query.check_query_ts(bk_tenant_id=self.rule.bk_tenant_id, **params)
         elif spec_record.input_type == RecordRuleV4InputType.PROMQL.value:
+            params: dict[str, Any] = copy.deepcopy(spec_record.input_config or {})
             result = api.unify_query.check_query_ts_by_promql(bk_tenant_id=self.rule.bk_tenant_id, **params)
         else:
             raise ValueError(f"unsupported input_type: {spec_record.input_type}")
         return result or {}
+
+    def build_check_query_ts_params(self, input_config: dict[str, Any]) -> dict[str, Any]:
+        """把用户输入归一为 /check/query/ts 可消费的 QueryTs 参数。
+
+        V4 预计算允许直接传 QueryTs，也允许传 SaaS 结构化查询配置。后者
+        使用现有 UnifyQuery builder 生成结构化查询，避免在预计算模块里
+        重新实现函数、聚合和条件的转换规则。
+        """
+
+        if "query_list" in input_config:
+            params = copy.deepcopy(input_config)
+        elif "query_configs" in input_config:
+            params = self.build_check_query_ts_params_from_structured_query(input_config)
+        else:
+            params = copy.deepcopy(input_config)
+
+        params.setdefault("space_uid", self.rule.space_uid)
+        return params
+
+    def build_check_query_ts_params_from_structured_query(self, input_config: dict[str, Any]) -> dict[str, Any]:
+        """使用 UnifyQuery 将 SaaS 结构化查询转换为 QueryTs check 参数。"""
+
+        from bkmonitor.data_source.data_source import load_data_source
+        from bkmonitor.data_source.unify_query.query import UnifyQuery
+
+        if "start_time" not in input_config or "end_time" not in input_config:
+            raise ValueError("structured query input_config requires start_time and end_time")
+
+        bk_biz_id = int(input_config.get("bk_biz_id") or self.rule.bk_biz_id)
+        query_configs = self.normalize_structured_query_configs(input_config.get("query_configs") or [])
+        if not query_configs:
+            raise ValueError("structured query input_config requires query_configs")
+
+        # load_data_source + UnifyQuery 是 SaaS 查询配置到 QueryTs 的既有真值源；
+        # resolver 只负责补齐 check 场景需要的时间、空间和可选预览参数。
+        data_sources = []
+        for query_config in query_configs:
+            data_source_class = load_data_source(query_config["data_source_label"], query_config["data_type_label"])
+            data_sources.append(
+                data_source_class(
+                    bk_biz_id=bk_biz_id,
+                    use_full_index_names=True,
+                    **query_config,
+                )
+            )
+
+        unify_query = UnifyQuery(
+            bk_biz_id=bk_biz_id,
+            data_sources=data_sources,
+            expression=input_config.get("expression") or "",
+            functions=input_config.get("functions") or [],
+            bk_tenant_id=self.rule.bk_tenant_id,
+        )
+        params = unify_query.get_unify_query_params(
+            start_time=self.normalize_timestamp_to_milliseconds(input_config["start_time"]),
+            end_time=self.normalize_timestamp_to_milliseconds(input_config["end_time"]),
+            time_alignment=False,
+            order_by=input_config.get("order_by"),
+            not_time_align=bool(input_config.get("not_time_align", False)),
+        )
+        params.pop("bk_tenant_id", None)
+        params["space_uid"] = self.rule.space_uid
+
+        # check/query/ts 只做解析预览，但这些字段会影响生成的 MetricQL；
+        # 仅透传结构化输入里明确给出的预览参数。
+        for field in (
+            "down_sample_range",
+            "timezone",
+            "instant",
+            "reference",
+            "not_time_align",
+            "limit",
+            "add_dimensions",
+        ):
+            if field in input_config:
+                params[field] = copy.deepcopy(input_config[field])
+        return params
+
+    def normalize_structured_query_configs(self, query_configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """归一化 SaaS query_configs，使其满足 DataSource 构造参数约定。"""
+
+        normalized_configs: list[dict[str, Any]] = []
+        for query_config in query_configs:
+            normalized = copy.deepcopy(query_config)
+            normalized["interval"] = self.normalize_interval_to_seconds(
+                normalized.get("interval"),
+                normalized.get("interval_unit") or "s",
+            )
+            normalized_configs.append(normalized)
+        return normalized_configs
+
+    @staticmethod
+    def normalize_interval_to_seconds(interval: Any, interval_unit: str) -> Any:
+        """把结构化查询的 interval/interval_unit 转成 UnifyQuery 使用的秒。"""
+
+        if interval in (None, ""):
+            return interval
+        try:
+            interval_value = int(interval)
+        except (TypeError, ValueError):
+            return interval
+
+        unit = interval_unit.lower()
+        if unit in {"ms", "millisecond", "milliseconds"}:
+            return max(interval_value // 1000, 1)
+        if unit in {"m", "min", "minute", "minutes"}:
+            return interval_value * 60
+        if unit in {"h", "hour", "hours"}:
+            return interval_value * 3600
+        return interval_value
+
+    @staticmethod
+    def normalize_timestamp_to_milliseconds(value: Any) -> int:
+        """UnifyQuery builder 接收毫秒时间戳；用户输入可能是秒或毫秒。"""
+
+        timestamp = int(value)
+        if timestamp > 10_000_000_000:
+            return timestamp
+        return timestamp * 1000
 
     def next_resolve_version(self, spec: RecordRuleV4Spec) -> int:
         """获取同一 spec 下的下一个解析版本号。"""

@@ -164,6 +164,55 @@ def build_query_config() -> dict:
     }
 
 
+def build_structured_query_config() -> dict:
+    return {
+        "bk_biz_id": 2,
+        "query_configs": [
+            {
+                "data_source_label": "bk_monitor",
+                "data_type_label": "time_series",
+                "metrics": [{"field": "in_use", "method": "AVG", "alias": "a"}],
+                "table": "system.disk",
+                "data_label": "",
+                "index_set_id": None,
+                "group_by": ["bk_target_cloud_id"],
+                "where": [
+                    {"key": "mount_point", "method": "eq", "value": ["/data1"]},
+                    {"condition": "and", "key": "bk_target_cloud_id", "method": "eq", "value": ["0"]},
+                ],
+                "interval": 60,
+                "interval_unit": "s",
+                "time_field": None,
+                "filter_dict": {},
+                "functions": [{"id": "rate", "params": [{"id": "window", "value": "2m"}]}],
+            },
+            {
+                "data_source_label": "bk_monitor",
+                "data_type_label": "time_series",
+                "metrics": [{"field": "usage", "method": "AVG", "alias": "b"}],
+                "table": "system.cpu_summary",
+                "data_label": "",
+                "index_set_id": None,
+                "group_by": [],
+                "where": [],
+                "interval": 60,
+                "interval_unit": "s",
+                "time_field": None,
+                "filter_dict": {},
+                "functions": [],
+            },
+        ],
+        "expression": "a / b",
+        "functions": [],
+        "alias": "c",
+        "name": "AVG(磁盘空间使用率) / AVG(CPU使用率)",
+        "start_time": 1778935339,
+        "end_time": 1778938939,
+        "slimit": 500,
+        "down_sample_range": "7s",
+    }
+
+
 def build_record(
     *,
     record_name: str = "cpu_usage",
@@ -451,6 +500,43 @@ def test_run_check_dispatches_promql_input_to_promql_api(v4_base_data, external_
         end="2",
     )
     external_api.check_query_ts.assert_not_called()
+
+
+def test_run_check_converts_structured_query_config_to_query_ts(v4_base_data, external_api):
+    record = build_record(input_config=build_structured_query_config())
+    rule = create_rule(records=[record], apply_immediately=False)
+    spec_record = rule.current_spec.records.get()
+    external_api.check_query_ts.reset_mock()
+
+    RecordRuleV4Resolver(rule, source="manual").run_check(spec_record)
+
+    _, kwargs = external_api.check_query_ts.call_args
+    assert kwargs["bk_tenant_id"] == TENANT_ID
+    assert kwargs["space_uid"] == "bkcc__2"
+    assert kwargs["start_time"] == "1778935339"
+    assert kwargs["end_time"] == "1778938939"
+    assert kwargs["step"] == "60s"
+    assert kwargs["order_by"] == ["-time"]
+    assert kwargs["metric_merge"] == "a / b"
+    assert kwargs["down_sample_range"] == "7s"
+
+    first_query, second_query = kwargs["query_list"]
+    assert first_query["table_id"] == "system.disk"
+    assert first_query["field_name"] == "in_use"
+    assert first_query["reference_name"] == "a"
+    assert first_query["dimensions"] == ["bk_target_cloud_id"]
+    assert first_query["time_aggregation"] == {"vargs_list": [], "function": "rate", "window": "2m", "position": 0}
+    assert first_query["function"] == [{"method": "mean", "dimensions": ["bk_target_cloud_id"]}]
+    assert first_query["conditions"] == {
+        "field_list": [
+            {"field_name": "mount_point", "value": ["/data1"], "op": "contains"},
+            {"field_name": "bk_target_cloud_id", "value": ["0"], "op": "contains"},
+        ],
+        "condition_list": ["and"],
+    }
+    assert second_query["table_id"] == "system.cpu_summary"
+    assert second_query["field_name"] == "usage"
+    assert second_query["reference_name"] == "b"
 
 
 def test_manual_refresh_only_marks_update_available(v4_base_data, external_api):

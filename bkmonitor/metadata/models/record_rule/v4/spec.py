@@ -25,6 +25,7 @@ from metadata.models.record_rule.v4.models import (
     normalize_labels,
     stable_hash,
 )
+from metadata.models.record_rule.v4.types import RecordRuleV4RecordInput
 
 logger = logging.getLogger("metadata")
 
@@ -47,7 +48,7 @@ class RecordRuleV4SpecBuilder:
     def create_spec(
         self,
         *,
-        records: list[dict[str, Any]],
+        records: list[RecordRuleV4RecordInput],
         raw_config: dict[str, Any],
         interval: str,
         deployment_strategy: str | dict[str, Any] | None,
@@ -105,7 +106,7 @@ class RecordRuleV4SpecBuilder:
                 )
         return spec
 
-    def normalize_record_payload(self, record: dict[str, Any]) -> dict[str, Any]:
+    def normalize_record_payload(self, record: RecordRuleV4RecordInput) -> dict[str, Any]:
         """归一化单条用户 record，并校验输入类型。"""
 
         normalized = RecordRuleV4SpecRecord.normalize_record_payload(copy.deepcopy(record))
@@ -178,10 +179,10 @@ class RecordRuleV4SpecBuilder:
         return result
 
     @staticmethod
-    def dump_spec_records(spec: RecordRuleV4Spec) -> list[dict[str, Any]]:
+    def dump_spec_records(spec: RecordRuleV4Spec) -> list[RecordRuleV4RecordInput]:
         """把已有 spec records 还原成 create_spec 可消费的输入结构。"""
 
-        records: list[dict[str, Any]] = []
+        records: list[RecordRuleV4RecordInput] = []
         for record in spec.records.order_by("source_index", "id"):
             records.append(
                 {
