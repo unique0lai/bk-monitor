@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import Any, cast
 
 from django.db import models, transaction
 
@@ -35,6 +35,13 @@ from metadata.models.record_rule.v4.models import (
     merge_labels,
     now,
     stable_hash,
+)
+from metadata.models.record_rule.v4.types import (
+    CheckQueryPromQLInput,
+    CheckQueryTsInput,
+    RecordRuleV4QueryTsInputConfig,
+    StructuredQueryConfigInput,
+    StructuredQueryInput,
 )
 
 logger = logging.getLogger("metadata")
@@ -239,17 +246,33 @@ class RecordRuleV4Resolver:
         """根据输入类型调用 unify-query 的预览接口。"""
 
         if spec_record.input_type == RecordRuleV4InputType.QUERY_TS.value:
-            params = self.build_check_query_ts_params(spec_record.input_config or {})
+            params = self.build_check_query_ts_params(
+                cast(RecordRuleV4QueryTsInputConfig, spec_record.input_config or {})
+            )
             params.setdefault("space_uid", self.rule.space_uid)
             result = api.unify_query.check_query_ts(bk_tenant_id=self.rule.bk_tenant_id, **params)
         elif spec_record.input_type == RecordRuleV4InputType.PROMQL.value:
-            params: dict[str, Any] = copy.deepcopy(spec_record.input_config or {})
+            params = self.build_check_promql_params(cast(CheckQueryPromQLInput, spec_record.input_config or {}))
             result = api.unify_query.check_query_ts_by_promql(bk_tenant_id=self.rule.bk_tenant_id, **params)
         else:
             raise ValueError(f"unsupported input_type: {spec_record.input_type}")
         return result or {}
 
-    def build_check_query_ts_params(self, input_config: dict[str, Any]) -> dict[str, Any]:
+    def build_check_promql_params(self, input_config: CheckQueryPromQLInput) -> CheckQueryPromQLInput:
+        """补齐 /check/query/ts/promql 需要的最小参数。
+
+        PromQL 表达式本身才是 record rule 的稳定输入；start/end 只用于
+        unify-query check 接口完成解析预览，缺省时使用最近一小时。
+        """
+
+        params: CheckQueryPromQLInput = copy.deepcopy(input_config)
+        if params.get("start") in (None, "") or params.get("end") in (None, ""):
+            start, end = self.resolve_default_check_time_range_seconds()
+            params["start"] = str(start)
+            params["end"] = str(end)
+        return params
+
+    def build_check_query_ts_params(self, input_config: RecordRuleV4QueryTsInputConfig) -> CheckQueryTsInput:
         """把用户输入归一为 /check/query/ts 可消费的 QueryTs 参数。
 
         V4 预计算允许直接传 QueryTs，也允许传 SaaS 结构化查询配置。后者
@@ -258,16 +281,18 @@ class RecordRuleV4Resolver:
         """
 
         if "query_list" in input_config:
-            params = copy.deepcopy(input_config)
+            params: CheckQueryTsInput = copy.deepcopy(cast(CheckQueryTsInput, input_config))
         elif "query_configs" in input_config:
-            params = self.build_check_query_ts_params_from_structured_query(input_config)
+            params = self.build_check_query_ts_params_from_structured_query(cast(StructuredQueryInput, input_config))
         else:
-            params = copy.deepcopy(input_config)
+            params = copy.deepcopy(cast(CheckQueryTsInput, input_config))
 
         params.setdefault("space_uid", self.rule.space_uid)
         return params
 
-    def build_check_query_ts_params_from_structured_query(self, input_config: dict[str, Any]) -> dict[str, Any]:
+    def build_check_query_ts_params_from_structured_query(
+        self, input_config: StructuredQueryInput
+    ) -> CheckQueryTsInput:
         """使用 UnifyQuery 将 SaaS 结构化查询转换为 QueryTs check 参数。"""
 
         from bkmonitor.data_source.data_source import load_data_source
@@ -299,17 +324,18 @@ class RecordRuleV4Resolver:
             functions=input_config.get("functions") or [],
             bk_tenant_id=self.rule.bk_tenant_id,
         )
-        params = unify_query.get_unify_query_params(
+        raw_params = unify_query.get_unify_query_params(
             start_time=start_time,
             end_time=end_time,
             time_alignment=False,
             order_by=input_config.get("order_by"),
         )
-        params.pop("bk_tenant_id", None)
+        raw_params.pop("bk_tenant_id", None)
+        params = cast(CheckQueryTsInput, raw_params)
         params["space_uid"] = self.rule.space_uid
         return params
 
-    def resolve_structured_query_check_time_range(self, input_config: dict[str, Any]) -> tuple[int, int]:
+    def resolve_structured_query_check_time_range(self, input_config: StructuredQueryInput) -> tuple[int, int]:
         """生成 check 接口需要的时间范围。
 
         recording rule 的最终 MetricQL 不应依赖用户查询窗口；这里保留用户
@@ -325,13 +351,22 @@ class RecordRuleV4Resolver:
                 self.normalize_timestamp_to_milliseconds(end_time),
             )
 
-        default_end_time = int(now().timestamp() * 1000)
-        return default_end_time - 3600 * 1000, default_end_time
+        start, end = self.resolve_default_check_time_range_seconds()
+        return start * 1000, end * 1000
 
-    def normalize_structured_query_configs(self, query_configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @staticmethod
+    def resolve_default_check_time_range_seconds() -> tuple[int, int]:
+        """返回默认 check 时间窗口，单位为秒。"""
+
+        default_end_time = int(now().timestamp())
+        return default_end_time - 3600, default_end_time
+
+    def normalize_structured_query_configs(
+        self, query_configs: list[StructuredQueryConfigInput]
+    ) -> list[StructuredQueryConfigInput]:
         """归一化 SaaS query_configs，使其满足 DataSource 构造参数约定。"""
 
-        normalized_configs: list[dict[str, Any]] = []
+        normalized_configs: list[StructuredQueryConfigInput] = []
         for query_config in query_configs:
             normalized = copy.deepcopy(query_config)
             normalized["interval"] = self.normalize_interval_to_seconds(

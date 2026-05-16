@@ -120,7 +120,12 @@ class RecordRuleV4Operator:
         operator: str = "",
         apply_immediately: bool = True,
     ) -> RecordRuleV4:
-        """创建 group，并按 create -> resolve -> plan -> apply 的顺序初始化。"""
+        """创建 group，并按 create -> resolve -> plan -> apply 的顺序初始化。
+
+        raw_config 是调用方提交的完整原始配置快照，主要用于审计、回显和
+        触发声明版本变更；执行链路仍只消费 records / interval / labels /
+        deployment_strategy 这些已经拆出来的规范字段。
+        """
 
         deployment_strategy_config = normalize_deployment_strategy(deployment_strategy)
         RecordRuleV4.validate_interval(interval)
@@ -150,6 +155,8 @@ class RecordRuleV4Operator:
             # 避免等到第一次 apply 才补 metadata。
             RecordRuleV4OutputResources.ensure_group_output(rule)
             instance = cls(rule, source=source, operator=operator)
+            # 调用方不传 raw_config 时，保存一份由规范字段组成的最小快照；
+            # 这样 spec.raw_config 永远可用于回看“用户当时提交了什么”。
             spec = instance.spec_builder.create_spec(
                 records=records,
                 raw_config=raw_config
@@ -193,6 +200,9 @@ class RecordRuleV4Operator:
         records/raw_config/interval/labels/deployment_strategy/delete 会进入新的
         spec/resolved/plan 链路；running/stopped 只改变运行态 desired_status，
         并直接下发到已 applied 的 Flow，不推进 generation。
+        raw_config 本身不是 resolver 的输入真值源，只是用户完整配置快照；
+        当调用方只更新 raw_config 时，会生成新 spec 记录这次声明变更，
+        但 resolved 是否变化仍由规范化 records 等字段决定。
         """
 
         spec: RecordRuleV4Spec | None = None

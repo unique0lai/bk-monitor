@@ -55,7 +55,11 @@ class RecordRuleV4SpecBuilder:
         desired_status: str,
         labels: list[dict[str, Any]] | None = None,
     ) -> RecordRuleV4Spec:
-        """创建一份新的 spec 快照和对应的 spec records。"""
+        """创建一份新的 spec 快照和对应的 spec records。
+
+        raw_config 只记录调用方原始完整配置，便于审计和回显；spec record
+        才是 resolver 消费的规范输入，避免同一层存在两份执行真值源。
+        """
 
         RecordRuleV4.validate_desired_status(desired_status)
         RecordRuleV4.validate_interval(interval)

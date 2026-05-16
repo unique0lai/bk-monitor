@@ -13,6 +13,37 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 
+class CheckQueryTsInput(TypedDict, total=False):
+    """直接传给 unify-query /check/query/ts 的结构化 QueryTs 输入。
+
+    这里仅描述 record rule 当前会关心的公共形态；更细的 query_list
+    内部结构由 unify-query schema 负责校验。
+    """
+
+    query_list: list[dict[str, Any]]
+    metric_merge: str
+    start_time: int | str
+    end_time: int | str
+    step: str
+    order_by: list[str]
+    space_uid: str
+    not_time_align: bool
+
+
+class CheckQueryPromQLInput(TypedDict, total=False):
+    """直接传给 unify-query /check/query/ts/promql 的 PromQL 输入。
+
+    start/end 是 check 接口参数，不是 recording rule 的稳定语义字段；
+    调用方缺省时后续可以按统一默认窗口补齐。
+    """
+
+    promql: str
+    start: int | str
+    end: int | str
+    step: str
+    bk_biz_ids: list[str]
+
+
 class RecordRuleV4RecordInput(TypedDict, total=False):
     """Operator.create/update_spec 接收的单条预计算 record。
 
@@ -23,7 +54,7 @@ class RecordRuleV4RecordInput(TypedDict, total=False):
     record_key: str
     record_name: str
     input_type: str
-    input_config: dict[str, Any]
+    input_config: RecordRuleV4InputConfig
     metric_name: str
     labels: list[dict[str, str]]
 
@@ -67,7 +98,6 @@ class StructuredQueryConfigInput(TypedDict, total=False):
     metrics: list[StructuredQueryMetricInput]
     table: str
     data_label: str
-    index_set_id: int | None
     group_by: list[str]
     where: list[StructuredQueryConditionInput]
     interval: int
@@ -86,11 +116,8 @@ class StructuredQueryInput(TypedDict, total=False):
     functions: list[StructuredQueryFunctionInput]
     start_time: int | str
     end_time: int | str
-    limit: int
-    slimit: int
-    down_sample_range: str
-    timezone: str
-    instant: bool
-    reference: bool
-    not_time_align: bool
-    add_dimensions: list[str]
+    order_by: list[str]
+
+
+RecordRuleV4QueryTsInputConfig = CheckQueryTsInput | StructuredQueryInput
+RecordRuleV4InputConfig = RecordRuleV4QueryTsInputConfig | CheckQueryPromQLInput

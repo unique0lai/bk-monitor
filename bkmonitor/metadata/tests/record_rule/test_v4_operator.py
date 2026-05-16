@@ -502,6 +502,24 @@ def test_run_check_dispatches_promql_input_to_promql_api(v4_base_data, external_
     external_api.check_query_ts.assert_not_called()
 
 
+def test_promql_check_uses_default_time_range(v4_base_data, external_api):
+    record = build_record(
+        record_name="cpu_promql",
+        input_type=RecordRuleV4InputType.PROMQL.value,
+        input_config={"promql": "sum(cpu_usage)"},
+        metric_name="cpu_usage_sum",
+    )
+    rule = create_rule(records=[record], apply_immediately=False)
+    spec_record = rule.current_spec.records.get()
+    external_api.check_promql.reset_mock()
+
+    RecordRuleV4Resolver(rule, source="manual").run_check(spec_record)
+
+    _, kwargs = external_api.check_promql.call_args
+    assert kwargs["promql"] == "sum(cpu_usage)"
+    assert int(kwargs["end"]) - int(kwargs["start"]) == 3600
+
+
 def test_run_check_converts_structured_query_config_to_query_ts(v4_base_data, external_api):
     record = build_record(input_config=build_structured_query_config())
     rule = create_rule(records=[record], apply_immediately=False)
