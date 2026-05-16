@@ -259,14 +259,20 @@ def stable_hash(payload: Any) -> str:
 
 
 def now() -> datetime:
+    """统一封装当前时间，方便模型方法和测试保持同一入口。"""
+
     return timezone.now()
 
 
 def generate_record_key() -> str:
+    """生成组内 record 的内部稳定 ID。"""
+
     return f"{SPEC_RECORD_KEY_PREFIX}_{uuid4().hex[:12]}"
 
 
 def _safe_component(value: str, max_length: int, fallback: str) -> str:
+    """把用户输入裁剪成可用于 table / flow name 的安全片段。"""
+
     raw = str(value or "").strip()
     if not raw:
         return fallback
@@ -285,6 +291,8 @@ def _safe_component(value: str, max_length: int, fallback: str) -> str:
 
 
 def _extract_random_suffix_from_table(table_id: str) -> str:
+    """从已生成 table_id 中取出随机段，用于关联 group 级 Flow 名称。"""
+
     name = table_id.split(".", 1)[0]
     suffix = name.rsplit("_", 1)[-1]
     return suffix[:RECORD_RULE_V4_NAME_RANDOM_SUFFIX_LENGTH] or uuid4().hex[:RECORD_RULE_V4_NAME_RANDOM_SUFFIX_LENGTH]
@@ -425,6 +433,12 @@ class RecordRuleV4(BaseModelWithTime):
         return f"rrv4_{group_slug}_{hint_slug}_{suffix}"[:max_length].rstrip("_")
 
     def get_condition(self, condition_type: str) -> dict[str, Any]:
+        """按 condition type 获取当前状态。
+
+        conditions 是按 type 覆盖的当前态，不保存历史；历史过程统一记录在
+        RecordRuleV4Event。
+        """
+
         return dict((self.conditions or {}).get(condition_type) or {})
 
     def set_condition(
@@ -435,6 +449,8 @@ class RecordRuleV4(BaseModelWithTime):
         message: str = "",
         detail: dict[str, Any] | None = None,
     ) -> None:
+        """按 condition type 覆盖当前状态。"""
+
         conditions = dict(self.conditions or {})
         conditions[condition_type] = {
             "type": condition_type,
@@ -448,10 +464,13 @@ class RecordRuleV4(BaseModelWithTime):
         self.conditions = conditions
 
     def sync_phase(self) -> None:
+        """根据声明态、观测态和 conditions 推导用户可见的聚合状态。"""
+
         if self.desired_status == RecordRuleV4DesiredStatus.DELETED.value:
             self.status = RecordRuleV4Status.DELETED.value if self.deleted_at else RecordRuleV4Status.DELETING.value
             return
 
+        # 任何关键 condition 失败都优先展示 failed，避免被 pending/running 掩盖。
         if any(
             self.get_condition(condition_type).get("status") == CONDITION_FALSE
             for condition_type in [
@@ -464,10 +483,12 @@ class RecordRuleV4(BaseModelWithTime):
             self.status = RecordRuleV4Status.FAILED.value
             return
 
+        # generation 表达用户声明变更，observed_generation 表达成功下发到外部的版本。
         if self.generation > self.observed_generation:
             self.status = RecordRuleV4Status.PENDING.value
             return
 
+        # resolved 漂移但未下发时，用 auto_refresh 区分“待自动执行”和“需要人工更新”。
         if self.update_available:
             self.status = RecordRuleV4Status.PENDING.value if self.auto_refresh else RecordRuleV4Status.OUTDATED.value
             return
@@ -479,9 +500,12 @@ class RecordRuleV4(BaseModelWithTime):
         self.status = RecordRuleV4Status.RUNNING.value
 
     def use_spec(self, spec: RecordRuleV4Spec) -> None:
+        """切换当前用户声明快照并推进 generation。"""
+
         self.current_spec = spec
         self.generation = spec.generation
         if spec.desired_status == RecordRuleV4DesiredStatus.DELETED.value:
+            # running/stopped 是运行态，不走 use_spec；只有 deleted 会进入声明快照。
             self.desired_status = spec.desired_status
         self.update_available = True
         self.set_condition(CONDITION_UPDATE_AVAILABLE, CONDITION_TRUE, "SpecChanged")
@@ -499,6 +523,8 @@ class RecordRuleV4(BaseModelWithTime):
         )
 
     def use_resolved(self, resolved: RecordRuleV4Resolved) -> None:
+        """切换最近解析快照，并根据 applied 指针标记是否可更新。"""
+
         self.latest_resolved = resolved
         self.last_error = ""
         self.last_check_time = now()
@@ -525,6 +551,8 @@ class RecordRuleV4(BaseModelWithTime):
         )
 
     def use_deployment(self, deployment: RecordRuleV4Deployment) -> None:
+        """切换最近部署计划，并根据 applied 指针标记是否需要下发。"""
+
         self.latest_deployment = deployment
         self.update_available = self.applied_deployment_id != deployment.pk
         self.set_condition(CONDITION_DEPLOYMENT_READY, CONDITION_TRUE, "Planned")
@@ -545,6 +573,11 @@ class RecordRuleV4(BaseModelWithTime):
         )
 
     def set_desired_status(self, desired_status: str) -> None:
+        """更新 group 运行态期望状态。
+
+        running/stopped 不生成 spec；deleted 会由 use_spec 统一处理。
+        """
+
         self.validate_desired_status(desired_status)
         self.desired_status = desired_status
         if desired_status != RecordRuleV4DesiredStatus.DELETED.value:
@@ -553,6 +586,8 @@ class RecordRuleV4(BaseModelWithTime):
         self.save(update_fields=["desired_status", "deleted_at", "status", "updated_at"])
 
     def mark_deployment_applied(self, deployment: RecordRuleV4Deployment) -> None:
+        """标记一次 deployment 已完整下发成功。"""
+
         self.applied_deployment = deployment
         self.observed_generation = deployment.generation
         self.last_refresh_time = now()
@@ -569,6 +604,12 @@ class RecordRuleV4(BaseModelWithTime):
     def acquire_operation_lock(
         self, owner: str, reason: str, ttl_seconds: int = DEFAULT_OPERATION_LOCK_TTL_SECONDS
     ) -> str:
+        """获取数据库级轻量操作锁。
+
+        这里使用条件 update 做原子抢锁，避免后台 reconcile 和用户 apply
+        同时下发同一个 group。
+        """
+
         locked_until = now() + timedelta(seconds=ttl_seconds)
         token = uuid4().hex
         updated = (
@@ -595,6 +636,8 @@ class RecordRuleV4(BaseModelWithTime):
         return ""
 
     def release_operation_lock(self, token: str) -> bool:
+        """按 token 释放操作锁，避免误释放其他执行方持有的锁。"""
+
         updated = RecordRuleV4.objects.filter(pk=self.pk, operation_lock_token=token).update(
             operation_lock_token="",
             operation_lock_owner="",
@@ -610,6 +653,8 @@ class RecordRuleV4(BaseModelWithTime):
         return bool(updated)
 
     def should_refresh(self, refresh_interval: int = RECORD_RULE_V4_DEFAULT_REFRESH_INTERVAL) -> bool:
+        """判断当前 group 是否到达统一的定时检查周期。"""
+
         if not self.last_check_time:
             return True
         check_before = now() - timedelta(seconds=refresh_interval)
@@ -686,6 +731,8 @@ class RecordRuleV4Spec(BaseModelWithTime):
         unique_together = (("rule", "generation"),)
 
     def get_records(self) -> list[RecordRuleV4SpecRecord]:
+        """按用户输入顺序返回 spec records。"""
+
         return list(self.records.order_by("source_index", "id"))
 
 
@@ -722,6 +769,8 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
 
     @staticmethod
     def normalize_record_payload(record: dict[str, Any]) -> dict[str, Any]:
+        """补齐单条 spec record 的默认字段。"""
+
         return {
             "record_key": record.get("record_key") or "",
             "record_name": record["record_name"],
@@ -734,6 +783,8 @@ class RecordRuleV4SpecRecord(BaseModelWithTime):
 
     @staticmethod
     def identity_payload(record: dict[str, Any]) -> dict[str, Any]:
+        """返回用于跨版本继承 record_key 的稳定身份字段。"""
+
         return {
             "record_name": record["record_name"],
             "input_type": record["input_type"],
@@ -772,6 +823,8 @@ class RecordRuleV4Resolved(BaseModelWithTime):
         unique_together = (("rule", "spec", "resolve_version"),)
 
     def get_records(self) -> list[RecordRuleV4ResolvedRecord]:
+        """按用户输入顺序返回 resolved records，并预加载 spec record。"""
+
         return list(self.records.select_related("spec_record").order_by("source_index", "id"))
 
 
@@ -840,12 +893,16 @@ class RecordRuleV4Deployment(BaseModelWithTime):
         unique_together = (("rule", "resolved", "deployment_version"),)
 
     def mark_apply_succeeded(self) -> None:
+        """记录 deployment 已成功执行。"""
+
         self.apply_status = RecordRuleV4ApplyStatus.SUCCEEDED.value
         self.applied_at = now()
         self.apply_error = ""
         self.save(update_fields=["apply_status", "applied_at", "apply_error", "updated_at"])
 
     def mark_apply_failed(self, err: Exception | str) -> None:
+        """记录 deployment 执行失败及错误信息。"""
+
         self.apply_status = RecordRuleV4ApplyStatus.FAILED.value
         self.apply_error = str(err)
         self.save(update_fields=["apply_status", "apply_error", "updated_at"])
@@ -881,6 +938,8 @@ class RecordRuleV4Flow(BaseModelWithTime):
         ordering = ("id",)
 
     def mark_flow_observed(self, flow_status: str) -> None:
+        """写入最近一次从 bkbase 观测到的 Flow 实际状态。"""
+
         self.flow_status = flow_status
         self.last_observed_at = now()
         self.save(update_fields=["flow_status", "last_observed_at", "updated_at"])
@@ -943,6 +1002,8 @@ class RecordRuleV4Event(BaseModelWithTime):
         index_together = (("rule", "generation"), ("rule", "event_type"))
 
     def clean(self) -> None:
+        """保存前统一校验事件类型、状态、关联对象和 detail 字段。"""
+
         self.validate_event_payload(
             event_type=self.event_type,
             status=self.status,
@@ -1289,6 +1350,12 @@ class RecordRuleV4Event(BaseModelWithTime):
         message: str = "",
         detail: dict[str, Any] | None = None,
     ) -> RecordRuleV4Event:
+        """写入一条结构化事件。
+
+        事件只能通过这里或上方的语义化封装写入，避免 event_type/detail
+        变成随意扩展的自由文本。
+        """
+
         detail = detail or {}
         cls.validate_event_payload(
             event_type=event_type,
@@ -1340,6 +1407,8 @@ class RecordRuleV4Event(BaseModelWithTime):
         flow: RecordRuleV4Flow | None,
         detail: dict[str, Any],
     ) -> None:
+        """按照 EVENT_DEFINITIONS 校验事件结构。"""
+
         definition = EVENT_DEFINITIONS.get(event_type)
         if not definition:
             raise ValueError(f"unsupported event_type: {event_type}")
@@ -1355,6 +1424,7 @@ class RecordRuleV4Event(BaseModelWithTime):
             ("deployment", deployment),
             ("flow", flow),
         ]:
+            # 每类事件都明确声明允许挂载哪些上下文对象，避免排查时语义混乱。
             policy = definition.get(relation_name, EVENT_RELATION_OPTIONAL)
             if policy == EVENT_RELATION_REQUIRED and value is None:
                 raise ValueError(f"{relation_name} is required for event_type: {event_type}")
@@ -1363,4 +1433,5 @@ class RecordRuleV4Event(BaseModelWithTime):
 
         allowed_detail_keys = definition.get("detail_keys")
         if allowed_detail_keys is not None and set(detail) - set(allowed_detail_keys):
+            # detail_keys 是白名单；新增字段需要先更新事件定义和测试。
             raise ValueError(f"unsupported detail keys for {event_type}: {sorted(set(detail) - allowed_detail_keys)}")

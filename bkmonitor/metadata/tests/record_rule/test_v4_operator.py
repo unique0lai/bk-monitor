@@ -289,6 +289,20 @@ def test_create_allows_duplicate_group_name_with_random_output_names(v4_base_dat
     assert first.dst_vm_table_id != second.dst_vm_table_id
 
 
+def test_create_prepares_output_rt_and_vm_record_before_apply(v4_base_data, external_api):
+    rule = create_rule(apply_immediately=False)
+
+    assert models.ResultTable.objects.filter(table_id=rule.table_id, bk_tenant_id=TENANT_ID).exists()
+    assert models.AccessVMRecord.objects.filter(
+        result_table_id=rule.table_id,
+        vm_result_table_id=rule.dst_vm_table_id,
+        bk_tenant_id=TENANT_ID,
+        vm_cluster_id=v4_base_data.cluster.cluster_id,
+    ).exists()
+    assert not models.ResultTableField.objects.filter(table_id=rule.table_id, bk_tenant_id=TENANT_ID).exists()
+    external_api.apply_data_link.assert_not_called()
+
+
 def test_spec_record_key_is_inherited_by_identity_when_input_key_is_hidden(v4_base_data, external_api):
     rule = create_rule(apply_immediately=False)
     original_record = rule.current_spec.records.get()

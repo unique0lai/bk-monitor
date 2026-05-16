@@ -30,6 +30,7 @@ from metadata.models.record_rule.v4.models import (
     RecordRuleV4Resolved,
     RecordRuleV4Spec,
 )
+from metadata.models.record_rule.v4.output import RecordRuleV4OutputResources
 from metadata.models.record_rule.v4.resolver import RecordRuleV4Resolver
 from metadata.models.record_rule.v4.spec import RecordRuleV4SpecBuilder
 
@@ -37,7 +38,12 @@ T = TypeVar("T")
 
 
 class RecordRuleV4Operator:
-    """串联 V4 预计算 group 的声明态、解析态和部署态。"""
+    """串联 V4 预计算 group 的声明态、解析态和部署态。
+
+    Operator 只负责流程编排和操作锁，不直接拼 Flow 配置，也不直接解释
+    unify-query 响应。具体解析与部署细节分别交给 Resolver 和
+    DeploymentRunner。
+    """
 
     def __init__(self, rule: RecordRuleV4, source: str = "system", operator: str = "") -> None:
         self.rule = rule
@@ -61,6 +67,8 @@ class RecordRuleV4Operator:
         return DeploymentRunner(self.rule, source=self.source, operator=self.operator)
 
     def reload_rule(self, for_update: bool = False) -> RecordRuleV4:
+        """重新加载 rule；需要互斥写入时可带行锁。"""
+
         queryset = RecordRuleV4.objects
         if for_update:
             queryset = queryset.select_for_update()
@@ -68,12 +76,16 @@ class RecordRuleV4Operator:
         return self.rule
 
     def require_current_spec(self) -> RecordRuleV4Spec:
+        """获取当前 spec，缺失时视为数据异常。"""
+
         spec = self.rule.current_spec
         if spec is None:
             raise ValueError("current spec is missing")
         return spec
 
     def run_with_operation_lock(self, reason: str, callback: Callable[[], T], locked_result: T) -> T:
+        """围绕关键下发 / 刷新操作加轻量操作锁，避免后台与手动操作竞态。"""
+
         token = self.rule.acquire_operation_lock(owner=self.actor, reason=reason)
         if not token:
             self.reload_rule()
@@ -104,30 +116,36 @@ class RecordRuleV4Operator:
         operator: str = "",
         apply_immediately: bool = True,
     ) -> RecordRuleV4:
+        """创建 group，并按 create -> resolve -> plan -> apply 的顺序初始化。"""
+
         RecordRuleV4.validate_deployment_strategy(deployment_strategy)
         bk_tenant_id = bk_tenant_id or space_uid_to_bk_tenant_id(f"{space_type}__{space_id}")
         table_id = RecordRuleV4.compose_table_id(group_name)
 
-        rule = RecordRuleV4.objects.create(
-            bk_tenant_id=bk_tenant_id,
-            space_type=space_type,
-            space_id=space_id,
-            group_name=group_name,
-            table_id=table_id,
-            dst_vm_table_id=RecordRuleV4.compose_dst_vm_table_id(table_id),
-            auto_refresh=auto_refresh,
-            creator=operator or source,
-            updater=operator or source,
-        )
-        instance = cls(rule, source=source, operator=operator)
-        spec = instance.spec_builder.create_spec(
-            records=records,
-            raw_config=raw_config or {"records": records},
-            desired_status=RecordRuleV4DesiredStatus.RUNNING.value,
-            deployment_strategy=deployment_strategy,
-        )
-        rule.use_spec(spec)
-        RecordRuleV4Event.record_user_create(rule, spec, source=source, operator=operator)
+        with transaction.atomic():
+            rule = RecordRuleV4.objects.create(
+                bk_tenant_id=bk_tenant_id,
+                space_type=space_type,
+                space_id=space_id,
+                group_name=group_name,
+                table_id=table_id,
+                dst_vm_table_id=RecordRuleV4.compose_dst_vm_table_id(table_id),
+                auto_refresh=auto_refresh,
+                creator=operator or source,
+                updater=operator or source,
+            )
+            # 输出 RT / VM 映射是 group 级资源，创建 rule 后立刻准备，
+            # 避免等到第一次 apply 才补 metadata。
+            RecordRuleV4OutputResources.ensure_group_output(rule)
+            instance = cls(rule, source=source, operator=operator)
+            spec = instance.spec_builder.create_spec(
+                records=records,
+                raw_config=raw_config or {"records": records},
+                desired_status=RecordRuleV4DesiredStatus.RUNNING.value,
+                deployment_strategy=deployment_strategy,
+            )
+            rule.use_spec(spec)
+            RecordRuleV4Event.record_user_create(rule, spec, source=source, operator=operator)
 
         resolved = instance.resolver.resolve_current(force=True)
         if resolved:
@@ -147,6 +165,13 @@ class RecordRuleV4Operator:
         auto_refresh: bool | object = RecordRuleV4.UNSET,
         apply_immediately: bool = True,
     ) -> RecordRuleV4:
+        """更新用户声明或运行态。
+
+        records/raw_config/deployment_strategy/delete 会进入新的 spec/resolved/plan
+        链路；running/stopped 只改变运行态 desired_status，并直接下发到已
+        applied 的 Flow，不推进 generation。
+        """
+
         spec: RecordRuleV4Spec | None = None
         records_changed = False
         definition_changed = False
@@ -156,6 +181,8 @@ class RecordRuleV4Operator:
         with transaction.atomic():
             self.reload_rule(for_update=True)
             current_spec = self.require_current_spec()
+            # 先把所有输入归一成下一份声明需要的候选值，后面再判断哪些是真正
+            # 的定义态变更，哪些只是运行态启停。
             next_records: list[dict[str, Any]] = (
                 RecordRuleV4SpecBuilder.dump_spec_records(current_spec)
                 if records is RecordRuleV4.UNSET
@@ -165,6 +192,8 @@ class RecordRuleV4Operator:
             requested_desired_status = None if desired_status is RecordRuleV4.UNSET else str(desired_status)
             if requested_desired_status is not None:
                 RecordRuleV4.validate_desired_status(requested_desired_status)
+            # running/stopped 只属于运行态；deleted 会进入声明态，用来生成
+            # delete action 并确保外部 Flow 被真正删除。
             runtime_desired_status = (
                 requested_desired_status
                 if requested_desired_status
@@ -196,6 +225,7 @@ class RecordRuleV4Operator:
                 runtime_desired_status is not None and runtime_desired_status != self.rule.desired_status
             )
             if runtime_desired_status_changed and runtime_desired_status:
+                # 启停不生成 spec，因此事件也不挂 spec/resolved/deployment。
                 self.rule.set_desired_status(runtime_desired_status)
                 RecordRuleV4Event.record_user_desired_status_changed(
                     self.rule, source=self.source, operator=self.operator
@@ -221,6 +251,8 @@ class RecordRuleV4Operator:
                 if not runtime_desired_status_changed:
                     return self.rule
             else:
+                # 只有计算定义变化才创建新 spec。这样 stop/start 不会污染
+                # generation 和后续 resolved 对比。
                 spec = self.spec_builder.create_spec(
                     records=next_records,
                     raw_config=copy.deepcopy(next_raw_config),
@@ -236,6 +268,7 @@ class RecordRuleV4Operator:
                     changed_fields=changed_fields,
                 )
 
+        # 事务外执行外部 check / plan，避免长时间持有数据库行锁。
         if records_changed and spec.desired_status != RecordRuleV4DesiredStatus.DELETED.value:
             previous_resolved_id = self.rule.latest_resolved_id
             resolved = self.refresh_resolved(force=False)
@@ -249,17 +282,23 @@ class RecordRuleV4Operator:
         if apply_immediately and self.rule.update_available:
             self.apply()
         elif apply_immediately and runtime_desired_status_changed and runtime_desired_status:
+            # Runtime-only 的启停没有 deployment plan，直接把 desired_status
+            # 注入已落地的 Flow 配置并下发。
             self.deployment_runner.apply_desired_status(runtime_desired_status)
         self.reload_rule()
         return self.rule
 
     def delete(self, apply_immediately: bool = True) -> RecordRuleV4:
+        """声明删除 group，并通过 plan 删除已落地 Flow。"""
+
         return self.update_spec(
             desired_status=RecordRuleV4DesiredStatus.DELETED.value,
             apply_immediately=apply_immediately,
         )
 
     def manual_refresh(self) -> RecordRuleV4Resolved | None:
+        """用户主动刷新解析结果；只标记待更新，不自动下发。"""
+
         return self.run_with_operation_lock(
             "manual_refresh",
             self.manual_refresh_unlocked,
@@ -267,6 +306,8 @@ class RecordRuleV4Operator:
         )
 
     def manual_refresh_unlocked(self) -> RecordRuleV4Resolved | None:
+        """不带操作锁的手动刷新实现，便于 reconcile 复用相同语义。"""
+
         previous_resolved_id = self.rule.latest_resolved_id
         resolved = self.refresh_resolved(force=False)
         if resolved and resolved.pk != previous_resolved_id:
@@ -275,6 +316,8 @@ class RecordRuleV4Operator:
         return resolved
 
     def reconcile(self, auto_apply: bool | None = None) -> bool:
+        """后台周期入口：检查 resolved 漂移，并按 auto_refresh 决定是否下发。"""
+
         return self.run_with_operation_lock(
             "reconcile",
             lambda: self.reconcile_unlocked(auto_apply=auto_apply),
@@ -282,6 +325,8 @@ class RecordRuleV4Operator:
         )
 
     def reconcile_unlocked(self, auto_apply: bool | None = None) -> bool:
+        """不带操作锁的 reconcile 主流程。"""
+
         previous_resolved_id = self.rule.latest_resolved_id
         resolved = self.refresh_resolved(force=False)
         changed = bool(resolved and resolved.pk != previous_resolved_id)
@@ -295,9 +340,13 @@ class RecordRuleV4Operator:
         return changed
 
     def refresh_resolved(self, force: bool = False) -> RecordRuleV4Resolved | None:
+        """重新调用 Resolver，返回当前最新解析快照。"""
+
         return self.resolver.resolve_current(force=force)
 
     def apply(self, deployment: RecordRuleV4Deployment | None = None) -> bool:
+        """下发 latest deployment，或重试指定 deployment。"""
+
         return self.run_with_operation_lock(
             "apply",
             lambda: self.deployment_runner.apply(deployment=deployment),
@@ -305,6 +354,8 @@ class RecordRuleV4Operator:
         )
 
     def refresh_flow_health(self) -> str:
+        """观测 applied deployment 对应的实际 Flow 状态。"""
+
         return self.run_with_operation_lock(
             "refresh_flow_health",
             self.deployment_runner.refresh_flow_health,

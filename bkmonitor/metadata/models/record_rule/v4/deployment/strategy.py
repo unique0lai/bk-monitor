@@ -40,6 +40,8 @@ class DeploymentStrategy(ABC):
     def build_flows(
         self, *, rule: RecordRuleV4, spec: RecordRuleV4Spec, resolved: RecordRuleV4Resolved
     ) -> list[FlowPlan]:
+        """把 resolved records 按策略分组成一个或多个目标 Flow。"""
+
         raise NotImplementedError
 
     def compose_flow_plan(
@@ -51,6 +53,8 @@ class DeploymentStrategy(ABC):
         flow_name: str,
         records: list[RecordRuleV4ResolvedRecord],
     ) -> FlowPlan:
+        """生成目标 Flow 草案并计算与运行态无关的内容指纹。"""
+
         flow_config = self.compose_flow_config(rule=rule, spec=spec, flow_name=flow_name, records=records)
         content_hash = stable_hash(
             {
@@ -76,6 +80,9 @@ class DeploymentStrategy(ABC):
         flow_name: str,
         records: list[RecordRuleV4ResolvedRecord],
     ) -> dict:
+        """拼装 bkbase V4 Flow 配置。"""
+
+        # 一个 Flow 可以消费多个源 VM RT，因此先按 RT 去重生成 VmSourceNode。
         src_vm_table_ids = sorted({table_id for record in records for table_id in record.src_vm_table_ids})
         source_nodes: list[dict] = []
         source_names: list[str] = []
@@ -101,6 +108,7 @@ class DeploymentStrategy(ABC):
             spec_record = resolved_record.spec_record
             vm_storage_name = vm_storage_name or resolved_record.vm_storage_name
             for index, expr in enumerate(resolved_record.metricql):
+                # 单条 record 可能展开成多个 MetricQL，额外产物用递增后缀避免指标名冲突。
                 metric_name = spec_record.metric_name if index == 0 else f"{spec_record.metric_name}_{index + 1}"
                 recording_rule_config.append(
                     {
@@ -137,6 +145,7 @@ class DeploymentStrategy(ABC):
                         },
                     },
                 ],
+                # recording rule 暂不关心这些调度参数，按 bkbase 示例默认值透传。
                 "operation_config": {
                     "start_position": "from_head",
                     "stream_cluster": None,
@@ -151,6 +160,8 @@ class DeploymentStrategy(ABC):
 
     @staticmethod
     def strip_runtime_status(flow_config: dict) -> dict:
+        """移除运行态字段，避免启停造成 Flow 内容指纹变化。"""
+
         pure_config = copy.deepcopy(flow_config)
         pure_config.get("spec", {}).pop("desired_status", None)
         return pure_config
@@ -162,8 +173,11 @@ class PerRecordDeploymentStrategy(DeploymentStrategy):
     def build_flows(
         self, *, rule: RecordRuleV4, spec: RecordRuleV4Spec, resolved: RecordRuleV4Resolved
     ) -> list[FlowPlan]:
+        """每条 resolved record 独立生成一个 Flow。"""
+
         flows: list[FlowPlan] = []
         for record in resolved.get_records():
+            # record_key 本身带随机段，用它生成稳定可读的 Flow 名称。
             suffix = record.record_key.rsplit("_", 1)[-1]
             flow_name = RecordRuleV4.compose_flow_name(
                 rule.group_name, record.spec_record.record_name, random_suffix=suffix
@@ -186,6 +200,8 @@ class SingleFlowDeploymentStrategy(DeploymentStrategy):
     def build_flows(
         self, *, rule: RecordRuleV4, spec: RecordRuleV4Spec, resolved: RecordRuleV4Resolved
     ) -> list[FlowPlan]:
+        """把整个 resolved 聚合到同一个 Flow。"""
+
         records = resolved.get_records()
         if not records:
             return []
@@ -204,6 +220,8 @@ class SingleFlowDeploymentStrategy(DeploymentStrategy):
 
 
 def get_deployment_strategy(strategy: str) -> DeploymentStrategy:
+    """根据 spec 中的策略值返回对应的部署策略实现。"""
+
     if strategy == RecordRuleV4DeploymentStrategy.SINGLE_FLOW.value:
         return SingleFlowDeploymentStrategy()
     return PerRecordDeploymentStrategy()

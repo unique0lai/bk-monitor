@@ -18,6 +18,12 @@ from metadata.models.record_rule.v4.models import RecordRuleV4Flow, RecordRuleV4
 
 @dataclass(frozen=True)
 class FlowPlan:
+    """部署策略生成的目标 Flow 草案。
+
+    这一层还不是数据库实体；Runner 会把它持久化成 RecordRuleV4Flow，
+    再和已成功落地的 Flow 快照做增删改对比。
+    """
+
     flow_key: str
     flow_name: str
     resolved_records: list[RecordRuleV4ResolvedRecord]
@@ -27,6 +33,12 @@ class FlowPlan:
 
 @dataclass(frozen=True)
 class DeploymentPlanAction:
+    """一次部署批次中的 Flow 动作。
+
+    动作本身不建表，持久化时落在 Deployment.plan_config，并通过 Event
+    记录 started/succeeded/failed，便于部分失败后按 action_key 重试。
+    """
+
     action_key: str
     action_type: str
     flow: RecordRuleV4Flow
@@ -34,6 +46,8 @@ class DeploymentPlanAction:
     flow_config_snapshot: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
+        """转换成可稳定存储到 deployment.plan_config 的结构。"""
+
         return {
             "action_key": self.action_key,
             "action_type": self.action_type,
@@ -47,11 +61,19 @@ class DeploymentPlanAction:
 
 @dataclass(frozen=True)
 class DeploymentPlan:
+    """完整部署计划，包含目标 Flow 快照和本次需要执行的动作。"""
+
     strategy: str
     actions: list[DeploymentPlanAction]
     target_flows: list[RecordRuleV4Flow]
 
     def to_config(self, *, desired_status: str, resolved_content_hash: str) -> dict[str, Any]:
+        """生成 Deployment.plan_config。
+
+        desired_status 只用于记录执行当时的运行态；Flow 的内容差异仍由
+        action / Flow content_hash 表达。
+        """
+
         return {
             "desired_status": desired_status,
             "strategy": self.strategy,

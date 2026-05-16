@@ -37,7 +37,11 @@ logger = logging.getLogger("metadata")
 
 
 class RecordRuleV4Resolver:
-    """将当前 spec 解析为 resolved 快照。"""
+    """将当前 spec 解析为 resolved 快照。
+
+    Resolver 的职责边界是调用 unify-query check，并把 check 结果沉淀成
+    Resolved / ResolvedRecord。是否生成 Flow、是否下发都不在这里处理。
+    """
 
     def __init__(self, rule: RecordRuleV4, source: str = "system", operator: str = "") -> None:
         self.rule = rule
@@ -49,6 +53,8 @@ class RecordRuleV4Resolver:
         return self.operator or self.source
 
     def reload_rule(self, for_update: bool = False) -> RecordRuleV4:
+        """重新加载 rule，避免 resolve 长流程使用过期指针。"""
+
         queryset = RecordRuleV4.objects
         if for_update:
             queryset = queryset.select_for_update()
@@ -56,6 +62,8 @@ class RecordRuleV4Resolver:
         return self.rule
 
     def resolve_current(self, force: bool = False) -> RecordRuleV4Resolved | None:
+        """解析当前 spec，语义变化时创建新的 resolved 快照。"""
+
         self.reload_rule()
         spec = self.rule.current_spec
         if spec is None:
@@ -72,11 +80,13 @@ class RecordRuleV4Resolver:
             return None
 
         try:
+            # 外部 check 可能耗时或失败，先在事务外完成，避免长时间持有行锁。
             runtime_records = [
                 self.build_runtime_record(record) for record in spec.records.order_by("source_index", "id")
             ]
         except Exception as err:
             if not self.is_spec_current(spec):
+                # 用户在 check 过程中更新了 spec，本次结果已经过期，直接丢弃。
                 return None
             self.rule.last_error = str(err)
             self.rule.last_check_time = now()
@@ -96,6 +106,7 @@ class RecordRuleV4Resolver:
         if not self.is_spec_current(spec):
             return None
 
+        # resolved content_hash 只包含解析语义结果，不包含后续 Flow 模板。
         resolved_config = {"records": [record["resolved_payload"] for record in runtime_records]}
         content_hash = stable_hash(resolved_config)
 
@@ -106,6 +117,7 @@ class RecordRuleV4Resolver:
 
             latest_resolved = self.rule.latest_resolved
             if not force and latest_resolved and latest_resolved.content_hash == content_hash:
+                # 解析语义未变时只更新时间和 condition，不推进 resolved 版本。
                 self.rule.last_error = ""
                 self.rule.last_check_time = now()
                 if (
@@ -127,6 +139,7 @@ class RecordRuleV4Resolver:
                 )
                 return latest_resolved
 
+            # 解析语义变化才创建新版本，用于后续生成部署计划。
             resolved = RecordRuleV4Resolved.objects.create(
                 rule=self.rule,
                 spec=spec,
@@ -139,6 +152,8 @@ class RecordRuleV4Resolver:
                 updater=self.actor,
             )
             for runtime_record in runtime_records:
+                # resolved record 保留每条逻辑 record 的 metricql / VMRT 范围，
+                # 后续部署策略只消费这一层结构。
                 spec_record = runtime_record["spec_record"]
                 RecordRuleV4ResolvedRecord.objects.create(
                     resolved=resolved,
@@ -170,6 +185,8 @@ class RecordRuleV4Resolver:
         return self.rule.current_spec_id == spec.pk and self.rule.generation == spec.generation
 
     def build_runtime_record(self, spec_record: RecordRuleV4SpecRecord) -> dict[str, Any]:
+        """将一条 spec record 解析成运行时 record payload。"""
+
         check_result = self.run_check(spec_record)
         route_info = check_result.get("route_info") or []
         data = check_result.get("data") or []
@@ -184,6 +201,7 @@ class RecordRuleV4Resolver:
         if not src_vm_table_ids:
             raise ValueError(f"unify-query check src vm table ids is empty, record_key: {spec_record.record_key}")
 
+        # 输出 VM storage 跟当前空间相关，而不是从单条查询结果里推导。
         vm_storage_info = self.get_vm_storage_info()
         resolved_payload = {
             "record_key": spec_record.record_key,
@@ -205,6 +223,8 @@ class RecordRuleV4Resolver:
         }
 
     def run_check(self, spec_record: RecordRuleV4SpecRecord) -> dict[str, Any]:
+        """根据输入类型调用 unify-query 的预览接口。"""
+
         params: dict[str, Any] = copy.deepcopy(spec_record.input_config or {})
         if spec_record.input_type == RecordRuleV4InputType.QUERY_TS.value:
             params.setdefault("space_uid", self.rule.space_uid)
@@ -216,11 +236,15 @@ class RecordRuleV4Resolver:
         return result or {}
 
     def next_resolve_version(self, spec: RecordRuleV4Spec) -> int:
+        """获取同一 spec 下的下一个解析版本号。"""
+
         latest = RecordRuleV4Resolved.objects.filter(rule=self.rule, spec=spec).order_by("-resolve_version").first()
         return 1 if latest is None else latest.resolve_version + 1
 
     @staticmethod
     def extract_metricql(data: list[dict[str, Any]]) -> list[str]:
+        """从 check data 中提取去重后的 MetricQL。"""
+
         metricql: list[str] = []
         for item in data:
             value = item.get("metricql")
@@ -230,6 +254,8 @@ class RecordRuleV4Resolver:
 
     @staticmethod
     def extract_src_vm_table_ids(data: list[dict[str, Any]], route_info: list[dict[str, Any]]) -> list[str]:
+        """从 check data 和 route_info 中合并源结果表。"""
+
         table_ids: list[str] = []
         for item in data:
             result_table_id = item.get("result_table_id") or []
@@ -245,6 +271,8 @@ class RecordRuleV4Resolver:
         return sorted(table_ids)
 
     def normalize_src_vm_table_ids(self, table_ids: list[str]) -> list[str]:
+        """把源 RT 统一转换成 VM RT，并排除当前预计算自己的输出表。"""
+
         from metadata import models as metadata_models
 
         exclude_table_ids = {self.rule.table_id, self.rule.dst_vm_table_id}
@@ -264,6 +292,8 @@ class RecordRuleV4Resolver:
                 missing.append(table_id)
                 continue
             if table_id in exclude_table_ids or vm_table_id in exclude_table_ids:
+                # 解析结果可能因为已有预计算链路而包含自身输出；这里必须跳过，
+                # 否则会生成自引用的 VmSourceNode。
                 logger.info(
                     "RecordRuleV4 normalize_src_vm_table_ids: skip self reference table_id->[%s], "
                     "vm_table_id->[%s], rule_table_id->[%s]",
@@ -279,6 +309,8 @@ class RecordRuleV4Resolver:
         return sorted(result)
 
     def get_vm_storage_info(self) -> dict[str, Any]:
+        """获取当前空间 recording rule 输出要写入的 VM storage。"""
+
         from metadata.models.vm import utils as vm_utils
 
         return vm_utils.get_vm_cluster_id_name(

@@ -28,7 +28,10 @@ logger = logging.getLogger("metadata")
 
 
 class RecordRuleV4SpecBuilder:
-    """负责创建用户声明快照，以及为组内 record 分配稳定 key。"""
+    """负责创建用户声明快照，以及为组内 record 分配稳定 key。
+
+    SpecBuilder 只处理用户输入层，不调用 unify-query，也不生成 Flow。
+    """
 
     def __init__(self, rule: RecordRuleV4, source: str = "system", operator: str = "") -> None:
         self.rule = rule
@@ -47,10 +50,14 @@ class RecordRuleV4SpecBuilder:
         desired_status: str,
         deployment_strategy: str,
     ) -> RecordRuleV4Spec:
+        """创建一份新的 spec 快照和对应的 spec records。"""
+
         RecordRuleV4.validate_desired_status(desired_status)
         RecordRuleV4.validate_deployment_strategy(deployment_strategy)
         normalized_records = [self.normalize_record_payload(record) for record in records]
         generation = self.rule.generation + 1
+        # spec content_hash 表达用户声明内容；resolved 漂移和 Flow 模板变化
+        # 都不应该混入这一层。
         content_payload = {
             "records": [self.record_content_payload(record) for record in normalized_records],
             "raw_config": raw_config,
@@ -90,6 +97,8 @@ class RecordRuleV4SpecBuilder:
         return spec
 
     def normalize_record_payload(self, record: dict[str, Any]) -> dict[str, Any]:
+        """归一化单条用户 record，并校验输入类型和周期。"""
+
         normalized = RecordRuleV4SpecRecord.normalize_record_payload(copy.deepcopy(record))
         RecordRuleV4.validate_input_type(normalized["input_type"])
         RecordRuleV4.validate_interval(normalized["interval"])
@@ -97,6 +106,8 @@ class RecordRuleV4SpecBuilder:
 
     @staticmethod
     def record_content_payload(record: dict[str, Any]) -> dict[str, Any]:
+        """返回参与单条 record 内容指纹计算的字段。"""
+
         return {
             "record_name": record["record_name"],
             "input_type": record["input_type"],
@@ -107,6 +118,13 @@ class RecordRuleV4SpecBuilder:
         }
 
     def assign_record_keys(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """为 records 分配稳定 record_key。
+
+        API 模式可以显式传 record_key；SCode 等隐藏 key 的模式则按
+        identity_hash 继承上一版 record_key，避免轻微内容修改导致 Flow
+        身份整体变化。
+        """
+
         previous_records = []
         if self.rule.current_spec_id:
             previous_records = list(self.rule.current_spec.records.all())
@@ -126,6 +144,7 @@ class RecordRuleV4SpecBuilder:
             if explicit_key:
                 record_key = explicit_key
             elif identity_hash in previous_by_identity:
+                # 用户不传 key 时，稳定身份相同就继承旧 key。
                 record_key = previous_by_identity[identity_hash].record_key
             else:
                 record_key = generate_record_key()
@@ -153,6 +172,8 @@ class RecordRuleV4SpecBuilder:
 
     @staticmethod
     def dump_spec_records(spec: RecordRuleV4Spec) -> list[dict[str, Any]]:
+        """把已有 spec records 还原成 create_spec 可消费的输入结构。"""
+
         records: list[dict[str, Any]] = []
         for record in spec.records.order_by("source_index", "id"):
             records.append(
