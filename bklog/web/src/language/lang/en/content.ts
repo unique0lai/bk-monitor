@@ -23,9 +23,9 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-/** biome-ignore-all lint/suspicious/noTemplateCurlyInString: reason */
 
 export default {
+  请选择业务: 'Please select a business',
   '正则匹配：': 'Regex matching:',
   '范围匹配：': 'Range matching:',
   搜索字段名: 'Search field name',
@@ -73,6 +73,16 @@ export default {
   两个参数都: 'Both parameters',
   新建索引集: 'New Indices',
   请选择集群: 'Please select a cluster',
+  请选择采集目标: 'Please select collection targets',
+  请完善基础信息: 'Please complete the basic information',
+  请完善采集配置: 'Please complete the collection settings',
+  请完善段日志规则: 'Please complete the multiline log rules',
+  请检查日志路径: 'Please check the log path',
+  请检查日志过滤: 'Please check the log filters',
+  请检查采集配置项: 'Please check the collection items',
+  请检查设备元数据: 'Please check the device metadata',
+  请完善存储配置: 'Please complete the storage settings',
+  请完善清洗字段配置: 'Please complete the cleaning field settings',
   请选择索引: 'Please select an index',
   '连通成功！': 'Connected successfully!',
   '连通失败！': 'Connection failed!',
@@ -158,6 +168,7 @@ export default {
   无匹配的数据: 'No matching data',
   业务独享集群: 'Business exclusive cluster',
   ES集群管理: 'ES cluster management',
+  Doris集群管理: 'Doris cluster management',
   一键拉群功能: 'WeCom',
   请选择群成员: 'Select group members',
   搜索拓扑节点: 'Search topology nodes',
@@ -244,6 +255,8 @@ export default {
   腾讯云Cos区域: 'Tencent cloud cos region',
   是否批量开启告警: 'Batch enable alerts?',
   是否批量关闭告警: 'Batch close alerts?',
+  '确认开启告警策略？': 'Confirm to enable the alert strategy?',
+  '确认关闭告警策略？': 'Confirm to disable the alert strategy?',
   可去告警策略编辑: 'Can go to alert policy editor',
   '耗时优化指引 >': 'Optimizing time consumption >',
   最大自定义天数为: 'Maximum custom days is',
@@ -365,6 +378,9 @@ export default {
   '当前日志聚类未启用，请前往设置': 'The current log clustering is not enabled, please go to settings',
   '私有的只支持默认的“个人收藏”': "Private only supports default 'personal collection'",
   '{n}不规范, 包含特殊符号.': '{n} is not standard, contains special characters.',
+  '占位符仅支持字母、数字、下划线、连字符': 'Placeholder only supports letters, numbers, underscores, and hyphens',
+  '第 {n} 行填写不规范：{msg}': 'Row {n} is invalid: {msg}',
+  请检查正则和占位符填写是否正确: 'Please check the regular expression and placeholder',
   '需要采集日志，请先创建采集任务': 'Log collection is required, please create a collection task first',
   '当前主机数较多，请进行容量评估': 'Current number of hosts is high, please perform capacity assessment',
   请填写容量评估的每日单台日志量: 'Please fill in the daily log volume per host for capacity assessment',
@@ -456,6 +472,7 @@ export default {
     'The front-end ignores numbers and all common symbols, only retaining the specific contents of the log',
   '已加载完全部数据，如需查看更多查询条件可以{0}':
     'All data has been loaded, if more query conditions are needed, please {0}',
+  '已加载全部数据 ({n} 个字段)': 'All data loaded ({n} fields)',
   '2. 将keytab放es每个节点对应的目录中去': '2. Put the keytab in the directory corresponding to each node of ES',
   每15分钟按照CMDB最新拓扑自动部署或取消采集:
     'Automatically deploy or cancel collection every 15 minutes based on the latest topology in CMDB',
@@ -730,6 +747,7 @@ export default {
   给全员: 'To all',
   按发送频率: 'By sending frequency',
   '近{n}天': 'Last {n} days',
+  '最近{n}月': 'Last {n} months',
   '{0}小时': '{0} hours',
   条: 'item',
   '{0}小时前': '{0} hours ago',
@@ -990,6 +1008,8 @@ export default {
     'In this mode, only the original text of the unordered log reported by you is downloaded, and you can sort it locally by log time; the log cannot contain platform supplementary fields: such as cluster name, module name and other information. The maximum number of log exports in this mode is 5 million.',
   '该模式下，下载的日志有序，可包含平台补充字段，但下载时间较长。该模式的日志导出上限为200万条':
     'In this mode, the downloaded logs are in order and can contain platform supplementary fields, but the download time is longer. The maximum number of log exports in this mode is 2 million.',
+  '该模式下，下载的日志有序，可包含平台补充字段，但下载时间较长。':
+    'In this mode, the downloaded logs are in order and can contain platform supplementary fields, but the download time is longer.',
   全文下载: 'Full text download',
   暂未保留原始日志: 'The original log has not been kept yet',
   '超出集群最大可保存天数，当前最大可保存{n}天':
@@ -1052,6 +1072,27 @@ export default {
   展示空字段: 'Display Empty Field',
   '在日志采集中，若您的日志中产生新的JSON字段，我们会自动采集并合入 __ext_json 字段中，您可以通过 __ext_json.xxx 检索该数据':
     'When collecting logs, if new JSON fields are generated in your logs, we will automatically collect and merge them into the __ext_json field, and you can use __ext_json.xxx to retrieve the data',
+  '解析层级越大，可直接检索的字段越多，但也更容易达到 ES 字段数量上限。':
+    'A larger parse depth enables more fields for direct search, but is also more likely to hit the ES field limit.',
+  '只展开 __ext_json 下第一层字段': 'Only expand the first-level fields under __ext_json',
+  '展开到第二层，推荐': 'Expand to the second level (recommended)',
+  展开到第三层: 'Expand to the third level',
+  '保持完整动态展开，存在字段膨胀风险': 'Keep full dynamic expansion; there is a risk of field explosion',
+  '无限解析可能产生大量动态字段，达到 ES 字段上限后，相关日志可能写入失败。建议仅在字段结构稳定时使用。':
+    'Unlimited parsing may generate a large number of dynamic fields. After the ES field limit is reached, related logs may fail to write. It is recommended only when the field structure is stable.',
+  查看解析示例: 'View parse example',
+  'service 内部不再继续生成字段。': 'No more fields will be generated inside service.',
+  'labels 内部不再继续生成字段。': 'No more fields will be generated inside labels.',
+  '无限模式下将完整展开动态字段。': 'In unlimited mode, dynamic fields will be fully expanded.',
+  '更深层级的对象将按动态对象字段处理，不再继续展开。':
+    'Deeper objects will be treated as dynamic object fields and will not be expanded further.',
+  '确认调整动态字段解析层级？': 'Confirm adjusting the dynamic field parse depth?',
+  '调整后系统将创建新的 ES 索引，仅影响配置生效后写入的数据。历史索引不会改变，因此不同时间段可检索的字段可能不完全一致。':
+    'After the change, the system will create a new ES index. Only data written after the configuration takes effect will be affected. Historical indexes will not change, so searchable fields may differ across time ranges.',
+  '动态字段解析层级已生效，新写入数据将按 {n} 解析。':
+    'The dynamic field parse depth is now in effect. Newly written data will be parsed at {n}.',
+  '配置未生效，创建新索引失败，请重试或联系管理员。':
+    'The configuration did not take effect. Failed to create a new index. Please retry or contact the administrator.',
   过期时间不能大于存储天数: 'The expiration time cannot be greater than the storage days',
   '确定 ⌘/Ctrl + Enter': 'Confirm Ctrl + Enter',
   收藏成功: 'Favorite successfully',
@@ -1309,5 +1350,276 @@ export default {
   前往日志检索: 'Go to Log Search',
   整体趋势: 'Overall Trend',
   相关样本: 'Related Samples',
-  '当前选中日志暂无trace字段，请检查日志内容': 'The currently selected log has no trace field. Please check the log content',
+  '当前选中日志暂无trace字段，请检查日志内容':
+    'The currently selected log has no trace field. Please check the log content',
+  '未找到与 "{keyword}" 匹配的用户或任务': 'No user or task matching "{keyword}" was found',
+  请检查任务ID和用户ID是否输入错误: 'Please check if the task ID and user ID are entered incorrectly',
+  '平台默认保存 90 天的任务记录，请检查 ID 是否过期':
+    'The platform keeps task records for 90 days by default, please check if the ID has expired',
+  '若检查均无问题，请联系': 'If no issues are found after checking, please contact',
+  蓝鲸助手: 'BlueKing Assistant',
+  未找到匹配的用户或任务: 'No matching user or task found',
+  '暂未采集，无法获取日志': 'No collection, unable to obtain logs',
+  '正在采集目标日志文件，预计2-3分钟': 'Collecting target log file, estimated 2-3 minutes',
+  '日志采集失败，请重新采集': 'Log collection failed, please collect again',
+  '搜索 名称、描述、更新人、定义': 'Search by name, description, updater, or definition',
+  内置Grok模式不可编辑: 'Built-in Grok patterns are not editable',
+  内置Grok模式不可删除: 'Built-in Grok patterns cannot be deleted',
+  '新建 Grok 模式': 'New Grok pattern',
+  '编辑 Grok 模式': 'Edit Grok pattern',
+  选填: 'Optional',
+  'Grok 定义（可引用其他模式）': 'Grok definition (can reference other patterns)',
+  例如: 'For example:',
+  '当前Grok名称为{n}，确认要删除？': 'The current Grok name is {n}. Are you sure you want to delete it?',
+  'Grok 模式更新成功': 'Grok pattern updated successfully',
+  'Grok 模式删除成功': 'Grok pattern deleted successfully',
+  'Grok 模式创建成功': 'Grok pattern created successfully',
+  请输入需要调试的样例: 'Please enter the sample you need to debug',
+  '请先完成调试，方可提交': 'Please complete the debugging process before submitting',
+  调试成功: 'Debugging successful',
+  调试失败: 'Debugging failed',
+  '内容有变更，请重新调试': 'The content has changed; please reconfigure the settings',
+  没有更多数据: 'No more data',
+  'Grok 模式': 'Grok pattern',
+  '当检测到 %{PATTERN} 就按 Grok 处理，否则按传统正则':
+    'When %{PATTERN} is detected, process it with Grok; otherwise, process it with traditional regular expressions',
+  '请选择一条 Grok 模式查看调试结果': 'Please select a Grok pattern to view the debugging results',
+  输出结果: 'Output result',
+  暂无调试结果: 'No debugging results yet',
+  解析结果: 'Parsing result',
+  '请先按照 {0} 日志范围后，再进行日志检索！':
+    'Please narrow down the log range using {0} before performing a log search!',
+  场景过滤: 'Scene Filter',
+  筛选字段不能为空: 'The filter field cannot be empty',
+  请先通过过滤缩小范围: 'Please narrow down the scope using filters first',
+  '检索条件有变更，请点击{icon}按钮{shortcut}':
+    'The search criteria have changed. Please click the {icon} button {shortcut}',
+  当前日志未过滤: 'The current log is not filtered',
+  '请先按照标签过滤日志范围后，再进行日志检索': 'Please filter the log range by tags before performing log retrieval',
+  '场景化检索默认搜索全量日志，为保证检索体验及集群稳定性，请通过顶部标签过滤数据后查看日志。可随时修改标签过滤内容':
+    'Contextualized search defaults to searching the entire log. To ensure a better search experience and cluster stability, please filter data using the tags at the top and then view the logs. You can modify the tag filters at any time',
+  未匹配到索引集: 'No index set matched',
+  '根据过滤条件未匹配到索引集，请修改过滤条件':
+    'No index set matched the filter criteria. Please modify the filter criteria',
+  '若仍无结果返回，可点击联系': 'If there are still no results, you can click to contact',
+  全量日志: 'Full log',
+  全量: 'Full',
+  全: 'Full',
+  搜索当前行内容: 'Search current row',
+  上一个: 'Previous',
+  下一个: 'Next',
+  分块: 'Chunks',
+  正在读取全量数据: 'Reading full data...',
+  '正在读取全量数据...': 'Reading full data...',
+  '未找到当前行全量数据，已显示当前渲染数据':
+    'Full data for the current row was not found. Showing rendered data instead.',
+  '读取全量数据失败，已显示当前渲染数据': 'Failed to read full data. Showing rendered data instead.',
+  BK助手: 'BK Assistant',
+  '搜索 采集项': 'Search collection item',
+  可选采集项: 'Optional collection items',
+  已选采集项: 'Selected collection items',
+  '点击添加到 {0}': 'Click to add to {0}',
+  当前索引集: 'Current index set',
+  已选采集项不能为空: 'Selected collection items cannot be empty',
+  查看下载历史: 'View download history',
+  下载成功: 'Download successful',
+  当前空间: 'Current space',
+  关联空间: 'Associated space',
+  采集项来源: 'Collection item source',
+  关联预览: 'Associated preview',
+  请先在左侧选择: 'Please select on the left first',
+  '共 {0} 个': 'Total of {0}',
+  '关联空间的索引集，无法编辑': 'Index sets from associated spaces cannot be edited',
+  '请{0}编辑。': 'Please edit {0}.',
+  前往对应的空间: 'Go to the corresponding space',
+  当前租户可见: 'Visible to current tenants',
+  '复制 {0} 成功': 'Copied {0} successfully',
+  '按用量排序需要实时请求集群使用情况，需等待较长时间，点击确认执行':
+    'Sorting by usage requires a real-time request for cluster usage and may take a while. Click Confirm to proceed.',
+  '搜索 数据 ID、采集名、数据名、存储集群、存储名':
+    'Search by Data ID, Collection Name, Data Name, Storage Cluster, or Storage Name',
+  '确认同步后，会将模板最新清洗配置同步到以下所有采集项。该操作会影响线上日志字段解析结果。':
+    'After confirmation, the latest cleaning configuration will be synced to all collection items below. This may affect online log field parsing.',
+  '选择<同步所有采集项> 后，系统会将最新配置更新到全部关联采集项，可能会影响线上日志字段解析结果。':
+    'After selecting <Sync All Collection Items>, the latest configuration will be applied to all related collection items and may affect online log field parsing results.',
+  '当前模板已生效到{0}个采集项，关联{1}个索引集':
+    'The current template is active in {0} collection items and related to {1} index sets',
+  '您已修改过模板配置，确认后将和模板解除绑定关系，本次清洗配置将保存并单独生效该索引集，是否确认。':
+    'You have modified the template configuration. After confirmation, it will be unbound from the template and saved as an independent cleaning configuration for this index set. Continue?',
+  '当前清洗配置处于模板绑定状态，无法修改采集配置。如需修改，请点击':
+    'The current cleaning configuration is bound to a template and cannot be modified. To make changes, click',
+  '解除绑定后，将实例化为手动配置的清洗规则，不再随模板更新。':
+    'After unbinding, it will be instantiated as a manually configured scrubbing rule and will no longer update with the template.',
+  请选择采集项: 'Please select the data collection items.',
+  请选择左侧模板: 'Please select a template from the left.',
+  '如果在下方列表编辑了内容，将自动脱离模板，转为手动配置清洗规则。':
+    'If you edit the content in the list below, it will automatically detach from the template and switch to manual configuration of cleaning rules.',
+  '该模板已同步至关联采集项，无需同步':
+    'This template has already been synchronized to the associated collection items; no further synchronization is required.',
+  '确定删除该清洗模板？': 'Are you sure you want to delete this cleaning template?',
+  '删除模板后，原来关联的采集项，将实例化为手动配置的清洗规则。':
+    'After deleting the template, the previously associated data collection items will be instantiated as manually configured cleaning rules.',
+  '模板名称：': 'Template Name:',
+  '确定解除与模板的关联关系？': 'Are you sure you want to remove the association with the template?',
+  忽略冲突并继续填入: 'Ignore conflicts and continue filling in',
+  未从样例中匹配到有效值: 'No valid value was matched from the examples',
+  字段类型不匹配: 'Field type mismatch',
+  仅新创建采集项支持选择采集范围: 'Collection range can only be selected when creating a new collection item',
+  '您当前登录的企业空间是【{current}】，无法访问【{target}】企业空间的资源。请返回登录页或切换企业空间后重试。':
+    'You are currently logged in to enterprise space [{current}] and cannot access resources in enterprise space [{target}]. Please return to the login page or switch enterprise space and try again.',
+  '无法跨企业空间访问该业务（当前登录：{current}，目标：{target}，空间UID: {spaceUid}，业务ID: {bizId}）。请返回登录页或切换企业空间。':
+    'Cannot access this business across enterprise spaces (currently logged in: {current}, target: {target}, space UID: {spaceUid}, business ID: {bizId}). Please return to the login page or switch enterprise space.',
+  返回登录页: 'Return to login page',
+  访问当前企业空间: 'Access current enterprise space',
+  '当前无可用业务信息，请联系管理员申请（空间UID：{spaceUid}，业务ID：{bizId}）':
+    'No available business information. Please contact the administrator to apply (space UID: {spaceUid}, business ID: {bizId})',
+  或者移除业务参数重试: 'Or remove the business parameters and retry',
+  '业务下无采集项，请按照指引完成接入，或联系管理员申请':
+    'No collection items under this business. Please follow the guide to onboard, or contact the administrator to apply',
+  'API无权限，请联系管理员申请': 'No API permission. Please contact the administrator to apply',
+  '无权限，请联系管理员': 'No permission. Please contact the administrator',
+  '无法获取采集预览数据，Kafka 分区信息读取失败。':
+    'Failed to load collection preview data because Kafka partition information could not be retrieved.',
+  '你可以继续选择存储集群，预览数据可能暂不可用。请稍后重试，或检查采集配置是否已下发。如问题持续，请联系管理员。':
+    'You can continue selecting a storage cluster. Preview data may be unavailable. Please retry later, check whether the collection configuration has been issued, or contact the administrator if the issue persists.',
+  '获取存储集群列表失败，暂时无法展示可选集群。':
+    'Failed to load the storage cluster list, so available clusters cannot be displayed.',
+  '请稍后重试，或检查采集配置。如问题持续，请联系管理员。':
+    'Please retry later or check the collection configuration. Contact the administrator if the issue persists.',
+  '操作失败，系统返回了内部异常。': 'The operation failed because the system returned an internal error.',
+  '请求 ID：{n}': 'Request ID: {n}',
+  任务: 'Task',
+  选择任务: 'Select task',
+  '未采集，无法选择': 'Not collected; cannot select',
+  '采集中，无法选择': 'Collection in progress; cannot select',
+  '采集失败，无法选择': 'Collection failed; cannot select',
+  '已选 {0} 个任务': '{0} tasks selected',
+  全选已采集: 'Select all collected',
+  '超过单次上限（{n} 个任务）': 'Exceeds the limit of {n} tasks per download',
+  '下载已选（{n}）': 'Download selected ({n})',
+  移出: 'Remove',
+  '下载 {n} 个采集任务': 'Download {n} collected tasks',
+  开始下载: 'Start download',
+  '批量下载：{n} 个文件下载失败': 'Batch download: {n} files failed to download',
+  '文件下载失败，请稍后重试': 'Failed to download the file. Please try again later',
+  '风险提示：': 'Risk notice:',
+  '本次任务会从已授权的主机中临时提取日志，并生成有时效的下载链接':
+    'This task temporarily extracts logs from authorized hosts and generates a download link with an expiration time',
+  '请确认目标范围、文件范围和过滤条件符合授权用途':
+    'Confirm that the targets, files and text filters match the authorized purpose',
+  下载链接过期后需要重新下发或重新生成: 'Submit the task or generate the download link again after it expires',
+  '{0} 个授权内主机': '{0} authorized hosts',
+  '{0} 个文件': '{0} files',
+  '最新行数：{0} 行': 'Latest {0} lines',
+  '将向{0}符合提取范围的主机提取：以下{1}个文件':
+    'Extract the following {1} files from {0} hosts within the extraction scope',
+  '将向{0}符合提取范围的主机提取：': 'Extract files from {0} hosts within the extraction scope:',
+  '{0}之外的{1}文件': 'Extract {1} files except {0}',
+  '除去以下{0}个文件': 'the following {0} files',
+  '请在检索后，在文件列表选择日志文件': 'After searching, select log files from the file list',
+  '搜索文件名/最后修改时间': 'Search by file name / last modified time',
+  暂无已选文件: 'No files selected',
+  '{0} 个节点': '{0} nodes',
+  '关键字过滤：{0}（关键字匹配模式：{1}）': 'Keyword filtering: {0} (Keyword matching mode: {1})',
+  访问权限未开通: 'Access not granted',
+  '暂无业务 / 空间访问权限': 'No business / space access',
+  '你尚未获得任何业务或空间的访问权限，暂时无法使用日志平台':
+    'You do not have access to any business or space and cannot use the log platform yet',
+  '请到蓝鲸权限中心申请加入业务用户组，或申请日志平台所需权限':
+    'Apply to join a business user group in BlueKing IAM, or request the permissions required by the log platform',
+  '申请入口：蓝鲸门户 → 权限中心；审批通过后重新检测权限':
+    'Apply via BlueKing Portal → IAM. Recheck permissions after approval',
+  按业务角色申请权限: 'Apply for permissions by business role',
+  打开权限中心: 'Open IAM',
+  '进入蓝鲸门户，打开「权限中心」，进入「权限申请」':
+    'Go to BlueKing Portal, open IAM, and select Permission Application',
+  申请加入用户组: 'Apply to join a user group',
+  '选择「加入用户组」，按业务名搜索，勾选对应角色的用户组并提交':
+    'Select Join User Group, search by business name, select the group for your role, and submit',
+  审批后重新检测: 'Recheck after approval',
+  '审批通过后，返回日志平台，点击「重新检测权限」':
+    'After approval, return to the log platform and click Recheck Permissions',
+  '用户组权限不足？在权限中心选择日志平台，补充申请所需权限':
+    'Need more user group permissions? Select the log platform in IAM and request the additional permissions',
+  '找不到用户组，或不确定需要哪些权限？': 'Cannot find a user group, or unsure which permissions you need?',
+  '无权限，请': 'No permission.',
+  暂时无法访问当前业务: 'Unable to access this business',
+  请确认当前登录的企业与该业务所属企业一致: 'Make sure you are signed in to the enterprise that owns this business',
+  '如不一致，请按以下步骤切换企业后重新登录':
+    'If they do not match, follow the steps below to switch enterprises and sign in again',
+  如何切换到所属企业: 'How to switch to the correct enterprise',
+  退出当前登录: 'Sign out',
+  '点击页面右上角的个人名称，在菜单中选择「退出登录」':
+    'Click your name in the top-right corner of the page and select Sign Out from the menu',
+  切换企业: 'Switch enterprise',
+  '进入登录页后，点击右上角的「切换企业」': 'On the sign-in page, click Switch Enterprise in the top-right corner',
+  选择所属企业: 'Select your enterprise',
+  '输入或选择你的所属企业，确认后重新登录日志平台':
+    'Enter or select your enterprise, confirm your choice, and sign in to the log platform again',
+  '请确认选择的是该业务所属企业，切换后重新登录日志平台':
+    'Make sure you select the enterprise that owns this business, then sign in to the log platform again',
+  '企业选择正确，仍无法访问？请联系{0}确认授权':
+    'Selected the correct enterprise but still cannot access logs? Contact {0} to confirm access.',
+  '请说明业务或空间、日志范围和登录账号；BK助手完成授权后，刷新页面重试':
+    'Provide the business or space, log scope, and sign-in account. Refresh the page after BK Assistant grants access',
+  暂无日志访问权限: 'No permission to access logs',
+  '当前账号尚未获得业务或空间的日志访问权限。请联系运维人员开通':
+    'Your account does not have permission to access logs in this business or space. Contact your operations team to request access',
+  开始接入日志: 'Start collecting logs',
+  当前空间还没有采集项: 'No collection items in this space yet',
+  '空间「{spaceName}」尚未配置日志采集': 'Log collection has not been configured for space "{spaceName}"',
+  '创建第一个采集项，将主机或容器日志接入日志平台':
+    'Create your first collection item to send host or container logs to the log platform',
+  '首次接入建议先选择少量目标，确认采集正常后再扩大范围':
+    'Start with a small set of targets. Expand the scope once log collection is working correctly',
+  '从日志接入到检索，只需三步': 'From collection to search in three steps',
+  '选择日志来源，为采集项命名，关联当前业务或空间':
+    'Select a log source, name the collection item, and associate it with the current business or space',
+  配置并下发: 'Configure and deploy',
+  '设置目标资源、日志路径和采集规则，完成采集配置下发':
+    'Set the target resources, log paths, and collection rules, then deploy the collection configuration',
+  开始检索日志: 'Start searching logs',
+  '采集正常且数据入库后，选择对应索引集，即可检索日志':
+    'Once collection is working and logs are stored, select the corresponding index set to search logs',
+  '创建前，请准备好目标资源与日志路径，并确认资源访问权限':
+    'Before creating an item, prepare the target resources and log paths, and confirm resource access permissions',
+  '没有采集项创建权限？': 'No permission to create collection items?',
+  '其他空间已接入日志？': 'Already collecting logs in another space?',
+  切换空间: 'Switch space',
+  选择合适的权限申请方式: 'Choose how to apply for permissions',
+  '进入蓝鲸门户，打开「权限中心」，在「权限申请」中按使用场景选择申请方式':
+    'Go to BlueKing Portal, open IAM, and choose an application method under Permission Application for your use case',
+  按业务角色申请: 'Apply by business role',
+  推荐: 'Recommended',
+  '权限申请 → 加入用户组 → 搜索业务名 → 勾选用户组':
+    'Permission Application → Join User Group → Search by business name → Select a user group',
+  '选择与你的业务角色对应的用户组，确认组内包含所需权限后提交审批。加入用户组后，将继承该组的权限':
+    'Select the user group for your business role, confirm that it includes the permissions you need, and submit for approval. You will inherit the group permissions after joining',
+  只申请所需的单项权限: 'Apply only for the individual permissions you need',
+  '在权限中心选择日志平台，申请所需权限': 'Select the log platform in IAM and apply for the permissions you need',
+  '权限模板：': 'Permission template:',
+  '选择符合使用场景的模板，并按页面提示配置资源范围':
+    'Select a template for your use case and follow the page instructions to configure the resource scope',
+  '自定义：': 'Custom:',
+  '勾选所需操作，点击「关联实例」，选择具体业务等资源实例后提交':
+    'Select the required actions, click Associate Instances, select resource instances such as a specific business, and submit',
+  '已有用户组权限不足时，可以继续申请单项权限；仅在 CMDB 中配置了运维人员，不代表已获得权限中心授权。审批通过后，返回本页重新检测权限':
+    'If your user group permissions are insufficient, you can apply for individual permissions. Being listed as an operator in CMDB does not grant IAM permissions. After approval, return to this page and recheck permissions',
+  日志接入指引: 'Log collection guide',
+  准备采集资源: 'Prepare collection resources',
+  '主机日志需准备目标主机及日志路径；容器日志需准备集群、命名空间及日志来源':
+    'For host logs, prepare the target hosts and log paths. For container logs, prepare the cluster, namespace, and log sources',
+  配置并下发采集项: 'Configure and deploy collection items',
+  '确认采集范围、文件编码和日志规则，完成配置下发并检查采集状态':
+    'Confirm the collection scope, file encoding, and log rules, deploy the configuration, and check the collection status',
+  验证后开始检索: 'Verify collection and start searching',
+  '等待数据入库，选择对应索引集，确认可以检索到预期日志':
+    'Wait for the data to be stored, select the corresponding index set, and confirm that you can find the expected logs',
+  '具体可用采集类型和配置方式，以当前环境的采集管理功能为准':
+    'Available collection types and configuration methods depend on the collection management features in this environment',
+  确认调整导出排序: 'Confirm export sort order',
+  按此排序导出: 'Export with this order',
+  '为支持分片并行导出，将优先按日志时间降序排列，同一时间内保留其他字段的排序规则。筛选条件、导出字段和数据范围不变。实际导出排序：{sort}':
+    'For parallel export, logs will be sorted by log time descending first, retaining the other sort rules for equal timestamps. Filters, exported fields, and the data range remain unchanged. Export order: {sort}',
+  '导出排序已变化，请重新提交并确认': 'The export sort order has changed. Please submit again and confirm.',
 };

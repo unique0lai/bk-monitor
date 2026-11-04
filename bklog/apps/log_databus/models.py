@@ -19,6 +19,7 @@ We undertake not to change the open source license (MIT license) applicable to t
 the project delivered to anyone in the future.
 """
 
+from collections import defaultdict
 from typing import Union
 
 from django.conf import settings
@@ -49,7 +50,12 @@ from django_jsonfield_backport.models import (  # noqa  pylint: disable=unused-i
 )
 
 from apps.api import CmsiApi, TransferApi  # noqa
-from apps.log_databus.constants import CollectItsmStatus  # noqa
+from apps.log_databus.constants import (  # noqa
+    DORIS_CLUSTER_TYPE,
+    STORAGE_CLUSTER_TYPE,
+    CleanTemplateStatus,
+    CollectItsmStatus,
+)
 from apps.log_databus.constants import EtlConfig  # noqa
 from apps.log_databus.constants import TargetNodeTypeEnum  # noqa
 from apps.log_databus.constants import TargetObjectTypeEnum  # noqa
@@ -120,7 +126,7 @@ class CollectorConfig(CollectorBase):
     """
 
     collector_config_id = models.AutoField(_("采集配置ID"), primary_key=True)
-    collector_config_name = models.CharField(_("采集配置名称"), max_length=64)
+    collector_config_name = models.CharField(_("采集配置名称"), max_length=128)
     collector_plugin_id = models.BigIntegerField(_("采集插件ID"), db_index=True, null=True)
     bk_app_code = models.CharField(_("接入的来源APP"), max_length=64, default="bk_log_search")
     collector_scenario_id = models.CharField(_("采集场景"), max_length=64)
@@ -192,6 +198,8 @@ class CollectorConfig(CollectorBase):
     log_group_id = models.BigIntegerField(_("自定义日志组ID"), null=True, blank=True)
     is_nanos = models.BooleanField(_("采集项是否为纳秒采集"), default=False)
     enable_v4 = models.BooleanField(_("采集项是否为v4链路"), default=False)
+    storage_cluster_type = models.CharField(_("存储集群类型"), max_length=32, default=STORAGE_CLUSTER_TYPE)
+    clean_template_id = models.IntegerField(_("清洗模板ID"), null=True, blank=True, db_index=True)
 
     def get_name(self):
         return self.collector_config_name
@@ -218,7 +226,7 @@ class CollectorConfig(CollectorBase):
         multi_execute_func.append(
             "result_table_storage",
             TransferApi.get_result_table_storage,
-            params={"result_table_list": self.table_id, "storage_type": "elasticsearch", "no_request": True},
+            params={"result_table_list": self.table_id, "storage_type": self.storage_cluster_type, "no_request": True},
             use_request=False,
         )
         result = multi_execute_func.run(return_exception=True)
@@ -410,6 +418,41 @@ class CollectorConfig(CollectorBase):
             self.save(update_fields=["index_set_id"])
         return index_set
 
+    @staticmethod
+    def get_storage_cluster_type_by_table_id(table_id: str):
+        """
+        根据 table_id 获取存储集群类型
+        """
+        collector_config_obj = CollectorConfig.objects.filter(table_id=table_id).first()
+        return collector_config_obj.storage_cluster_type if collector_config_obj else STORAGE_CLUSTER_TYPE
+
+    @staticmethod
+    def get_storage_cluster_type_map_by_table_ids(table_ids: list | str):
+        """
+        根据 table_ids 获取存储集群类型
+        """
+        if not table_ids:
+            return {}
+        if isinstance(table_ids, str):
+            table_ids = table_ids.split(",")
+        storage_cluster_type_map = dict(
+            CollectorConfig.objects.filter(table_id__in=table_ids).values_list("table_id", "storage_cluster_type")
+        )
+        return {t_id: (storage_cluster_type_map.get(t_id) or STORAGE_CLUSTER_TYPE) for t_id in table_ids}
+
+    @staticmethod
+    def get_table_str_map_by_storage_cluster_type(table_str: str):
+        """
+        将 table_str 按照相对应的存储集群类型分组
+        """
+        if not table_str:
+            return {}
+        storage_cluster_type_map = CollectorConfig.get_storage_cluster_type_map_by_table_ids(table_str)
+        table_str_map = defaultdict(list)
+        for key, value in storage_cluster_type_map.items():
+            table_str_map[value].append(key)
+        return {storage_cluster_type: ",".join(t_ids) for storage_cluster_type, t_ids in table_str_map.items()}
+
 
 class ContainerCollectorConfig(SoftDeleteModel):
     collector_config_id = models.IntegerField(_("采集项id"), db_index=True)
@@ -543,6 +586,14 @@ class CleanTemplate(SoftDeleteModel):
     visible_type = models.CharField(_("可见类型"), max_length=64, default=VisibleEnum.CURRENT_BIZ.value)
     visible_bk_biz_id = MultiStrSplitByCommaFieldText(_("可见业务ID"), default="")
     alias_settings = models.JSONField(_("别名配置"), null=True, blank=True)
+    description = models.TextField(_("模板描述"), blank=True, default="")
+    status = models.CharField(
+        _("模板状态"),
+        max_length=32,
+        choices=CleanTemplateStatus.get_choices(),
+        default=CleanTemplateStatus.PUBLISHED.value,
+    )
+    snapshot = models.JSONField(_("模板草稿快照"), null=True, blank=True, default=None)
 
     class Meta:
         verbose_name = _("清洗模板")
@@ -552,6 +603,7 @@ class CleanTemplate(SoftDeleteModel):
 
 class CleanStash(SoftDeleteModel):
     clean_stash_id = models.AutoField(_("清洗缓存id"), primary_key=True)
+    clean_template_id = models.IntegerField(_("清洗模板ID"), null=True, blank=True, db_index=True)
     clean_type = models.CharField(_("模板类型"), max_length=64)
     etl_params = models.JSONField(_("etl配置"), null=True, blank=True)
     etl_fields = models.JSONField(_("etl字段"), null=True, blank=True)
@@ -666,8 +718,10 @@ class RestoreConfig(SoftDeleteModel):
             "content": _("你创建的归档回溯已经完成"),
             "title": str(_("【日志平台】")),
         }
-        CmsiApi.send_mail(send_params)
-        CmsiApi.send_weixin(send_params)
+        index_set = LogIndexSet.objects.get(index_set_id=self.index_set_id)
+        bk_tenant_id = Space.get_tenant_id(space_uid=index_set.space_uid)
+        CmsiApi.send_mail(send_params, bk_tenant_id=bk_tenant_id)
+        CmsiApi.send_weixin(send_params, bk_tenant_id=bk_tenant_id)
 
     @classmethod
     def get_collector_config_id(cls, restore_config_id):
@@ -819,3 +873,32 @@ class FieldDateFormat(OperateRecordModel):
             }
             for obj in objs
         ]
+
+
+class GrokInfo(OperateRecordModel):
+    """
+    Grok模式信息
+    """
+
+    bk_biz_id = models.IntegerField(_("业务id"), db_index=True)
+    name = models.CharField(_("规则名称"), max_length=128, db_index=True)
+    pattern = models.TextField(_("表达式"))
+    is_builtin = models.BooleanField(_("是否内置"), default=False)
+    sample = models.TextField(_("样例"), null=True, blank=True)
+    description = models.TextField(_("描述"), null=True, blank=True)
+    sample_result = models.JSONField(_("样例匹配结果"), null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("Grok规则")
+        verbose_name_plural = _("Grok规则")
+        unique_together = ("name", "bk_biz_id")
+
+
+# 节点管理 V3 控制面模型。定义在 nodeman_v3 子包内（模型声明了 app_label="log_databus"），
+# 在此导入以便 Django 完成注册与迁移发现。
+from apps.log_databus.nodeman_v3.models import (  # noqa  pylint: disable=unused-import
+    NodeManV3Binding,
+    NodeManV3Operation,
+    NodeManV3SubConfigTarget,
+    NodeManV3Workflow,
+)

@@ -58,14 +58,17 @@ def report_all(job: str = settings.DEFAULT_METRIC_PUSH_JOB, registry: BkCollecto
     if not get_metric_agg_gateway_url():
         return
     METRIC_PUSH_COUNT.labels(deployment=DEPLOYMENT).inc()
+    snapshot = registry.take_snapshot()
     try:
         # 发送消息
-        push_to_gateway(gateway="", job=job, registry=registry, handler=udp_handler)
+        push_to_gateway(gateway="", job=job, registry=snapshot, handler=udp_handler)
     except Exception:
-        # 失败不处理，handler已经打了日志了，这里只是为了防止上报过程出现任何异常导致正常逻辑无法走下去
+        # handler已经打了日志了，这里只是为了防止上报过程出现任何异常导致正常逻辑无法走下去
+        # 数据放回 registry，随下次上报重发
+        snapshot.restore()
         return
 
-    registry.clear_data()
+    snapshot.commit()
 
 
 def safe_push_to_gateway(job: str = settings.DEFAULT_METRIC_PUSH_JOB, registry: BkCollectorRegistry = REGISTRY):
@@ -88,6 +91,7 @@ class StatusEnum:
 
     SUCCESS = "success"
     FAILED = "failed"
+    DEFERRED = "deferred"
 
     @classmethod
     def from_exc(cls, expr):
@@ -217,6 +221,24 @@ DETECT_PROCESS_DATA_COUNT = Counter(
     labelnames=("strategy_id", "type"),
 )
 
+# 新维度值检测(NewSeries)自监控：失败安全分支会静默不报，故指标是能力闭环的一部分。
+NEW_SERIES_PROCESS_TIME = Histogram(
+    name="bkmonitor_new_series_pre_detect_time",
+    documentation="NewSeries pre_detect(读旧态+写新态)耗时",
+    labelnames=("strategy_id",),
+    # 显式桶覆盖到 60s(整次 strategy detect 锁顶): 包装类默认桶顶=30s, 超 30s 全塌进 +Inf,
+    # p95/p99 会饱和、分不清 31s 与 59s(恰是锁危险区)。低端保留亚秒分辨率(现实最坏 ~7s)。
+    buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, INF),
+)
+
+NEW_SERIES_PROCESS_COUNT = Counter(
+    name="bkmonitor_new_series_process_count",
+    documentation=(
+        "NewSeries 处理计数(type: seen_write/trim/over_limit/invalid_value/active_failure/active_over_limit/active_trim/claimed_trim/failure)"
+    ),
+    labelnames=("strategy_id", "type"),
+)
+
 # trigger
 TRIGGER_PROCESS_TIME = Histogram(
     name="bkmonitor_trigger_process_time",
@@ -240,6 +262,64 @@ TRIGGER_PROCESS_PUSH_DATA_COUNT = Counter(
     name="bkmonitor_trigger_process_push_data_count",
     documentation="trigger 模块数据推送条数",
     labelnames=("strategy_id",),
+)
+
+# alarmd Detect→Trigger Shadow 自监控：旁路对旧链 fail-open，broker 拒绝只在指标和日志可见，
+# 因此发布结果、耗时和已确认条数本身就是能力闭环的一部分。
+# stage/status 都是有界枚举，禁止按 strategy_id、topic、partition 或错误文本展开。
+ALARMD_SHADOW_PUBLISH_COUNT = Counter(
+    name="bkmonitor_alarmd_shadow_publish_count",
+    documentation="alarmd Shadow 发布次数(stage: access_v2/reference; status: success/failed)",
+    labelnames=("stage", "status"),
+)
+
+ALARMD_SHADOW_PUBLISH_RECORD_COUNT = Counter(
+    name="bkmonitor_alarmd_shadow_publish_record_count",
+    documentation="alarmd Shadow 已获 broker 确认的记录条数(stage: access_v2/reference)",
+    labelnames=("stage",),
+)
+
+ALARMD_SHADOW_PUBLISH_TIME = Histogram(
+    name="bkmonitor_alarmd_shadow_publish_time",
+    documentation="alarmd Shadow 异步发布耗时，含等待 broker 确认",
+    labelnames=("stage", "status"),
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, INF),
+)
+
+ALARMD_SHADOW_ASYNC_JOB_COUNT = Counter(
+    name="bkmonitor_alarmd_shadow_async_job_count",
+    documentation="alarmd Shadow 异步任务阶段次数（阶段诊断指标，不用于计数守恒）",
+    labelnames=("stage", "status"),
+)
+
+ALARMD_SHADOW_ACCESS_RECORD_COUNT = Counter(
+    name="bkmonitor_alarmd_shadow_access_record_count",
+    documentation="alarmd Access v2 终态记录漏斗(status: source/acked/dropped/ack_unknown)",
+    labelnames=("status",),
+)
+
+ALARMD_SHADOW_ACCESS_RECORD_EXCLUSION_COUNT = Counter(
+    name="bkmonitor_alarmd_shadow_access_record_exclusion_count",
+    documentation="alarmd Access v2 从 source 到 wire 前排除的记录条数",
+    labelnames=("reason",),
+)
+
+ALARMD_SHADOW_ACCESS_MESSAGE_COUNT = Counter(
+    name="bkmonitor_alarmd_shadow_access_wire_message_count",
+    documentation="alarmd Access v2 终态 wire message 漏斗(status: planned/acked/dropped/ack_unknown)",
+    labelnames=("status",),
+)
+
+ALARMD_SHADOW_ACCESS_BYTES = Counter(
+    name="bkmonitor_alarmd_shadow_access_wire_bytes",
+    documentation="alarmd Access v2 终态 wire bytes 漏斗(status: planned/acked/dropped/ack_unknown)",
+    labelnames=("status",),
+)
+
+STRATEGY_ROUTER_CACHE_REFRESH_FAIL = Counter(
+    name="bkmonitor_strategy_router_cache_refresh_fail",
+    documentation="告警后台 CacheRouter 进程路由缓存刷新失败次数（stale-while-error 保旧快照）",
+    labelnames=("cluster",),
 )
 
 # nodata
@@ -286,6 +366,12 @@ ALERT_MANAGE_COUNT = Counter(
     labelnames=("status", "exception"),
 )
 
+ALERT_MANAGE_DEFERRED_COUNT = Counter(
+    name="bkmonitor_alert_manage_deferred_count",
+    documentation="alert(manager) 模块因瞬态基础设施错误延后重试的告警量(本批未 finalize, 下周期重跑, 不计入处理成功率)",
+    labelnames=("exception",),
+)
+
 ALERT_PROCESS_PULL_EVENT_COUNT = Counter(
     name="bkmonitor_alert_process_pull_event_count",
     documentation="alert(builder) 模块事件拉取条数",
@@ -320,6 +406,24 @@ PROCESS_OVER_FLOW = Counter(
     name="bkmonitor_process_overflow",
     documentation="模块处理量级过大",
     labelnames=("module", "strategy_id", "bk_biz_id", "strategy_name", "redis_node"),
+)
+
+CHECK_RESULT_OPPORTUNITY_TRIM_COUNT = Counter(
+    name="bkmonitor_check_result_opportunity_trim_count",
+    documentation="CHECK_RESULT 机会裁剪扫描、命令和删除成员计数",
+    labelnames=("type",),
+)
+
+CHECK_RESULT_OPPORTUNITY_TRIM_TIME = Histogram(
+    name="bkmonitor_check_result_opportunity_trim_time",
+    documentation="CHECK_RESULT 机会裁剪任务耗时",
+    labelnames=(),
+)
+
+CHECK_RESULT_OPPORTUNITY_TRIM_QUEUE_DELAY = Histogram(
+    name="bkmonitor_check_result_opportunity_trim_queue_delay",
+    documentation="CHECK_RESULT 机会裁剪任务排队耗时",
+    labelnames=(),
 )
 
 TRIGGER_EVENT_RATE_LIMIT_DROP = Counter(
@@ -357,6 +461,93 @@ AIOPS_PRE_DETECT_LATENCY = Gauge(
     name="bkmonitor_aiops_pre_detect_latency",
     documentation="AIOPS SDK策略预检测耗时",
     labelnames=("strategy_id", "strategy_name", "bk_biz_id"),
+)
+
+AIOPS_SAS_REQUEST_LATENCY = Histogram(
+    name="bkmonitor_aiops_sas_request_latency",
+    documentation="SAS 异常等级评分任务侧等待耗时，包含线程池调度时间",
+    labelnames=("status",),
+    buckets=(0.5, 1, 2, 3, 5, 8, 10, 15, 20, 30, 45, 60, INF),
+)
+
+AIOPS_SAS_REQUEST_COUNT = Counter(
+    name="bkmonitor_aiops_sas_request_count_total",
+    documentation="SAS 异常等级评分请求统计",
+    labelnames=("status",),
+)
+
+AIOPS_SAS_REQUEST_POINT_COUNT = Histogram(
+    name="bkmonitor_aiops_sas_request_point_count",
+    documentation="单次 SAS 异常等级评分请求包含的异常点数量",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, INF),
+)
+
+AIOPS_SAS_CLIENT_REQUEST_COUNT = Counter(
+    name="bkmonitor_aiops_sas_client_request_count_total",
+    documentation="SAS 客户端实际调用统计，batch_timeout 表示调用未在批次预算内完成",
+    labelnames=("status",),
+)
+
+AIOPS_SAS_CLIENT_REQUEST_LATENCY = Histogram(
+    name="bkmonitor_aiops_sas_client_request_latency",
+    documentation="SAS 客户端实际调用耗时，不包含线程池调度时间；batch_timeout 记录批次截止时已观测耗时",
+    labelnames=("status",),
+    buckets=(0.5, 1, 2, 3, 5, 8, 10, 15, 20, 30, 45, 60, INF),
+)
+
+AIOPS_SAS_BATCH_COUNT = Counter(
+    name="bkmonitor_aiops_sas_batch_count_total",
+    documentation="SAS 动态告警等级处理批次统计",
+    labelnames=("status",),
+)
+
+AIOPS_SAS_BATCH_LATENCY = Histogram(
+    name="bkmonitor_aiops_sas_batch_latency",
+    documentation="SAS 动态告警等级处理批次耗时",
+    labelnames=("status",),
+    buckets=(0.5, 1, 2, 3, 5, 8, 10, 15, 20, 30, 45, 60, INF),
+)
+
+AIOPS_SAS_BATCH_POINT_COUNT = Histogram(
+    name="bkmonitor_aiops_sas_batch_point_count",
+    documentation="单个 SAS 动态告警等级处理批次包含的异常点数量",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, INF),
+)
+
+AIOPS_SAS_BATCH_REQUEST_COUNT = Histogram(
+    name="bkmonitor_aiops_sas_batch_request_count",
+    documentation="单个 SAS 动态告警等级处理批次发起的请求数量",
+    buckets=(1, 2, 5, 10, 20, 50, 100, 200, 500, INF),
+)
+
+AIOPS_DYNAMIC_ALERT_LEVEL_POINT_COUNT = Counter(
+    name="bkmonitor_aiops_dynamic_alert_level_point_count_total",
+    documentation="智能异常检测动态告警等级功能覆盖点数",
+    labelnames=("mode", "stage"),
+)
+
+AIOPS_SAS_RESULT_COUNT = Counter(
+    name="bkmonitor_aiops_sas_result_count_total",
+    documentation="SAS 异常等级评分结果统计",
+    labelnames=("status",),
+)
+
+AIOPS_SAS_FALLBACK_COUNT = Counter(
+    name="bkmonitor_aiops_sas_fallback_count_total",
+    documentation="SAS 异常等级评分回退统计",
+    labelnames=("reason",),
+)
+
+AIOPS_SAS_ALERT_LEVEL_COUNT = Counter(
+    name="bkmonitor_aiops_sas_alert_level_count_total",
+    documentation="SAS 动态告警等级分布",
+    labelnames=("source", "alert_level"),
+)
+
+AIOPS_SAS_ALERT_LEVEL_PROJECTION_COUNT = Counter(
+    name="bkmonitor_aiops_sas_alert_level_projection_count_total",
+    documentation="SAS 原始告警等级到允许输出等级的投影统计",
+    labelnames=("raw_alert_level", "alert_level"),
 )
 
 TRIGGER_PROCESS_LATENCY = Histogram(
@@ -418,6 +609,48 @@ ISSUE_LEGACY_FALLBACK_HIT = Counter(
     "alert.issue_id 永久指向 RESOLVED Issue（best-effort,不会重新关联到新 fingerprint Issue)。"
     "正常上线后此 metric 应在分钟级回零;持续非零说明 migrate 未成功执行",
     labelnames=("bk_biz_id",),
+)
+
+ISSUE_LLM_TITLE_TOTAL = Counter(
+    name="bkmonitor_issue_llm_title_total",
+    documentation="Issue LLM 标题生成结果计数",
+    # result 取值：
+    #   - ok / shadow_ok：生成并写入 / shadow 模式生成未写入
+    #   - empty_log：关联日志为空（非日志类告警或取数失败），不适用
+    #   - ratelimited：业务级限流丢弃
+    #   - timeout：soft_time_limit 触发（取日志或调 LLM 阶段）
+    #   - llm_error：LLM 调用 / Issue 读写失败
+    #   - invalid_output：输出校验不过（多行/禁项/空）
+    #   - name_changed：CAS 失败（用户已改名），放弃写入
+    #   - alert_not_found：Alert 查询未找到；自动路径在 1s/3s 重试耗尽后计入，显式补偿路径直接计入
+    #   - alert_error：其他 Alert 查询错误
+    #   - retry_schedule_error：Alert 暂不可见后的定向重试派发失败
+    #   - skipped_merged_member：活跃合并成员，跳过（自动与运维显式补偿路径均可能产生）
+    #   仅运维显式补偿路径（regenerate_issue_llm_title）产生的额外取值：
+    #   - not_found：Issue 不存在或业务归属不匹配
+    #   - skipped_user_renamed：最近一次真实用户改名或标题来源无法确认，跳过
+    #   - skipped_inactive：非活跃 Issue，跳过
+    #   - eligibility_error：资格检查依赖查询失败，失败关闭
+    #   - no_alert：Issue 无关联告警，无重跑素材
+    # examples_source 取值 strategy|biz|static：自动 few-shot 是否生效及其层级；
+    # auto 桶（strategy/biz）违例率劣化是 few-shot 漂移信号，回退 = 停周期任务等缓存过期
+    labelnames=("bk_biz_id", "result", "examples_source"),
+)
+
+ISSUE_LLM_TITLE_ALERT_LOOKUP_TOTAL = Counter(
+    name="bkmonitor_issue_llm_title_alert_lookup_total",
+    documentation=(
+        "Issue LLM 标题任务查询关联 Alert 的结果计数。result="
+        "first_attempt_success|retry_scheduled|retry_recovered|retry_exhausted|error|retry_schedule_error"
+    ),
+    labelnames=("bk_biz_id", "result"),
+)
+
+ISSUE_LLM_TITLE_STEP_SECONDS = Histogram(
+    name="bkmonitor_issue_llm_title_step_seconds",
+    documentation="Issue LLM 标题生成分步耗时。step=fetch_log（关联日志取数，长尾在日志平台查询侧）| llm_call",
+    labelnames=("step",),
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, INF),
 )
 
 # composite
@@ -664,6 +897,20 @@ CONFIG_MAXMEMORY = Gauge(
     labelnames=("node", "role", "host", "port", "cluster_name"),
 )
 
+# 聚合类型的紧凑编码阈值：成员数越过该阈值后 zset/hash 由 listpack 转为 skiplist/hashtable，
+# 单成员内存开销显著上升且转换不可逆。估算检测态内存成本时必须知道实际阈值，不能假定默认值。
+CONFIG_ZSET_MAX_LISTPACK_ENTRIES = Gauge(
+    name="redis_config_zset_max_listpack_entries",
+    documentation="The value of the zset-max-listpack-entries configuration directive (-1 if unavailable)",
+    labelnames=("node", "role", "host", "port", "cluster_name"),
+)
+
+CONFIG_HASH_MAX_LISTPACK_ENTRIES = Gauge(
+    name="redis_config_hash_max_listpack_entries",
+    documentation="The value of the hash-max-listpack-entries configuration directive (-1 if unavailable)",
+    labelnames=("node", "role", "host", "port", "cluster_name"),
+)
+
 CONNECTIONS_RECEIVED_TOTAL = Gauge(
     name="redis_connections_received_total",
     documentation="Total number of connections accepted by the server",
@@ -784,6 +1031,19 @@ EXPORTER_SCRAPE_DURATION_SECONDS_COUNT = Gauge(
     name="redis_exporter_scrape_duration_seconds_count",
     documentation="Durations of scrapes by the exporter",
     labelnames=("node", "role", "host", "port", "cluster_name"),
+)
+
+REDIS_STRATEGY_COST_SNAPSHOT_EXECUTE_COUNT = Counter(
+    name="redis_strategy_cost_snapshot_execute_count",
+    documentation="Redis strategy cost snapshot execution count",
+    labelnames=("cluster_name", "node_id", "status"),
+)
+
+REDIS_STRATEGY_COST_SNAPSHOT_DURATION_SECONDS = Histogram(
+    name="redis_strategy_cost_snapshot_duration_seconds",
+    documentation="Redis strategy cost snapshot execution duration in seconds",
+    labelnames=("cluster_name", "node_id", "status"),
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 15, 20, 30, 60, INF),
 )
 
 EXPORTER_SCRAPES_TOTAL = Gauge(
@@ -1234,6 +1494,12 @@ METADATA_DATA_LINK_ACCESS_TOTAL = Counter(
     name="bkmonitor_metadata_data_link_access_total",
     documentation="监控元数据数据链路接入统计",
     labelnames=("version", "biz_id", "strategy", "status"),
+)
+
+METADATA_DATA_LINK_REFRESH_TOTAL = Counter(
+    name="bkmonitor_metadata_data_link_refresh_total",
+    documentation="监控元数据数据链路组件刷新结果统计",
+    labelnames=("operation",),
 )
 
 API_REQUESTS_TOTAL = Counter(

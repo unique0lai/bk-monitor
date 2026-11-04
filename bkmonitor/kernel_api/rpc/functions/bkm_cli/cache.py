@@ -123,6 +123,33 @@ ALLOWED_KEY_SPECS: dict[str, CacheKeySpec] = {
         required_params={"strategy_id"},
         label="[nodata] 无数据告警处理锁 — 查看指定策略当前是否被 nodata 检测占用",
     ),
+    "ISSUE_ACTIVE_CONTENT_KEY": CacheKeySpec(
+        key_name="ISSUE_ACTIVE_CONTENT_KEY",
+        key_type="string",
+        required_params={"fingerprint"},
+        label="[issue] 活跃 Issue 热缓存 — 按 fingerprint 查指定活跃 Issue 内容快照；"
+        "aggregate_dimensions=[] 时 fingerprint 退化为 `strategy:{strategy_id}`",
+    ),
+    "ISSUE_FINGERPRINT_LOCK": CacheKeySpec(
+        key_name="ISSUE_FINGERPRINT_LOCK",
+        key_type="string",
+        required_params={"fingerprint"},
+        label="[issue] Issue 指纹级分布式锁 — 查指定 fingerprint 当前是否被某进程创建中",
+    ),
+    "ISSUE_ACTIVE_COUNT_KEY": CacheKeySpec(
+        key_name="ISSUE_ACTIVE_COUNT_KEY",
+        key_type="string",
+        required_params={"strategy_id"},
+        label="[issue] 单策略活跃 Issue 数缓存 — _check_active_issue_count 5min cache，"
+        "high_cardinality 熔断观测；值含 ≤5min 滞后",
+    ),
+    "ISSUE_LEGACY_MIGRATION_DONE_KEY": CacheKeySpec(
+        key_name="ISSUE_LEGACY_MIGRATION_DONE_KEY",
+        key_type="string",
+        required_params=set(),
+        label="[issue] legacy 迁移完成全局哨兵 — 看到该哨兵则 processor 跳过 fingerprint=null "
+        "全索引 fallback；migrate_legacy_active_issues 完成时 set",
+    ),
 }
 
 
@@ -208,8 +235,10 @@ def _try_json(s: str | None) -> Any:
 
 
 def _read_string(key_obj, key_params: dict[str, Any]) -> dict[str, Any]:
+    # 必须传 SimilarStr 原对象给 client；str() 会丢失 strategy_id 属性，
+    # 导致 RedisProxy 按 strategy_id=0 路由到错误的 cache_node。
     resolved_key = key_obj.get_key(**key_params)
-    raw = key_obj.client.get(str(resolved_key))
+    raw = key_obj.client.get(resolved_key)
     value = _safe_decode(raw)
     return {
         "exists": value is not None,
@@ -218,26 +247,42 @@ def _read_string(key_obj, key_params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_READ_HASH_SCAN_MAX_ROUNDS = 5
+
+
 def _read_hash(key_obj, key_params: dict[str, Any], field: str | None, limit: int) -> dict[str, Any]:
     resolved_key = key_obj.get_key(**key_params)
     client = key_obj.client
     if field:
-        raw = client.hget(str(resolved_key), field)
+        raw = client.hget(resolved_key, field)
         value = _safe_decode(raw)
         return {
             "exists": value is not None,
             "field": field,
             "value": _try_json(value),
         }
-    raw_map: dict = client.hgetall(str(resolved_key))
-    items = {_safe_decode(k): _try_json(_safe_decode(v)) for k, v in raw_map.items()}
-    total = len(items)
-    truncated_items = dict(list(items.items())[:limit])
+    # 计数走 HLEN、取样走 HSCAN 游标，与 zset/list/set 分支保持一致的有界读取。
+    # 不用 HGETALL：检测态 hash（如 LAST_CHECKPOINTS_CACHE_KEY）单键 field 数可达万级，
+    # 全量拉取会长时间占用 Redis 单线程，而本接口只需要总数和少量样本。
+    total: int = client.hlen(resolved_key)
+    items: dict[str, Any] = {}
+    cursor = 0
+    # listpack 编码的小 hash 会忽略 count 一次返回全部，此时首轮即 cursor=0 退出；
+    # hashtable 编码下 count 仅为每轮提示，故设固定轮数上限兜底，保证命令数有界。
+    for _ in range(_READ_HASH_SCAN_MAX_ROUNDS):
+        cursor, chunk = client.hscan(resolved_key, cursor=cursor, count=limit)
+        for raw_field, raw_value in (chunk or {}).items():
+            if len(items) >= limit:
+                break
+            items[_safe_decode(raw_field)] = _try_json(_safe_decode(raw_value))
+        if cursor == 0 or len(items) >= limit:
+            break
     return {
         "exists": total > 0,
         "total_fields": total,
-        "truncated": total > limit,
-        "items": truncated_items,
+        "returned_count": len(items),
+        "truncated": total > len(items),
+        "items": items,
     }
 
 
@@ -246,11 +291,11 @@ def _read_zset(
 ) -> dict[str, Any]:
     resolved_key = key_obj.get_key(**key_params)
     client = key_obj.client
-    total: int = client.zcard(str(resolved_key))
+    total: int = client.zcard(resolved_key)
     if score_min is not None and score_max is not None:
-        raw_pairs = client.zrangebyscore(str(resolved_key), score_min, score_max, withscores=True, start=0, num=limit)
+        raw_pairs = client.zrangebyscore(resolved_key, score_min, score_max, withscores=True, start=0, num=limit)
     else:
-        raw_pairs = client.zrange(str(resolved_key), 0, limit - 1, withscores=True)
+        raw_pairs = client.zrange(resolved_key, 0, limit - 1, withscores=True)
     members = [{"score": score, "value": _try_json(_safe_decode(member))} for member, score in raw_pairs]
     return {
         "exists": total > 0,
@@ -264,8 +309,8 @@ def _read_zset(
 def _read_list(key_obj, key_params: dict[str, Any], limit: int) -> dict[str, Any]:
     resolved_key = key_obj.get_key(**key_params)
     client = key_obj.client
-    total: int = client.llen(str(resolved_key))
-    raw_items = client.lrange(str(resolved_key), 0, limit - 1)
+    total: int = client.llen(resolved_key)
+    raw_items = client.lrange(resolved_key, 0, limit - 1)
     items = [_try_json(_safe_decode(v)) for v in raw_items]
     return {
         "exists": total > 0,
@@ -282,12 +327,12 @@ _READ_SET_HARD_CAP = 2000
 def _read_set(key_obj, key_params: dict[str, Any], limit: int) -> dict[str, Any]:
     resolved_key = key_obj.get_key(**key_params)
     client = key_obj.client
-    total: int = client.scard(str(resolved_key))
+    total: int = client.scard(resolved_key)
     if total > _READ_SET_HARD_CAP:
         raise CustomException(
             message=f"set 成员数 {total} 超过安全读取上限 {_READ_SET_HARD_CAP}，拒绝 smembers 全量拉取"
         )
-    raw_items = client.smembers(str(resolved_key))
+    raw_items = client.smembers(resolved_key)
     members = [_try_json(_safe_decode(v)) for v in raw_items]
     return {
         "exists": total > 0,
@@ -296,6 +341,69 @@ def _read_set(key_obj, key_params: dict[str, Any], limit: int) -> dict[str, Any]
         "truncated": total > limit,
         "members": members[:limit],
     }
+
+
+def _node_identity(node) -> dict[str, Any]:
+    """CacheNode 身份字段（对账够用，且不含敏感信息）。
+
+    故意不含 host/port（内部 Redis 拓扑/内网 IP，排障输出可能贴进归档/PR 触红线）
+    与 password/connection_kwargs（凭据）。read-cache-key routing 与 list-cache-routing
+    共用本函数，保证两条出口的脱敏纪律一致。
+    """
+    return {
+        "id": node.id,
+        "node_alias": getattr(node, "node_alias", "") or "",
+        "cluster_name": node.cluster_name,
+        "cache_type": node.cache_type,
+        "is_default": bool(node.is_default),
+        "is_enable": bool(node.is_enable),
+    }
+
+
+def _resolve_routing(key_obj, similar_key) -> dict[str, Any]:
+    """回显本次读取实际路由到的 Redis 节点身份。
+
+    与 RedisProxy 的路由逻辑保持一致：按 SimilarStr.strategy_id 调 get_node_by_strategy_id。
+    用途：核对服务桥读到的 Redis 实例与 alarm_backends worker 写入的实例是否一致
+    （定位 exists=false 是键不存在还是读错了实例）。
+    仅在主读取完成后调用（路由缓存已由主读取填充，不引入新的节点解析副作用）；
+    回显失败不影响主读取结果。
+
+    前提：主读取通过 RedisProxy 以相同 strategy_id 路由，已先行触发同一 get_node_by_strategy_id
+    （strategy_id=0 时其内部 default_node() 的 get_or_create 写已由主读取完成）。若将来出现绕过
+    RedisProxy 的读取路径，需重新评估本函数是否会成为 default_node() 的首个调用方而引入写副作用。
+    """
+    try:
+        from alarm_backends.core.cluster import get_cluster
+        from alarm_backends.core.storage.redis import CACHE_BACKEND_CONF_MAP
+        from alarm_backends.core.storage.redis_cluster import get_node_by_strategy_id
+
+        backend = getattr(key_obj, "backend", None)
+        strategy_id = int(getattr(similar_key, "strategy_id", 0) or 0)
+        node = get_node_by_strategy_id(strategy_id)
+        return {
+            "strategy_id": strategy_id,
+            "backend": backend,
+            "db": CACHE_BACKEND_CONF_MAP.get(backend, {}).get("db", 0),
+            "process_cluster": get_cluster().name,
+            "node": _node_identity(node),
+        }
+    except Exception as exc:
+        # 回显属于附加诊断信息，任何失败都不能影响主读取
+        return {"error": str(exc)}
+
+
+def _resolve_ttl_ms(key_obj, similar_key) -> int | None:
+    """回显键的剩余 TTL（毫秒）。Redis PTTL 语义：-1=永不过期，-2=键不存在，>=0=剩余毫秒。
+
+    用途：exists=false 时区分"刚过期(-2 但曾存在,无法区分)"与"持续刷新"；exists=true 时
+    判断是否在被持续刷新（TTL 接近满值）还是陈旧将过期。必须传 SimilarStr 原对象以保留
+    strategy_id 路由（str() 会丢路由属性）。失败兜底 None，不影响主读取。
+    """
+    try:
+        return int(key_obj.client.pttl(similar_key))
+    except Exception:
+        return None
 
 
 def read_cache_key(params: dict[str, Any]) -> dict[str, Any]:
@@ -312,7 +420,8 @@ def read_cache_key(params: dict[str, Any]) -> dict[str, Any]:
     limit = _normalize_limit(params.get("limit"))
 
     key_obj = _get_key_obj(key_name)
-    resolved_key = str(key_obj.get_key(**key_params))
+    similar_key = key_obj.get_key(**key_params)
+    resolved_key = str(similar_key)
 
     if spec.key_type == "string":
         data = _read_string(key_obj, key_params)
@@ -335,7 +444,108 @@ def read_cache_key(params: dict[str, Any]) -> dict[str, Any]:
         "key_type": spec.key_type,
         "resolved_key": resolved_key,
         "label": spec.label,
+        "routing": _resolve_routing(key_obj, similar_key),
+        "ttl_ms": _resolve_ttl_ms(key_obj, similar_key),
         **data,
+    }
+
+
+# ---------- measure-cache-footprint ----------
+
+MAX_FOOTPRINT_TARGETS = 500
+
+# 每种键类型的 O(1) 计数命令与计数语义。刻意只用计数命令、不取成员：
+# 成本核算只要数量，取成员会把命令复杂度从 O(1) 抬到 O(N) 并把返回体撑大。
+FOOTPRINT_COUNTERS: dict[str, tuple[str, str]] = {
+    "hash": ("hlen", "hash field 数"),
+    "zset": ("zcard", "zset 成员数"),
+    "list": ("llen", "list 长度"),
+    "set": ("scard", "set 成员数"),
+    "string": ("strlen", "字符串值字节数"),
+}
+
+
+def _measure_one_footprint(key_name: str, spec: CacheKeySpec, key_params: Any) -> dict[str, Any]:
+    """测量单个目标，恰好一条计数命令。
+
+    单个目标失败只记录该条 error，不中断整批：批量测量的价值就在于一次拿到全景，
+    让一个参数写错的目标废掉其余几百个目标的结果是最差的取舍。
+    """
+    result: dict[str, Any] = {"params": key_params}
+    try:
+        if not isinstance(key_params, dict):
+            raise CustomException(message="targets 每一项必须是对象")
+        _validate_params(key_params, spec)
+
+        key_obj = _get_key_obj(key_name)
+        # 必须把 SimilarStr 原对象交给 client，str() 会丢 strategy_id 而错误路由到 default node
+        similar_key = key_obj.get_key(**key_params)
+        command, _ = FOOTPRINT_COUNTERS[spec.key_type]
+        count = int(getattr(key_obj.client, command)(similar_key))
+
+        result["resolved_key"] = str(similar_key)
+        result["count"] = count
+        result["exists"] = count > 0
+        # 路由回显走本地路由快照，不产生 Redis 命令，因此可以逐目标附带；
+        # 成本榜需要按节点分组，这个字段让"某节点上的成本排序"一次扫描即可得出。
+        routing = _resolve_routing(key_obj, similar_key)
+        result["node"] = routing.get("node") or {"error": routing.get("error")}
+    except CustomException as exc:
+        result["error"] = exc.message
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def measure_cache_footprint(params: dict[str, Any]) -> dict[str, Any]:
+    """批量测量白名单缓存键的数量足迹，用于策略级 Redis 成本核算。
+
+    与 read-cache-key 的分工：后者面向单键取证、会返回成员样本；本操作只返回数量，
+    换来"命令数恒等于目标数、每条都是 O(1)"的可估算性，从而支持全量启用策略扫描。
+    """
+    key_name = str(params.get("key_name") or "").strip()
+    if not key_name:
+        raise CustomException(message="key_name is required")
+
+    spec = _get_key_spec(key_name)
+    if spec.key_type not in FOOTPRINT_COUNTERS:
+        raise CustomException(message=f"不支持的 key_type: {spec.key_type}")
+
+    targets = params.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise CustomException(message="targets 必须是非空数组")
+    if len(targets) > MAX_FOOTPRINT_TARGETS:
+        raise CustomException(message=f"targets 数量超过硬上限 {MAX_FOOTPRINT_TARGETS}: {len(targets)}")
+
+    command, count_semantics = FOOTPRINT_COUNTERS[spec.key_type]
+    results = [_measure_one_footprint(key_name, spec, key_params) for key_params in targets]
+    measured = [item for item in results if "error" not in item]
+
+    return {
+        "key_name": key_name,
+        "key_type": spec.key_type,
+        "label": spec.label,
+        "command": command.upper(),
+        "count_semantics": count_semantics,
+        "requested": len(targets),
+        "measured": len(measured),
+        "failed": len(results) - len(measured),
+        "redis_commands": {
+            "per_target": 1,
+            "total": len(targets),
+            "note": "每个目标恰好一条 O(1) 计数命令，扫描全量策略的命令数等于目标数",
+        },
+        "total_count": sum(item["count"] for item in measured),
+        # AR-3 要求两个口径分列。hash 的 field 数是活跃键数的上界：field 由 detect 写入后
+        # 随 hash 的 7 天滑动 TTL 保留，对应的 CHECK_RESULT zset 却按 P*I 独立过期，
+        # 因此可能存在 field 还在、zset 已过期的残留。本操作不做存活探测（那需要逐 field
+        # 反查 zset，命令数不再有界），故此处显式给 null 而不是拿 field 数冒充活跃键数。
+        "active_key_count": None,
+        "active_key_count_note": (
+            "未探测。hash field 数是活跃键数的上界；抽样校准实测存活率为 100%，"
+            "但成本排序仍应以配置推导的峰值为准，不以本计数为准"
+        ),
+        "results": results,
     }
 
 
@@ -460,7 +670,57 @@ def _read_shield(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _read_action_config(params: dict[str, Any]) -> dict[str, Any]:
+    """读取处理/通知套餐(ActionConfig)的运行时配置缓存。
+
+    用于「克隆/新建套餐缓存未传播被误判为已删除/禁用」类排障的缓存侧取证。缓存有三态：
+    - exists=False（键不存在）：套餐尚未刷入缓存（克隆/新建竞态特征），或负缓存哨兵已过 TTL 被清；
+      单看缓存无法区分「竞态未传播」与「曾真删」，须配合 read-db-model(ActionConfig, origin_objects)
+      读 DB 真态对拍。
+    - exists=True 且 is_negative=True（负缓存哨兵）：读路径回查 DB 也未命中，即 DB 已确认套餐
+      真删/不存在——这是缓存层对「真删」的最高置信信号（来自 set_negative_cache，非真实配置）。
+    - exists=True 且 is_negative=False：套餐配置已正常刷入缓存，is_enabled 为其真实启停态。
+
+    脱敏：execute_config（执行参数，可内嵌 webhook/凭据）不透出，只回安全摘要。
+    注意：config_id 命中内置默认通知套餐(DEFAULT_NOTICE_ID)时，返回硬编码默认、不读 Redis，
+    故该 id 恒 exists=True、is_negative=False，与缓存实际状态无关。
+    """
+    config_id = params.get("config_id")
+    if config_id is None:
+        raise CustomException(message="params.config_id is required for cache_type=action_config")
+    try:
+        config_id = int(config_id)
+    except (TypeError, ValueError) as exc:
+        raise CustomException(message=f"config_id must be an integer: {config_id}") from exc
+
+    from alarm_backends.core.cache.action_config import ActionConfigCacheManager
+
+    data = ActionConfigCacheManager.get_action_config_by_id(config_id)
+    # 负缓存哨兵：非空但带 NEGATIVE_CACHE_FLAG 标记，表示 DB 已确认真删/不存在（非真实配置）。
+    is_negative = bool(data) and bool(data.get(ActionConfigCacheManager.NEGATIVE_CACHE_FLAG))
+    summary = None
+    if data:
+        # 安全摘要白名单：只回取证必要字段 + 负缓存标记；execute_config 等其余字段一律不透出。
+        summary = {
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "is_enabled": data.get("is_enabled"),
+            "plugin_id": data.get("plugin_id"),
+            "bk_biz_id": data.get("bk_biz_id"),
+            "is_negative": is_negative,
+        }
+    return {
+        "cache_type": "action_config",
+        "params": {"config_id": config_id},
+        "exists": bool(data),
+        "is_negative": is_negative,
+        "data": summary,
+    }
+
+
 def read_config_cache(params: dict[str, Any]) -> dict[str, Any]:
+    if "operation" in params and params["operation"] != "snapshot":
+        raise CustomException(message="operation must be snapshot")
     cache_type = str(params.get("cache_type") or "").strip()
     if not cache_type:
         raise CustomException(message="cache_type is required")
@@ -477,10 +737,32 @@ def read_config_cache(params: dict[str, Any]) -> dict[str, Any]:
         return _read_assign(cache_params)
     elif cache_type == "shield.biz":
         return _read_shield(cache_params)
+    elif cache_type == "action_config":
+        return _read_action_config(cache_params)
+    elif cache_type == "circuit_breaking":
+        from kernel_api.rpc.functions.bkm_cli.circuit_breaking import read_circuit_breaking
+
+        unknown = set(params) - {"cache_type", "params", "operation", "bk_tenant_id"}
+        if unknown:
+            raise CustomException(message=f"unsupported circuit breaking parameters: {sorted(unknown)}")
+        return read_circuit_breaking(cache_params)
     else:
         raise CustomException(
-            message=f"不支持的 cache_type: {cache_type}。允许: strategy, host, assign.biz, shield.biz"
+            message=(
+                f"不支持的 cache_type: {cache_type}。"
+                "允许: strategy, host, assign.biz, shield.biz, action_config, circuit_breaking"
+            )
         )
+
+
+# ---------- list-cache-routing ----------
+
+
+def list_cache_routing(params: dict[str, Any]) -> dict[str, Any]:
+    """列出 CacheRouter 快照，或为完整正数路由表生成变更预览。"""
+    from kernel_api.rpc.functions.bkm_cli.cache_routing import list_cache_routing as handler
+
+    return handler(params)
 
 
 KernelRPCRegistry.register_function(
@@ -496,7 +778,7 @@ KernelRPCRegistry.register_function(
         "key_name": f"白名单键常量名，可选值: {sorted(ALLOWED_KEY_SPECS)}",
         "params": "键模板变量，因 key_name 而异",
         "limit": f"最大返回条数，默认 {DEFAULT_LIMIT}，上限 {MAX_LIMIT}",
-        "field": "Hash 类型指定字段（省略则 hgetall）",
+        "field": "Hash 类型指定字段（省略则返回 HLEN 总数 + HSCAN 取样，不做全量拉取）",
         "score_range": "ZSet 类型分值区间 {min, max}",
     },
     example_params={
@@ -513,6 +795,9 @@ BkmCliOpRegistry.register(
     description=(
         "按白名单键常量名读取 alarm_backends 运行时 Redis 缓存。"
         "key_name 参数对应 key.py 中的键常量，类比 read-db-model 的 model 参数。"
+        "输出 routing 字段回显实际路由到的 Redis 节点（node.id/node_alias/cluster_name/cache_type，"
+        "不含 host/port），用于核对服务桥与 alarm_backends worker 是否读写同一实例；"
+        "配合 list-cache-routing 可做双边对账。输出 ttl_ms 为键剩余 TTL（-1 永不过期/-2 不存在/>=0 毫秒）。"
     ),
     capability_level="readonly",
     risk_level="low",
@@ -531,18 +816,64 @@ BkmCliOpRegistry.register(
     },
 )
 
+_FOOTPRINT_PARAMS_SCHEMA = {
+    "key_name": f"白名单键常量名，可选值: {sorted(ALLOWED_KEY_SPECS)}",
+    "targets": f"目标数组，每项是该 key_name 的键模板变量对象，上限 {MAX_FOOTPRINT_TARGETS} 个",
+}
+
+_FOOTPRINT_EXAMPLE = {
+    "key_name": "LAST_CHECKPOINTS_CACHE_KEY",
+    "targets": [
+        {"strategy_id": 1687, "item_id": 1805},
+        {"strategy_id": 8361, "item_id": 8479},
+    ],
+}
+
+KernelRPCRegistry.register_function(
+    func_name="bkm_cli.measure_cache_footprint",
+    summary="运行时 Redis 缓存键批量数量测量",
+    description=(
+        "bkm-cli measure-cache-footprint 后端函数。"
+        "对白名单键的多个目标各执行一条 O(1) 计数命令（HLEN/ZCARD/LLEN/SCARD/STRLEN），"
+        "只返回数量不返回成员，用于策略级缓存成本核算。"
+    ),
+    handler=measure_cache_footprint,
+    params_schema=_FOOTPRINT_PARAMS_SCHEMA,
+    example_params=_FOOTPRINT_EXAMPLE,
+)
+
+BkmCliOpRegistry.register(
+    op_id="measure-cache-footprint",
+    func_name="bkm_cli.measure_cache_footprint",
+    summary="运行时 Redis 缓存键批量数量测量",
+    description=(
+        "批量测量白名单缓存键的数量足迹。每个目标恰好一条 O(1) 计数命令，"
+        "命令总数等于目标数，因此可事先估算全量扫描开销。"
+        "逐目标回显路由节点身份（不含 host/port），可直接按节点分组做成本排序。"
+        "输出 active_key_count 恒为 null 并附说明：hash field 数只是活跃键数的上界，"
+        "本操作不做存活探测，避免把单一数字误当作活跃占用。"
+    ),
+    capability_level="readonly",
+    risk_level="low",
+    requires_confirmation=False,
+    audit_tags=["cache", "redis", "readonly"],
+    params_schema=_FOOTPRINT_PARAMS_SCHEMA,
+    example_params=_FOOTPRINT_EXAMPLE,
+)
+
 KernelRPCRegistry.register_function(
     func_name="bkm_cli.read_config_cache",
     summary="告警后端配置缓存只读查询 (CacheManager)",
     description=(
         "bkm-cli read-config-cache 后端函数。"
         "按 cache_type 读取 alarm_backends CacheManager 子类管理的 Redis 配置缓存。"
-        "支持的 cache_type: strategy, host, assign.biz, shield.biz。"
+        "支持的 cache_type: strategy, host, assign.biz, shield.biz, action_config, circuit_breaking。"
     ),
     handler=read_config_cache,
     params_schema={
-        "cache_type": "缓存类型: strategy | host | assign.biz | shield.biz",
-        "params": "缓存查询参数，因 cache_type 而异",
+        "operation": "snapshot，默认 snapshot",
+        "cache_type": "缓存类型: strategy | host | assign.biz | shield.biz | action_config | circuit_breaking",
+        "params": "缓存查询参数，因 cache_type 而异（action_config 需 config_id）",
     },
     example_params={
         "cache_type": "strategy",
@@ -563,6 +894,7 @@ BkmCliOpRegistry.register(
     requires_confirmation=False,
     audit_tags=["cache", "redis", "readonly", "config"],
     params_schema={
+        "operation": "snapshot，默认 snapshot",
         "cache_type": "string",
         "params": "object",
     },
@@ -570,4 +902,43 @@ BkmCliOpRegistry.register(
         "cache_type": "strategy",
         "params": {"strategy_id": 121950},
     },
+)
+
+KernelRPCRegistry.register_function(
+    func_name="bkm_cli.list_cache_routing",
+    summary="列出 alarm_backends Redis 缓存路由表 (CacheRouter)",
+    description=(
+        "只读返回当前集群 CacheRouter 快照、安全节点身份、最大策略 ID 与向上取整到 100 的分界建议；"
+        "也可为完整正数路由表生成受快照绑定的普通变更或计划节点 drain 预览。不含 host/port/password。"
+    ),
+    handler=lambda params: list_cache_routing(params or {}),
+    params_schema={
+        "operation": "snapshot | preview | drain_preview，默认 snapshot",
+        "drain_node_id": "drain_preview 必填",
+        "expected_snapshot_id": "preview/drain_preview 必填",
+        "desired_routes": "preview/drain_preview 必填，完整的正数路由表",
+    },
+    example_params={"operation": "snapshot"},
+)
+
+BkmCliOpRegistry.register(
+    op_id="list-cache-routing",
+    func_name="bkm_cli.list_cache_routing",
+    summary="列出 alarm_backends Redis 缓存路由表 (CacheRouter)",
+    description=(
+        "只读快照默认操作保持兼容；preview/drain_preview 根据 expected_snapshot_id 和完整 desired_routes 返回"
+        "独立 plan_id、expected_after_snapshot_id 与精确 diff。drain 只允许解除一个非默认节点的正路由引用；"
+        "node 仅包含安全身份字段。"
+    ),
+    capability_level="readonly",
+    risk_level="low",
+    requires_confirmation=False,
+    audit_tags=["cache", "redis", "readonly", "routing"],
+    params_schema={
+        "operation": "snapshot | preview | drain_preview",
+        "drain_node_id": "integer, drain_preview required",
+        "expected_snapshot_id": "string, preview/drain_preview required",
+        "desired_routes": "array, preview/drain_preview required",
+    },
+    example_params={"operation": "snapshot"},
 )

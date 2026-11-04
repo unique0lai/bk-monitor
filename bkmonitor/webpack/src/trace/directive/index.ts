@@ -26,6 +26,7 @@
 
 import type { App } from 'vue';
 
+import { BkXssFilterDirective } from '@blueking/xss-filter';
 import { bkTooltips, clickoutside } from 'bkui-vue';
 import { directive } from 'vue-tippy';
 
@@ -45,6 +46,7 @@ const directives: Record<string, any> = {
 
 export default {
   install(app: App) {
+    app.use(BkXssFilterDirective);
     for (const [key, directive] of Object.entries(directives)) {
       app.directive(key, directive);
     }

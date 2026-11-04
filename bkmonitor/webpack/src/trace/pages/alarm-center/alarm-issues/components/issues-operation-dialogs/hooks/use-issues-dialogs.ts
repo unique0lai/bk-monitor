@@ -182,7 +182,9 @@ export const useIssuesDialogs = (
     dialogType: IssuesBatchActionType,
     data: IssueItem[]
   ): IssuesOperationDialogParams => {
-    console.log('getDialogParamByDialogType', dialogType, data);
+    if (dialogType === IssuesBatchActionEnum.ASSIGN && data.length === 1) {
+      return { assignee: data[0].assignee };
+    }
     return {};
   };
 

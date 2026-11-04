@@ -24,6 +24,7 @@
  * IN THE SOFTWARE.
  */
 
+import { showClusterSelectError } from '@/common/collector-api-error';
 import * as authorityMap from '../common/authority-map';
 
 export default {
@@ -73,10 +74,17 @@ export default {
       if (this.curCollect?.data_link_id) {
         queryData.data_link_id = this.curCollect.data_link_id;
       }
+      if (this.clusterType) {
+        queryData.cluster_type = this.clusterType;
+      }
       try {
-        const res = await this.$http.request('collect/getStorage', {
-          query: queryData,
-        });
+        const res = await this.$http.request(
+          'collect/getStorage',
+          {
+            query: queryData,
+          },
+          { catchIsShowMessage: false },
+        );
         if (res.data) {
           // 根据权限排序
           const s1 = [];
@@ -94,10 +102,7 @@ export default {
           );
         }
       } catch (error) {
-        this.$bkMessage({
-          theme: 'error',
-          message: error.message,
-        });
+        showClusterSelectError(error);
       }
     },
     // 输入自定义过期天数、冷热集群存储期限
@@ -157,6 +162,7 @@ export default {
           },
         }).href,
         '_blank',
+        'noopener,noreferrer',
       );
     },
     // 存储集群管理权限
@@ -173,7 +179,7 @@ export default {
             },
           ],
         });
-        window.open(res.data.apply_url);
+        window.open(res.data.apply_url, '_blank', 'noopener,noreferrer');
       } catch (err) {
         console.warn(err);
       } finally {

@@ -38,6 +38,7 @@ from bkmonitor.data_source.unify_query.functions import (
     Functions,
     Params,
     SubQueryFunctions,
+    normalize_metric_method,
 )
 from bkmonitor.utils.common_utils import to_bk_data_rt_id
 from bkmonitor.utils.range import load_agg_condition_instance
@@ -525,6 +526,7 @@ def _parse_function_params(
 class DataSource(metaclass=ABCMeta):
     data_source_label = ""
     data_type_label = ""
+    supports_unify_query_dimensions: bool = False
 
     bk_tenant_id: str | None
     metrics: list[dict]
@@ -807,14 +809,30 @@ class PrometheusTimeSeriesDataSource(DataSource):
             bk_biz_id=bk_biz_id,
             promql=query_config["promql"],
             interval=query_config["agg_interval"],
+            alias=query_config.get("alias", ""),
             filter_dict=query_config.get("filter_dict"),
         )
 
-    def __init__(self, bk_biz_id: int, promql: str, interval: int, filter_dict: dict = None, *args, **kwargs):
+    def __init__(
+        self,
+        bk_biz_id: int,
+        promql: str,
+        interval: int,
+        filter_dict: dict = None,
+        alias: str = "",
+        query_output_config: dict = None,
+        *args,
+        **kwargs,
+    ):
         self.bk_biz_id = bk_biz_id
         self.promql = promql
         self.interval = interval
+        self.alias = alias
         self.filter_dict = filter_dict or {}
+        # 命名输出配置（expression 已翻译为完整 PromQL），透传给 /query/ts/promql
+        self.query_output_config = query_output_config
+        # 命名输出查询是否部分失败，由 UnifyQuery 汇总到顶层 is_partial
+        self.is_partial = False
         super().__init__()
 
     @staticmethod
@@ -857,6 +875,10 @@ class PrometheusTimeSeriesDataSource(DataSource):
             timezone=timezone.get_current_timezone_name(),
         )
 
+        # 命名输出：将 response_contract / legacy_output_ref / output_list 透传给 UQ
+        if self.query_output_config:
+            params.update(self.query_output_config)
+
         data = api.unify_query.query_data_by_promql(**params)
         return data, end_time * 1000
 
@@ -864,15 +886,70 @@ class PrometheusTimeSeriesDataSource(DataSource):
         from bkmonitor.data_source.unify_query.query import UnifyQuery
 
         data, end_time_ms = self._execute_promql(start_time, end_time)
-        return UnifyQuery.process_unify_query_data({}, data, end_time=end_time_ms)
+
+        # 无命名输出配置：走普通解析
+        if not self.query_output_config:
+            return UnifyQuery.process_unify_query_data({}, data, end_time=end_time_ms)
+
+        # 命名输出：UQ /query/ts/promql 支持后，响应带 contract_version + outputs，
+        # 复用 UnifyQuery.process_named_outputs_data 解析；若 UQ 未升级（无 contract_version），
+        # 降级为普通解析并标记命名输出 UNSUPPORTED，避免检测失败。
+        from bkmonitor.data_source.unify_query.constants import REF_VALUES_RESERVED_FIELD
+
+        legacy_output_ref = self.query_output_config["legacy_output_ref"]
+        params = {"query_list": [{"reference_name": legacy_output_ref}], "legacy_output_ref": legacy_output_ref}
+
+        if "contract_version" in data:
+            records, is_partial, _ = UnifyQuery.process_named_outputs_data(params, data, end_time=end_time_ms)
+            self.is_partial = is_partial
+            return records
+
+        records = UnifyQuery.process_unify_query_data(params, data, end_time=end_time_ms)
+        self.is_partial = bool(data.get("is_partial", False))
+        state = "PARTIAL" if self.is_partial else "SUCCESS"
+        for record in records:
+            ref_values = {
+                output["reference_name"]: {"state": "UNSUPPORTED"} for output in self.query_output_config["output_list"]
+            }
+            ref_values[legacy_output_ref] = {"value": record.get("_result_"), "state": state}
+            record[REF_VALUES_RESERVED_FIELD] = ref_values
+        return records
 
     def query_data_with_stat(self, start_time: int, end_time: int, *args, **kwargs) -> tuple[list, dict]:
         from bkmonitor.data_source.unify_query.query import UnifyQuery
 
         data, end_time_ms = self._execute_promql(start_time, end_time)
-        # 先提取 stat 再处理 data，因为 process_unify_query_data 会消费 series 内容
-        series_stat = UnifyQuery.process_unify_query_series_stat({}, data)
-        records = UnifyQuery.process_unify_query_data({}, data, end_time=end_time_ms)
+
+        # 无命名输出配置：走普通解析
+        if not self.query_output_config:
+            # 先提取 stat 再处理 data，因为 process_unify_query_data 会消费 series 内容
+            series_stat = UnifyQuery.process_unify_query_series_stat({}, data)
+            records = UnifyQuery.process_unify_query_data({}, data, end_time=end_time_ms)
+            return records, series_stat
+
+        # 命名输出：UQ /query/ts/promql 支持后，响应带 contract_version + outputs，
+        # 复用 UnifyQuery.process_named_outputs_data 解析；若 UQ 未升级（无 contract_version），
+        # 降级为普通解析并标记命名输出 UNSUPPORTED，避免检测失败。
+        from bkmonitor.data_source.unify_query.constants import REF_VALUES_RESERVED_FIELD
+
+        legacy_output_ref = self.query_output_config["legacy_output_ref"]
+        params = {"query_list": [{"reference_name": legacy_output_ref}], "legacy_output_ref": legacy_output_ref}
+
+        if "contract_version" in data:
+            records, is_partial, series_stat = UnifyQuery.process_named_outputs_data(params, data, end_time=end_time_ms)
+            self.is_partial = is_partial
+            return records, series_stat
+
+        series_stat = UnifyQuery.process_unify_query_series_stat(params, data)
+        records = UnifyQuery.process_unify_query_data(params, data, end_time=end_time_ms)
+        self.is_partial = bool(data.get("is_partial", False))
+        state = "PARTIAL" if self.is_partial else "SUCCESS"
+        for record in records:
+            ref_values = {
+                output["reference_name"]: {"state": "UNSUPPORTED"} for output in self.query_output_config["output_list"]
+            }
+            ref_values[legacy_output_ref] = {"value": record.get("_result_"), "state": state}
+            record[REF_VALUES_RESERVED_FIELD] = ref_values
         return records, series_stat
 
 
@@ -1092,7 +1169,8 @@ class TimeSeriesDataSource(DataSource):
             }
 
             if metric.get("method") and metric["method"] != AGG_METHOD_REAL_TIME:
-                method = metric["method"].lower()
+                # 归一化方法名（大小写/未解析占位符兜底，如 MAX_without_time / ${method}_without_time）
+                method = normalize_metric_method(metric["method"])
 
                 # 分位数method特殊处理
                 cp_agg_method = CpAggMethods.get(method)
@@ -1512,6 +1590,8 @@ class CustomTimeSeriesDataSource(TimeSeriesDataSource):
 
 
 class BaseBkMonitorLogDataSource(DataSource, ABC):
+    supports_unify_query_dimensions: bool = True
+
     RESERVED_FIELDS: list[str] = ["_after_key_"]
     INNER_DIMENSIONS: list[str] = []
     DISTINCT_METHODS: set[str] = {"AVG", "SUM", "COUNT"}
@@ -2086,8 +2166,8 @@ class LogSearchTimeSeriesDataSource(BaseBkMonitorLogDataSource):
     WILDCARD_PATTERN: str = "*"
     QUERY_SPECIAL_REGEX = re.compile(r"[+\-=&|><!(){}\[\]^\"~*?:/]|AND|OR|TO|NOT")
 
-    # 用于灰度对账的临时白名单列表（类成员变量），对账完成后会清空此列表以恢复正常逻辑。
-    LOG_UNIFY_QUERY_WHITE_BIZ_LIST: list[int] | None = None
+    # 用于灰度对账的临时黑名单列表（类成员变量），对账完成后会清空此列表以恢复正常逻辑。
+    LOG_UNIFY_QUERY_BLACK_BIZ_LIST: list[int] | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2102,16 +2182,13 @@ class LogSearchTimeSeriesDataSource(BaseBkMonitorLogDataSource):
                 condition["_origin_method"] = condition["method"]
                 condition["method"] = condition_mapping[condition["method"]]
 
-    def _fetch_black_list(self) -> list[str | int]:
-        return []
-
     @classmethod
-    def _fetch_white_list(cls) -> list[str | int]:
+    def _fetch_black_list(cls) -> list[str | int]:
         # 仅用于命令行对账，线上环境恒定为 None。
-        if cls.LOG_UNIFY_QUERY_WHITE_BIZ_LIST is not None:
-            return cls.LOG_UNIFY_QUERY_WHITE_BIZ_LIST
+        if cls.LOG_UNIFY_QUERY_BLACK_BIZ_LIST is not None:
+            return cls.LOG_UNIFY_QUERY_BLACK_BIZ_LIST
 
-        return settings.LOG_UNIFY_QUERY_WHITE_BIZ_LIST_ENV
+        return settings.LOG_UNIFY_QUERY_BLACK_BIZ_LIST_ENV
 
     def _get_unify_query_string(self) -> str:
         # 背景：没有切换 UnifyQuery 的场景直调日志平台 API，此处对其日志平台对 query_string 的处理逻辑。
@@ -2123,26 +2200,24 @@ class LogSearchTimeSeriesDataSource(BaseBkMonitorLogDataSource):
             return query_string
         return f"{self.WILDCARD_PATTERN}{query_string}{self.WILDCARD_PATTERN}"
 
-    def switch_unify_query(self, bk_biz_id: int):
+    def switch_unify_query(self, bk_biz_id: int) -> bool:
         # 如果数据源在 UnifyQueryDataSources 列表中，则使用 unify-query 查询
         if (self.data_source_label, self.data_type_label) in UnifyQueryDataSources:
             return True
 
-        # 白名单机制，只要业务在白名单中，就使用 unify-query 查询。
-        white_list: list[str | int] = self._fetch_white_list()
-        if bk_biz_id in white_list or str(bk_biz_id) in white_list:
+        # 日志聚类场景，使用 unify-query 查询。
+        if self._get_unify_query_table_suffix() == "_clustered":
             return True
-        return False
+
+        # 黑名单机制，命中的业务不使用 unify-query 查询，其他业务默认使用。
+        black_list: list[str | int] = self._fetch_black_list()
+        return bk_biz_id not in black_list and str(bk_biz_id) not in black_list
 
     @classmethod
     def _get_datasource(cls) -> str:
         return "bklog"
 
-    def _get_unify_query_table(self) -> str:
-        """获取 unify-query 查询表名
-        存在 __dist 聚类字段时，查询表名后缀为 _clustered，参考：
-        https://github.com/TencentBlueKing/bk-monitor/blob/master/bklog/apps/log_esquery/serializers.py#L114-L125
-        """
+    def _get_unify_query_table_suffix(self) -> str:
         suffix: str = ""
         for cond in self._get_conditions().get("field_list", []):
             field_name: str = cond.get("field_name", "")
@@ -2152,6 +2227,14 @@ class LogSearchTimeSeriesDataSource(BaseBkMonitorLogDataSource):
 
         if "__dist_05" in (self.query_string or ""):
             suffix = "_clustered"
+        return suffix
+
+    def _get_unify_query_table(self) -> str:
+        """获取 unify-query 查询表名
+        存在 __dist 聚类字段时，查询表名后缀为 _clustered，参考：
+        https://github.com/TencentBlueKing/bk-monitor/blob/master/bklog/apps/log_esquery/serializers.py#L114-L125
+        """
+        suffix: str = self._get_unify_query_table_suffix()
         return f"bklog_index_set_{self.index_set_id}{suffix}"
 
     @classmethod
@@ -2195,9 +2278,30 @@ class LogSearchTimeSeriesDataSource(BaseBkMonitorLogDataSource):
         return records
 
     def process_unify_query_log(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        processed_records: list[dict[str, Any]] = []
         for record in records:
-            record.pop("_meta", None)
-        return records
+            processed_record: dict[str, Any] = {}
+            for field, value in record.items():
+                if field == "_meta":
+                    # 排除无需返回的字段。
+                    continue
+
+                if self.OBJECT_FIELD_SEPERATOR not in field:
+                    # 不包含分隔符，设置 kv 并提前返回。
+                    processed_record[field] = value
+                    continue
+
+                current: dict[str, Any] = processed_record
+                field_parts: list[str] = field.split(self.OBJECT_FIELD_SEPERATOR)
+                for field_part in field_parts[:-1]:
+                    if field_part not in current:
+                        current[field_part] = {}
+                    current = current[field_part]
+                current[field_parts[-1]] = value
+
+            processed_records.append(processed_record)
+
+        return processed_records
 
     def is_dimensions_field(self, field: str) -> bool:
         """日志检索维度都是完整的，不需要补全"""
@@ -2260,7 +2364,8 @@ class LogSearchLogDataSource(LogSearchTimeSeriesDataSource):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.metrics = self.metrics or [{"field": "_index", "method": "COUNT"}]
+        if not self.metrics and not self.distinct:
+            self.metrics = [{"field": "_index", "method": "COUNT"}]
 
     @property
     def metric_display(self):
@@ -2446,6 +2551,10 @@ class BkApmTraceDataSource(BaseBkMonitorLogDataSource):
         return settings.APM_UNIFY_QUERY_BLACK_BIZ_LIST
 
     def switch_unify_query(self, bk_biz_id: int) -> bool:
+        # PREFIX# 开头的表名表示按索引前缀检索，无法被结果表路由解析，只能走 ES 查询。
+        if self.table.startswith("PREFIX#"):
+            return False
+
         for field_cond in self._get_conditions().get("field_list", []):
             # 如果存在 ES 检索的特殊操作符，则不使用 unify-query。
             # 背景：之前用户输入 events.a.b.c 时，SaaS 需要根据 mapping 判断是否为嵌套字段，增加 nested 检索关键字。
@@ -2482,6 +2591,11 @@ class BkApmTraceDataSource(BaseBkMonitorLogDataSource):
                     # 排除无需返回的字段。
                     continue
 
+                # 新版本 collector 会补充 app_name & bk_biz_id 作为 Span 元数据。
+                # 如果旧版本没有补充，增量应用会返回字段默认值，在此进行移除，避免干扰上层逻辑。
+                if field in ["bk_biz_id", "app_name"] and value in (None, "", "0", 0):
+                    continue
+
                 # TODO(crayon) 目前 Nested 字段在 Doris 查询仅返回字符串，为保证功能可用，此处转为结构化数据，等待 unify-query 支持
                 if field in self.NESTED_FIELDS and isinstance(value, str):
                     try:
@@ -2492,6 +2606,8 @@ class BkApmTraceDataSource(BaseBkMonitorLogDataSource):
                 if self.OBJECT_FIELD_SEPERATOR not in field:
                     # 不包含分隔符，设置 kv 并提前返回。
                     processed_record[field] = value
+                    if field in self.OBJECT_FIELDS:
+                        exists_object_fields.add(field)
                     continue
 
                 root_field, attr_field = field.split(".", 1)
@@ -2952,6 +3068,28 @@ class BkMonitorAlertDataSource(BkFtaEventDataSource):
             self.filter_dict["strategy_id"] = self.strategy_id
 
 
+class BkRumDataSource(BkApmTraceDataSource):
+    data_source_label = DataSourceLabel.BK_RUM
+    data_type_label = DataTypeLabel.LOG
+
+    # Span 对象字段
+    SPAN_OBJECT_FIELDS: set[str] = {OtlpKey.ATTRIBUTES, OtlpKey.RESOURCE, OtlpKey.STATUS}
+
+    # 预计算字段
+    PRE_CALCULATE_OBJECT_FIELDS: set[str] = set()
+
+    # 对象字段，需要进行存在性校验，选用 Set 结构以提升效率。
+    OBJECT_FIELDS: set[str] = SPAN_OBJECT_FIELDS | PRE_CALCULATE_OBJECT_FIELDS
+
+    def _fetch_black_list(self) -> list[str | int]:
+        return []
+
+
+class BkRumTimeSeriesDataSource(BkRumDataSource):
+    data_source_label = DataSourceLabel.BK_RUM
+    data_type_label = DataTypeLabel.TIME_SERIES
+
+
 @lru_cache_with_ttl(ttl=120)
 def judge_auto_filter(bk_biz_id: int, table_id: str) -> dict[str, Any]:
     """
@@ -3065,6 +3203,8 @@ def load_data_source(data_source_label: str, data_type_label: str) -> type[DataS
         BkFtaEventDataSource,
         BkApmTraceDataSource,
         BkApmTraceTimeSeriesDataSource,
+        BkRumDataSource,
+        BkRumTimeSeriesDataSource,
         PrometheusTimeSeriesDataSource,
     ]
 

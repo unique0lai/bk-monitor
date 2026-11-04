@@ -12,7 +12,7 @@ import pytest
 
 from core.drf_resource.exceptions import CustomException
 from kernel_api.resource.bkm_cli import BkmCliOpCallResource
-from kernel_api.rpc.bkm_cli_registry import BkmCliOpRegistry
+from kernel_api.rpc.bkm_cli_registry import BkmCliOpNotFound, BkmCliOpRegistry
 from kernel_api.rpc.registry import KernelRPCRegistry
 
 
@@ -58,11 +58,116 @@ def test_bkm_cli_op_call_resolves_op_id_to_whitelisted_registered_function():
     assert result["audit"]["audit_tags"] == ["phase1"]
 
 
+def test_bkm_cli_mutation_audit_reports_declared_operator_and_trusted_caller(mocker):
+    request_username = mocker.patch("bkmonitor.utils.request.get_request_username", return_value="trusted-caller")
+    KernelRPCRegistry.register_function(
+        func_name="bkm_cli.test_manage",
+        summary="test manage",
+        description="test manage",
+        handler=lambda params: {"requested_operator": params["operator"]},
+    )
+    BkmCliOpRegistry.register(
+        op_id="test-manage",
+        func_name="bkm_cli.test_manage",
+        capability_level="admin",
+        risk_level="mutation",
+        requires_confirmation=True,
+        audit_tags=["admin", "mutation"],
+        params_schema={"operator": "实际执行人", "confirmed": "必须为 true"},
+        example_params={"operator": "alice", "confirmed": False},
+    )
+
+    result = BkmCliOpCallResource().perform_request(
+        {"op_id": "test-manage", "params": {"operator": "alice", "confirmed": True}}
+    )
+
+    assert result["audit"]["declared_operator"] == "alice"
+    assert result["audit"]["request_caller"] == "trusted-caller"
+    request_username.assert_called_once_with()
+
+
+def test_bkm_cli_readonly_audit_does_not_claim_declared_operator(mocker):
+    request_username = mocker.patch("bkmonitor.utils.request.get_request_username")
+    KernelRPCRegistry.register_function(
+        func_name="bkm_cli.test_query",
+        summary="test query",
+        description="test query",
+        handler=lambda params: {"ok": True},
+    )
+    BkmCliOpRegistry.register(
+        op_id="test-query",
+        func_name="bkm_cli.test_query",
+        capability_level="admin",
+        risk_level="readonly",
+        requires_confirmation=False,
+        audit_tags=["admin", "readonly"],
+        params_schema={},
+        example_params={},
+    )
+
+    result = BkmCliOpCallResource().perform_request({"op_id": "test-query", "params": {}})
+
+    assert "declared_operator" not in result["audit"]
+    assert "request_caller" not in result["audit"]
+    request_username.assert_not_called()
+
+
+def test_bkm_cli_mutation_audit_rejects_non_string_declared_operator(mocker):
+    mocker.patch("bkmonitor.utils.request.get_request_username", return_value="")
+    KernelRPCRegistry.register_function(
+        func_name="bkm_cli.test_malformed_manage",
+        summary="test malformed manage",
+        description="test malformed manage",
+        handler=lambda params: {"requested_operator": {"unexpected": "value"}},
+    )
+    BkmCliOpRegistry.register(
+        op_id="test-malformed-manage",
+        func_name="bkm_cli.test_malformed_manage",
+        capability_level="admin",
+        risk_level="mutation",
+        requires_confirmation=True,
+        audit_tags=["admin", "mutation"],
+        params_schema={"operator": "实际执行人", "confirmed": "必须为 true"},
+        example_params={"operator": "alice", "confirmed": False},
+    )
+
+    result = BkmCliOpCallResource().perform_request(
+        {"op_id": "test-malformed-manage", "params": {"operator": "alice", "confirmed": True}}
+    )
+
+    assert "declared_operator" not in result["audit"]
+
+
 def test_bkm_cli_op_call_rejects_unknown_op_id():
     with pytest.raises(CustomException) as exc:
         BkmCliOpCallResource().perform_request({"op_id": "missing-op", "params": {}})
 
     assert "未找到 bkm-cli op" in str(exc.value)
+
+
+def test_resolve_unknown_op_raises_op_not_found_with_code_404():
+    """未注册 op 抛 BkmCliOpNotFound，且 .code == 404（让 CLI 映射为 target_not_found，
+    而非误落 invalid_argument 兜底导致 agent 徒劳改 schema）。"""
+    KernelRPCRegistry.ensure_loaded()
+    with pytest.raises(BkmCliOpNotFound) as exc:
+        BkmCliOpRegistry.resolve("不存在的op")
+
+    assert exc.value.code == 404
+    assert exc.value.status_code == 404
+    # 子类仍是 CustomException，沿用既有异常处理链
+    assert isinstance(exc.value, CustomException)
+    assert "未找到 bkm-cli op" in str(exc.value)
+
+
+def test_op_not_found_code_survives_into_envelope():
+    """custom_exception_handler 末尾 result.update(exc.extra) 不会把 envelope 的 code 冲掉，
+    最终 envelope 里 code 仍为 404（子类 __init__ 已把 code=404 注入 extra）。"""
+    from core.drf_resource.exceptions import custom_exception_handler
+
+    exc = BkmCliOpNotFound(message="未找到 bkm-cli op: x")
+    response = custom_exception_handler(exc, context={})
+    assert response.status_code == 404
+    assert response.data["code"] == 404
 
 
 def test_bkm_cli_op_call_does_not_accept_raw_func_name():

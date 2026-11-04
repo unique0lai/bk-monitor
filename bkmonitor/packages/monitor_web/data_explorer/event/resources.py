@@ -21,6 +21,7 @@ from django.utils.translation import gettext_lazy as _
 
 
 from bkmonitor.data_source.data_source import dict_to_q, q_to_dict
+from bkmonitor.data_source.utils.base import sort_fields
 from bkmonitor.data_source.unify_query.builder import QueryConfigBuilder, UnifyQuerySet
 from bkmonitor.models import MetricListCache
 from bkmonitor.utils.common_utils import format_percent
@@ -74,7 +75,6 @@ from .utils import (
     get_qs_from_req_data,
     is_dimensions,
     format_field,
-    sort_fields,
 )
 
 logger = logging.getLogger(__name__)
@@ -608,7 +608,8 @@ class EventStatisticsGraphResource(EventBaseResource):
                 for interval in intervals
             ]
         )
-        return sorted(buckets, key=lambda x: int(x[1].split("-")[0]))
+        buckets.sort(key=lambda item: item[0])
+        return [data_point for _start, data_point in buckets]
 
     @classmethod
     def _get_q_by_interval(cls, query, field, interval):
@@ -632,7 +633,7 @@ class EventStatisticsGraphResource(EventBaseResource):
         for query in queries:
             queryset = queryset.add_query(query)
         try:
-            bucket.append([queryset.original_data[0]["_result_"], f"{interval[0]}-{interval[1]}"])
+            bucket.append((interval[0], [queryset.original_data[0]["_result_"], f"{interval[0]}-{interval[1]}"]))
         except (IndexError, KeyError) as exc:
             logger.warning("[EventStatisticsGraphResource] failed to get field interval_buckets, err -> %s", exc)
             raise ValueError(_("获取数值类型区间统计数量失败"))

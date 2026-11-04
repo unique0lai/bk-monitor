@@ -34,7 +34,7 @@ export default (
   immediateStart = true,
 ) => {
   const debounceCallback = debounce(
-    (entry) => {
+    entry => {
       callbackFn?.(entry);
     },
     typeof delayCallback === 'number' ? delayCallback : 120,
@@ -57,13 +57,17 @@ export default (
   };
 
   let resizeObserver: ResizeObserver;
+  let observedElement: HTMLElement | null = null;
   const isStoped = ref(true);
 
   const observeElement = () => {
     if (isStoped.value) {
       isStoped.value = false;
       const cellElement = getTarget() as HTMLElement;
-      resizeObserver?.observe(cellElement);
+      if (isElement(cellElement)) {
+        observedElement = cellElement;
+        resizeObserver?.observe(cellElement);
+      }
     }
   };
 
@@ -72,7 +76,7 @@ export default (
 
     if (isElement(cellElement)) {
       // 创建一个 ResizeObserver 实例
-      resizeObserver = new ResizeObserver((entries) => {
+      resizeObserver = new ResizeObserver(entries => {
         for (const entry of entries) {
           if (delayCallback === false) {
             callbackFn?.(entry);
@@ -92,13 +96,14 @@ export default (
   };
 
   const stopObserve = () => {
-    const cellElement = getTarget() as HTMLElement;
     isStoped.value = true;
+    debounceCallback.cancel();
 
-    if (isElement(cellElement)) {
-      resizeObserver?.unobserve(cellElement);
-      resizeObserver?.disconnect();
+    if (isElement(observedElement)) {
+      resizeObserver?.unobserve(observedElement);
     }
+    observedElement = null;
+    resizeObserver?.disconnect();
   };
 
   const destoyResizeObserve = () => {

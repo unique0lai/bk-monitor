@@ -27,8 +27,7 @@
  * alarm-center-apm.tsx —— APM 场景下的告警中心包装组件
  *
  * 本组件是 AlarmCenter 的 APM 适配层，通过 Vue 3 的 provide/inject 机制
- * 将 APM 专属的行为注入到通用的 AlarmCenter 中，取代原先基于条件编译
- * （#if IS_APM_MONITOR）的方案。
+ * 将 APM 专属的行为注入到通用的 AlarmCenter 中。
  *
  * 组件层级关系：
  *   alarm-center-apm-entry.ts          ← 独立构建入口，createApp 挂载根组件
@@ -48,10 +47,11 @@
 import { defineComponent, inject, onBeforeUnmount, provide, watch } from 'vue';
 
 import AlarmCenter from './alarm-center';
+import { clearEmbedContext, setEmbedContext } from '@/common/embed-context';
 import { useAlarmCenterStore } from '@/store/modules/alarm-center';
 
-import type { CommonCondition } from './typings';
 import type { EMode } from '../../components/retrieval-filter/typing';
+import type { CommonCondition } from './typings';
 
 /**
  * AlarmCenter 消费的 APM 专属回调接口。
@@ -63,10 +63,10 @@ import type { EMode } from '../../components/retrieval-filter/typing';
 export interface AlarmCenterApmHooks {
   /** 检索条件变更时回调，将新的条件列表通知宿主 */
   onConditionChange?: (condition: CommonCondition[]) => void;
-  /** 查询语句变更时回调，将新的查询字符串通知宿主 */
-  onQueryStringChange?: (queryString: string) => void;
   /** 筛选模式（UI / 语句）变更时回调，将新的模式通知宿主 */
   onFilterModeChange?: (mode: EMode) => void;
+  /** 查询语句变更时回调，将新的查询字符串通知宿主 */
+  onQueryStringChange?: (queryString: string) => void;
 }
 
 /** provide/inject key —— AlarmCenter 用此 key 获取 APM 回调钩子 */
@@ -89,7 +89,14 @@ export default defineComponent({
     const bridgeProps = inject(BRIDGE_PROPS_KEY, {} as Record<string, any>);
     const bridgeEmit = inject(BRIDGE_EMIT_KEY, (() => {}) as (event: string, ...args: unknown[]) => void);
 
-    /** 将宿主传入的 queryString 挂到 window 上，供非 Vue 组件（如接口请求层）读取 */
+    /**
+     * 声明「已被宿主嵌入」并给出宿主的查询口径，服务层的 withEmbedQuery 据此收敛业务与过滤范围。
+     * window.APM_QUERY_STRING 仍需保留：Vue 2 宿主（如 APM 快捷新增策略）会直接读取它。
+     */
+    setEmbedContext({
+      bizId: Number(window.bk_biz_id),
+      queryString: bridgeProps.queryString || '',
+    });
     if (bridgeProps.queryString) {
       window.APM_QUERY_STRING = bridgeProps.queryString;
     }
@@ -102,7 +109,7 @@ export default defineComponent({
 
     /**
      * 监听宿主属性变化，同步到 alarmStore。
-     * 宿主通过 handle.update({ timeRange, refreshInterval, ... }) 推送新值，
+     * 宿主通过 handle.update({ timeRange, refreshInterval, timezone, ... }) 推送新值，
      * reactive 代理会触发此 watcher，从而驱动 AlarmCenter 内部刷新。
      */
     watch(
@@ -111,6 +118,9 @@ export default defineComponent({
         alarmStore.refreshImmediate = bridgeProps.refreshImmediate;
         alarmStore.refreshInterval = Number(bridgeProps.refreshInterval);
         alarmStore.timeRange = bridgeProps.timeRange;
+        if (bridgeProps.timezone) {
+          alarmStore.timezone = bridgeProps.timezone;
+        }
       },
       {
         immediate: true,
@@ -130,8 +140,9 @@ export default defineComponent({
     };
     provide(ALARM_CENTER_APM_HOOKS_KEY, apmHooks);
 
-    /** 组件卸载时清理全局变量 */
+    /** 组件卸载时清理嵌入上下文与全局变量 */
     onBeforeUnmount(() => {
+      clearEmbedContext();
       window.APM_QUERY_STRING = '';
     });
   },

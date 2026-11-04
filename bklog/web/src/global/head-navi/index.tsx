@@ -39,9 +39,13 @@ import useStore from '@/hooks/use-store';
 import logoImg from '@/images/log-logo.png';
 import platformConfigStore from '@/store/modules/platform-config';
 import { BK_LOG_STORAGE } from '@/store/store.type';
+import { isFeatureToggleOn } from '@/store/helper';
 import { bkDropdownMenu, bkMessage } from 'bk-magic-vue';
 import jsCookie from 'js-cookie';
 import { useRoute } from 'vue-router/composables';
+
+import BkLoginUserinfo from '@blueking/login-userinfo/vue2';
+import '@blueking/login-userinfo/vue2/vue2.css';
 
 import { MENU_LISTS } from './complete-menu';
 import LogVersion from './log-version';
@@ -52,7 +56,7 @@ import { join } from '../utils/path';
 
 export default defineComponent({
   name: 'HeaderNavTsx',
-  components: { BizMenuSelect, GlobalDialog, LogVersion, bkDropdownMenu },
+  components: { BizMenuSelect, GlobalDialog, LogVersion, bkDropdownMenu, BkLoginUserinfo },
   props: {
     welcomeData: {
       type: Object as () => Record<string, any> | null,
@@ -73,7 +77,7 @@ export default defineComponent({
       const matchedList = route.matched;
       const menuList = store.state.menuList;
       return (
-        menuList.find((item) => {
+        menuList.find(item => {
           return matchedList.some(record => record.name === item.id);
         }) || {}
       );
@@ -97,11 +101,11 @@ export default defineComponent({
       isFirstLoad: true,
       username: '',
       bk_tenant_id: null,
+      timezone: 'Asia/Shanghai',
       usernameRequested: false,
       isShowLanguageDropdown: false,
       isShowGlobalDropdown: false,
       isShowHelpDropdown: false,
-      isShowLogoutDropdown: false,
       showLogVersion: false,
       language: 'zh-cn',
       showGlobalDialog: false,
@@ -148,6 +152,7 @@ export default defineComponent({
         const res = store.state.userMeta;
         state.username = res?.username || '';
         state.bk_tenant_id = res?.bk_tenant_id || null;
+        state.timezone = res?.time_zone || 'Asia/Shanghai';
         if ((window as any).__aegisInstance && state.username) {
           (window as any).__aegisInstance.setConfig({ uin: state.username });
         }
@@ -164,8 +169,14 @@ export default defineComponent({
     function jumpToHome() {
       store.commit('updateState', { isShowGlobalDialog: false });
       if ((window as any).IS_EXTERNAL) {
+        const externalMenu = (store.state.externalMenu as string[]) || [];
+        // 外部版优先跳转管理，无管理权限再考虑检索或客户端日志检索
+        let defaultRoute = 'manage';
+        if (externalMenu.includes('manage')) defaultRoute = 'manage';
+        else if (externalMenu.includes('retrieve')) defaultRoute = 'retrieve';
+        else if (externalMenu.includes('client-log-search')) defaultRoute = 'client-log-search';
         router.push({
-          name: 'manage',
+          name: defaultRoute,
           query: {
             spaceUid: store.state.spaceUid,
             bizId: bkBizId.value,
@@ -188,7 +199,12 @@ export default defineComponent({
       // 相同菜单再次点击时的处理策略
       const sameMenuHandlers: Record<string, () => void> = {
         retrieve: () => {
-          router.push({ name: 'retrieve', query: spaceUidQuery });
+          const indexId = route.params?.indexId;
+          router.push({
+            name: 'retrieve',
+            params: indexId ? { indexId } : undefined,
+            query: spaceUidQuery,
+          });
         },
         extract: () => {
           if (currentRoute.query.create) {
@@ -213,13 +229,13 @@ export default defineComponent({
       const navigateHandlers: Record<string, () => void> = {
         monitor: () => {
           const url = `${(window as any).MONITOR_URL}/?bizId=${bkBizId.value}#/strategy-config`;
-          window.open(url, '_blank');
+          window.open(url, '_blank', 'noopener,noreferrer');
         },
         trace: () => {
           router.push({ name: 'trace-list', query: spaceUidQuery });
         },
         dashboard: () => {
-          window.open(`${window.MONITOR_URL}/?bizId=${bkBizId.value}#/grafana`, '_blank');
+          window.open(`${window.MONITOR_URL}/?bizId=${bkBizId.value}#/grafana`, '_blank', 'noopener,noreferrer');
         },
         default: () => {
           router.push({ name: menu.id, query: spaceUidQuery });
@@ -249,9 +265,7 @@ export default defineComponent({
       jsCookie.set('blueking_language', value, {
         expires: 3600,
         domain:
-          envConfig.value.bkDomain || location.host.split('.').slice(-2)
-            .join('.')
-            .replace(`:${location.port}`, ''),
+          envConfig.value.bkDomain || location.host.split('.').slice(-2).join('.').replace(`:${location.port}`, ''),
       });
 
       if (state.bk_tenant_id) {
@@ -259,8 +273,13 @@ export default defineComponent({
           (window as any).BK_PAAS_API_HOST,
           '/api/bk-user-web/prod/api/v3/open-web/tenant/current-user/language/',
         );
-        requestJson({ url, params: { language: value }, method: 'PUT', headers: { 'X-Bk-Tenant-Id': state.bk_tenant_id } })
-          .catch((err) => {
+        requestJson({
+          url,
+          params: { language: value },
+          method: 'PUT',
+          headers: { 'X-Bk-Tenant-Id': state.bk_tenant_id },
+        })
+          .catch(err => {
             bkMessage({
               message: err.message,
               theme: 'error',
@@ -300,7 +319,7 @@ export default defineComponent({
       } else if (type === 'docCenter') {
         handleGotoLink('docCenter');
       } else if (type === 'feedback') {
-        window.open((window as any).BK_FAQ_URL);
+        window.open((window as any).BK_FAQ_URL, '_blank', 'noopener,noreferrer');
       }
     }
 
@@ -319,9 +338,10 @@ export default defineComponent({
      */
     function handleGoToMyApplication() {
       state.showGlobalDialog = false;
-      const host =        process.env.NODE_ENV === 'development'
-        ? `http://${(process as any).env.devHost}:7001`
-        : (window as any).MONITOR_URL;
+      const host =
+        process.env.NODE_ENV === 'development'
+          ? `http://${(process as any).env.devHost}:7001`
+          : (window as any).MONITOR_URL;
       const targetSrc = `${host}/?bizId=${bkBizId.value}&needMenu=false#/trace/report/my-applied-report`;
       state.globalDialogTitle = t('我申请的');
       state.showGlobalDialog = true;
@@ -333,9 +353,10 @@ export default defineComponent({
      */
     function handleGoToMyReport() {
       state.showGlobalDialog = false;
-      const host =        process.env.NODE_ENV === 'development'
-        ? `http://${(process as any).env.devHost}:7001`
-        : (window as any).MONITOR_URL;
+      const host =
+        process.env.NODE_ENV === 'development'
+          ? `http://${(process as any).env.devHost}:7001`
+          : (window as any).MONITOR_URL;
       const targetSrc = `${host}/?bizId=${bkBizId.value}&needMenu=false#/trace/report/my-report`;
       state.globalDialogTitle = t('我的订阅');
       state.showGlobalDialog = true;
@@ -401,6 +422,38 @@ export default defineComponent({
       );
     }
 
+    const showPersonalSettings = computed(() => {
+      const config = (window as any).SHOW_PERSONAL_SETTINGS;
+      return config === undefined ? true : config;
+    });
+
+    const actionList = computed(() => [
+      {
+        text: t('权限中心'),
+        icon: 'bklog-icon bklog-quanxianzhongxin',
+        handle: handleGoToPermissionCenter,
+      },
+      ...(showPersonalSettings.value
+        ? [
+            {
+              text: t('个人设置'),
+              icon: 'bklog-icon bklog-yonghu',
+              handle: handleGoToPersonalCenter,
+            },
+          ]
+        : []),
+      {
+        text: t('退出登录'),
+        icon: 'bklog-icon bklog-tuichu',
+        handle: handleQuit,
+        theme: 'danger' as const,
+      },
+    ]);
+
+    const renderSlot = h => {
+      return h('bk-user-display-name', { 'user-id': state.username });
+    };
+
     /**
      * 渲染带图标的语言下拉菜单链接
      */
@@ -419,9 +472,17 @@ export default defineComponent({
 
     // 计算可见菜单（外部版根据 externalMenu 限制）
     const menuList = computed(() => {
-      const list =        (navMenu.topMenu as any).value?.filter((menu: any) => {
-        return menu.feature === 'on' && (isExternal.value ? store.state.externalMenu.includes(menu.id) : true);
-      }) || [];
+      const list =
+        (navMenu.topMenu as any).value?.filter((menu: any) => {
+          const baseFilter =
+            menu.feature === 'on' && (isExternal.value ? store.state.externalMenu.includes(menu.id) : true);
+          if (!baseFilter) return false;
+          // 客户端日志菜单项需要检查 tgpa_task 功能开关
+          if (menu.id === 'client-log-search') {
+            return isFeatureToggleOn('tgpa_task', [String(bkBizId.value), String(store.state.spaceUid)]);
+          }
+          return true;
+        }) || [];
       if (process.env.NODE_ENV === 'development' && (process as any).env.MONITOR_APP === 'apm' && list.length) {
         return [...list, { id: 'monitor-apm-log', name: 'APM Log检索' }];
       }
@@ -562,8 +623,8 @@ export default defineComponent({
                 <ul class='bk-dropdown-list'>
                   <li>
                     {renderDropdownLink(t('产品文档'), () => dropdownHelpTriggerHandler('docCenter'))}
-                    {!isExternal.value
-                      && renderDropdownLink(t('版本日志'), () => dropdownHelpTriggerHandler('logVersion'))}
+                    {!isExternal.value &&
+                      renderDropdownLink(t('版本日志'), () => dropdownHelpTriggerHandler('logVersion'))}
                     {renderDropdownLink(t('问题反馈'), () => dropdownHelpTriggerHandler('feedback'))}
                   </li>
                 </ul>
@@ -579,30 +640,18 @@ export default defineComponent({
           />
 
           {/* 用户 */}
-          <bkDropdownMenu
-            scopedSlots={{
-              'dropdown-trigger': () => (
-                <div class={['icon-language-container', state.isShowLogoutDropdown && 'active']}>
-                  {state.username ? (
-                    <span class='username'>
-                      <bk-user-display-name user-id={state.username}></bk-user-display-name>
-                      <i class='bk-icon icon-down-shape'></i>
-                    </span>
-                  ) : null}
-                </div>
-              ),
-              'dropdown-content': () => (
-                <ul class='bk-dropdown-list'>
-                  <li>{renderDropdownLink(t('权限中心'), handleGoToPermissionCenter)}</li>
-                  <li>{renderDropdownLink(t('个人中心'), handleGoToPersonalCenter)}</li>
-                  <li>{renderDropdownLink(t('退出登录'), handleQuit)}</li>
-                </ul>
-              ),
+          {/* @ts-ignore */}
+          <BkLoginUserinfo
+            class='username'
+            userinfo={{
+              name: state.username,
+              organization: state.bk_tenant_id,
+              timezone: state.timezone,
             }}
-            align='center'
-            onHide={() => (state.isShowLogoutDropdown = false)}
-            onShow={() => (state.isShowLogoutDropdown = true)}
-          ></bkDropdownMenu>
+            offset={[0, 20]}
+            renderSlot={renderSlot}
+            actionList={actionList.value}
+          ></BkLoginUserinfo>
         </div>
 
         <GlobalDialog

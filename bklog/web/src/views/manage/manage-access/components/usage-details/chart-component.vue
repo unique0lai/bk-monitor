@@ -26,8 +26,8 @@
 
 <template>
   <div
-    class="chart-container"
     v-bkloading="{ isLoading: loading, zIndex: 0 }"
+    class="chart-container"
   >
     <div class="chart-header">
       <div class="title">{{ type }}</div>
@@ -301,7 +301,7 @@
         );
       },
       goToGuide() {
-        window.open(this.retrieveTimeGuide, '_blank');
+        window.open(this.retrieveTimeGuide, '_blank', 'noopener,noreferrer');
       },
     },
   };

@@ -1,9 +1,10 @@
 <script setup>
-  import { computed, nextTick } from 'vue';
+  import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 
   import useLocale from '@/hooks/use-locale';
   import useStore from '@/hooks/use-store';
   import { BK_LOG_STORAGE } from '@/store/store.type';
+  import RetrieveHelper, { RetrieveEvent } from '@/views/retrieve-helper';
 
   import FieldFilterComp from '../field-filter-comp';
   const store = useStore();
@@ -17,8 +18,8 @@
   const showFieldAlias = computed(() => store.state.storage[BK_LOG_STORAGE.SHOW_FIELD_ALIAS]);
   /** 时间选择器绑定的值 */
   const datePickerValue = computed(() => {
-    const { start_time = 'now-15m', end_time = 'now' } = store.state.indexItem;
-    return [start_time, end_time];
+    const { start_time: startTime = 'now-15m', end_time: endTime = 'now' } = store.state.indexItem;
+    return [startTime, endTime];
   });
 
   const indexSetItem = computed(() => {
@@ -29,16 +30,37 @@
     return store.state.indexFieldInfo.sort_list;
   });
 
-  const totalFields = computed(() => {
-    return store.getters.filteredFieldList;
+  const sourceFields = computed(() => store.getters.filteredFieldList ?? []);
+  // 千级字段进 store 后先让 search XHR 出去，下一帧再把列表交给左侧面板，避免首屏 flush 挡住检索。
+  const deferredFields = ref([]);
+  let fieldPaintFrame = 0;
+  watch(
+    sourceFields,
+    fields => {
+      if (fieldPaintFrame) {
+        cancelAnimationFrame(fieldPaintFrame);
+      }
+      fieldPaintFrame = requestAnimationFrame(() => {
+        fieldPaintFrame = 0;
+        deferredFields.value = fields;
+      });
+    },
+    { immediate: true },
+  );
+  onBeforeUnmount(() => {
+    if (fieldPaintFrame) {
+      cancelAnimationFrame(fieldPaintFrame);
+    }
   });
+
+  const totalFields = computed(() => deferredFields.value);
 
   const fieldAliasMap = computed(() => {
     const fieldAliasMap = {};
-    totalFields.value.filter(field => !field.is_virtual_alias_field).forEach(item => {
-      item.minWidth = 0;
-      item.filterExpand = false; // 字段过滤展开
-      item.filterVisible = true;
+    totalFields.value.forEach(item => {
+      if (item?.is_virtual_alias_field) {
+        return;
+      }
       fieldAliasMap[item.field_name] = item.query_alias || item.field_name;
     });
 
@@ -74,6 +96,7 @@
     await nextTick();
     store.commit('resetVisibleFields', { displayFieldNames, version: 'v2' });
     store.commit('updateIsSetDefaultTableColumn', false);
+    RetrieveHelper.fire(RetrieveEvent.VISIBLE_FIELD_COLUMN_LAYOUT_CHANGE);
   };
   const handleCloseFilterTitle = isTextClick => {
     if (isTextClick && props.value) return;
@@ -88,25 +111,22 @@
     :style="rootStyle"
   >
     <!-- 字段过滤 -->
-    <div
-      style="position: absolute; top: 64px; transform: translate(-50%, -50%)"
-      class="tab-item-title field-filter-title"
-    >
+    <div class="tab-item-title field-filter-title">
       <div
         class="close-total"
         @click="handleCloseFilterTitle(false)"
       >
         <span
+          v-bk-tooltips="{ content: value ? $t('收起') : $t('打开') }"
           :style="{ transform: value ? '' : 'rotate(180deg)' }"
           style="font-size: 14px"
           class="bklog-icon bklog-collapse"
-          v-bk-tooltips="{ content: value ? $t('收起') : $t('打开') }"
         ></span>
       </div>
     </div>
     <FieldFilterComp
-      ref="fieldFilterRef"
       v-show="value"
+      ref="fieldFilterRef"
       :date-picker-value="datePickerValue"
       :field-alias-map="fieldAliasMap"
       :index-set-item="indexSetItem"

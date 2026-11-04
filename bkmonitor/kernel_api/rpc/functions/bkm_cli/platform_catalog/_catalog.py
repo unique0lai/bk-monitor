@@ -8,6 +8,7 @@ You may obtain a copy of the License at http://opensource.org/licenses/MIT
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -34,6 +35,22 @@ VALID_INVOKE_STYLES = ("kwargs", "positional_dict")
 VALID_CACHE_BYPASS_METHODS = ("refresh", "cacheless")
 
 
+class ParamsGuardRejected(ValueError):
+    """params_guard 拒绝本次调用：属策略拦截（映射 unsafe_action_blocked），不是 provider 故障。"""
+
+    def __init__(self, message: str, *, code: str = "unsafe_action_blocked") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ProviderResponseRejected(ValueError):
+    """上游响应不符合已注册的只读结果契约，不得投影为完整空结果。"""
+
+    def __init__(self, message: str, *, code: str = "provider_unavailable") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass
 class OperationSpec:
     """一个具体的 api.<domain>.<resource> 能力描述。
@@ -48,6 +65,16 @@ class OperationSpec:
     - ``"refresh"``：调 ``handler.request.refresh(...)``，刷新并回写缓存
     - ``"cacheless"``：调 ``handler.request.cacheless(...)``，不读不写缓存
     - ``None``：handler 不支持缓存绕过；``force_refresh`` 视为 noop，meta 中带 warning
+
+    params_guard 是 invoke 前置参数防线：在 handler 调用前接收 invoke params，
+    返回（可归一化的）params 放行，或抛 ``ParamsGuardRejected`` 拒绝（映射
+    unsafe_action_blocked）。guard 必须 total：除 ``ParamsGuardRejected`` 外不得抛
+    其它异常，对任意类型入参都要能给出放行/拒绝判定。注意：guard 返回值同时用于
+    handler 调用与 response_postprocess 的 fields 提取——带 response_postprocess 的
+    op 其 guard 必须透传 ``fields``，否则 postprocess 会静默回落 default_fields。
+
+    response_postprocess_needs_params 用于上游响应缺少查询标识、投影必须引用 guard
+    归一化参数的场景。开启后，response_postprocess 第三个参数接收实际 invoke params。
     """
 
     id: str
@@ -59,7 +86,9 @@ class OperationSpec:
     example_params: dict[str, Any] = field(default_factory=dict)
     default_fields: list[str] = field(default_factory=list)
     allowed_fields: list[str] = field(default_factory=list)
-    response_postprocess: Callable[[Any, list[str] | None], Any] | None = None
+    response_postprocess: Callable[..., Any] | None = None
+    response_postprocess_needs_params: bool = False
+    params_guard: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     audit_tags: list[str] = field(default_factory=list)
     required_params: list[str] = field(default_factory=list)
     notes: str = ""
@@ -81,6 +110,21 @@ class OperationSpec:
             raise ValueError("handler must be callable")
         if getattr(self.handler, "__name__", "") == "<lambda>":
             raise ValueError("handler must not be a lambda; use api.<domain>.<resource> reference")
+        if self.params_guard is not None and not callable(self.params_guard):
+            raise ValueError("params_guard must be callable or None")
+        if self.response_postprocess is not None and not callable(self.response_postprocess):
+            raise ValueError("response_postprocess must be callable or None")
+        if not isinstance(self.response_postprocess_needs_params, bool):
+            raise ValueError("response_postprocess_needs_params must be a boolean")
+        if self.response_postprocess_needs_params:
+            if self.response_postprocess is None:
+                raise ValueError("response_postprocess_needs_params requires response_postprocess")
+            try:
+                inspect.signature(self.response_postprocess).bind(None, None, {})
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "response_postprocess must accept three arguments when response_postprocess_needs_params is enabled"
+                ) from error
         if self.invoke_style not in VALID_INVOKE_STYLES:
             raise ValueError(f"invalid invoke_style: {self.invoke_style}; must be one of {VALID_INVOKE_STYLES}")
         if self.cache_bypass_method is not None and self.cache_bypass_method not in VALID_CACHE_BYPASS_METHODS:

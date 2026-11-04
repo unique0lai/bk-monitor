@@ -8,13 +8,39 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+import json
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from django.conf import settings
+from django.db import router, transaction
+from django.utils import timezone
 from rest_framework import serializers
 
-from constants.issue import IssuePriority, IssueStatus
+from constants.issue import IssueActivityType, IssuePriority, IssueStatus
 from core.drf_resource import Resource
 from core.drf_resource.viewsets import ResourceRoute, ResourceViewSet
-from bkmonitor.documents.issue import IssueActivityNotFoundError, IssueDocument, IssueNameDuplicatedError
+from core.errors.issue import IssueRenameConflictError
+from bkmonitor.documents.issue import (
+    IssueActivityDocument,
+    IssueActivityNotFoundError,
+    IssueDocument,
+    IssueNameDuplicatedError,
+)
+from bkmonitor.issue_merge import (
+    MergeConflictError,
+    MergeCrossBizForbiddenError,
+    MergeGroupInconsistentError,
+    MergeGroupTooLargeError,
+    MergeIssuesNotFoundError,
+    MergeTargetIsMemberError,
+    SplitNotFoundError,
+)
+from bkmonitor.models.issue import IssueMergeRelation
 from fta_web.issue.resources import IssueIDField
+
+logger = logging.getLogger("root")
 
 
 class AssignResource(Resource):
@@ -188,8 +214,8 @@ class RenameResource(Resource):
                 new_name=validated_request_data["new_name"], operator=validated_request_data["operator"]
             )
         except IssueNameDuplicatedError as e:
-            # 同业务下已存在同名 Issue
-            raise serializers.ValidationError(str(e))
+            # 同业务下已存在同名 Issue：抛专有错误码（3327001），web 端据此识别并转页面提示
+            raise IssueRenameConflictError(message=str(e), data={"name": validated_request_data["new_name"]})
         return {
             "bk_biz_id": issue.bk_biz_id,
             "issue_id": issue.id,
@@ -261,6 +287,469 @@ class EditFollowUpResource(Resource):
         }
 
 
+class MergeResource(Resource):
+    """合并 Issue：把多个 Issue 收敛到一个主 Issue（api role 端执行，cache 真生效）。
+
+    合并/拆分只建立或解除合并关系，与 Issue 状态完全解耦：main 与 member 处于任意状态
+    （含已解决/已归档）都可参与合并。合并后 member 被冻结 + 列表隐藏，自身 status 不再权威，
+    由主状态变更级联（_cascade_follow_status）与拆分重置接管，仅把其影响范围/告警追加到主
+    聚合，不改变告警路由。
+
+    **已成组的主可继续并入另一主（扁平化 reparent）**：merge(main=B, members=[A]) 中 A 自身是
+    某组 active main 时，A 的 active 成员在同一写事务内被改挂到 B，成为 B 的平级 member。
+    关系深度因此**恒为 1**——``IssueMergeResolver`` 与 ``_cascade_follow_status`` 全部按单层
+    实现，依赖该不变量；改挂而非嵌套是这个不变量得以保持的原因。
+
+    校验顺序（按"轻量 → 重"组织）：
+    1. ES 存在性 + 跨业务一致
+    2. 防链式（main 端）：main 自身不能是别行 active 关系的 member —— 同时天然拦住环
+       （若 B 本就是 A 的 member，merge(main=B, members=[A]) 在此被拒）
+    3. 任一 member 不能已在 active 关系（不可重复合并）
+    4. 待改挂成员的一致性前置（已在目标组 / 自身还带成员 → 失败关闭）
+    5. 合并后组规模上限
+
+    历史：曾有"members 自身不能是别组 active main"的对称校验（``MergeMemberIsAnotherMainError``
+    3337108），因防真嵌套递归而设；改挂方案下深度仍为 1，该校验已移除，错误码保留占位。
+    """
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(label="业务ID")
+        main_issue_id = IssueIDField(label="主 Issue ID")
+        members = serializers.ListField(
+            label="并入 Issue ID 列表",
+            child=IssueIDField(),
+            min_length=1,
+            max_length=100,
+        )
+        # 合并依据非必填：缺省/空列表均合法（与拆分依据对齐；merge_reasons 模型默认空列表）
+        reasons = serializers.ListField(label="合并依据", child=serializers.CharField(), required=False, default=list)
+        operator = serializers.CharField(label="操作人")
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        main_id = validated_request_data["main_issue_id"]
+        members = list(dict.fromkeys(validated_request_data["members"]))  # 去重保序
+        reasons = validated_request_data["reasons"]
+        operator = validated_request_data["operator"]
+
+        if main_id in members:
+            members = [m for m in members if m != main_id]
+        if not members:
+            raise serializers.ValidationError("members 去重后为空")
+
+        # 校验 1: ES 存在性 + 跨业务一致
+        all_ids = [main_id, *members]
+        biz_hits = (
+            IssueDocument.search(all_indices=True)
+            .filter("terms", _id=all_ids)
+            .source(["bk_biz_id"])
+            .params(size=len(all_ids))
+            .execute()
+            .hits
+        )
+        found_ids = {hit.meta.id for hit in biz_hits}
+        missing_ids = [iid for iid in all_ids if iid not in found_ids]
+        if missing_ids:
+            raise MergeIssuesNotFoundError(missing_ids)
+
+        biz_set = {str(getattr(h, "bk_biz_id", "")) for h in biz_hits if getattr(h, "bk_biz_id", None)}
+        if not biz_set or len(biz_set) > 1 or str(bk_biz_id) not in biz_set:
+            raise MergeCrossBizForbiddenError()
+
+        # 状态不再校验：合并/拆分与 Issue 状态解耦，main 处于任意状态（含已解决/已归档）都可作为
+        # 合并目标（详见类 docstring）。member 同样不限状态。
+
+        # SQL 关系校验 + 写入 + 改挂放进同一事务，对关系行加锁（select_for_update）重查：
+        # 表无 DB UNIQUE 约束，唯一性靠应用层 SELECT。并发 merge 同一 member 时，两侧校验 3
+        # 都可能查不到 active 关系而各写一行，破坏"一 member 至多一个 active main"。校验 3 的
+        # select_for_update 利用 (member_issue_id, status) 索引间隙锁，阻断并发事务在该区间插入，
+        # 把竞态窗口收窄到提交前。极端残留（隔离级别/边界）仍由 list_conflicts + repair
+        # resolve_conflicts 周期对账兜底（彻底方案是 DB 层 active member 唯一约束，更重，未做）。
+        # 待改挂成员行同样在事务内 select_for_update，防并发 split / 另一路 merge 改动它们。
+
+        #
+        # atomic 必须显式指定 IssueMergeRelation 实际写入的库：api role 启用 BackendRouter 后，
+        # bkmonitor app 路由到 monitor_api 库，而 transaction.atomic() 缺省作用于 default 库。
+        # 二者不一致时，事务开在 default、select_for_update 跑在 monitor_api（autocommit），
+        # 触发 "select_for_update cannot be used outside of a transaction"。用 router.db_for_write
+        # 取真实写库（同时兼容 default==backend 的单库部署），保证锁与事务落在同一连接。
+        with transaction.atomic(using=router.db_for_write(IssueMergeRelation)):
+            # 校验 2: 主 issue 自身是某行活跃 member（防链式 - main 端）
+            target_as_member = (
+                IssueMergeRelation.objects.select_for_update()
+                .filter(
+                    member_issue_id=main_id,
+                    status=IssueMergeRelation.STATUS_ACTIVE,
+                )
+                .values("main_issue_id")
+                .first()
+            )
+            if target_as_member:
+                raise MergeTargetIsMemberError(main_id, target_as_member["main_issue_id"])
+
+            # 校验 3: 任一 member 已在 active 关系（不可重复合并）——加锁重查，间隙锁阻断并发重复插入
+            existing = (
+                IssueMergeRelation.objects.select_for_update()
+                .filter(
+                    member_issue_id__in=members,
+                    status=IssueMergeRelation.STATUS_ACTIVE,
+                )
+                .values("member_issue_id", "main_issue_id")
+                .first()
+            )
+            if existing:
+                raise MergeConflictError(existing["main_issue_id"])
+
+            # 收集待改挂成员：members 中若有自身是 active main 的（已成组的主），其成员随之改挂。
+            # select_for_update 锁住这些行，防并发 split / 另一路 merge 同时改动它们。
+            carried_rows = list(
+                IssueMergeRelation.objects.select_for_update()
+                .filter(
+                    main_issue_id__in=members,
+                    status=IssueMergeRelation.STATUS_ACTIVE,
+                )
+                .values("id", "main_issue_id", "member_issue_id")
+            )
+            carried_member_ids = [row["member_issue_id"] for row in carried_rows]
+
+            # 校验 4: 待改挂成员的一致性前置（失败关闭，不静默跳过）。
+            # 两种情形都意味着改动前关系表已不一致，掩盖会把不一致扩散到更大的组。
+            if carried_member_ids:
+                # (a) 待改挂成员已经是目标主的 active 成员（等价 duplicate_active_members）
+                already_in_target = list(
+                    IssueMergeRelation.objects.filter(
+                        main_issue_id=main_id,
+                        member_issue_id__in=carried_member_ids,
+                        status=IssueMergeRelation.STATUS_ACTIVE,
+                    )
+                    .values_list("member_issue_id", flat=True)
+                    .distinct()
+                )
+                if already_in_target:
+                    raise MergeGroupInconsistentError(already_in_target, "already_active_member_of_target")
+
+                # (b) 待改挂成员自身还带着 active 成员（等价深度违例；单事务下不应出现）
+                nested_mains = list(
+                    IssueMergeRelation.objects.filter(
+                        main_issue_id__in=carried_member_ids,
+                        status=IssueMergeRelation.STATUS_ACTIVE,
+                    )
+                    .values_list("main_issue_id", flat=True)
+                    .distinct()
+                )
+                if nested_mains:
+                    raise MergeGroupInconsistentError(nested_mains, "carried_member_has_own_members")
+
+            # 校验 5: 合并后组规模上限——必须在任何写入之前，避免超限请求留下半写状态
+            group_limit = getattr(settings, "ISSUE_MAX_MERGE_GROUP_SIZE", 0) or 0
+            if group_limit > 0:
+                current_count = IssueMergeRelation.objects.filter(
+                    main_issue_id=main_id,
+                    status=IssueMergeRelation.STATUS_ACTIVE,
+                ).count()
+                if current_count + len(members) + len(carried_member_ids) > group_limit:
+                    raise MergeGroupTooLargeError(
+                        current=current_count,
+                        incoming=len(members),
+                        carried=len(carried_member_ids),
+                        limit=group_limit,
+                    )
+
+            # 写关系表（与校验同事务，受上面行锁保护）
+            IssueMergeRelation.objects.bulk_create(
+                [
+                    IssueMergeRelation(
+                        bk_biz_id=bk_biz_id,
+                        main_issue_id=main_id,
+                        member_issue_id=m,
+                        status=IssueMergeRelation.STATUS_ACTIVE,
+                        merge_reasons=reasons,
+                        create_user=operator,
+                        update_user=operator,
+                    )
+                    for m in members
+                ]
+            )
+
+            # 改挂（reparent）：把被并入主的 active 成员迁到新主，深度保持为 1。
+            #
+            # 用 UPDATE 而非"标 split + 插新行"：标 split 会被 get_split_info_map 采集，
+            # 前端会给这些成员错误挂上「由合并拆分」标签。
+            # create_time / create_user 保留原始合并事实不动（"谁在何时把它并入上一跳主"），
+            # 上一跳主记入 via_issue_id；.update() 不触发 auto_now，update_time 需显式赋值。
+            # 只动 status='active' 行：status='split' 的历史行记录"曾从上一跳主拆出"，
+            # 改挂等于伪造历史，故留在原主名下。
+            if carried_rows:
+                now_dt = timezone.now()
+                for row in carried_rows:
+                    IssueMergeRelation.objects.filter(pk=row["id"]).update(
+                        main_issue_id=main_id,
+                        via_issue_id=row["main_issue_id"],
+                        update_user=operator,
+                        update_time=now_dt,
+                    )
+
+        # 写 ES 活动日志（main 1 条 + 每 member 1 条 MERGED_INTO + 每个被改挂成员 1 条，失败仅 warning）
+        now = int(time.time())
+        bk_biz_id_str = str(bk_biz_id)
+        activities: list[IssueActivityDocument] = [
+            IssueActivityDocument(
+                issue_id=main_id,
+                bk_biz_id=bk_biz_id_str,
+                activity_type=IssueActivityType.MERGED_INTO,
+                from_value=None,
+                to_value=None,
+                operator=operator,
+                content=json.dumps({"kind": "manual", "members": members}, ensure_ascii=False),
+                time=now,
+                create_time=now,
+            ),
+        ]
+        for m in members:
+            activities.append(
+                IssueActivityDocument(
+                    issue_id=m,
+                    bk_biz_id=bk_biz_id_str,
+                    activity_type=IssueActivityType.MERGED_INTO,
+                    from_value=None,
+                    to_value=main_id,
+                    operator=operator,
+                    content=json.dumps({"kind": "manual", "main_issue_id": main_id}, ensure_ascii=False),
+                    time=now,
+                    create_time=now,
+                )
+            )
+        # 被改挂成员：kind=reparent 区别于用户直接合并的 kind=manual，from_main_issue_id 记上一跳。
+        # 关系表的 via_issue_id 只留最近一跳，完整链路由这些 append-only 活动日志承载。
+        for row in carried_rows:
+            activities.append(
+                IssueActivityDocument(
+                    issue_id=row["member_issue_id"],
+                    bk_biz_id=bk_biz_id_str,
+                    activity_type=IssueActivityType.MERGED_INTO,
+                    from_value=row["main_issue_id"],
+                    to_value=main_id,
+                    operator=operator,
+                    content=json.dumps(
+                        {
+                            "kind": "reparent",
+                            "from_main_issue_id": row["main_issue_id"],
+                            "main_issue_id": main_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    time=now,
+                    create_time=now,
+                )
+            )
+        try:
+            IssueActivityDocument.bulk_create(activities)
+        except Exception as e:
+            logger.warning("[issue-merge] merge activity bulk write failed: %s", e)
+
+        return {
+            "status": "ok",
+            "main_issue_id": main_id,
+            "members": members,
+            # 被改挂成员：调用方（web 薄壳 / 前端）据此提示"同时并入 N 个来源成员"
+            "reparented_members": carried_member_ids,
+        }
+
+
+class SplitResource(Resource):
+    """拆分 member Issue：恢复为独立 Issue 并重置状态为 PENDING_REVIEW + 清 assignee。
+
+    api role 端执行，bulk_reset_for_split 的 cache DEL 真生效。
+
+    支持两种入参（二选一，由 validate 强制）：
+    - ``member_issue_id``（旧，单条）：行为与响应契约保持不变——失败抛错，成功返回
+      ``{"status": "ok", "member_issue_id": ...}``（apigw 外部消费者依赖旧契约）
+    - ``member_issue_ids``（新，批量 ≤50）：逐条独立执行单条拆分（无跨条目事务，部分失败
+      不阻塞其余条目），返回逐条执行结果；同批重复 ID 去重保序；ES 重置按主 Issue 分组
+      合并调用（同组明细通常一个主 → 1 次 bulk）；failed 条目统一通用文案，内部细节
+      仅日志（``_mark_split`` 当前仅抛 SplitNotFoundError，其余异常按通用失败兜底）
+    """
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(label="业务ID")
+        member_issue_id = IssueIDField(label="并入 Issue ID", required=False)
+        member_issue_ids = serializers.ListField(
+            label="并入 Issue ID 列表",
+            child=IssueIDField(),
+            required=False,
+            min_length=1,
+            max_length=50,
+        )
+        # 拆分依据非必填：缺省/空列表均合法（下游 bulk_reset_for_split 与 split_info 已按空兜底）；
+        # 批量拆分时同一 reasons 应用到全部条目（与需求"每条明细拆分行为与单条一致"对齐）
+        reasons = serializers.ListField(label="拆分依据", child=serializers.CharField(), required=False, default=list)
+        operator = serializers.CharField(label="操作人")
+
+        def validate(self, attrs):
+            has_single = attrs.get("member_issue_id") is not None
+            has_batch = attrs.get("member_issue_ids") is not None
+            if has_single == has_batch:
+                raise serializers.ValidationError("member_issue_id 与 member_issue_ids 必须二选一")
+            return attrs
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        reasons = validated_request_data["reasons"]
+        operator = validated_request_data["operator"]
+
+        # 旧单条契约：行为不变（任一步骤失败抛错 / 成功返回单条 shape）
+        if validated_request_data.get("member_issue_id") is not None:
+            member_id = validated_request_data["member_issue_id"]
+            relation = self._mark_split(bk_biz_id=bk_biz_id, member_id=member_id, reasons=reasons, operator=operator)
+            self._reset_es(relation.main_issue_id, [member_id], bk_biz_id=bk_biz_id, reasons=reasons, operator=operator)
+            return {"status": "ok", "member_issue_id": member_id}
+
+        # 新批量契约：逐条独立执行，单条异常隔离，部分失败不阻塞其余条目
+        member_ids = list(dict.fromkeys(validated_request_data["member_issue_ids"]))  # 去重保序
+        results = []
+        main_to_members: dict[str, list[str]] = {}
+        for member_id in member_ids:
+            try:
+                relation = self._mark_split(
+                    bk_biz_id=bk_biz_id, member_id=member_id, reasons=reasons, operator=operator
+                )
+                main_to_members.setdefault(relation.main_issue_id, []).append(member_id)
+                results.append({"member_issue_id": member_id, "status": "ok"})
+            except SplitNotFoundError:
+                # 关系不存在或已被拆分（并发/重复触发）：幂等跳过而非整批报错
+                results.append({"member_issue_id": member_id, "status": "skipped", "message": "relation not active"})
+            except Exception as e:  # 单条异常隔离，不影响其他条目
+                # 非领域异常：内部细节（SQL/存储层信息）只进日志，不下发给调用方
+                logger.warning("[issue-merge] batch split failed, member(%s)", member_id, exc_info=e)
+                results.append({"member_issue_id": member_id, "status": "failed", "message": "split failed"})
+
+        # ES 重置按主 Issue 分组合并调用（同组明细通常一个主 → 1 次 bulk），失败仅 warning
+        for main_issue_id, split_members in main_to_members.items():
+            self._reset_es(main_issue_id, split_members, bk_biz_id=bk_biz_id, reasons=reasons, operator=operator)
+
+        return {"status": "ok", "results": results}
+
+    @staticmethod
+    def _mark_split(bk_biz_id, member_id, reasons, operator):
+        """执行单条拆分的关系改写：查 active 关系 + 条件 UPDATE 改 status=split，返回关系行。
+
+        条件 UPDATE（status 仍为 active 才生效）：SELECT 与 UPDATE 之间被并发拆分抢先时
+        rowcount=0，按"关系已不存在"处理（单条契约抛 SplitNotFoundError，批量契约由调用方
+        记 skipped），避免重复刷写 split_reasons/update_time 与重复写活动日志。
+
+        关系必须存在且 active
+        """
+        relation = IssueMergeRelation.objects.filter(
+            bk_biz_id=bk_biz_id,
+            member_issue_id=member_id,
+            status=IssueMergeRelation.STATUS_ACTIVE,
+        ).first()
+        if not relation:
+            raise SplitNotFoundError(member_id)
+
+        # SQL UPDATE 改 status=split（条件单条 UPDATE 已原子，无需事务）
+        # 显式写 update_time：split 关系的 update_time 即"拆分时间"，被 split_info.split_time
+        # 消费（详情/列表展示 + 前端"刚拆出"瞬态高亮）。QuerySet.update() 不触发 auto_now，
+        # 不显式赋值会残留合并时间 / cascade 触达时间，导致 split_time 错误。
+        updated = IssueMergeRelation.objects.filter(pk=relation.pk).update(
+            status=IssueMergeRelation.STATUS_SPLIT,
+            split_kind=IssueMergeRelation.SPLIT_KIND_MANUAL,
+            split_reasons=reasons,
+            update_user=operator,
+            update_time=timezone.now(),
+        )
+        if not updated:
+            raise SplitNotFoundError(member_id)
+        return relation
+
+    @staticmethod
+    def _reset_es(main_issue_id, member_ids, bk_biz_id, reasons, operator) -> None:
+        """ES 重置 member 状态 + 写活动日志（含 reasons，让 SPLIT_FROM content 自包含）。
+
+        失败仅 warning，bkm-cli + management command 兜底
+        """
+        IssueDocument.bulk_reset_for_split(
+            member_ids,
+            operator=operator,
+            kind=IssueMergeRelation.SPLIT_KIND_MANUAL,
+            main_issue_id=main_issue_id,
+            bk_biz_id=bk_biz_id,
+            reasons=reasons,
+        )
+
+
+class RegenerateTitleResource(Resource):
+    """批量重跑 Issue LLM 标题（运维显式补偿，同步执行，最多 5 个）。
+
+    用于修复"未重命名成功"（LLM 标题任务失败/超时/未派发，Issue 仍是默认名）。语义与约束
+    见 ``alarm_backends...issue_tasks.regenerate_issue_llm_title``：绕过业务白名单 +
+    ENABLE_ISSUE_LLM_TITLE 部署闸门，保留业务级限流；已被用户手工改名的跳过，上次 LLM 改的可覆盖。
+
+    并发（而非串行）执行：单条含 LLM 调用尾延迟可达数十秒，串行 5 条易撞网关超时；
+    并发后接口耗时收敛到最慢一条。单条异常隔离进各自 result，不影响其他条目。
+    注：本接口在 api role 执行（同步直调 regenerate_issue_llm_title，非 apply_async 派发），
+    api role 具备 REDIS_*_CONF（限流/示例缓存）与 AIDEV 网关配置，可直接跑 LLM。
+
+    超时兜底：补偿路径复用的 _apply_llm_title 不像原 Celery 任务带 soft/hard time_limit，
+    而取关联日志（get_alert_relation_info）下游有 sleep 重试 + 无超时的日志平台查询，卡住会
+    长期占用请求线程。故每条用 future.result(timeout) 限时：超时则该条记 timeout 结果、
+    释放请求线程（游离线程由 ES/HTTP 客户端自身 socket 超时收尾，不阻塞 API 返回）。
+    单条上限 = AIDEV 客户端 TIMEOUT(30s) + 取日志重试冗余，取 60s。
+    """
+
+    # 单条重跑墙钟上限（秒）：AIDEV chat_completion TIMEOUT=30s + get_alert_relation_info
+    # 一次 sleep 重试 + 日志查询冗余。超过即判该条 timeout，释放请求线程。
+    PER_ISSUE_TIMEOUT = 60
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(label="业务ID")
+        issue_ids = serializers.ListField(label="Issue ID 列表", child=IssueIDField(), min_length=1, max_length=5)
+        # 操作人可选：运维显式补偿默认记 system（与自动派发路径一致），传入则记该账号便于审计
+        operator = serializers.CharField(label="操作人", required=False, default="system")
+
+    def perform_request(self, validated_request_data):
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+        from alarm_backends.service.fta_action.tasks.issue_tasks import regenerate_issue_llm_title
+
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        issue_ids = list(dict.fromkeys(validated_request_data["issue_ids"]))  # 去重保序
+        operator = validated_request_data["operator"]
+
+        def _fallback(issue_id: str, result: str) -> dict:
+            return {
+                "issue_id": issue_id,
+                "bk_biz_id": bk_biz_id,
+                "result": result,
+                "old_name": None,
+                "new_name": None,
+            }
+
+        # submit + result(timeout) 而非 executor.map：单条超时只影响该条（记 timeout），
+        # 不让卡住的取数拖垮整个请求线程；其余条目正常返回。
+        # 不用 with 上下文：其 __exit__ 会 shutdown(wait=True) 阻塞到卡住线程结束，反而抵消超时；
+        # 改为手动 shutdown(wait=False)——请求线程即时返回，游离线程由客户端 socket 超时自行收尾。
+        executor = ThreadPoolExecutor(max_workers=len(issue_ids))
+        try:
+            future_map = {
+                executor.submit(regenerate_issue_llm_title, iid, bk_biz_id, operator=operator): iid for iid in issue_ids
+            }
+            results = []
+            for future, iid in future_map.items():
+                try:
+                    results.append(future.result(timeout=self.PER_ISSUE_TIMEOUT))
+                except FuturesTimeoutError:
+                    logger.warning("[issue][llm_title] regenerate timeout, issue(%s)", iid)
+                    results.append(_fallback(iid, "timeout"))
+                except Exception as e:  # 单条异常隔离，不影响其他条目
+                    logger.warning("[issue][llm_title] regenerate failed, issue(%s): %s", iid, e)
+                    results.append(_fallback(iid, "llm_error"))
+        finally:
+            executor.shutdown(wait=False)
+
+        return {"bk_biz_id": bk_biz_id, "results": results}
+
+
 class IssueViewSet(ResourceViewSet):
     """
     Issue 接口
@@ -285,4 +774,10 @@ class IssueViewSet(ResourceViewSet):
         ResourceRoute("POST", AddFollowUpResource(), endpoint="add_follow_up"),
         # 编辑 Issue 跟进评论
         ResourceRoute("POST", EditFollowUpResource(), endpoint="edit_follow_up"),
+        # 合并 Issue（独立映射层）
+        ResourceRoute("POST", MergeResource(), endpoint="merge"),
+        # 拆分 Issue
+        ResourceRoute("POST", SplitResource(), endpoint="split"),
+        # 批量重跑 Issue LLM 标题（运维显式补偿，≤5，同步）
+        ResourceRoute("POST", RegenerateTitleResource(), endpoint="regenerate_title"),
     ]

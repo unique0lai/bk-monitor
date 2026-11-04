@@ -156,8 +156,9 @@ class QueryCustomEventGroup(Resource):
             # 2）只查全平台, 不关注业务
             queryset = queryset.filter(is_platform=True)
         elif params.get("bk_biz_id"):
-            # 3）非全平台，查当前业务(0表示全部业务)
             queryset = queryset.filter(bk_biz_id=params["bk_biz_id"])
+        else:
+            raise ValidationError(_("业务 ID 不能为空"))
 
         if params.get("search_key"):
             search_key = params["search_key"]
@@ -253,7 +254,7 @@ class GetCustomEventGroup(Resource):
 
         label_display_dict = get_label_display_dict()
         data["scenario_display"] = label_display_dict.get(data["scenario"], [data["scenario"]])
-        data["access_token"] = self.get_token(data["bk_data_id"])
+        data["access_token"] = self.get_token(event_info_list, data["bk_data_id"])
 
         event_info_num: int = len(data["event_info_list"])
         if event_info_num:
@@ -265,7 +266,10 @@ class GetCustomEventGroup(Resource):
         return data
 
     @staticmethod
-    def get_token(bk_data_id):
+    def get_token(event_group_info: dict[str, Any], bk_data_id: int):
+        if event_group_info.get("token"):
+            return event_group_info["token"]
+
         data_id_info = api.metadata.get_data_id({"bk_data_id": bk_data_id, "with_rt_info": False})
         return data_id_info["token"]
 

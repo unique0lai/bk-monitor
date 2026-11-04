@@ -35,6 +35,10 @@ ADVANCED_OPTIONS = OrderedDict(
         ("QOS_DROP_ACTION_WINDOW", slz.IntegerField(label="处理动作流控窗口大小(秒)", default=60)),
         ("QOS_ALERT_THRESHOLD", slz.IntegerField(label="告警生成流控丢弃阈值", default=100)),
         ("QOS_ALERT_WINDOW", slz.IntegerField(label="告警生成流控窗口大小(秒)", default=60)),
+        (
+            "ALERT_NOTICE_WAY_BY_RECORDS",
+            slz.BooleanField(label="告警列表通知类型按通知记录统计", default=False),
+        ),
         ("SAAS_APP_CODE", slz.CharField(label="SAAS 应用码", default=settings.APP_CODE)),
         ("SAAS_SECRET_KEY", slz.CharField(label="SAAS 应用密钥", default=settings.SECRET_KEY)),
         (
@@ -46,6 +50,19 @@ ADVANCED_OPTIONS = OrderedDict(
         ("COMPATIBLE_ALARM_FORMAT", slz.BooleanField(label="是否兼容老版本数据字段格式", default=False)),
         ("ENABLE_RESOURCE_DATA_COLLECT", slz.BooleanField(label="是否开启Resource数据收集", default=False)),
         ("RESOURCE_DATA_COLLECT_RATIO", slz.IntegerField(label="Resource数据采样率", default=0)),
+        (
+            "ENABLE_REDIS_STRATEGY_COST_SNAPSHOT",
+            slz.BooleanField(label="是否开启Redis策略成本周期快照", default=False),
+        ),
+        (
+            "REDIS_STRATEGY_COST_SNAPSHOT_TOTAL_BUDGET_SECONDS",
+            slz.IntegerField(
+                label="Redis策略成本快照命令间软预算(秒)",
+                default=20,
+                min_value=5,
+                max_value=30,
+            ),
+        ),
         ("DIMENSION_COLLECT_THRESHOLD", slz.IntegerField(label="同维度汇总阈值", default=2)),
         ("DIMENSION_COLLECT_WINDOW", slz.IntegerField(label="同维度汇总时间窗口", default=120)),
         ("MULTI_STRATEGY_COLLECT_THRESHOLD", slz.IntegerField(label="多策略汇总阈值", default=3)),
@@ -61,7 +78,23 @@ ADVANCED_OPTIONS = OrderedDict(
         # === BKDATA & AIOPS 相关配置 开始 ===
         ("AIOPS_BIZ_WHITE_LIST", slz.ListField(label="开启智能异常算法的业务白名单", default=[])),
         ("AIOPS_INCIDENT_BIZ_WHITE_LIST", slz.ListField(label="开启根因故障定位的业务白名单", default=[])),
-        ("BK_INCIDENT_BUILTIN_CONFIG", slz.DictField(label="故障分析内置通知配置", default={})),
+        # Issue AI 分析：白名单为空 = 功能关闭，-1 表示全量
+        ("ISSUE_AI_ANALYSIS_BIZ_WHITE_LIST", slz.ListField(label=_("Issue AI 分析业务白名单"), default=[])),
+        # Issue LLM 标题生成：白名单为空 = 功能关闭（注意与 AIOPS 白名单"空=全开"语义不同），-1 表示全量
+        ("ISSUE_LLM_TITLE_BIZ_WHITE_LIST", slz.ListField(label="Issue LLM 标题生成业务白名单", default=[])),
+        # 业务级 prompt 模板：{bk_biz_id: 模板文本}（一业务一模板字符串，自适应模板已覆盖日志行/事件两形态）。
+        # 模板须含 {log} 占位符。配置走 django shell 辅助函数（自带校验+安全合并，别直接改这个共用 dict
+        # 否则会抹掉其他业务模板）：alarm_backends.service.fta_action.llm_title.set_biz_template(biz_id, 模板)；
+        # 范例常量 EXAMPLE_BIZ_TEMPLATE，配置前可用 preview_biz_template(biz_id) 预览实际 prompt。
+        # 非字符串值（如误配成 dict）会被运行时校验拒绝并 fallback 内置模板，不影响任务。
+        ("ISSUE_LLM_TITLE_BIZ_TEMPLATES", slz.DictField(label="Issue LLM 标题业务级模板", default={})),
+        # shadow 模式：只生成+打日志+打点，不写 Issue name。默认关闭（开白名单即直接改名）；
+        # 需先抽检质量的环境可手工开启 True 观察一段时间再关。
+        ("ISSUE_LLM_TITLE_SHADOW", slz.BooleanField(label="Issue LLM 标题 shadow 模式", default=False)),
+        # 默认 hy3-preview：经 trpc/C++/etcd 真实日志样本实测（6/6 零幻觉）；改模型走 GlobalConfig 覆盖
+        ("ISSUE_LLM_TITLE_MODEL", slz.CharField(label="Issue LLM 标题生成模型", default="hy3-preview")),
+        # 业务级限流阈值（次/分钟），<=0 表示不限流
+        ("ISSUE_LLM_TITLE_RATE_LIMIT_PER_MINUTE", slz.IntegerField(label="Issue LLM 标题生成限流", default=100)),
         ("BK_DATA_PROJECT_ID", slz.IntegerField(label="监控在计算平台使用的公共项目ID", default=1)),
         ("BK_DATA_BK_BIZ_ID", slz.IntegerField(label="监控在计算平台使用的公共业务ID", default=2)),
         (
@@ -154,12 +187,22 @@ ADVANCED_OPTIONS = OrderedDict(
         ("GLOBAL_SHIELD_ENABLED", slz.BooleanField(label="是否开启全局告警屏蔽", default=False)),
         ("BIZ_WHITE_LIST_FOR_3RD_EVENT", slz.ListField(label="第三方事件接入业务白名单", default=[])),
         ("TIME_SERIES_METRIC_EXPIRED_SECONDS", slz.IntegerField(label="自定义指标过期时间", default=30 * 24 * 3600)),
-        (
-            "ENABLE_TS_METRIC_FILTER_BY_IS_ACTIVE",
-            slz.BooleanField(label="是否根据is_active过滤自定义指标", default=False),
-        ),
         ("AIDEV_AGENT_LLM_DEFAULT_TEMPERATURE", slz.IntegerField(label="LLM默认温度参数", default=0.3)),
+        # Keep defaults aligned with config/default.py; empty means legacy-only permissions.
+        # Do not add serializer instances to field kwargs: options are persisted as JSON.
+        (
+            "MCP_NATIVE_PERMISSION_TOOLS",
+            slz.ListField(label="启用MCP权限优先、SaaS权限兜底的工具列表（空列表只查MCP权限）", default=[]),
+        ),
+        (
+            "MCP_LOG_IAM_PROFILE",
+            slz.DictField(label="MCP原生日志IAM配置（mode=v3-current及gateway_url）", default={}),
+        ),
         ("MCP_MAX_TIME_SPAN_SECONDS", slz.IntegerField(label="MCP查询跨度限制", default=86400)),
+        (
+            "MCP_MAX_RESPONSE_BYTES",
+            slz.IntegerField(label="MCP最大JSON响应体大小（字节）", default=5 * 1024 * 1024, min_value=1),
+        ),
         (
             "APM_PROFILING_MCP_MAX_TIME_SPAN_SECONDS",
             slz.IntegerField(label="APM Profiling MCP 查询跨度限制(秒)", default=30 * 60),
@@ -188,6 +231,10 @@ ADVANCED_OPTIONS = OrderedDict(
         ("APM_APP_BKDATA_OPERATOR", slz.CharField(label="APM应用操作数据平台所用到的用户名", default="admin")),
         ("APM_APP_BKDATA_MAINTAINER", slz.ListField(label="APM应用操作数据平台时数据源的默认维护人", default=[])),
         ("APM_APPLICATION_QUICK_REFRESH_INTERVAL", slz.IntegerField(label=_("新建应用的刷新频率"), default=2)),
+        (
+            "APM_RELATED_LOG_INDEX_STATUS_CACHE_TTL",
+            slz.IntegerField(label=_("APM 关联日志索引状态快照有效期（秒）"), default=15 * 60, min_value=1),
+        ),
         (
             "APM_APPLICATION_QUICK_REFRESH_DELTA",
             slz.IntegerField(label=_("新建应用的创建时间到当前时间的时长范围"), default=30),
@@ -307,6 +354,12 @@ ADVANCED_OPTIONS = OrderedDict(
         ("ACCESS_LATENCY_INTERVAL_FACTOR", slz.IntegerField(label="access数据源延迟上报周期因子", default=1)),
         ("ACCESS_LATENCY_THRESHOLD_CONSTANT", slz.IntegerField(label="access数据源延迟上报常量阈值", default=180)),
         ("ACCESS_DETECT_MERGE_STRATEGY_IDS", slz.ListField(label="access合并detect策略列表", default=[])),
+        ("ENABLE_DETECT_INLINE_TRIGGER", slz.BooleanField(label="Detect完成后是否同步执行Trigger", default=True)),
+        ("ENABLE_EVENT_INLINE_TRIGGER", slz.BooleanField(label="Event完成后是否同步执行Trigger", default=True)),
+        (
+            "EVENT_INLINE_TRIGGER_MAX_CONCURRENCY_PER_ITEM",
+            slz.IntegerField(label="单Event策略项内联Trigger最大并发", default=1, min_value=1),
+        ),
         ("KAFKA_AUTO_COMMIT", slz.BooleanField(label="kafka是否自动提交", default=True)),
         ("MAX_BUILD_EVENT_NUMBER", slz.IntegerField(label="单次告警生成任务处理的event数量", default=0)),
         ("HOST_DYNAMIC_FIELDS", slz.ListField(label="主机动态属性", default=[])),
@@ -415,6 +468,10 @@ ADVANCED_OPTIONS = OrderedDict(
         ("BKBASE_REDIS_LOCK_NAME", slz.CharField(label="计算平台Redis锁名称", default="watch_bkbase_meta_redis_lock")),
         ("ENABLE_SYNC_BKBASE_METADATA_TO_DB", slz.BooleanField(label="是否同步bkbase元数据至DB", default=False)),
         (
+            "GRAPH_RELATION_V4_BIZ_ID_WHITE_LIST",
+            slz.ListField(label="Graph Relation V4 双写与 v1beta3 查询灰度业务白名单", default=[]),
+        ),
+        (
             "ACCESS_DATA_BATCH_PROCESS_THRESHOLD",
             slz.IntegerField(label="access数据批量处理触发阈值(0为不触发)", default=0),
         ),
@@ -451,6 +508,14 @@ ADVANCED_OPTIONS = OrderedDict(
             "BK_DATA_RECORD_RULE_PROJECT_ID",
             slz.IntegerField(label="监控使用计算平台的预计算流程的公共项目ID", default=1),
         ),
+        (
+            "RECORD_RULE_V4_CONFIG",
+            slz.JSONField(
+                label="RecordingRule V4 配置",
+                default={"max_sources": 20, "max_rules": 20},
+                help_text="max_sources 为单 Flow 去重后的 source 上限，max_rules 为 group 中 rule 条数上限，均为正整数，默认 20。",
+            ),
+        ),
         ("METADATA_REQUEST_ES_TIMEOUT", slz.JSONField(label="metadata请求ES超时时间", default={"default": 10})),
         ("SKIP_INFLUXDB_TABLE_ID_LIST", slz.BooleanField(label="跳过写入influxdb的结果表列表", default=[])),
         ("ENABLE_UPTIMECHECK_TEST", slz.BooleanField(label="是否开启拨测联通性测试", default=True)),
@@ -462,15 +527,74 @@ ADVANCED_OPTIONS = OrderedDict(
         ("ES_INDEX_ROTATION_STEP", slz.IntegerField(label="ES索引轮转并发个数", default=50)),
         ("ES_STORAGE_OFFSET_HOURS", slz.IntegerField(label="ES采集项整体时间偏移量", default=8)),
         ("METADATA_REQUEST_ES_TIMEOUT_SECONDS", slz.IntegerField(label="Metadata轮转任务请求ES超时时间", default=10)),
-        ("BCS_DISCOVER_BCS_CLUSTER_INTERVAL", slz.IntegerField(label="BCS集群自动发现任务周期", default=5)),
         ("HOME_PAGE_ALARM_GRAPH_BIZ_LIMIT", slz.IntegerField(label="首页告警图业务数量限制", default=5)),
         ("HOME_PAGE_ALARM_GRAPH_LIMIT", slz.IntegerField(label="首页告警图图表数量限制", default=10)),
         ("INITIALIZED_TENANT_LIST", slz.ListField(label="已经初始化的租户列表", default=["system"])),
         # RUM 配置
         ("RUM_ENABLED", slz.BooleanField(label="RUM总开关", default=False)),
         ("RUM_ACCESS_URL", slz.CharField(label="RUM接收端URL", default="", allow_blank=True)),
+        ("RUM_KAFKA_CLUSTER_ID", slz.IntegerField(label="RUM默认Kafka集群ID", default=None, allow_null=True)),
+        ("RUM_ELASTICSEARCH_CLUSTER_ID", slz.IntegerField(label="RUM默认ES集群ID", default=None, allow_null=True)),
+        ("RUM_APP_DEFAULT_ES_STORAGE_CLUSTER", slz.IntegerField(label="RUM应用默认集群ID", default=-1)),
+        ("RUM_APP_DEFAULT_ES_RETENTION", slz.IntegerField(label="RUM应用默认过期时间", default=7)),
+        ("RUM_APP_DEFAULT_ES_SLICE_LIMIT", slz.IntegerField(label="RUM应用ES索引集默认切分大小", default=100)),
+        ("RUM_APP_DEFAULT_ES_REPLICAS", slz.IntegerField(label="RUM应用默认副本数", default=0)),
+        ("RUM_APP_DEFAULT_ES_SHARDS", slz.IntegerField(label="RUM应用默认索引分片数", default=3)),
         ("COLLECTING_UPGRADE_WITH_UPDATE_BIZ", slz.ListField(label="采集升级使用订阅更新模式的业务列表", default=[0])),
         ("EXCLUDE_WORKER_TASKS", slz.ListField(label="排除特定的worker任务(需要重启alarm-beat生效)", default=[])),
+        (
+            "NEW_ENV_BIZ_BLACK_LIST",
+            slz.ListField(label="新环境业务黑名单业务ID列表", default=[]),
+        ),
+        (
+            "NEW_ENV_BIZ_WHITE_LIST",
+            slz.ListField(label="新环境业务白名单业务ID列表", default=[]),
+        ),
+        (
+            "NEW_ENV_CLUSTER_BLACK_LIST",
+            slz.ListField(label="新环境集群黑名单业务ID列表", default=[]),
+        ),
+        (
+            "NEW_ENV_CLUSTER_WHITE_LIST",
+            slz.ListField(label="新环境集群白名单业务ID列表", default=[]),
+        ),
+        (
+            "ALARM_CACHE_REFRESH_BIZ_CONCURRENT",
+            slz.IntegerField(label="告警缓存刷新任务的业务并发度", default=3),
+        ),
+        # === 运营数据(operation) MCP 环境相关配置 ===
+        ("OPERATION_MCP_ENV", slz.CharField(label="运营MCP当前环境标识(bkte/bkop/sg)", default="")),
+        (
+            "OPERATION_MCP_FRONTEND_EVENT_TABLE",
+            slz.CharField(label="运营MCP前端埋点事件bkdata结果表", default=""),
+        ),
+        (
+            "OPERATION_MCP_FRONTEND_EVENT_TARGET",
+            slz.CharField(label="运营MCP前端埋点事件target取值", default=""),
+        ),
+        (
+            "OPERATION_MCP_LOG_QUERY_API_PROMQL",
+            slz.CharField(label="运营MCP日志查询量(API)PromQL", default=""),
+        ),
+        (
+            "OPERATION_MCP_DORIS_STORAGE_PROMQL",
+            slz.JSONField(label="运营MCP doris存储量PromQL(按环境, 形如{bkte:.., sg:..})", default={}),
+        ),
+        (
+            "OPERATION_MCP_PLATFORM_BIZ_ID",
+            slz.IntegerField(label="运营MCP平台统计指标所在业务ID", default=0),
+        ),
+        (
+            "OPERATION_MCP_STAT_BIZ_IDS",
+            slz.JSONField(label="运营MCP按指标族的统计业务ID(形如{default:id,logbeat:id})", default={}),
+        ),
+        # ------------------------------------------------------------------
+        # Runtime read mode only. It must not control provider loading or dual writes.
+        # Explicit BKAPP_IAM_PERMISSION_MODE overrides this configuration-center value.
+        (
+            "BK_IAM_PERMISSION_MODE",
+            slz.ChoiceField(label="IAM鉴权模式", choices=["v3", "v4", "union"], default="v3"),
+        ),
     ]
 )
 
@@ -532,8 +656,13 @@ STANDARD_CONFIGS = OrderedDict(
         ("CUSTOM_REPORT_DEFAULT_PROXY_DOMAIN", slz.ListField(label=_("自定义上报默认服务器(域名显示)"), default=[])),
         ("CUSTOM_REPORT_DEFAULT_DEPLOY_CLUSTER", slz.ListField(label=_("自定义上报默认部署K8S集群"), default=[])),
         (
-            "CUSTOM_REPORT_DEFAULT_K8S_CLUSTER_SERVICE",
-            slz.CharField(label=_("集群内服务域名"), default="bkm-collector.bkmonitor-operator"),
+            "CUSTOM_REPORT_ENDPOINTS",
+            slz.JSONField(
+                label=_("集群内上报服务配置"),
+                default=[
+                    {"endpoint": "bkm-collector.bkmonitor-operator", "alias": "集群内服务"},
+                ],
+            ),
         ),
         (
             "CUSTOM_REPORT_K8S_SECRETS_CONFIG",
@@ -590,12 +719,12 @@ STANDARD_CONFIGS = OrderedDict(
         ("APM_DORIS_STORAGE_CONFIG", slz.DictField(label=_("APM Doris 存储配置"), default={})),
         ("APM_PROFILE_V4_BIZ_WHITE_LIST", slz.ListField(label=_("APM Profile V4 链路业务白名单"), default=[])),
         (
-            "APM_PROFILE_V4_DORIS_BINDING_CLUSTER",
-            slz.CharField(label=_("APM Profile V4 DorisBinding 存储集群名称"), default="", allow_blank=True),
+            "APM_PROFILING_DEFAULT_USE_BKDATA_V4",
+            slz.BooleanField(label=_("APM Profiling 默认使用 BKData V4 链路"), default=False),
         ),
         (
-            "APM_PROFILE_V4_DATABUS_PREFER_CLUSTER",
-            slz.CharField(label=_("APM Profile V4 Databus 计算集群名称"), default="", allow_blank=True),
+            "APM_PROFILE_V4_DORIS_BINDING_CLUSTER",
+            slz.CharField(label=_("APM Profile V4 DorisBinding 存储集群名称"), default="", allow_blank=True),
         ),
         ("APM_PROFILING_ENABLED_APPS", slz.DictField(label=_("APM Profiling 开启应用白名单"), default={})),
         ("APM_PROFILING_ENABLED", slz.BooleanField(label=_("APM Profiling 开启功能"), default=False)),
@@ -608,11 +737,23 @@ STANDARD_CONFIGS = OrderedDict(
             slz.DictField(label=_("APM metrics维度补充功能应用白名单"), default={}),
         ),
         (
+            "APM_RESOURCE_FILTER_LOGS_ENABLED_APPS",
+            slz.DictField(label=_("APM logs维度补充功能应用白名单"), default={}),
+        ),
+        (
+            "APM_CROSS_APP_TRACE_SEARCH_SCOPE_WHITE_LIST",
+            slz.ListField(label=_("APM 跨应用 Trace 检索数据源域白名单"), default=[]),
+        ),
+        (
             "APM_BMW_DEPLOY_BIZ_ID",
             slz.IntegerField(label=_("APM BMW 模块部署集群所属的业务 ID(用来查询指标)"), default=0),
         ),
         ("APM_CREATE_VIRTUAL_METRIC_ENABLED_BK_BIZ_ID", slz.ListField(label=_("APM 创建虚拟指标业务列表"), default=[])),
         ("APM_BMW_TASK_QUEUES", slz.ListField(label=_("APM BMW 任务能够使用的队列名称"), default=["apm-01"])),
+        (
+            "APM_BMW_TASK_CRON_DRY_RUN",
+            slz.BooleanField(label=_("APM BMW 预计算任务定时分派空跑(跳过分派，不下发/删除任务)"), default=False),
+        ),
         ("PER_ROUND_SPAN_MAX_SIZE", slz.IntegerField(label=_("拓扑发现允许的最大 Span 数量"), default=1000)),
         ("WXWORK_BOT_NAME", slz.CharField(label=_("蓝鲸监控机器人名称"), default="BK-Monitor", allow_blank=True)),
         ("WXWORK_BOT_SEND_IMAGE", slz.BooleanField(label=_("蓝鲸监控机器人发送图片"), default=True)),
@@ -675,6 +816,14 @@ STANDARD_CONFIGS = OrderedDict(
         ("FTA_ES_RETENTION", slz.IntegerField(label=_("自愈ES数据保留时间"), default=365)),
         ("DOUBLE_CHECK_SUM_STRATEGY_IDS", slz.ListField(label=_("适用 SUM 聚合方法二次确认的策略ID列表"), default=[])),
         ("SMS_CONTENT_LENGTH", slz.IntegerField(label=_("发送短信内容最大长度（0表示不限制）"), default=0)),
+        (
+            "SMS_NOTICE_TEMPLATE_MODE",
+            slz.ChoiceField(
+                label=_("短信文案模式"),
+                choices=[("legacy", _("原文案")), ("standard", _("标准文案"))],
+                default=settings.SMS_NOTICE_TEMPLATE_MODE,
+            ),
+        ),
         ("IS_ACCESS_BK_DATA", slz.BooleanField(label=_("是否开启与计算平台的功能对接"), default=False)),
         (
             "IS_MIGRATE_AIOPS_STRATEGY",
@@ -703,8 +852,6 @@ STANDARD_CONFIGS = OrderedDict(
         ("APM_UNIFY_QUERY_BLACK_BIZ_LIST", slz.ListField(label=_("APM UnifyQuery 查询业务黑名单"), default=[])),
         # 事件 UnifyQuery 查询业务黑名单，在此列表内的业务，检索能力不切换到 UnifyQuery。
         ("EVENT_UNIFY_QUERY_BLACK_BIZ_LIST", slz.ListField(label=_("事件 UnifyQuery 查询业务黑名单"), default=[])),
-        # 日志 UnifyQuery 查询业务白名单，在此列表内的业务，检索能力切换到 UnifyQuery。
-        ("LOG_UNIFY_QUERY_WHITE_BIZ_LIST", slz.ListField(label=_("日志 UnifyQuery 查询业务白名单"), default=[])),
         # APM 调用分析启用全局指标的应用列表，在此列表内的应用，调用分析将使用带 data_label（APM）的全局指标进行出图。
         # 背景：APM 策略模板基于「查询模板」能力进行开发，查询模板定义指标查询、计算方式来固化部分通用计算场景，
         # 为避免模板管理复杂度及保障导入导出、仪表盘配置、asCode 等的易用性，使用 data_label 屏蔽原有指标表名带「应用名」所带来的差异性。
@@ -724,16 +871,35 @@ STANDARD_CONFIGS = OrderedDict(
         ("APM_SERVICE_CACHE_APPLICATIONS", slz.ListField(label=_("APM 按服务缓存指标的灰度应用列表"), default=[])),
         # 企业微信模块化（layouts）消息通知灰度业务列表
         ("WECOM_LAYOUTS_BIZ_LIST", slz.ListField(label=_("企业微信模块化消息通知灰度业务列表"), default=[])),
+        # 是否默认开启 APM 指标维度分组接入
+        (
+            "APM_METRIC_GROUP_DIMENSIONS_ENABLED",
+            slz.BooleanField(label=_("是否默认开启 APM 指标维度分组接入"), default=False),
+        ),
         # metric_group_dimensions 分组配置白名单，格式：["业务ID-应用名1", "业务ID-应用名2"]
         (
             "APM_METRIC_GROUP_DIMENSIONS_WHITELIST",
-            slz.ListField(label=_("允许 APM 配置指标分组维度的应用白名单"), default=[]),
+            slz.ListField(
+                label=_("允许 APM 配置指标分组维度的白名单，支持业务ID(整业务)或'业务ID-应用名'(单应用)格式"),
+                default=[],
+            ),
         ),
-        # APM 自定义指标 V2 开启的应用白名单，格式：["业务ID-应用名1", "业务ID-应用名2"]
+        # APM 自定义指标 V2 开启的白名单，格式：["2"](整业务) 或 ["2-app_name"](单应用)
         (
             "APM_CUSTOM_METRIC_V2_ENABLED_LIST",
-            slz.ListField(label=_("APM 自定义指标 V2 开启的应用白名单"), default=[]),
+            slz.ListField(
+                label=_("APM 自定义指标 V2 开启的白名单，支持业务ID(整业务)或'业务ID-应用名'(单应用)格式"), default=[]
+            ),
         ),
+        # RUM
+        ("RUM_ACCESS_URL", slz.CharField(label=_("RUM接入链接"), default="", allow_blank=True)),
+        ("RUM_FUNC_INTRODUCTION_URL", slz.CharField(label=_("RUM产品白皮书"), default="", allow_blank=True)),
+        # RUM新版灰度配置
+        ("RUM_BIZ_LIST", slz.ListField(label=_("RUM 新版灰度配置"), default=[])),
+        # Profiling 主动采集灰度配置
+        ("ACTIVE_PROFILING_BIZ_LIST", slz.ListField(label=_("Profiling 主动采集灰度配置"), default=[])),
+        # LLM 观测灰度业务列表
+        ("LLM_BIZ_LIST", slz.ListField(label=_("LLM 观测灰度业务列表"), default=[])),
     ]
 )
 

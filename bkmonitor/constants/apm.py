@@ -23,9 +23,27 @@ FIVE_MIN_SECONDS = 5 * 60
 
 DEFAULT_DATA_LABEL = "APM"  # 数据标签，用来查询数据时三段式前缀(注意：不能随意更改)
 
+# 内置资源只建后台数据源，不写 apm_web 应用表与 monitor_web 自定义事件表，对用户不可见
+BUILTIN_PROFILING_APP_NAME = "active_profiling_builtin_allocation_source"
+BUILTIN_EVENT_GROUP_NAME = "active_profiling_builtin_events"
+BUILTIN_EVENT_GROUP_LABEL = "application_check"
+
 APM_METRIC_TABLE_REGEX = re.compile(r"(?:.*_)?bkapm_(?:.*)?metric_.*")
 
 APM_TRACE_TABLE_REGEX = re.compile(r"(?:.*_)?bkapm_(?:.*)?trace_.*")
+
+
+def normalize_app_name(app_name: str) -> str:
+    """
+    统一转义 app_name 中的非法字符（`.`、`-`）为 `_`，并统一小写化，
+    用于拼接 table_id / data_name / event_group_name / ES 索引名等下游资源名。
+    小写化用于允许 app_name 大小写混用，但下游存储命名保持规范。
+
+    单一归一化真源（Single Source of Truth）：APM 所有涉及下游资源命名的场景，
+    请统一 `from constants.apm import normalize_app_name` 后调用本函数，
+    严禁复制内联实现，避免规则漂移。
+    """
+    return app_name.strip().replace("-", "_").replace(".", "_").lower()
 
 
 class CachedEnum(Enum):
@@ -72,6 +90,14 @@ def get_label_from_enums(value: Any, enums: list[type[CachedEnum]]) -> str:
             # label 不等于 value 时，认为已找到别名，直接返回。
             return label
     return value
+
+
+class ApmGlobalTablePrefix:
+    COMMON = "apm_global."
+    # 共享数据源场景
+    SHARED = f"{COMMON}shared"
+    # 预计算场景
+    PRECALCULATE = f"{COMMON}precalculate_storage"
 
 
 class TraceDataSourceConfig:
@@ -921,6 +947,14 @@ class TrpcAttributes:
     TRPC_CALLEE_METHOD = "trpc.callee_method"
     TRPC_STATUS_TYPE = "trpc.status_type"
     TRPC_STATUS_CODE = "trpc.status_code"
+    TRPC_STATUS_MSG = "trpc.status_msg"
+
+
+class RpcAttributes:
+    """for rpc"""
+
+    RPC_ERROR_CODE = "rpc.error_code"
+    RPC_ERROR_MESSAGE = "rpc.error_message"
 
 
 class CommonMetricTag(CachedEnum):
@@ -1874,7 +1908,7 @@ class ApmAlertHelper:
         filters: list[dict[str, Any]] | None = cls.build_trace_filters(strategy, target, dimensions)
         params: dict[str, Any] = cls.build_trace_query_params(target, filters or [], timestamp, duration)
         encoded_params: str = urllib.parse.urlencode(params)
-        return urllib.parse.urljoin(settings.BK_MONITOR_HOST, f"/?bizId={bk_biz_id}/#/trace/home/?{encoded_params}")
+        return urllib.parse.urljoin(settings.BK_MONITOR_HOST, f"?bizId={bk_biz_id}#/trace/home/?{encoded_params}")
 
 
 class OtlpProtocol:
@@ -1991,6 +2025,14 @@ class Vendor:
         return any(cls.equal(expect_sdk, i.get("name")) for i in service_sdk)
 
 
+class LLMProduct(TextChoices):
+    DEFAULT = "default"
+    AGENTLENS = "agentlens"
+    AIDEV = "aidev"
+    GALILEO = "galileo"
+    LANGFUSE = "langfuse"
+
+
 class SpanKindCachedEnum(CachedEnum):
     SPAN_KIND_UNSPECIFIED = 0
     SPAN_KIND_INTERNAL = 1
@@ -2001,7 +2043,8 @@ class SpanKindCachedEnum(CachedEnum):
 
     @cached_property
     def label(self):
-        return str({label["value"]: label["text"] for label in self.list()}.get(self, self.value))
+        # list() 以 value 为键，此处同样按 value 取，否则查不到只能回落成数字
+        return str({label["value"]: label["text"] for label in self.list()}.get(self.value, self.value))
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -2038,7 +2081,14 @@ class SpanKindCachedEnum(CachedEnum):
 
 
 TRACE_RESULT_TABLE_OPTION = {
-    "es_unique_field_list": ["trace_id", "span_id", "parent_span_id", "start_time", "end_time", "span_name"],
+    "es_unique_field_list": [
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "start_time",
+        "end_time",
+        "span_name",
+    ],
     # 以下为 UnifyQuery 查询所需的元数据：
     # 是否根据查询时间范围，指定具体日期的索引进行查询。
     "need_add_time": True,

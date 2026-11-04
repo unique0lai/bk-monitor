@@ -26,6 +26,24 @@
 
 // 表单内容相关的词条
 export default {
+  屏蔽期间产生的告警: 'Alerts generated during shielding',
+  屏蔽期内告警通知: 'Alert notifications during shielding',
+  屏蔽结束后发送一次通知: 'Send one notification after shielding ends',
+  屏蔽结束时不再通知: 'Do not notify when shielding ends',
+  '屏蔽结束时关闭告警，不再通知': 'Close alerts when shielding ends without notifications',
+  '屏蔽期间产生的告警不通知、不执行处理套餐；屏蔽结束时关闭，不补发通知、不补执行处理。屏蔽开始前的告警不受影响。':
+    'Alerts generated during shielding send no notifications and run no actions. They close when shielding ends, without deferred notifications or actions. Earlier alerts are unaffected.',
+  '屏蔽结束时，仍未恢复的告警将各发送一次通知，可能集中产生多条通知。':
+    'Each unrecovered alert sends one notification when shielding ends. Multiple notifications may arrive together.',
+  '屏蔽结束时，仍未恢复的告警将各发送一次通知。告警较多时，可能在短时间内集中产生多条通知。':
+    'Each unrecovered alert sends one notification when shielding ends. Many alerts may produce a burst of notifications.',
+  '屏蔽期间产生的告警，期间不发送通知、不执行处理套餐（作业、回调、自愈等），屏蔽结束时系统将这些告警关闭，不补发通知、不补执行处理，后续新触发的告警按原策略通知和处理。':
+    'Alerts generated during shielding send no notifications and run no actions (jobs, callbacks, self-healing, and so on). The system closes them when shielding ends, without deferred notifications or actions. Later alerts follow the original strategy.',
+  '结束处理方式创建后不可修改。如需使用另一种方式，请新建屏蔽规则。':
+    'The end policy cannot be changed after creation. Create a new shielding rule to use a different policy.',
+  '「屏蔽结束」包括按计划到期和提前解除，此选项不影响屏蔽开始前已存在的告警。':
+    '"Shielding ended" includes both scheduled expiry and early removal. This option does not affect alerts that already existed before shielding started.',
+  请选择屏蔽结束后的告警通知方式: 'Select how alerts are notified after shielding ends',
   // 规范：仅首字母大写
   // 规范：占位使用整条
 
@@ -72,6 +90,7 @@ export default {
   告警流控: 'Alarm flow control',
   事件忽略: 'Ignore related event',
   套餐: 'Package',
+  '大于 {0} 新增数据值': 'Greater than {0} new data values',
 
   // "[功能名称] (enable)"
   是否开启通知: 'Notify (enable)',
@@ -188,10 +207,13 @@ export default {
   日志分析: 'Log analysis',
   '日志分析总结：': 'Log analysis summary:',
   示例事件: 'Example event',
+  通用事件: 'General event',
   告警类别: 'Alarm category',
   事件类别: 'Event category',
   '（共 {0} 个{1}）': ' (total {0} {1})',
   '（共 {0} 个{1}，展示 {2} 如下）': ' (total {0} {1}, show {2} below)',
+  '（共 {0} 个{1}，示例如下）': ' (total {0} {1}, example below)',
+  '（共 {0} 个事件，示例如下）': ' (total {0} events, example below)',
   '示例日志：': 'Example log:',
   '（共 {0} 条日志）': ' (total {0} logs)',
   独立查看: 'View independently',
@@ -206,5 +228,21 @@ export default {
   '下降{0}%时触发告警': 'Trigger an alarm when falling {0}%',
   '{0}上升{1}%或下降{2}%': '{0} rises {1}% or falls {2}%',
   这个告警我有经验: 'I have experience with this alarm',
+  '次/秒': 'times/second',
   已归档: 'Archived',
+
+  // Issue 拆分合并
+  '误合并，根因不同': 'Merged incorrectly, root cause different',
+  影响范围不同: 'Affected scope different',
+  '责任 Owner 不同': 'Owner different',
+  修复方案不同: 'Fixing solution different',
+  后续复盘需要独立跟踪: 'Needs to be tracked independently for follow-up',
+  '异常类型 / 日志模块相近': 'Similarity of abnormal type / log module',
+  'message 高度相似': 'message highly similar',
+  堆栈顶帧一致: 'Stack top frame consistent',
+  服务或链路维度相关: 'Service or linkage dimension related',
+  时间窗口接近: 'Time window close to each other',
+  日志聚类一致: 'Log clustering consistent',
+  人工确认同根因: 'Manual confirmation same root cause',
+  命令执行时间: 'Command execution time',
 };

@@ -26,7 +26,7 @@ from django.core.cache import cache
 from django.utils.translation import gettext_lazy as _
 
 from apps.feature_toggle.handlers.toggle import FeatureToggleObject
-from apps.feature_toggle.plugins.constants import BKDATA_CLUSTERING_TOGGLE, MINI_CLUSTERING_CONFIG
+from apps.feature_toggle.plugins.constants import MINI_CLUSTERING_CONFIG
 from apps.log_clustering.constants import (
     CLUSTERING_CONFIG_DEFAULT,
     CLUSTERING_CONFIG_EXCLUDE,
@@ -45,6 +45,7 @@ from apps.log_clustering.exceptions import (
     DorisStorageNotExistException,
     RegexTemplateNotExistException,
 )
+from apps.log_clustering.handlers.aiops.config import get_online_clustering_config
 from apps.log_clustering.handlers.dataflow.constants import OnlineTaskTrainingArgs
 from apps.log_clustering.handlers.dataflow.dataflow_handler import DataFlowHandler
 from apps.log_clustering.handlers.pipline_service.constants import OperatorServiceEnum
@@ -135,12 +136,16 @@ class ClusteringConfigHandler:
 
         clustering_fields = params.get("clustering_fields", DEFAULT_CLUSTERING_FIELDS)
 
-        conf = FeatureToggleObject.toggle(BKDATA_CLUSTERING_TOGGLE).feature_config
-        default_conf = conf.get(CLUSTERING_CONFIG_DEFAULT)
         es_storage = ""
+        collector_config_name_en = ""
+
+        # 非业务类型的项目空间业务 id 为负数，需要通过 Space 的关系拿到其关联的真正的业务ID。然后以这个关联业务ID在计算平台操作, 没有则不允许创建聚类
+        related_space_pre_bk_biz_id = space_uid_to_bk_biz_id(log_index_set.space_uid)
+        bk_biz_id = self.validate_bk_biz_id(related_space_pre_bk_biz_id)
+        conf = get_online_clustering_config(bk_biz_id)
+        default_conf = conf.get(CLUSTERING_CONFIG_DEFAULT) or {}
         storage_type = conf.get("storage_type", StorageTypeEnum.ELASTICSEARCH.value)
         doris_storage = conf.get("doris_storage", "") if storage_type == StorageTypeEnum.DORIS.value else ""
-        collector_config_name_en = ""
 
         if collector_config_id:
             # 配置检查
@@ -165,10 +170,6 @@ class ClusteringConfigHandler:
                 etl_config=collector_config.etl_config,
                 clustering_fields=clustering_fields,
             )
-
-        # 非业务类型的项目空间业务 id 为负数，需要通过 Space 的关系拿到其关联的真正的业务ID。然后以这个关联业务ID在计算平台操作, 没有则不允许创建聚类
-        related_space_pre_bk_biz_id = space_uid_to_bk_biz_id(log_index_set.space_uid)
-        bk_biz_id = self.validate_bk_biz_id(related_space_pre_bk_biz_id)
 
         if storage_type == StorageTypeEnum.DORIS.value and not doris_storage:
             raise DorisStorageNotExistException(DorisStorageNotExistException.MESSAGE.format(index_set_id=index_set_id))
@@ -283,15 +284,20 @@ class ClusteringConfigHandler:
             # 当 regex_rule_type 为 customize 时，regex_template_id 设为0，predefined_varibles 按前端的传的保存
             params["regex_template_id"] = 0
         else:
-            # 当 regex_rule_type 为 template 时，predefined_varibles从模板获取
-            instance = RegexTemplate.objects.filter(id=regex_template_id).first()
-            if not instance:
-                raise RegexTemplateNotExistException(
-                    RegexTemplateNotExistException.MESSAGE.format(regex_template_id=regex_template_id)
-                )
+            # 模板必须属于目标索引集所在空间，避免只凭模板 ID 绑定并复制其他空间的规则
+            instance = self._get_space_scoped_regex_template(regex_template_id)
             params["predefined_varibles"] = instance.predefined_varibles
         pipeline_id = self.update(params)
         return [pipeline_id]
+
+    def _get_space_scoped_regex_template(self, regex_template_id):
+        log_index_set = LogIndexSet.objects.get(index_set_id=self.index_set_id)
+        instance = RegexTemplate.objects.filter(id=regex_template_id, space_uid=log_index_set.space_uid).first()
+        if not instance:
+            raise RegexTemplateNotExistException(
+                RegexTemplateNotExistException.MESSAGE.format(regex_template_id=regex_template_id)
+            )
+        return instance
 
     @staticmethod
     def _get_access_check_time_range():
@@ -437,6 +443,22 @@ class ClusteringConfigHandler:
             "message": _("dataflow({}) {}".format(flow_id, flow_status_mapping[flow_status]["message"])),
             "task_detail": task_detail,
         }
+
+    def sample_log(self):
+        """按索引集抽样采集原始日志，供聚类调试填充日志源。
+
+        采集项 ID 只从服务端聚类配置或索引集反查，不接受前端传入，避免越权抽样。
+        """
+        collector_config_id = getattr(self.data, "collector_config_id", None)
+        if not collector_config_id and self.index_set_id:
+            log_index_set = LogIndexSet.objects.filter(index_set_id=self.index_set_id).first()
+            collector_config_id = getattr(log_index_set, "collector_config_id", None) if log_index_set else None
+        if not collector_config_id:
+            raise ClusteringAccessNotSupportedException()
+
+        from apps.log_databus.handlers.collector import CollectorHandler
+
+        return CollectorHandler.get_instance(collector_config_id).tail()
 
     def debug(self, input_data, predefined_varibles, delimeter, max_log_length):
         """

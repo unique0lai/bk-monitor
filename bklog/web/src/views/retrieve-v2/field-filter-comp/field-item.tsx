@@ -34,8 +34,11 @@ import { axiosInstance } from '@/api';
 import { BK_LOG_STORAGE } from '../../../store/store.type';
 import AggChart from './agg-chart';
 import FieldAnalysis from './field-analysis';
+import objectFieldTreeMeta from './object-field-tree-meta';
 
 import './field-item.scss';
+
+const { resolveObjectFieldChildrenCount, shouldShowObjectFieldTreeMeta } = objectFieldTreeMeta;
 @Component
 export default class FieldItem extends tsc<object> {
   @Prop({ type: String, default: 'visible', validator: v => ['visible', 'hidden'].includes(v as string) }) type: string;
@@ -62,18 +65,23 @@ export default class FieldItem extends tsc<object> {
   fieldIconCache: Record<string, { icon: string; color: string; textColor: string }> = {};
 
   get queryParams() {
-    const indexSetIDs = this.isUnionSearch
-      ? this.unionIndexList
-      : [window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId];
-
-    return {
+    const isScene = this.$store.getters.isSceneMode;
+    const baseParams = {
       ...this.retrieveParams,
-      index_set_ids: indexSetIDs,
       field_type: this.fieldItem.field_type,
       agg_field: this.agg_field,
       statisticalFieldData: this.statisticalFieldData,
       isFrontStatisticsL: this.isFrontStatistics,
     };
+
+    if (!isScene) {
+      const indexSetIDs = this.isUnionSearch
+        ? this.unionIndexList
+        : [window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId];
+      baseParams.index_set_ids = indexSetIDs;
+    }
+
+    return baseParams;
   }
 
   get fieldTypeMap() {
@@ -89,7 +97,7 @@ export default class FieldItem extends tsc<object> {
     return this.$store.getters.unionIndexItemList;
   }
   get indexSetList() {
-    return this.$store.state.retrieve?.indexSetList ?? [];
+    return this.$store.state.retrieve?.flatIndexSetList ?? [];
   }
   get gatherFieldsCount() {
     if (this.isFrontStatistics) {
@@ -110,9 +118,9 @@ export default class FieldItem extends tsc<object> {
   get isShowFieldsAnalysis() {
     const validTypes = ['keyword', 'integer', 'long', 'double', 'bool', 'conflict'];
     return (
-      validTypes.includes(this.fieldItem.field_type)
-      && this.fieldItem.es_doc_values
-      && !/^__dist_/.test(this.fieldItem.field_name)
+      validTypes.includes(this.fieldItem.field_type) &&
+      this.fieldItem.es_doc_values &&
+      !/^__dist_/.test(this.fieldItem.field_name)
     );
   }
   /** 冲突字段索引集名称*/
@@ -122,14 +130,14 @@ export default class FieldItem extends tsc<object> {
       .map(item => item.indexName);
   }
 
+  /** 聚合 / 请求始终使用业务主键 field_name，禁止把 UI 别名写入请求参数 */
   get agg_field() {
-    const fieldName = this.fieldItem.field_name;
-    return this.retrieveParams.showFieldAlias ? (this.fieldAliasMap[fieldName] ?? fieldName) : fieldName;
+    return this.fieldItem.field_name;
   }
 
   get computedFieldName() {
     let name = this.$store.state.storage[BK_LOG_STORAGE.SHOW_FIELD_ALIAS]
-      ? this.fieldItem.query_alias || this.fieldItem.alias_name || this.fieldItem.field_name
+      ? this.fieldItem.query_alias || this.fieldItem.field_name
       : this.fieldItem.field_name;
 
     if (this.isFieldObject) {
@@ -137,6 +145,10 @@ export default class FieldItem extends tsc<object> {
       name = parts.at(-1) || parts[0];
     }
     return name;
+  }
+
+  get isFieldDisplayToggleSupported() {
+    return true;
   }
 
   beforeDestroy() {
@@ -241,30 +253,31 @@ export default class FieldItem extends tsc<object> {
     return this.isUnionSearch && fieldType === 'conflict';
   }
 
-  getFieldIconColor = (type) => {
+  getFieldIconColor = type => {
     return this.fieldTypeMap?.[type] ? this.fieldTypeMap?.[type]?.color : '#EAEBF0';
   };
 
-  getFieldIconTextColor = (type) => {
+  getFieldIconTextColor = type => {
     return this.fieldTypeMap?.[type]?.textColor;
   };
   /** 下载 */
   downloadFieldStatistics() {
     this.btnLoading = true;
+    const isScene = this.$store.getters.isSceneMode;
+    const downRequestUrl = isScene ? '/search/scene/field/fetch_value_list/' : '/field/index_set/fetch_value_list/';
     const indexSetIDs = this.isUnionSearch
       ? this.unionIndexList
       : [window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId];
-    const downRequestUrl = '/field/index_set/fetch_value_list/';
     const data = {
       ...this.retrieveParams,
-      index_set_ids: indexSetIDs,
+      ...(isScene ? {} : { index_set_ids: indexSetIDs }),
       field_type: this.fieldItem.field_type,
       agg_field: this.agg_field,
       limit: this.fieldData?.distinct_count,
     };
     axiosInstance
       .post(downRequestUrl, data)
-      .then((res) => {
+      .then(res => {
         if (typeof res !== 'string') {
           this.$bkMessage({
             theme: 'error',
@@ -290,7 +303,10 @@ export default class FieldItem extends tsc<object> {
       backgroundColor: this.fieldItem.is_full_text ? '' : fieldIconInfo.color,
       color: this.fieldItem.is_full_text ? '' : fieldIconInfo.textColor,
     };
-    const childrenCount = this.fieldItem.children?.length || 0;
+    const childrenCount = resolveObjectFieldChildrenCount(this.fieldItem);
+    const showObjectTreeMeta = shouldShowObjectFieldTreeMeta(this.isFieldObject, childrenCount);
+    const showAnalysisOperation = this.isShowFieldsAnalysis && !this.isFrontStatistics;
+    const showOperationText = showAnalysisOperation || this.isFieldDisplayToggleSupported;
 
     return (
       <li class='filed-item'>
@@ -316,7 +332,7 @@ export default class FieldItem extends tsc<object> {
             {/* 字段名 */}
             <span>
               <span class='field-name'>{this.computedFieldName}</span>
-              {childrenCount > 0 && (
+              {showObjectTreeMeta && (
                 <span>
                   <span class='field-badge'>{childrenCount}</span>
                   <span class={['bk-icon', 'expand', this.expandIconShow ? 'icon-angle-up' : 'icon-angle-down']} />
@@ -339,35 +355,39 @@ export default class FieldItem extends tsc<object> {
               )}
             </span>
           </div>
-          <div
-            ref='operationRef'
-            class={['operation-text', { 'analysis-active': this.analysisActive }]}
-          >
-            {this.isShowFieldsAnalysis && !this.isFrontStatistics && (
-              <div
-                class='operation-icon-box'
-                v-bk-tooltips={{ content: this.$t('图表分析') }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  this.handleClickAnalysisItem();
-                }}
-              >
-                <i class='bklog-icon bklog-chart-2' />
-              </div>
-            )}
+          {showOperationText && (
             <div
-              class='operation-icon-box'
-              v-bk-tooltips={{
-                content: this.type === 'visible' ? this.$t('隐藏') : this.$t('显示'),
-              }}
-              onClick={(e) => {
-                e.stopPropagation();
-                this.handleShowOrHiddenItem();
-              }}
+              ref='operationRef'
+              class={['operation-text', { 'analysis-active': this.analysisActive }]}
             >
-              <i class={['bk-icon include-icon', this.type === 'visible' ? 'icon-eye' : 'icon-eye-slash']} />
+              {showAnalysisOperation && (
+                <div
+                  class='operation-icon-box'
+                  v-bk-tooltips={{ content: this.$t('图表分析') }}
+                  onClick={e => {
+                    e.stopPropagation();
+                    this.handleClickAnalysisItem();
+                  }}
+                >
+                  <i class='bklog-icon bklog-chart-2' />
+                </div>
+              )}
+              {this.isFieldDisplayToggleSupported && (
+                <div
+                  class='operation-icon-box'
+                  v-bk-tooltips={{
+                    content: this.type === 'visible' ? this.$t('隐藏') : this.$t('显示'),
+                  }}
+                  onClick={e => {
+                    e.stopPropagation();
+                    this.handleShowOrHiddenItem();
+                  }}
+                >
+                  <i class={['bk-icon include-icon', this.type === 'visible' ? 'icon-eye' : 'icon-eye-slash']} />
+                </div>
+              )}
             </div>
-          </div>
+          )}
           <div style='display: none'>
             <div ref='fieldChart'>
               {this.analysisActive && (
@@ -395,9 +415,19 @@ export default class FieldItem extends tsc<object> {
             <template slot='header'>
               <div class='agg-sides-slider-header'>
                 <div class='distinct-num'>
-                  <span class='field-name'>{this.fieldItem?.field_name}</span>
+                  <span
+                    class='field-name'
+                    v-bk-overflow-tips
+                  >
+                    {this.fieldItem?.field_name}
+                  </span>
                   <div class='col-line' />
-                  <span class='distinct-count-label'>{this.$t('去重后字段统计')}</span>
+                  <span
+                    class='distinct-count-label'
+                    v-bk-overflow-tips
+                  >
+                    {this.$t('去重后字段统计')}
+                  </span>
                   <span class='distinct-count-num'>{`(${this.distinctCount})`}</span>
                 </div>
                 <div class='fnBtn'>
@@ -405,7 +435,7 @@ export default class FieldItem extends tsc<object> {
                     loading={this.btnLoading}
                     size='small'
                     text
-                    onClick={(e) => {
+                    onClick={e => {
                       e.stopPropagation();
                       this.downloadFieldStatistics();
                     }}

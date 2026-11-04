@@ -23,23 +23,22 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-window.__IS_MONITOR_COMPONENT__ = true;
-window.__IS_MONITOR_TRACE__ = false;
-window.__IS_MONITOR_APM__ = true;
+
 import Vue from 'vue';
 import LogIcon from '@/components/log-icon';
 
 import i18n from '@/language/i18n';
+import JsonFormatWrapper from '@/global/json-format-wrapper.vue';
+import useStore from '@/hooks/use-store';
+import { performanceMonitorService } from '@/storage';
+
+import MonitorApmLog from './monitor';
 if (!window.mainComponent?.$t) {
   window.mainComponent = {
     $t: i18n.t.bind(i18n),
     $i18n: i18n,
   };
 }
-import JsonFormatWrapper from '@/global/json-format-wrapper.vue';
-import useStore from '@/hooks/use-store';
-
-import MonitorApmLog from './monitor';
 
 const logStore = useStore();
 
@@ -50,4 +49,11 @@ const initGlobalComponents = () => {
   Vue.component('JsonFormatWrapper', JsonFormatWrapper);
   Vue.component('LogIcon', LogIcon);
 };
-export { MonitorApmLog, logStore, i18n, initMonitorState, initGlobalComponents };
+const initWindowState = () => {
+  window.__IS_MONITOR_COMPONENT__ = true;
+  window.__IS_MONITOR_TRACE__ = false;
+  window.__IS_MONITOR_APM__ = true;
+  // 为嵌入运行时注册 workerManager / __BKLOG_WORKERS__ 诊断 API。
+  performanceMonitorService.init();
+};
+export { MonitorApmLog, logStore, i18n, initMonitorState, initGlobalComponents, initWindowState };

@@ -1,0 +1,303 @@
+"""
+Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
+Copyright (C) 2017-2025 Tencent. All rights reserved.
+Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+"""
+
+from django.utils.translation import gettext_lazy as _
+from django.utils.functional import cached_property
+
+from constants.elasticsearch import QueryStringOperators
+from constants.apm import CachedEnum
+
+
+OTEL_SPAN_COMMON_FIELD_ALIAS = {
+    "elapsed_time": _("耗时"),
+    "end_time": _("结束时间"),
+    "kind": _("类型"),
+    "links": _("关联信息"),
+    "parent_span_id": _("父 Span ID"),
+    "span_id": _("Span ID"),
+    "span_name": _("接口名称"),
+    "start_time": _("开始时间"),
+    "time": _("时间"),
+    "trace_id": _("Trace ID"),
+    "trace_state": _("Trace 状态"),
+}
+
+
+class OperatorEnum:
+    """操作符枚举"""
+
+    class OperatorOptions:
+        """操作符选项"""
+
+        IS_WILDCARD = {"label": _("使用通配符"), "name": "is_wildcard", "default": False}
+        GROUP_RELATION = {
+            "label": _("组间关系"),
+            "name": "group_relation",
+            "default": "OR",
+            "children": [
+                {"label": "AND", "value": "AND"},
+                {"label": "OR", "value": "OR"},
+            ],
+        }
+
+    EXISTS = {"operator": "exists", "label": _("存在"), "placeholder": _("确认字段已存在")}
+    NOT_EXISTS = {"operator": "not exists", "label": _("不存在"), "placeholder": _("确认字段不存在")}
+    EQUAL = {"operator": "equal", "label": "=", "placeholder": _("请选择或直接输入，Enter分隔")}
+    NOT_EQUAL = {"operator": "not_equal", "label": "!=", "placeholder": _("请选择或直接输入，Enter分隔")}
+    LIKE = {"operator": "like", "label": _("包含"), "placeholder": _("请选择或直接输入，Enter分隔")}
+    NOT_LIKE = {"operator": "not_like", "label": _("不包含"), "placeholder": _("请选择或直接输入，Enter分隔")}
+    GT = {"operator": "gt", "label": ">", "placeholder": _("请选择或直接输入")}
+    LT = {"operator": "lt", "label": "<", "placeholder": _("请选择或直接输入")}
+    GTE = {"operator": "gte", "label": ">=", "placeholder": _("请选择或直接输入")}
+    LTE = {"operator": "lte", "label": "<=", "placeholder": _("请选择或直接输入")}
+
+    LIKE_WILDCARD = {
+        "operator": "like",
+        "label": _("包含"),
+        "placeholder": _("请选择或直接输入，Enter分隔"),
+        "options": [OperatorOptions.IS_WILDCARD, OperatorOptions.GROUP_RELATION],
+    }
+    NOT_LIKE_WOLDCARD = {
+        "operator": "not_like",
+        "label": _("不包含"),
+        "placeholder": _("请选择或直接输入，Enter分隔"),
+        "options": [OperatorOptions.IS_WILDCARD, OperatorOptions.GROUP_RELATION],
+    }
+
+    QueryStringOperatorMapping = {
+        EXISTS["operator"]: QueryStringOperators.EXISTS,
+        NOT_EXISTS["operator"]: QueryStringOperators.NOT_EXISTS,
+        EQUAL["operator"]: QueryStringOperators.EQUAL,
+        NOT_EQUAL["operator"]: QueryStringOperators.NOT_EQUAL,
+        LIKE["operator"]: QueryStringOperators.INCLUDE,
+        NOT_LIKE["operator"]: QueryStringOperators.NOT_INCLUDE,
+        GT["operator"]: QueryStringOperators.GT,
+        LT["operator"]: QueryStringOperators.LT,
+        GTE["operator"]: QueryStringOperators.GTE,
+        LTE["operator"]: QueryStringOperators.LTE,
+        "between": QueryStringOperators.BETWEEN,
+    }
+
+
+class FieldTypeEnum(CachedEnum):
+    """字段类型枚举"""
+
+    KEYWORD = "keyword"
+    TEXT = "text"
+    INTEGER = "integer"
+    LONG = "long"
+    DOUBLE = "double"
+    FLOAT = "float"
+    DATE = "date"
+    BOOLEAN = "boolean"
+    CONFLICT = "conflict"
+
+    @cached_property
+    def label(self) -> str:
+        return self.value
+
+    @classmethod
+    def get_default(cls, value):
+        default = super().get_default(value)
+        default.label = value
+        return default
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(member.value, member.label) for member in cls]
+
+
+FIELD_OPERATIONS = {
+    FieldTypeEnum.KEYWORD.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+        OperatorEnum.LIKE,
+        OperatorEnum.NOT_LIKE,
+    ],
+    FieldTypeEnum.TEXT.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.LIKE_WILDCARD,
+        OperatorEnum.NOT_LIKE_WOLDCARD,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+    FieldTypeEnum.INTEGER.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.GT,
+        OperatorEnum.GTE,
+        OperatorEnum.LT,
+        OperatorEnum.LTE,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+    FieldTypeEnum.LONG.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.GT,
+        OperatorEnum.GTE,
+        OperatorEnum.LT,
+        OperatorEnum.LTE,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+    FieldTypeEnum.DOUBLE.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.GT,
+        OperatorEnum.GTE,
+        OperatorEnum.LT,
+        OperatorEnum.LTE,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+    FieldTypeEnum.FLOAT.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.GT,
+        OperatorEnum.GTE,
+        OperatorEnum.LT,
+        OperatorEnum.LTE,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+    FieldTypeEnum.DATE.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.GT,
+        OperatorEnum.GTE,
+        OperatorEnum.LT,
+        OperatorEnum.LTE,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+    FieldTypeEnum.BOOLEAN.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+    FieldTypeEnum.CONFLICT.value: [
+        OperatorEnum.EQUAL,
+        OperatorEnum.NOT_EQUAL,
+        OperatorEnum.GT,
+        OperatorEnum.GTE,
+        OperatorEnum.LT,
+        OperatorEnum.LTE,
+        OperatorEnum.EXISTS,
+        OperatorEnum.NOT_EXISTS,
+    ],
+}
+
+
+class EnabledStatisticsDimension(CachedEnum):
+    """
+    开启字段分析的维度类型枚举（映射到 Elasticsearch 数据类型）
+    """
+
+    KEYWORD = "keyword"
+    INTEGER = "integer"
+    LONG = "long"
+    DOUBLE = "double"
+    FLOAT = "float"
+    BOOLEAN = "boolean"
+
+    @classmethod
+    def choices(cls):
+        return [(dimension_type.value, dimension_type.name) for dimension_type in cls]
+
+    def is_integer(self) -> bool:
+        return self.value in {self.INTEGER.value, self.LONG.value}
+
+    def is_float(self) -> bool:
+        return self.value in {self.DOUBLE.value, self.FLOAT.value}
+
+    def is_numeric(self) -> bool:
+        return self.is_float() or self.is_integer()
+
+    @classmethod
+    def values(cls):
+        return [dimension_type.value for dimension_type in cls]
+
+
+class AggregatedMethod(CachedEnum):
+    """聚合方法枚举"""
+
+    AVG = "avg"
+    MAX = "max"
+    MIN = "min"
+    SUM = "sum"
+    COUNT = "count"
+    DISTINCT = "distinct"
+    CP50 = "cp50"
+
+    @cached_property
+    def label(self) -> str:
+        return str(
+            {
+                self.AVG: _("平均值"),
+                self.MAX: _("最大值"),
+                self.MIN: _("最小值"),
+                self.SUM: _("求和"),
+                self.COUNT: _("计数"),
+                self.DISTINCT: _("去重计数"),
+                self.CP50: _("中位数(CP50)"),
+            }.get(self, self.value)
+        )
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(member.value, member.label) for member in cls]
+
+
+class StatisticsProperty(CachedEnum):
+    """统计属性枚举"""
+
+    AVG = "avg"
+    MAX = "max"
+    MIN = "min"
+    TOTAL_COUNT = "total_count"
+    DISTINCT_COUNT = "distinct_count"
+    FIELD_COUNT = "field_count"
+    MEDIAN = "median"
+
+    @cached_property
+    def label(self) -> str:
+        return str(
+            {
+                self.AVG: _("平均值"),
+                self.MAX: _("最大值"),
+                self.MIN: _("最小值"),
+                self.TOTAL_COUNT: _("总计数"),
+                self.DISTINCT_COUNT: _("去重计数"),
+                self.FIELD_COUNT: _("字段计数"),
+                self.MEDIAN: _("中位数"),
+            }.get(self, self.value)
+        )
+
+    @classmethod
+    def choices(cls) -> list[tuple[str, str]]:
+        return [(member.value, member.label) for member in cls]
+
+    @classmethod
+    def method_mapping(cls) -> dict[str, str]:
+        """统计属性到聚合方法的映射"""
+        return {
+            cls.TOTAL_COUNT.value: AggregatedMethod.COUNT.value,
+            cls.FIELD_COUNT.value: AggregatedMethod.COUNT.value,
+            cls.DISTINCT_COUNT.value: AggregatedMethod.DISTINCT.value,
+            cls.AVG.value: AggregatedMethod.AVG.value,
+            cls.MAX.value: AggregatedMethod.MAX.value,
+            cls.MIN.value: AggregatedMethod.MIN.value,
+            cls.MEDIAN.value: AggregatedMethod.CP50.value,
+        }

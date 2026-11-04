@@ -28,12 +28,10 @@ import { getRGBAColors } from './colors';
 import JsonFormatter from './json-formatter';
 import StaticUtil from './static.util';
 
-import type OptimizedHighlighter from './optimized-highlighter';
 import type RetrieveEvent from './retrieve-events';
 import { EventEmitter } from './event';
 import { reportRouteLog } from '@/store/modules/report-helper.ts';
 import { formatTimeZoneString } from '@/global/utils/time';
-
 
 export default class extends EventEmitter<RetrieveEvent> {
   // 滚动条查询条件
@@ -64,13 +62,14 @@ export default class extends EventEmitter<RetrieveEvent> {
   // 趋势图高度
   trendGraphHeight: number;
 
+  // 场景筛选面板高度
+  sceneFilterPanelHeight: number;
+
   // 索引集id列表
   indexSetIdList: string[];
 
   // 索引集类型
   indexSetType: string;
-
-  markInstance: OptimizedHighlighter = undefined;
 
   // JSON格式化辅助
   jsonFormatter: JsonFormatter;
@@ -87,7 +86,7 @@ export default class extends EventEmitter<RetrieveEvent> {
 
   logRowsContainerId: string;
 
-  RGBA_LIST: string[];
+  RGBA_LIST: string[][];
 
   isSearching = false;
 
@@ -143,6 +142,10 @@ export default class extends EventEmitter<RetrieveEvent> {
    * @returns 格式化后的时间戳
    */
   formatTimeZoneValue(data: number | string, fieldType: string, timezone: string = 'Asia/Shanghai') {
+    if (data === null || data === undefined || data === '' || data === '--') {
+      return '--';
+    }
+
     if (['date', 'date_nanos', 'date_time', 'time'].includes(fieldType)) {
       let format = 'YYYY-MM-DD HH:mm:ss';
       if (fieldType === 'date_nanos' || fieldType === 'date') {
@@ -168,23 +171,27 @@ export default class extends EventEmitter<RetrieveEvent> {
       if (`${data}`.startsWith('<mark>')) {
         const value = `${data}`.replace(/^<mark>/i, '').replace(/<\/mark>$/i, '');
 
-        if (/^\d+$/.test(value)) {
-          return `<mark>${formatTimeZoneString(this.normalizeTimestampToMs(Number(value)), timezone, format, false)}</mark>`;
+        if (value === '' || value === '--') {
+          return '<mark>--</mark>';
         }
 
-        return `<mark>${formatTimeZoneString(value, timezone, format, false)}</mark>`;
+        const markFormatValue = /^\d+$/.test(value)
+          ? formatTimeZoneString(this.normalizeTimestampToMs(Number(value)), timezone, format, false)
+          : formatTimeZoneString(value, timezone, format, false);
+        return `<mark>${markFormatValue === 'Invalid Date' ? value : markFormatValue}</mark>`;
       }
 
-      if (/^\d+$/.test(`${data}`)) {
-        return formatTimeZoneString(this.normalizeTimestampToMs(Number(data)), timezone, format, false) || data || '--';
+      if (/^\d+$/.test(String(data))) {
+        const formatValue = formatTimeZoneString(this.normalizeTimestampToMs(Number(data)), timezone, format, false);
+        return formatValue === 'Invalid Date' ? data : formatValue || data || '--';
       }
 
-      return formatTimeZoneString(data, timezone, format, false) || data || '--';
+      const formatValue = formatTimeZoneString(data, timezone, format, false);
+      return formatValue === 'Invalid Date' ? data : formatValue || data || '--';
     }
 
     return data || '--';
   }
-
 
   private normalizeTimestampToMs(ts: number): number {
     const len = `${ts}`.length;

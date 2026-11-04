@@ -23,6 +23,8 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
+import { buildProfilingExploreLocation } from 'monitor-common/utils/profiling-url';
+
 import * as dataRetrievalAuth from '../../pages/data-retrieval/authority-map';
 import * as traceAuth from '../../pages/trace-retrieval/authority-map';
 
@@ -39,8 +41,26 @@ const LogRetrievalNew = () =>
   import(/* webpackChunkName: 'LogRetrievalNew'*/ '../../pages/data-retrieval/log-retrieval');
 const TraceRetrieval = () =>
   import(/* webpackChunkName: 'TraceRetrieval'*/ '../../pages/trace-retrieval/trace-retrieval');
-const Profiling = () => import(/* webpackChunkName: 'Profiling'*/ '../../pages/profiling/profiling');
+const ProfilingExplore = () =>
+  import(/* webpackChunkName: 'ProfilingExplore' */ '../../pages/profiling-explore/profiling-explore');
+const Rum = () => import(/* webpackChunkName: 'Rum'*/ '../../pages/rum/rum');
+const RumExplore = () => import(/* webpackChunkName: 'RumExplore'*/ '../../pages/rum-explore/rum-explore');
 export default [
+  {
+    path: '/trace/profiling-explore',
+    name: 'profiling-explore',
+    components: { noCache: ProfilingExplore },
+    meta: {
+      title: 'Profiling 检索',
+      navId: 'profiling-explore',
+      navClass: 'profiling-explore-nav',
+      noChangeLoading: true,
+      noNavBar: true,
+      needClearQuery: true,
+      route: { parent: 'data' },
+      authority: { map: traceAuth, page: traceAuth.VIEW_AUTH },
+    },
+  },
   {
     path: '/data-retrieval',
     name: 'data-retrieval',
@@ -172,18 +192,48 @@ export default [
   {
     path: '/trace/profiling',
     name: 'profiling',
+    redirect: to => {
+      const { path, query } = buildProfilingExploreLocation(to.query.target);
+      return { path, query };
+    },
+  },
+  {
+    path: '/trace/rum-explore',
+    name: 'rum-explore',
     components: {
-      noCache: Profiling,
+      noCache: RumExplore,
     },
     meta: {
-      title: 'Profiling 检索',
-      navId: 'profiling',
-      navClass: 'profiling-retrieval-nav',
+      title: 'RUM 检索',
+      navId: 'rum-explore',
+      navClass: 'rum-explore-nav',
       noChangeLoading: true,
       noNavBar: true,
       needClearQuery: true, // 需要清空query搜索条件
       route: {
         parent: 'data',
+      },
+      authority: {
+        map: traceAuth,
+        page: traceAuth.VIEW_AUTH,
+      },
+    },
+  },
+  {
+    path: '/trace/rum',
+    name: 'rum',
+    components: {
+      noCache: Rum,
+    },
+    meta: {
+      title: 'RUM',
+      navId: 'rum',
+      navClass: 'rum-retrieval-nav',
+      noChangeLoading: true,
+      noNavBar: true,
+      needClearQuery: true,
+      route: {
+        parent: 'scenes',
       },
       authority: {
         map: traceAuth,

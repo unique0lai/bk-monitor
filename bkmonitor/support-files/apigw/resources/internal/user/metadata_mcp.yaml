@@ -26,8 +26,9 @@ paths:
         pluginConfigs: []
         authConfig:
           userVerifiedRequired: true
-          appVerifiedRequired: true
+          appVerifiedRequired: false
           resourcePermissionRequired: true
+          oauth2PersonalClientEnabled: true
   /mcp/search_spaces/:
     get:
       operationId: search_spaces
@@ -62,11 +63,12 @@ paths:
         backend:
           name: default
           method: get
-          path: /api/v3/meta/list_spaces/
+          path: /api/v4/mcp/search_spaces/
           matchSubpath: false
           timeout: 0
         pluginConfigs: []
         authConfig:
           userVerifiedRequired: true
-          appVerifiedRequired: true
+          appVerifiedRequired: false
           resourcePermissionRequired: true
+          oauth2PersonalClientEnabled: true

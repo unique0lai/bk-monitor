@@ -26,6 +26,7 @@
 
 import { K8sTableColumnKeysEnum, SceneEnum } from '../../../../typings/k8s-new';
 import { K8sBasePromqlGenerator } from './base-promql-generator';
+import { gpuOr } from './gpu-dcgm-compat';
 
 import type { K8sBasePromqlGeneratorContext } from '../../typing';
 
@@ -38,11 +39,18 @@ export class K8sCapacityPromqlGenerator extends K8sBasePromqlGenerator {
 
   scenePrivatePromqlGenerateMain(metric: string, context: K8sBasePromqlGeneratorContext): string {
     const clusterId = context.bcs_cluster_id;
+    // GPU 指标写死聚合方法的 case 使用：node 层级按 node 分线，cluster 层级聚合到 bcs_cluster_id（序列上不存在 cluster label）
+    const gpuByDim = context.groupByField === K8sTableColumnKeysEnum.NODE ? 'node' : 'bcs_cluster_id';
+    // GPU 指标叶子走双源(原生 or dcgm 等价,跨 schema 互斥;gpuOr 见 gpu-dcgm-compat,与后端 gpu_compat 对齐)。
+    // gpuContent 为 GPU case 共用过滤串;dcgm 支为空时 or 回退原生,故非 dcgm 集群表现不变。
+    const gpuContent = K8sBasePromqlGenerator.createCommonPromqlContent(context);
     switch (metric) {
       case 'node_cpu_seconds_total': // 节点CPU使用量
         return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)}(last_over_time(rate(node_cpu_seconds_total{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},mode!="idle"}[$interval])[$interval:] $time_shift))`;
-      case 'node_cpu_capacity_ratio': // 节点CPU装箱率
-        return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)}(sum by (${context.groupByField},pod) (kube_pod_container_resource_requests{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},container_name!="POD",resource="cpu"})
+      case 'node_cpu_capacity_ratio': // 节点CPU装箱率（含原生 sidecar：常规容器 request + 运行中的 restartable-init request，用 status_running==1 近似识别 sidecar）
+        return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)}(sum by (${context.groupByField},pod) (kube_pod_container_resource_requests{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},container_name!="POD",resource="cpu"}
+ or
+ (kube_pod_init_container_resource_requests{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},container_name!="POD",resource="cpu"} * on(namespace,pod,container) group_left() (kube_pod_init_container_status_running{bcs_cluster_id="${clusterId}"}==1)))
  /
  on (pod) group_left() count(count by (pod)(kube_pod_status_phase{bcs_cluster_id="${clusterId}",phase!="Evicted"})) by(pod))
 /
@@ -57,8 +65,10 @@ ${K8sBasePromqlGenerator.createCommonPromqlMethod(context)} (kube_node_status_al
         -
        ${K8sBasePromqlGenerator.createCommonPromqlMethod(context)} (last_over_time(node_memory_MemAvailable_bytes{${K8sBasePromqlGenerator.createCommonPromqlContent(context)}}[$interval:] $time_shift))`;
 
-      case 'node_memory_capacity_ratio': // 节点内存装箱率
-        return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)} (sum by (${context.groupByField},pod) (kube_pod_container_resource_requests{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},container_name!="POD",resource="memory"})
+      case 'node_memory_capacity_ratio': // 节点内存装箱率（含原生 sidecar：常规容器 request + 运行中的 restartable-init request，用 status_running==1 近似识别 sidecar）
+        return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)} (sum by (${context.groupByField},pod) (kube_pod_container_resource_requests{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},container_name!="POD",resource="memory"}
+ or
+ (kube_pod_init_container_resource_requests{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},container_name!="POD",resource="memory"} * on(namespace,pod,container) group_left() (kube_pod_init_container_status_running{bcs_cluster_id="${clusterId}"}==1)))
  /
  on (pod) group_left() count(count by (pod)(kube_pod_status_phase{bcs_cluster_id="${clusterId}",phase!="Evicted"})) by(pod))
 /
@@ -90,6 +100,37 @@ ${K8sBasePromqlGenerator.createCommonPromqlMethod(context)}  (kube_node_status_a
         return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)} (last_over_time(rate(node_network_receive_packets_total{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},device!~"lo|veth.*"}[$interval])[$interval:] $time_shift))`;
       case 'node_network_transmit_packets_total': // 节点网络出包量
         return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)} (last_over_time(rate(node_network_transmit_packets_total{${K8sBasePromqlGenerator.createCommonPromqlContent(context)},device!~"lo|veth.*"}[$interval])[$interval:] $time_shift))`;
+      case 'node_gpu_usage_ratio': // GPU使用率（卡级算力使用率均值，聚合写死 avg；数据源 elastic-gpu-exporter 卡级指标）
+        return `avg by(${gpuByDim})(last_over_time(${gpuOr('gpu_core_utilization_percentage', gpuContent)}[$interval:] $time_shift))`;
+      case 'node_gpu_mem_usage_ratio': // GPU显存使用率 = sum(已用显存)/sum(单卡总显存)*100，加权口径
+        return `sum by(${gpuByDim})(last_over_time(${gpuOr('gpu_mem_usage', gpuContent)}[$interval:] $time_shift))
+ /
+ sum by(${gpuByDim})(last_over_time(${gpuOr('gpu_mem_each_card', gpuContent)}[$interval:] $time_shift)) * 100`;
+      case 'node_gpu_mem_used': // GPU显存使用量（原始数据为MiB）
+        return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)}(last_over_time(${gpuOr('gpu_mem_usage', gpuContent)}[$interval:] $time_shift))`;
+      case 'node_gpu_power_usage': // GPU功耗（单位W）
+        return `${K8sBasePromqlGenerator.createCommonPromqlMethod(context)}(last_over_time(${gpuOr('gpu_power_usage', gpuContent)}[$interval:] $time_shift))`;
+      case 'node_gpu_temperature': // GPU温度（最高卡温，聚合写死 max；gpu_temprature 为 exporter 原始拼写）
+        return `max by(${gpuByDim})(last_over_time(${gpuOr('gpu_temprature', gpuContent)}[$interval:] $time_shift))`;
+      case 'node_gpu_anomaly_count': {
+        // GPU异常数 = ECC错误增量(counter_type="aggregate"累计计数) + 掉卡数(gpu_count 对 1d 基线的下降)
+        // 掉卡半 gpu_count 走双源(dcgm 用 count(DCGM_FI_DEV_GPU_UTIL) 合成);因合成是复合表达式,max_over_time 基线改子查询 [1d:]。
+        // ECC 半维持原生(dcgm ECC 默认禁用)。or 兜底防空向量：exporter 静默的 GPU 节点按全卡掉卡计入；合法摘卡在基线滚动过期(1d)前会被计为掉卡
+        const countLeaf = gpuOr('gpu_count', gpuContent);
+        if (context.groupByField === K8sTableColumnKeysEnum.NODE) {
+          const baseline = `max by(node)(max_over_time(${countLeaf}[1d:] $time_shift))`;
+          const current = `max by(node)(last_over_time(${countLeaf}[$interval:] $time_shift))`;
+          return `(sum by(node)(last_over_time(increase(gpu_ecc_error_count{${gpuContent},counter_type="aggregate"}[$interval])[$interval:] $time_shift)) or ${baseline} * 0)
+ +
+ clamp_min(${baseline} - (${current} or ${baseline} * 0), 0)`;
+        }
+        // cluster 层级：掉卡按 (bcs_cluster_id,node) 粒度求差后再 sum，避免集群级 max 折叠节点掩盖掉卡
+        const baseline = `max by(bcs_cluster_id,node)(max_over_time(${countLeaf}[1d:] $time_shift))`;
+        const current = `max by(bcs_cluster_id,node)(last_over_time(${countLeaf}[$interval:] $time_shift))`;
+        return `sum by(bcs_cluster_id)((sum by(bcs_cluster_id,node)(last_over_time(increase(gpu_ecc_error_count{${gpuContent},counter_type="aggregate"}[$interval])[$interval:] $time_shift)) or ${baseline} * 0)
+ +
+ clamp_min(${baseline} - (${current} or ${baseline} * 0), 0))`;
+      }
       default:
         return '';
     }

@@ -30,9 +30,17 @@ import { CancelToken } from 'monitor-api/cancel';
 import { getIntelligentDetectAccessStatus, getIntelligentModel } from 'monitor-api/modules/strategies';
 
 import IntelligentModelsStore, { IntelligentModelsType } from '../../../../../../store/modules/intelligent-models';
+import { splitNumberHighlightFragments } from '../../../../../text-display-utils';
 import { type IDetectionTypeRuleData, DetectionRuleTypeEnum } from '../../../typings';
+import {
+  type AlertLevel,
+  type AlertLevelMode,
+  type IAiAlertLevelValue,
+  createAiAlertLevelValue,
+  serializeAiAlertLevelValue,
+} from '../../alert-level';
 import Form from '../form/form';
-import { type IFormDataItem, FormItem } from '../form/utils';
+import { type IFormDataItem, FormItem, syncAiLevelAutoEnabled } from '../form/utils';
 
 import type { IModelData } from '../time-series-forecast/time-series-forecast';
 
@@ -49,6 +57,8 @@ export interface ITipsData {
 }
 
 interface IAiOpsValue {
+  alert_level_mode?: AlertLevelMode;
+  alert_levels?: AlertLevel[];
   args: { [key in string]: number | string };
   [MODEL_FIELD]: string;
   visual_type: ChartType;
@@ -61,6 +71,7 @@ interface IntelligentDetectEvents {
 }
 
 interface IntelligentDetectProps {
+  autoLevelEnabled?: boolean;
   data?: IDetectionTypeRuleData<IAiOpsValue>;
   interval: number;
   isEdit?: boolean;
@@ -70,6 +81,8 @@ interface IntelligentDetectProps {
 @Component({})
 export default class IntelligentDetect extends tsc<IntelligentDetectProps, IntelligentDetectEvents> {
   @Prop({ type: Object }) data: IDetectionTypeRuleData<IAiOpsValue>;
+  /** 当前指标和算法组合是否允许启用自动级别 */
+  @Prop({ type: Boolean, default: false }) autoLevelEnabled: boolean;
   @Prop({ type: Boolean, default: false }) readonly: boolean;
   /** 是否为编辑模式 */
   @Prop({ type: Boolean, default: false }) isEdit: boolean;
@@ -108,8 +121,9 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
       {
         label: window.i18n.tc('告警级别'),
         field: LEVEL_FIELD,
-        value: this.localData.level,
+        value: createAiAlertLevelValue(this.data),
         type: 'ai-level',
+        autoEnabled: this.autoLevelEnabled,
         required: true,
       },
       {
@@ -170,6 +184,9 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
     if (this.data) {
       this.localData = this.data;
     } else {
+      const alertLevel = serializeAiAlertLevelValue(createAiAlertLevelValue());
+      this.localData.level = alertLevel.level;
+      this.localData.config = { ...this.localData.config, ...alertLevel.config };
       this.emitLocalData();
     }
   }
@@ -245,10 +262,12 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
       id,
       latest_release_id: relId || latest_release_id,
     };
-    needLoading && (this.loading = true);
+    if (needLoading) this.loading = true;
     const detailData = await getIntelligentModel(params, {
       cancelToken: new CancelToken(c => (this.modelDetailCancelFn = c)),
-    }).finally(() => needLoading && (this.loading = false));
+    }).finally(() => {
+      if (needLoading) this.loading = false;
+    });
     const valueDisplay = this.localData.config?.args || {};
     this.argsFormItem = FormItem.createFormItemData(detailData, valueDisplay);
     this.handleValueChange();
@@ -272,7 +291,10 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
   }
 
   handleValueChange() {
-    this.localData.level = this.staticFormItem.find(item => item.field === LEVEL_FIELD).value as number;
+    const alertLevel = serializeAiAlertLevelValue(
+      this.staticFormItem.find(item => item.field === LEVEL_FIELD).value as IAiAlertLevelValue
+    );
+    this.localData.level = alertLevel.level;
     this.localData.config = {
       [MODEL_FIELD]: this.currentModelId,
       visual_type: this.currentModelData?.visual_type,
@@ -280,6 +302,7 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
         args[item.field] = item.value;
         return args;
       }, {}),
+      ...alertLevel.config,
     };
     this.emitLocalData();
   }
@@ -291,7 +314,12 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
 
   @Watch('strategyId', { immediate: true })
   strategyIdChange(val: number) {
-    if (!!val && `${val}` !== '0') this.getStatusMessage();
+    if (val && `${val}` !== '0') this.getStatusMessage();
+  }
+
+  @Watch('autoLevelEnabled')
+  autoLevelEnabledChange(autoLevelEnabled: boolean) {
+    syncAiLevelAutoEnabled(this.staticFormItem, autoLevelEnabled);
   }
 
   /** 获取头部提示信息 */
@@ -305,8 +333,7 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
       failed: 'error',
     };
     this.tipsData.status = statusMap[resData.status];
-    this.tipsData.message =
-      resData.status_detail?.replace?.(/(([1-9]\d*\.?\d*)|(0\.\d*))/g, '<span class="hl">$1</span>') || '';
+    this.tipsData.message = resData.status_detail || '';
   }
 
   /** 校验方法 */
@@ -340,8 +367,20 @@ export default class IntelligentDetect extends tsc<IntelligentDetectProps, Intel
             <div
               class='ai-ops-tips'
               slot='title'
-              domPropsInnerHTML={this.tipsData.message}
-            />
+            >
+              {splitNumberHighlightFragments(this.tipsData.message).map(fragment =>
+                fragment.highlight ? (
+                  <span
+                    key={fragment.start}
+                    class='hl'
+                  >
+                    {fragment.text}
+                  </span>
+                ) : (
+                  fragment.text
+                )
+              )}
+            </div>
           </bk-alert>
         )}
         <Form

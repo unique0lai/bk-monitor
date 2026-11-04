@@ -11,6 +11,7 @@ specific language governing permissions and limitations under the License.
 import logging
 
 from bk_monitor_base.strategy import get_metric_id
+from django.conf import settings
 from django.utils.translation import gettext as _
 
 from bkmonitor.models import MetricListCache, StrategyModel
@@ -67,7 +68,14 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
 
     def load_strategies(self, strategies: list) -> list:
         """加载默认告警策略 ."""
-        # 查询监控内置的主机指标
+        strategy_names = {str(config["name"]) for config in strategies}
+        existing_strategy_names = set(
+            StrategyModel.objects.filter(bk_biz_id=self.bk_biz_id, name__in=strategy_names).values_list(
+                "name", flat=True
+            )
+        )
+
+        # 查询监控内置的主机指标（时序）
         metrics = []
         metrics.extend(
             MetricListCache.objects.filter(
@@ -77,6 +85,10 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
                 related_id="system",
             )
         )
+        # bk_monitor 源系统事件（两模式共用此查询）：
+        # 单租户为全局内置（system.event 全量事件）；多租户下 BaseAlarmMetricCacheManager 仅内置
+        # proc_port/os_restart 两个伪事件（底层 system.proc_port/system.env 时序在多租户同样产出），
+        # gse 系统事件改走下方 custom 链路，故此查询在多租户只会命中 proc_port/os_restart。
         metrics.extend(
             MetricListCache.objects.filter(
                 bk_tenant_id=self.bk_tenant_id,
@@ -85,33 +97,83 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
                 data_type_label=DataTypeLabel.EVENT,
             )
         )
-
-        metric_dict = {
-            get_metric_id(
-                **{
-                    "data_type_label": metric.data_type_label,
-                    "data_source_label": metric.data_source_label,
-                    "result_table_id": metric.result_table_id,
-                    "metric_field": metric.metric_field,
-                }
-            ): metric
-            for metric in metrics
-        }
+        # 建立 bk_monitor 指标索引。多租户 custom 系统事件不依赖 MetricListCache：
+        # 结果表命名固定为 base_{tenant}_{biz}_event，事件名、聚合维度和检测参数均由 v2 配置提供，
+        # 可直接生成查询配置，避免指标缓存尚未刷新时默认策略无法创建。
+        metric_dict = {}
+        for metric in metrics:
+            metric_dict[
+                get_metric_id(
+                    data_type_label=metric.data_type_label,
+                    data_source_label=metric.data_source_label,
+                    result_table_id=metric.result_table_id,
+                    metric_field=metric.metric_field,
+                )
+            ] = metric
 
         strategy_config_list = []
         for default_config in strategies:
-            metric_id = get_metric_id(
-                **{
-                    "data_type_label": default_config["data_type_label"],
-                    "data_source_label": default_config["data_source_label"],
-                    "result_table_id": default_config.get("result_table_id", ""),
-                    "metric_field": default_config["metric_field"],
-                }
-            )
-            # 主机内置告警策略中的指标必须存在
-            metric = metric_dict.get(metric_id)
-            if not metric:
+            # PING 不可达：仅在全局 ping 告警开关开启时内置（ENABLE_PING_ALARM，运行时判定，不在策略模块
+            # import 期固化）。该项仅在 worker role 静态定义、loader 跑在 monitor_web 角色，故用 getattr 兜底，
+            # 默认 True（与全局默认一致）；运行时告警触发另由 alarm_backends access 层按同一开关硬门控，此处
+            # 跳过只是避免建出永不触发的悬空策略。覆盖单租户 ping-gse 与多租户 PingUnreachable 两种命名。
+            if default_config["metric_field"] in ("PingUnreachable", "ping-gse") and not getattr(
+                settings, "ENABLE_PING_ALARM", True
+            ):
                 continue
+
+            strategy_name = str(default_config["name"])
+            if strategy_name in existing_strategy_names:
+                logger.info(
+                    "default os strategy already exists, skip: bk_biz_id=%s, name=%s",
+                    self.bk_biz_id,
+                    strategy_name,
+                )
+                strategy_config_list.append(default_config)
+                continue
+
+            is_custom_event = (default_config["data_source_label"], default_config["data_type_label"]) == (
+                DataSourceLabel.CUSTOM,
+                DataTypeLabel.EVENT,
+            )
+            if is_custom_event:
+                # 多租户系统事件的结果表按租户和业务固定生成，无需等待 MetricListCache 刷新。
+                custom_event_name = default_config["metric_field"]
+                result_table_id = f"base_{self.bk_tenant_id}_{self.bk_biz_id}_event"
+                metric_id = get_metric_id(
+                    data_type_label=default_config["data_type_label"],
+                    data_source_label=default_config["data_source_label"],
+                    result_table_id=result_table_id,
+                    custom_event_name=custom_event_name,
+                )
+                metric_field = custom_event_name
+                metric_field_name = str(default_config.get("name", custom_event_name))
+                data_type_label = default_config["data_type_label"]
+                data_source_label = default_config["data_source_label"]
+                default_condition = []
+                default_dimensions = []
+                agg_interval = default_config.get("agg_interval", 60)
+                unit = ""
+            else:
+                metric_id = get_metric_id(
+                    data_type_label=default_config["data_type_label"],
+                    data_source_label=default_config["data_source_label"],
+                    result_table_id=default_config.get("result_table_id", ""),
+                    metric_field=default_config["metric_field"],
+                )
+                # 主机内置告警策略中的指标必须存在
+                metric = metric_dict.get(metric_id)
+                if not metric:
+                    continue
+                result_table_id = metric.result_table_id
+                metric_field = metric.metric_field
+                metric_field_name = metric.metric_field_name
+                data_type_label = metric.data_type_label
+                data_source_label = metric.data_source_label
+                default_condition = metric.default_condition
+                default_dimensions = metric.default_dimensions
+                agg_interval = default_config.get("agg_interval", metric.collect_interval * 60)
+                unit = metric.unit
 
             # 根据配置类型获得通知组ID
             config_type = default_config.get("type")
@@ -122,7 +184,7 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
 
             strategy_config = {
                 "bk_biz_id": self.bk_biz_id,
-                "name": str(default_config.get("name", metric.metric_field_name)),
+                "name": str(default_config.get("name", metric_field_name)),
                 "scenario": default_config["result_table_label"],
                 "detects": [
                     {
@@ -141,7 +203,7 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
                 ],
                 "items": [
                     {
-                        "name": _(metric.metric_field_name),
+                        "name": _(metric_field_name),
                         "no_data_config": {
                             "is_enabled": default_config.get("no_data_enabled", False),
                             "continuous": default_config.get("no_data_continuous", 5),
@@ -150,15 +212,15 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
                         "query_configs": [
                             {
                                 "metric_id": metric_id,
-                                "data_type_label": metric.data_type_label,
-                                "data_source_label": metric.data_source_label,
-                                "result_table_id": metric.result_table_id,
-                                "agg_condition": default_config.get("agg_condition", metric.default_condition),
-                                "agg_dimension": default_config.get("agg_dimension", metric.default_dimensions),
-                                "agg_interval": default_config.get("agg_interval", metric.collect_interval * 60),
+                                "data_type_label": data_type_label,
+                                "data_source_label": data_source_label,
+                                "result_table_id": result_table_id,
+                                "agg_condition": default_config.get("agg_condition", default_condition),
+                                "agg_dimension": default_config.get("agg_dimension", default_dimensions),
+                                "agg_interval": agg_interval,
                                 "agg_method": default_config.get("agg_method", "AVG"),
-                                "metric_field": metric.metric_field,
-                                "unit": metric.unit,
+                                "metric_field": metric_field,
+                                "unit": unit,
                                 "alias": "A",
                             }
                         ],
@@ -194,23 +256,40 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
 
             item = strategy_config["items"][0]
             # 非事件性策略配置阈值
-            if metric.data_type_label != DataTypeLabel.EVENT:
+            if data_type_label != DataTypeLabel.EVENT:
                 item["algorithms"][0]["config"].append(
                     [{"threshold": default_config["threshold"], "method": default_config["method"]}]
                 )
                 item["algorithms"][0]["type"] = "Threshold"
                 item["algorithms"][0]["unit_prefix"] = default_config.get("unit_prefix", "")
 
-            # 主机重启、进程端口、PING不可达、实际上是时序性指标，需要做特殊处理
-            if metric.metric_field in EVENT_DETECT_LIST:
-                event_detect_config = EVENT_DETECT_LIST[metric.metric_field]
-                item["query_configs"][0].update(EVENT_QUERY_CONFIG_MAP.get(metric.metric_field, {}))
+            # 多租户系统事件（custom 源）：补 custom_event_name，使检测按事件名过滤
+            # （缺失则退化为整表扫描、任意事件都触发误告警）。
+            # 检测语义已确认：CustomEventDataSource.init_by_query_config 硬编码 metric=COUNT，
+            # 并以 custom_event_name 过滤 event_name，故实际查询为「周期内该事件计数」，按 >= 1 即异常配阈值。
+            # 这里写 query_config["agg_method"]="COUNT" 主要是策略配置表达保持一致，真正的 COUNT 由数据源实现驱动。
+            if is_custom_event:
+                query_config = item["query_configs"][0]
+                query_config["custom_event_name"] = custom_event_name
+                query_config["agg_method"] = "COUNT"
+                item["algorithms"][0]["config"] = [[{"threshold": 1, "method": "gte"}]]
+                item["algorithms"][0]["type"] = "Threshold"
+
+            # 主机重启、进程端口、PING不可达 实际上是时序性指标，需套用对应检测算法。
+            # 命中的事件指标（metric_field ∈ EVENT_DETECT_LIST）经 EVENT_QUERY_CONFIG_MAP 把查询
+            # 重定向到底层时序表；主机重启保留 metric_id "bk_monitor.os_restart"——alarm_backends 的
+            # handle_special_query_config 据此补 "a <= 3600" 表达式，OsRestart 算法依赖该改写
+            # （见 alarm_backends/core/cache/strategy.py）。多租户下命中的是 BaseAlarmMetricCacheManager
+            # 内置的 proc_port/os_restart，走同一条重定向路径，与单租户一致。
+            if metric_field in EVENT_DETECT_LIST:
+                event_detect_config = EVENT_DETECT_LIST[metric_field]
+                item["query_configs"][0].update(EVENT_QUERY_CONFIG_MAP.get(metric_field, {}))
                 item["query_configs"][0]["data_type_label"] = DataTypeLabel.TIME_SERIES
                 item["algorithms"][0]["type"] = event_detect_config[0]["type"]
                 item["algorithms"][0]["config"] = event_detect_config[0]["config"]
 
-            # GSE失联事件追加GSE管理员
-            if metric.metric_field == "agent-gse":
+            # GSE失联事件追加GSE管理员（多租户 V4 事件名为 AgentLost）
+            if metric_field in ("agent-gse", "AgentLost"):
                 gse_notice_group_id = get_or_create_gse_manager_group(self.bk_biz_id)
                 if gse_notice_group_id is not None:
                     strategy_config["notice"]["user_groups"].append(gse_notice_group_id)
@@ -219,5 +298,6 @@ class OsDefaultAlarmStrategyLoader(DefaultAlarmStrategyLoaderBase):
             resource.strategies.save_strategy_v2(**strategy_config)
 
             strategy_config_list.append(strategy_config)
+            existing_strategy_names.add(strategy_name)
 
         return strategy_config_list

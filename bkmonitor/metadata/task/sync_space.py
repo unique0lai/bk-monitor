@@ -18,8 +18,9 @@ from django.db.models import Q
 from django.db.transaction import atomic
 
 from alarm_backends.core.lock.service_lock import share_lock
+from api.cmdb import client
 from api.cmdb.define import Business
-from constants.common import DEFAULT_TENANT_ID
+from bkmonitor.utils.new_env import is_biz_id_need_managed
 from core.drf_resource import api
 from core.prometheus import metrics
 from metadata import config, models
@@ -27,7 +28,6 @@ from metadata.models.constants import BULK_CREATE_BATCH_SIZE, BULK_UPDATE_BATCH_
 from metadata.models.space import Space, SpaceDataSource, SpaceResource
 from metadata.models.space.constants import (
     SKIP_DATA_ID_LIST_FOR_BKCC,
-    SPACE_TO_RESULT_TABLE_CHANNEL,
     SYSTEM_USERNAME,
     BCSClusterTypes,
     SpaceStatus,
@@ -37,7 +37,6 @@ from metadata.models.space.space_data_source import (
     get_biz_data_id,
     get_real_zero_biz_data_id,
 )
-from metadata.models.space.space_table_id_redis import SpaceTableIDRedis
 from metadata.models.space.utils import (
     cached_cluster_k8s_data_id,
     create_bcs_spaces,
@@ -53,31 +52,10 @@ from metadata.models.vm.constants import (
     QUERY_VM_SPACE_UID_LIST_KEY,
 )
 from metadata.task.tasks import check_bkcc_space_builtin_datalink
-from metadata.task.utils import bulk_handle
 from metadata.tools.constants import TASK_FINISHED_SUCCESS, TASK_STARTED
 from metadata.utils.redis_tools import RedisTools
 
 logger = logging.getLogger("metadata")
-
-
-def is_sync_bkcc_space_managed_biz(bk_biz_id: str, start_biz_id: int | None) -> bool:
-    """
-    判断当前业务是否由 sync_bkcc_space 接管新增、删除及 V4 内置链路检查。
-
-    规则：
-    - 未配置 ``SYNC_BKCC_SPACE_START_BIZ_ID``（``start_biz_id`` 为 ``None``）：全部接管，保持历史行为；
-    - 已配置：仅当 ``bk_biz_id`` **严格大于**阈值时才接管，阈值以下（含阈值）的业务交由其它任务/链路管理；
-    - ``bk_biz_id`` 无法解析为整数：保守地视为不接管，避免异常数据被误纳入删除链。
-
-    注意：冲突空间软禁用等保护性逻辑不受该阈值影响，仍对全量业务生效。
-    """
-    if start_biz_id is None:
-        return True
-
-    try:
-        return int(bk_biz_id) > start_biz_id
-    except (TypeError, ValueError):
-        return False
 
 
 def _disable_related_bkci_spaces(bkcc_space_ids: list[str]):
@@ -150,6 +128,8 @@ def sync_bkcc_space(bk_tenant_id: str | None = None, allow_deleted=False, create
     bkcc_type_id = SpaceTypes.BKCC.value
     biz_list: list[Business] = []
     for tenant_id in bk_tenant_ids:
+        # NOTE: 业务列表存在 1 小时的 cc 缓存，强制刷新，否则新增业务最长要等 1 小时才能建出空间
+        client.search_business.request.refresh(bk_tenant_id=tenant_id)
         temp: list[Business] = api.cmdb.get_business(bk_tenant_id=tenant_id)
         for b in temp:
             setattr(b, "bk_tenant_id", tenant_id)
@@ -163,26 +143,12 @@ def sync_bkcc_space(bk_tenant_id: str | None = None, allow_deleted=False, create
     biz_id_name_dict = {str(b.bk_biz_id): b for b in biz_list}
 
     # 只有业务 ID 大于阈值的业务才会被接管新增、删除及 V4 内置链路检查；阈值以下业务交由其它任务/链路管理
-    start_biz_id = settings.SYNC_BKCC_SPACE_START_BIZ_ID
-    if start_biz_id in ("", None):
-        start_biz_id = None
-    else:
-        try:
-            start_biz_id = int(start_biz_id)
-        except (TypeError, ValueError):
-            logger.warning(
-                "sync_bkcc_space: invalid SYNC_BKCC_SPACE_START_BIZ_ID(%s), disable threshold filter", start_biz_id
-            )
-            start_biz_id = None
-
-    managed_biz_ids = {biz_id for biz_id in biz_id_name_dict if is_sync_bkcc_space_managed_biz(biz_id, start_biz_id)}
+    managed_biz_ids = {biz_id for biz_id in biz_id_name_dict if is_biz_id_need_managed(biz_id)}
     # 过滤已经创建空间的业务
     space_id_list = Space.objects.filter(space_type_id=bkcc_type_id).values_list("space_id", flat=True)
     diff = managed_biz_ids - set(space_id_list)
     diff_delete = {
-        space_id
-        for space_id in set(space_id_list) - set(biz_id_name_dict.keys())
-        if is_sync_bkcc_space_managed_biz(space_id, start_biz_id)
+        space_id for space_id in set(space_id_list) - set(biz_id_name_dict.keys()) if is_biz_id_need_managed(space_id)
     }
 
     # 针对删除的业务
@@ -265,6 +231,7 @@ def sync_archived_bkcc_space(bk_tenant_id: str | None = None):
         bk_tenant_ids = [tenant["id"] for tenant in api.bk_login.list_tenant()]
 
     for tenant_id in bk_tenant_ids:
+        client.search_business.request.refresh(bk_tenant_id=tenant_id, condition={"bk_data_status": "disabled"})
         archived_biz_list.extend(api.cmdb.get_business(bk_tenant_id=tenant_id, is_archived=True))
     archived_biz_id_list = [str(b.bk_biz_id) for b in archived_biz_list]
     # 归档的业务，变更空间名称为 {当前名称}(已归档_20240619)
@@ -367,12 +334,6 @@ def sync_bkcc_space_data_source():
     create_bkcc_space_data_source(biz_data_id_dict)
     create_bkcc_space_data_source(real_biz_data_id_dict)
 
-    biz_id_list = list(biz_data_id_dict.keys())
-    biz_id_list.extend(real_biz_data_id_dict.keys())
-
-    # 组装数据，推送 redis 功能
-    space_id_list = [str(biz_id) for biz_id in biz_id_list if str(biz_id) != "0"]
-    push_and_publish_space_router(space_type=SpaceTypes.BKCC.value, space_id_list=space_id_list)
     cost_time = time.time() - start_time
 
     metrics.METADATA_CRON_TASK_STATUS_TOTAL.labels(
@@ -383,7 +344,7 @@ def sync_bkcc_space_data_source():
         task_name="sync_bkcc_space_data_source", process_target=None
     ).observe(cost_time)
     metrics.report_all()
-    logger.info("push bkcc type space to redis successfully, space: %s,cost: %s", json.dumps(space_id_list), cost_time)
+    logger.info("sync bkcc space data source successfully, cost: %s", cost_time)
 
 
 @share_lock(identify="metadata__sync_bcs_space")
@@ -711,18 +672,6 @@ def refresh_cluster_resource():
 
         logger.info(f"bulk create {bk_tenant_id} space data_id record")
 
-        if space_id_list:
-            # 推送 redis 功能, 包含空间到结果表，数据标签到结果表，结果表详情
-            push_and_publish_space_router(
-                bk_tenant_id=bk_tenant_id, space_type=SpaceTypes.BKCI.value, space_id_list=space_id_list
-            )
-
-            logger.info(
-                "push updated bcs space resource to redis successfully, tenant: %s, space: %s",
-                bk_tenant_id,
-                json.dumps(space_id_list),
-            )
-
     cost_time = time.time() - start_time
 
     metrics.METADATA_CRON_TASK_STATUS_TOTAL.labels(
@@ -769,93 +718,25 @@ def refresh_bkci_space_name():
     logger.info("refresh only bkci space successfully")
 
 
-def push_and_publish_space_router(
-    space_type: str | None = None,
-    space_id: str | None = None,
-    space_id_list: list[str] | None = None,
-    is_publish: bool | None = True,
-    bk_tenant_id: str | None = DEFAULT_TENANT_ID,
-):
-    """推送数据和通知"""
-    from metadata.models.space.constants import SPACE_TO_RESULT_TABLE_CHANNEL
-    from metadata.models.space.ds_rt import get_space_table_id_data_id
-    from metadata.models.space.space_table_id_redis import SpaceTableIDRedis
-
-    # 过滤数据
-    spaces = models.Space.objects.values("space_type_id", "space_id", "bk_tenant_id")
-    if space_type:
-        spaces = spaces.filter(space_type_id=space_type)
-    if space_id:
-        spaces = spaces.filter(space_id=space_id)
-    if bk_tenant_id:
-        logger.info("push and publish space router with bk_tenant_id->[%s]", bk_tenant_id)
-        spaces = spaces.filter(bk_tenant_id=bk_tenant_id)
-    # 这里不应该会有太多空间 ID 的输入
-    if space_id_list:
-        spaces = spaces.filter(space_id__in=space_id_list)
-
-    # 拼装数据
-    space_list = [
-        {"space_type": space["space_type_id"], "space_id": space["space_id"], "bk_tenant_id": space["bk_tenant_id"]}
-        for space in spaces
-    ]
-
-    # 批量处理 -- SPACE_TO_RESULT_TABLE 路由
-    bulk_handle(
-        lambda batch_spaces: SpaceTableIDRedis().push_multi_space_table_ids(batch_spaces, is_publish=False),
-        list(spaces),
-    )
-
-    # 通知到使用方
-    if is_publish:
-        space_uid_list = []
-        for space in spaces:
-            if settings.ENABLE_MULTI_TENANT_MODE:
-                space_uid_list.append(f"{space['space_type_id']}__{space['space_id']}|{space['bk_tenant_id']}")
-            else:
-                space_uid_list.append(f"{space['space_type_id']}__{space['space_id']}")
-        RedisTools.publish(SPACE_TO_RESULT_TABLE_CHANNEL, space_uid_list)
-
-    # 仅存在空间 id 时，可以直接按照结果表进行处理
-    # 非多租户环境: 所有table_id的路由一并推送
-    # 多租户环境: 按空间逐个推送路由,因为table_id不再唯一
-
-    if settings.ENABLE_MULTI_TENANT_MODE:  # 若开启多租户模式，则以空间粒度推送路由
-        for space in space_list:
-            tid_ds = get_space_table_id_data_id(space["space_type"], space["space_id"])
-            space_tid_list = list(tid_ds.keys())
-            space_client = SpaceTableIDRedis()
-            space_client.push_table_id_detail(
-                table_id_list=space_tid_list,
-                is_publish=is_publish,
-                include_es_table_ids=True,
-                bk_tenant_id=space["bk_tenant_id"],
-            )
-            space_client.push_data_label_table_ids(
-                table_id_list=space_tid_list,
-                is_publish=is_publish,
-                bk_tenant_id=space["bk_tenant_id"],
-            )
-    else:
-        table_id_list = []
-        if space_id:
-            for space in space_list:
-                tid_ds = get_space_table_id_data_id(space["space_type"], space["space_id"])
-                table_id_list.extend(tid_ds.keys())
-
-        space_client = SpaceTableIDRedis()
-        space_client.push_data_label_table_ids(table_id_list=table_id_list, is_publish=is_publish)
-        space_client.push_table_id_detail(table_id_list=table_id_list, is_publish=is_publish, include_es_table_ids=True)
-
-
 @atomic(config.DATABASE_CONNECTION_NAME)
 def delete_and_create_paas_space_data_id(
+    bk_tenant_id: str,
     space_type: str,
     space_id: str,
     need_delete_data_ids: set,
     need_add_data_ids: set,
 ):
+    """删除并重建空间与集群内置指标数据源的关联
+
+    Args:
+        bk_tenant_id: 租户 ID
+        space_type: 空间类型
+        space_id: 空间 ID
+        need_delete_data_ids: 需要删除的数据源 ID 集合
+        need_add_data_ids: 需要新增的数据源 ID 集合
+    """
     if need_delete_data_ids:
+        # 删除按 (space_type_id, space_id, bk_data_id) 唯一定位，无需再按租户过滤，兼容历史脏数据清理
         models.SpaceDataSource.objects.filter(
             space_type_id=space_type, space_id=space_id, bk_data_id__in=need_delete_data_ids
         ).delete()
@@ -863,7 +744,11 @@ def delete_and_create_paas_space_data_id(
     for data_id in need_add_data_ids:
         bulk_create_records.append(
             models.SpaceDataSource(
-                space_type_id=space_type, space_id=space_id, bk_data_id=data_id, from_authorization=True
+                bk_tenant_id=bk_tenant_id,
+                space_type_id=space_type,
+                space_id=space_id,
+                bk_data_id=data_id,
+                from_authorization=True,
             )
         )
 
@@ -885,9 +770,22 @@ def authorize_paas_space_cluster_data_source(space_cluster: dict):
     space_data_id_map = {}
     for space_data_id in space_data_ids:
         space_data_id_map.setdefault(space_data_id["space_id"], set()).add(space_data_id["bk_data_id"])
+    # 批量反查空间对应的租户信息，格式为 {space_id: bk_tenant_id}
+    space_tenant_map = dict(
+        models.Space.objects.filter(space_type_id=space_type, space_id__in=space_data_id_map.keys()).values_list(
+            "space_id", "bk_tenant_id"
+        )
+    )
     paas_data_id_list = settings.BKPAAS_AUTHORIZED_DATA_ID_LIST
     # 进行数据匹配
     for space_id, data_ids in space_data_id_map.items():
+        # 无对应 Space 时跳过，避免写入错误的默认租户
+        if space_id not in space_tenant_map:
+            logger.warning(
+                "authorize_paas_space_cluster_data_source: space not found for bksaas space_id->[%s], skip", space_id
+            )
+            continue
+        bk_tenant_id = space_tenant_map[space_id]
         # 匹配到需要增加的数据源
         need_create_data_ids = set(paas_data_id_list) - set(data_ids)
         try:
@@ -896,7 +794,11 @@ def authorize_paas_space_cluster_data_source(space_cluster: dict):
                 # 因为可能还会增加，更改为批量创建
                 objs = [
                     models.SpaceDataSource(
-                        space_type_id=space_type, space_id=space_id, bk_data_id=data_id, from_authorization=True
+                        bk_tenant_id=bk_tenant_id,
+                        space_type_id=space_type,
+                        space_id=space_id,
+                        bk_data_id=data_id,
+                        from_authorization=True,
                     )
                     for data_id in need_create_data_ids
                 ]
@@ -934,7 +836,9 @@ def authorize_paas_space_cluster_data_source(space_cluster: dict):
             json.dumps(need_add_data_ids),
         )
         try:
-            delete_and_create_paas_space_data_id(space_type, space_id, need_delete_data_ids, need_add_data_ids)
+            delete_and_create_paas_space_data_id(
+                bk_tenant_id, space_type, space_id, need_delete_data_ids, need_add_data_ids
+            )
         except Exception as e:
             logger.error(
                 """delete and create space data_ids failed, space_type: %s, space_id: %s,
@@ -1025,19 +929,5 @@ def refresh_bksaas_space_resouce():
     create_and_update_paas_space_resource(space_cluster_namespaces)
     # 重新授权
     authorize_paas_space_cluster_data_source(space_cluster)
-
-    # 批量进行推送数据
-    # NOTE: 此时集群或者公共插件相关的信息已经存在了，不需要再进行指标或 data_label 的映射
-    space_client = SpaceTableIDRedis()
-    bulk_handle(lambda space_list: space_client.push_multi_space_table_ids(space_list), spaces)
-
-    # 通知到使用方
-    push_redis_keys = []
-    for space in spaces:
-        if settings.ENABLE_MULTI_TENANT_MODE:
-            push_redis_keys.append(f"{space.space_type_id}__{space.space_id}|{space.bk_tenant_id}")
-        else:
-            push_redis_keys.append(f"{space.space_type_id}__{space.space_id}")
-    RedisTools.publish(SPACE_TO_RESULT_TABLE_CHANNEL, push_redis_keys)
 
     logger.info("refresh bksaas space resource successfully")

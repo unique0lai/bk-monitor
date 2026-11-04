@@ -1,14 +1,15 @@
 <template>
   <div
+    ref="warnTriggerRef"
     class="warn-table-wrap"
     @click="isShowList"
   >
     <span
+      v-bk-tooltips.top="$t('告警')"
       :style="{ color: badgeCount !== 0 ? 'red' : '' }"
       :class="`bklog-icon bklog-${badgeCount !== 0 ? 'gaojing-filled' : 'gaojing-line'}`"
-      v-bk-tooltips.top="$t('告警')" 
     ></span>
-    <span class='warn-table-text'>{{ $t('告警') }}</span>
+    <span class="warn-table-text">{{ $t('告警') }}</span>
     <bk-badge
       v-if="ownPendingCount !== 0"
       style="margin-top: -12px; margin-left: -3px"
@@ -31,14 +32,14 @@
           <template #setting>
             <div style="display: flex; align-items: center; justify-content: center; background-color: #f0f1f5">
               <div
-                class="selector-owner"
                 v-if="active === 'mission'"
+                class="selector-owner"
               >
                 {{ $t('我的') }}
                 <bk-switcher
+                  v-model="filterOwner"
                   class="selector-owner-switch"
                   size="small"
-                  v-model="filterOwner"
                 ></bk-switcher>
               </div>
               <div
@@ -47,9 +48,9 @@
               >
                 <span
                   v-for="type in ['all', 'unHandle']"
+                  :key="type"
                   class="option"
                   :class="{ selected: currentType === type }"
-                  :key="type"
                   @click="handleRadioGroup(type)"
                 >
                   {{ type === 'all' ? $t('全部') : $t('未恢复') }}
@@ -70,7 +71,7 @@
           </template>
 
           <bk-tab-panel
-            v-for="(item, index) in panels"
+            v-for="item in panels"
             :key="item.name"
             :label="item.label"
             :name="item.name"
@@ -92,16 +93,16 @@
             </bk-alert> -->
             <bk-table
               v-if="active === 'mission'"
+              :key="tableKey"
               v-bkloading="{ isLoading: loading }"
               :data="recordListshow"
               :empty-text="$t('暂无内容')"
-              :key="tableKey"
               :max-height="200"
               :min-height="120"
               :outer-border="false"
               :row-border="false"
-              @sort-change="handleSortChange"
               :stripe="true"
+              @sort-change="handleSortChange"
             >
               <bk-table-column
                 :label="$t('告警名称')"
@@ -109,6 +110,7 @@
               >
                 <template #default="{ row }">
                   <div
+                    v-bk-overflow-tips="row.alert_name"
                     class="bklog-table-col-alert-name"
                     :style="{
                       color: '#3a84ff',
@@ -116,7 +118,6 @@
                       '--severity-color': getLevelColor(row.severity),
                     }"
                     @click="handleViewWarningDetail(row)"
-                    v-bk-overflow-tips="row.alert_name"
                   >
                     <span class="severity-level"></span>{{ row.alert_name }}
                   </div>
@@ -177,11 +178,11 @@
             </bk-table>
             <bk-table
               v-if="active === 'config'"
+              :key="tableKey"
               v-bkloading="{ isLoading: loading }"
               :border="false"
               :data="strategyList"
               :empty-text="$t('暂无内容')"
-              :key="tableKey"
               :max-height="200"
               :outer-border="false"
               :row-border="false"
@@ -214,12 +215,14 @@
   </div>
 </template>
 <script setup lang="ts">
-  import { computed, onMounted, ref, watch } from 'vue';
+  import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+  import axios from 'axios';
   import $http from '@/api';
   import { formatDate } from '@/common/util';
   import PopInstanceUtil from '@/global/pop-instance-util';
   import useLocale from '@/hooks/use-locale';
   import useStore from '@/hooks/use-store';
+  import RequestPool from '@/store/request-pool';
   import { bkMessage } from 'bk-magic-vue';
 
   import { ConditionOperator } from '../../../store/condition-operator';
@@ -227,12 +230,17 @@
   import { BK_LOG_STORAGE } from '../../../store/store.type';
   import RetrieveHelper, { RetrieveEvent } from '@/views/retrieve-helper';
 
+  const ALERT_BADGE_CANCEL_KEY = 'retrieveAlertBadgeCancelToken';
+  const ALERT_LIST_CANCEL_KEY = 'retrieveAlertListCancelToken';
+  const STRATEGY_LIST_CANCEL_KEY = 'retrieveStrategyListCancelToken';
+
   const { t } = useLocale();
   const store = useStore();
 
   const { resolveQueryParams, resolveCommonParams } = useRetrieveHook();
 
   const refWarningSettingElement = ref(null);
+  const warnTriggerRef = ref(null);
 
   const PopInstanceUtilInstance = new PopInstanceUtil({
     refContent: refWarningSettingElement,
@@ -274,7 +282,7 @@
   const active = ref('mission');
   const typeMap = {
     all: 'ALL',
-    unHandle: 'NOT_SHIELDED_ABNORMAL',
+    unHandle: 'ABNORMAL',
   };
 
   const currentType = ref('all');
@@ -295,9 +303,8 @@
           item.assignee?.some(assignee => assignee === userMeta.value.username) ||
           item.appointee?.some(appointee => appointee === userMeta.value.username),
       );
-    } else {
-      return recordList.value;
     }
+    return recordList.value;
   });
 
   const pageSize = 10;
@@ -367,17 +374,31 @@
         : b.first_anomaly_time - a.first_anomaly_time;
     });
   };
-  const isShowList = e => {
+  const isShowList = () => {
+    // 固定挂载参照元素为按钮根节点，避免 e.target 在图标/文字子元素间漂移，
+    // 导致 newInstance:false 复用的 tippy 实例永久锚定在首次点击的子元素上。
+    const target = warnTriggerRef.value;
+    if (!target) {
+      return;
+    }
+
+    // 防御性修复：tippy 已隐藏但内部 isShowing 标志位未同步复位时，
+    // show() 里的 `if (this.isShowing) return` 会静默吞掉点击，表现为按钮失效。
+    if (!PopInstanceUtilInstance.isShown() && PopInstanceUtilInstance.isInstanceShowing()) {
+      PopInstanceUtilInstance.setIsShowing(false);
+    }
+
     if (!PopInstanceUtilInstance.isShown()) {
-      PopInstanceUtilInstance.show(e.target);
+      loadAlertPanelData();
+      PopInstanceUtilInstance.show(target);
     }
   };
 
   const getQueryString = () => {
     const timezone = store.state.indexItem.timezone;
-    const [start_time, end_time] = store.state.indexItem.datePickerValue;
+    const [startTime, endTime] = store.state.indexItem.datePickerValue;
 
-    return `queryString=metric:bk_log_search.index_set.${store.state.indexId}&from=${start_time}&to=${end_time}&timezone=${timezone}`;
+    return `queryString=metric:bk_log_search.index_set.${store.state.indexId}&from=${startTime}&to=${endTime}&timezone=${timezone}`;
   };
 
   const handleJumpMonitor = () => {
@@ -387,61 +408,108 @@
     };
     if (active.value === 'mission') {
       const res = getQueryString();
-      window.open(`${window.MONITOR_URL}/?bizId=${store.state.bkBizId}#/${addressMap[active.value]}?${res}`, '_blank');
+      window.open(
+        `${window.MONITOR_URL}/?bizId=${store.state.bkBizId}#/${addressMap[active.value]}?${res}`,
+        '_blank',
+        'noopener,noreferrer',
+      );
       return;
     }
 
     window.open(
       `${window.MONITOR_URL}/?bizId=${store.state.bkBizId}#/${addressMap[active.value]}?filters=[{"key":"metric_id","value":["bk_log_search.index_set.${store.state.indexId}"]}]`,
       '_blank',
+      'noopener,noreferrer',
     );
   };
 
   const handleViewWarningDetail = row => {
-    window.open(`${window.MONITOR_URL}/?bizId=${store.state.bkBizId}#/event-center/detail/${row.id}`, '_blank');
+    window.open(
+      `${window.MONITOR_URL}/?bizId=${store.state.bkBizId}#/event-center/detail/${row.id}`,
+      '_blank',
+      'noopener,noreferrer',
+    );
   };
 
   const handleStrategyInfoClick = row => {
     window.open(
       `${window.MONITOR_URL}/?bizId=${store.state.bkBizId}#/strategy-config/detail/${row.strategy_id}`,
       '_blank',
+      'noopener,noreferrer',
     );
+  };
+
+  const isCurrentIndexRequest = (requestIndexId: string | number) => requestIndexId === indexId.value;
+
+  const requestAlertList = (status: string, requestIndexId: string | number, cancelTokenKey: string) => {
+    RequestPool.execCanceToken(cancelTokenKey);
+    return $http.request(
+      'alertStrategy/alertList',
+      {
+        params: {
+          index_set_id: requestIndexId,
+        },
+        data: {
+          status,
+          page_size: pageSize,
+          space_uid: store.state.storage[BK_LOG_STORAGE.BK_SPACE_UID],
+        },
+      },
+      { cancelToken: RequestPool.getCancelToken(cancelTokenKey) },
+    );
+  };
+
+  /**
+   * 获取告警角标数量
+   * 角标口径与列表不同：已屏蔽的告警不应再红点提醒，因此固定使用 NOT_SHIELDED_ABNORMAL
+   */
+  const getAlertBadgeCount = async () => {
+    const requestIndexId = indexId.value;
+    try {
+      if (!requestIndexId) {
+        return;
+      }
+
+      const res = await requestAlertList('NOT_SHIELDED_ABNORMAL', requestIndexId, ALERT_BADGE_CANCEL_KEY);
+      if (!isCurrentIndexRequest(requestIndexId)) {
+        return;
+      }
+      const list = res?.data || [];
+
+      badgeCount.value = list.length;
+      ownPendingCount.value = list.filter(item => {
+        return (
+          item.assignee?.some(assignee => assignee === userMeta.value.username) ||
+          item.appointee?.some(appointee => appointee === userMeta.value.username)
+        );
+      }).length;
+    } catch (e) {
+      if (axios.isCancel(e)) {
+        return;
+      }
+      console.warn(e);
+    }
   };
 
   /**
    * 获取告警列表
    * @param val
    * ALL - 表示查询全部告警记录;
-   * NOT_SHIELDED_ABNORMAL - 表示查询未处理的告警记录;
+   * ABNORMAL - 表示查询未恢复的告警记录，含已屏蔽;
    * MY_ASSIGNEE - 表示我收到的告警记录
    */
   const getAlertListData = async (val: string) => {
+    const requestIndexId = indexId.value;
     try {
-      if (!indexId.value) {
+      if (!requestIndexId) {
         return;
       }
 
       recordList.value = [];
       loading.value = true;
-      const res = await $http.request('alertStrategy/alertList', {
-        params: {
-          index_set_id: indexId.value,
-        },
-        data: {
-          status: val,
-          page_size: pageSize,
-          space_uid: store.state.storage[BK_LOG_STORAGE.BK_SPACE_UID],
-        },
-      });
-
-      if (val === 'NOT_SHIELDED_ABNORMAL') {
-        badgeCount.value = res?.data.length;
-        ownPendingCount.value = res?.data.filter(item => {
-          return (
-            item.assignee?.some(assignee => assignee === userMeta.value.username) ||
-            item.appointee?.some(appointee => appointee === userMeta.value.username)
-          );
-        }).length;
+      const res = await requestAlertList(val, requestIndexId, ALERT_LIST_CANCEL_KEY);
+      if (!isCurrentIndexRequest(requestIndexId)) {
+        return;
       }
 
       recordList.value = res?.data || [];
@@ -449,9 +517,14 @@
       // panels.value[0].count = res?.data.length || 0;
       tableKey.value += 1;
     } catch (e) {
+      if (axios.isCancel(e)) {
+        return;
+      }
       console.warn(e);
     } finally {
-      loading.value = false;
+      if (isCurrentIndexRequest(requestIndexId)) {
+        loading.value = false;
+      }
     }
   };
 
@@ -459,25 +532,33 @@
    * 获取策略列表
    */
   const getStrategyDate = async () => {
-    try {
-      strategyList.value.length = 0;
-      strategyList.value = [];
+    const requestIndexId = indexId.value;
+    strategyList.value = [];
 
-      if (!indexId.value) {
+    if (!requestIndexId) {
+      return;
+    }
+
+    RequestPool.execCanceToken(STRATEGY_LIST_CANCEL_KEY);
+    loading.value = true;
+
+    try {
+      const res = await $http.request(
+        'alertStrategy/strategyList',
+        {
+          params: {
+            index_set_id: requestIndexId,
+          },
+          data: {
+            page_size: pageSize,
+            space_uid: store.state.storage[BK_LOG_STORAGE.BK_SPACE_UID],
+          },
+        },
+        { cancelToken: RequestPool.getCancelToken(STRATEGY_LIST_CANCEL_KEY) },
+      );
+      if (!isCurrentIndexRequest(requestIndexId)) {
         return;
       }
-
-      loading.value = true;
-
-      const res = await $http.request('alertStrategy/strategyList', {
-        params: {
-          index_set_id: indexId.value,
-        },
-        data: {
-          page_size: pageSize,
-          space_uid: store.state.storage[BK_LOG_STORAGE.BK_SPACE_UID],
-        },
-      });
 
       (res?.data || []).forEach(element => {
         strategyList.value.push(
@@ -490,10 +571,37 @@
       panels.value[1].count = res?.data.length || 0;
       tableKey.value += 1;
     } catch (e) {
+      if (axios.isCancel(e)) {
+        return;
+      }
       console.warn(e);
     } finally {
-      loading.value = false;
+      if (isCurrentIndexRequest(requestIndexId)) {
+        loading.value = false;
+      }
     }
+  };
+
+  const cancelAlertRequests = () => {
+    RequestPool.execCanceToken(ALERT_BADGE_CANCEL_KEY);
+    RequestPool.execCanceToken(ALERT_LIST_CANCEL_KEY);
+    RequestPool.execCanceToken(STRATEGY_LIST_CANCEL_KEY);
+  };
+
+  const resetAlertPanelData = () => {
+    badgeCount.value = 0;
+    ownPendingCount.value = 0;
+    recordList.value = [];
+    originRecordList.value = [];
+    strategyList.value = [];
+    panels.value[1].count = 0;
+    loading.value = false;
+  };
+
+  const loadAlertPanelData = () => {
+    const type = typeMap[currentType.value];
+    getAlertListData(type);
+    getStrategyDate();
   };
 
   const handleViewLogInfo = row => {
@@ -513,11 +621,11 @@
       })
       .then(resp => {
         if (resp.result) {
-          const { query_string, agg_condition } = resp.data;
+          const { query_string: queryString, agg_condition: aggCondition } = resp.data;
 
           const params = {
             search_mode: null,
-            addition: agg_condition.map(item => {
+            addition: aggCondition.map(item => {
               const instance = new ConditionOperator({
                 field: item.key,
                 operator: item.method,
@@ -526,7 +634,7 @@
               });
               return instance.formatApiOperatorToFront();
             }),
-            keyword: query_string,
+            keyword: queryString,
           };
           resolveCommonParams(params).then(() => {
             resolveQueryParams(params, true).then(res => {
@@ -563,28 +671,31 @@
       });
   };
 
-  const setMounted = async () => {
-    await getAlertListData('NOT_SHIELDED_ABNORMAL');
-
-    const type = typeMap[currentType.value];
-    getAlertListData(type);
-
-    getStrategyDate();
-  };
-
-  onMounted(async () => {
-    await setMounted();
+  onMounted(() => {
+    if (indexId.value) {
+      getAlertBadgeCount();
+    }
   });
 
-  // 索引集ID改变时，获取告警数量
-  // 逻辑和第一次加载时一样
-  watch(
-    () => [indexId.value],
-    () => {
-      badgeCount.value = 0;
+  onUnmounted(() => {
+    cancelAlertRequests();
+    PopInstanceUtilInstance?.uninstallInstance();
+  });
 
-      if (indexId.value) {
-        setMounted();
+  // 索引集切换时只刷新角标；策略列表等面板打开再拉，避免占满连接挡住检索
+  watch(
+    () => indexId.value,
+    () => {
+      cancelAlertRequests();
+      resetAlertPanelData();
+
+      if (!indexId.value) {
+        return;
+      }
+
+      getAlertBadgeCount();
+      if (PopInstanceUtilInstance.isShown()) {
+        loadAlertPanelData();
       }
     },
   );

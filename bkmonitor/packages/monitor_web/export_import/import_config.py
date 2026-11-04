@@ -17,10 +17,11 @@ from django.utils.translation import gettext as _
 
 from api.grafana.exporter import DashboardExporter
 from bk_dataview.api import get_or_create_org
-from bkmonitor.action.serializers import DutyRuleDetailSlz, UserGroupDetailSlz
+from bkmonitor.action.serializers import DutyRuleDetailSlz, ExecuteConfigSlz, UserGroupDetailSlz
 from bkmonitor.models import ActionConfig, DutyRule, StrategyModel, UserGroup
 from bkmonitor.utils.local import local
 from bkmonitor.utils.tenant import bk_biz_id_to_bk_tenant_id
+from constants.action import GLOBAL_BIZ_ID
 from constants.data_source import DataSourceLabel
 from core.drf_resource import api, resource
 from core.errors.export_import import ImportConfigError
@@ -238,8 +239,12 @@ def import_strategy(bk_biz_id, import_history_instance, strategy_config_list, is
     # 新创建的用户组
     newly_created_user_groups = {}  # {user_group.name: user_group}
 
-    # 已存在的处理套餐
-    existed_action_names = set(ActionConfig.objects.filter(bk_biz_id=bk_biz_id).values_list("name", flat=True))
+    # 已存在的处理套餐。UI validate_name 把当前业务和全局内置(bk_biz_id=0)放进同一命名空间，
+    # 导入只按当前业务去重会造出之后无法在页面保存的业务套餐。
+    existed_biz_action_names = set(ActionConfig.objects.filter(bk_biz_id=bk_biz_id).values_list("name", flat=True))
+    existed_action_names = existed_biz_action_names | set(
+        ActionConfig.objects.filter(bk_biz_id=GLOBAL_BIZ_ID).values_list("name", flat=True)
+    )
     # 新创建的处理套餐
     newly_created_actions = {}  # {action.name: action}
 
@@ -358,16 +363,20 @@ def import_strategy(bk_biz_id, import_history_instance, strategy_config_list, is
                 config.pop("id", None)
                 config["bk_biz_id"] = bk_biz_id
 
-                if not is_overwrite_mode:
-                    while config["name"] in existed_action_names:
-                        config["name"] = f"{config['name']}_clone"
+                # 覆盖只更新当前业务已有套餐；与全局内置撞名且本业务没有时仍改名。
+                while config["name"] in existed_action_names and (
+                    not is_overwrite_mode or config["name"] not in existed_biz_action_names
+                ):
+                    config["name"] = f"{config['name']}_clone"
 
                 # 避免重复创建处理套餐
                 if config["name"] in newly_created_actions:
                     action["config_id"] = newly_created_actions[config["name"]].id
                     continue
 
-                action_config_instance, created = ActionConfig.objects.update_or_create(
+                execute_config_serializer = ExecuteConfigSlz(data=config["execute_config"])
+                execute_config_serializer.is_valid(raise_exception=True)
+                action_config_instance, _ = ActionConfig.objects.update_or_create(
                     name=config["name"], bk_biz_id=bk_biz_id, defaults=config
                 )
                 action["config_id"] = action_config_instance.id

@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
-/** biome-ignore-all lint/suspicious/noExplicitAny: <explanation> */
+/** biome-ignore-all lint/suspicious/noExplicitAny: 兼容原始 Span 的动态属性及不同详情区块的数据结构。 */
 /*
  * Tencent is pleased to support the open source community by making
  * 蓝鲸智云PaaS平台社区版 (BlueKing PaaS Community Edition) available.
@@ -25,20 +25,43 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { type PropType, computed, defineComponent, onMounted, provide, reactive, ref, shallowRef, watch } from 'vue';
+import {
+  type PropType,
+  type Ref,
+  computed,
+  ref as deepRef,
+  defineComponent,
+  inject,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  provide,
+  reactive,
+  shallowRef,
+  watch,
+} from 'vue';
 
 import { Button, Exception, Loading, Message, Popover, Sideslider, Switcher, Tab } from 'bkui-vue';
 import { EnlargeLine } from 'bkui-vue/lib/icon';
 import dayjs from 'dayjs';
 import { CancelToken } from 'monitor-api/cancel';
 import { query as apmProfileQuery } from 'monitor-api/modules/apm_profile';
+import { listLinks, spanDetail } from 'monitor-api/modules/apm_trace';
 import { getSceneView } from 'monitor-api/modules/scene_view';
+import { buildHostMonitorTarget, hostMonitorHash } from 'monitor-common/utils/host-monitor-url';
+import { profilingExploreHash } from 'monitor-common/utils/profiling-url';
 import { copyText, deepClone, random } from 'monitor-common/utils/utils';
 import { useI18n } from 'vue-i18n';
 import VueJsonPretty from 'vue-json-pretty';
 
 import ExceptionGuide, { type IGuideInfo } from '../../components/exception-guide/exception-guide';
 import MonitorTab from '../../components/monitor-tab/monitor-tab';
+import {
+  hideSelectionDecoder,
+  isSelectionDecoderTrigger,
+  showSelectionDecoder,
+} from '../../components/selection-decoder';
+import transformTraceTree from '../../components/trace-view/model/transform-trace-data';
 import { formatDate, formatDuration, formatTime } from '../../components/trace-view/utils/date';
 import ProfilingFlameGraph from '../../plugins/charts/profiling-graph/profiling-flame-graph/flame-graph';
 import FlexDashboardPanel from '../../plugins/components/flex-dashboard-panel';
@@ -51,6 +74,7 @@ import { useSpanDetailQueryStore } from '../../store/modules/span-detail-query';
 import { useTraceStore } from '../../store/modules/trace';
 import {
   type IInfo,
+  type ISpanLinkItem,
   type IStageTimeItem,
   type IStageTimeItemContent,
   type ITagContent,
@@ -61,10 +85,13 @@ import { downFile } from '../../utils';
 import { toUnixMilliseconds } from '../../utils/date';
 import { SPAN_KIND_MAPS as SPAN_KIND_MAPS_NEW } from '../trace-explore/components/trace-explore-table/constants';
 import { safeParseJsonValueForWhere } from '../trace-explore/utils';
-import { TRACE_SPAN_DETAIL_BASIC_INFO_EXPAND_KEY } from './constants';
+import { SPAN_DETAILS_Z_INDEX, TRACE_SPAN_DETAIL_BASIC_INFO_EXPAND_KEY } from './constants';
 // import AiBluekingIcon from '@/components/ai-blueking-icon/ai-blueking-icon';
 import DashboardPanel from './dashboard-panel/dashboard-panel';
-import DecodeDialog from '@/components/decode-dialog/decode-dialog';
+import K8sContainer from './k8s-container';
+import LlmObservation from './llm-observation';
+import ObservationSearch from './llm-observation/components/observation-search';
+import { formatSpanLinks } from './utils/format-span-links';
 
 import type { Span } from '../../components/trace-view/typings';
 import type { IFlameGraphDataItem } from 'monitor-ui/chart-plugins/hooks/profiling-graph/types';
@@ -86,10 +113,33 @@ const guideInfoData: Record<string, IGuideInfo> = {
   // Index: {}
 };
 
-type TabName = 'BasicInfo' | 'Container' | 'Event' | 'Host' | 'Index' | 'Log' | 'Process' | 'Profiling';
+type SpanDetailResponseCache = {
+  key: string;
+  originData: null | Record<string, any>;
+  span: Span;
+};
+
+type SpanLinksRequestParams = {
+  requestAppName: string;
+  requestSpanId: string;
+  requestTraceId: string;
+};
+
+type SpanLinksResponse = Record<string, unknown>[] | { links?: Record<string, unknown>[] };
+
+type TabName =
+  | 'BasicInfo'
+  | 'Container'
+  | 'Event'
+  | 'Host'
+  | 'Index'
+  | 'LlmObservation'
+  | 'Log'
+  | 'Process'
+  | 'Profiling';
 
 /** 不需要解码的属性名白名单 */
-const UNDECODED_PROPERTY_NAMES_WHITELIST = ['net.peer.port'];
+const UNDECODED_PROPERTY_NAMES_WHITELIST = ['net.peer.port', 'span_id', 'trace_id'];
 export default defineComponent({
   name: 'SpanDetails',
   props: {
@@ -101,6 +151,10 @@ export default defineComponent({
     isPageLoading: { type: Boolean, default: false },
     activeTab: { type: String, default: 'BasicInfo' },
     defaultExpand: { type: Boolean, default: false } /* 是否默认展开所有详情项 */,
+    /** 跨业务场景优先使用的业务 ID（与 TraceDetail 对齐） */
+    bizId: { type: [Number, String], default: undefined },
+    /** 优先使用的应用名（与 TraceDetail 对齐） */
+    appName: { type: String, default: undefined },
   },
   emits: ['show', 'prevNextClicked'],
   setup(props, { emit }) {
@@ -110,7 +164,7 @@ export default defineComponent({
     const spanDetailQueryStore = useSpanDetailQueryStore();
     const { t } = useI18n();
     /* 侧栏show */
-    const localShow = ref(false);
+    const localShow = shallowRef(false);
     /* 详情数据 */
     const tempInfo = {
       title: '',
@@ -124,13 +178,58 @@ export default defineComponent({
     const info = reactive<IInfo>(deepClone(tempInfo));
 
     /** 切换显示原始数据 */
-    const showOriginalData = ref(false);
+    const showOriginalData = shallowRef(false);
 
     /** 原始数据 */
-    const originalData = ref<null | Record<string, any>>(null);
+    const originalData = deepRef<null | Record<string, any>>(null);
 
-    /* 当前应用名称 */
-    const appName = computed(() => store.traceData.appName);
+    /** TraceDetail 等上级注入的当前页面业务 / 应用上下文 */
+    const injectedBizId = inject<Ref<number | string> | undefined>('bizId', undefined);
+    const injectedAppName = inject<Ref<string> | undefined>('appName', undefined);
+    const appStore = useAppStore();
+
+    const viewAppName = computed(() => props.appName || injectedAppName?.value || store.traceData.appName || '');
+
+    const viewBizId = computed(() => {
+      const contextBizId =
+        props.bizId ?? injectedBizId?.value ?? appStore.bizId ?? window.bk_biz_id ?? window.cc_biz_id;
+      return contextBizId != null && contextBizId !== '' && !Number.isNaN(+contextBizId) ? +contextBizId : 0;
+    });
+
+    const loadedSpan = shallowRef<Span>(null);
+    const spanDetailLoading = shallowRef(false);
+    let spanDetailRequestKey = '';
+    let spanDetailRequestSeq = 0;
+    let spanDetailCancel: (() => void) | null = null;
+    let spanDetailResponseCache: null | SpanDetailResponseCache = null;
+
+    const detailSpan = computed<Span>(() => loadedSpan.value || props.spanDetails);
+
+    /** 后端补充的标准 LLM Span，仅命中 LLM 语义层级的 Span 才有 */
+    const llmDetail = computed(() => detailSpan.value?.llm_detail ?? null);
+
+    function shouldLoadSpanDetail(span: Span): boolean {
+      if (!span) return false;
+      const sourceSpanId = span.span_id || span.spanID;
+      if (!sourceSpanId) return false;
+      // 首屏可省略详情字段；关联 Trace / 检索入口也可能只传入 span_id stub。
+      const incomplete = (!span.operationName && !span.startTime) || !span.attributes?.length;
+      const appMismatch = Boolean(span.app_name && viewAppName.value && span.app_name !== viewAppName.value);
+      const bizMismatch =
+        span.bk_biz_id != null &&
+        span.bk_biz_id !== '' &&
+        Boolean(viewBizId.value) &&
+        String(span.bk_biz_id) !== String(viewBizId.value);
+      return Boolean(span.llm_detail && !span.llm_detail.attributes) || incomplete || appMismatch || bizMismatch;
+    }
+
+    /** 详情及其所有 Tab 统一使用 Span 自带上下文，存量数据缺字段时回退页面上下文。 */
+    const appName = computed(() => props.spanDetails?.app_name || viewAppName.value);
+
+    const bizId = computed(() => {
+      const spanBizId = props.spanDetails?.bk_biz_id;
+      return spanBizId != null && spanBizId !== '' && !Number.isNaN(+spanBizId) ? +spanBizId : viewBizId.value;
+    });
 
     const spanStatus = computed<{ alias: string; icon: string }>(() => {
       const statusMap = {
@@ -138,15 +237,13 @@ export default defineComponent({
         1: { alias: t('正常'), icon: 'normal' },
         2: { alias: t('异常'), icon: 'failed' },
       };
-      const status = props.spanDetails?.attributes?.find(item => item.query_key === 'status.code')?.query_value;
+      const status = detailSpan.value?.attributes?.find(item => item.query_key === 'status.code')?.query_value;
       return statusMap[status];
     });
 
     const fullscreen = shallowRef(false);
 
     const ellipsisDirection = computed(() => store.ellipsisDirection);
-
-    const bizId = computed(() => useAppStore().bizId || 0);
 
     const spans = computed(() => store.spanGroupTree);
 
@@ -194,32 +291,39 @@ export default defineComponent({
     });
     provide('customTimeProvider', customTimeProvider);
 
-    const serviceNameProvider = ref('');
+    const serviceNameProvider = shallowRef('');
     // 服务、应用 名在日志 tab 里能用到
     provide('serviceName', serviceNameProvider);
     provide('appName', appName);
+    provide('bizId', bizId);
 
     // 用于关联日志跳转信息
-    const traceId = ref('');
+    const traceId = shallowRef('');
     provide('traceId', traceId);
-    const spanTime = ref(0);
-    const spanStartTime = ref(0);
-    const spanEndTime = ref(0);
-    const originSpanStartTime = ref(0);
+    const spanTime = shallowRef(0);
+    const spanStartTime = shallowRef(0);
+    const spanEndTime = shallowRef(0);
+    const originSpanStartTime = shallowRef(0);
     provide('originSpanStartTime', originSpanStartTime);
-    const originSpanEndTime = ref(0);
+    const originSpanEndTime = shallowRef(0);
     provide('originSpanEndTime', originSpanEndTime);
 
     const spanId = computed(() => props.spanDetails.span_id);
     provide('spanId', spanId);
     // 用作 Event 栏的首行打开。
     let isInvokeOnceFlag = true;
+    let spanLinksCancelToken: (() => void) | null = null;
+    let spanLinksRequestKey = '';
+    let spanLinksRequestSeq = 0;
+    let spanLinksResponseKey = '';
+    let spanLinksResponseLinks: Record<string, unknown>[] = [];
 
     const getSpanDetailExpandUserConfig = () => {
       const allExpandTypes = [
         EListItemType.tags,
         EListItemType.stageTime,
         EListItemType.resource,
+        EListItemType.links,
         EListItemType.events,
       ];
       // 如果 defaultExpand 为 true，强制展开所有项
@@ -235,14 +339,195 @@ export default defineComponent({
 
     /** 获取 span 类型描述 */
     function getTypeText() {
-      const { kind, source, ebpf_kind: ebpfKind, is_virtual: isVirtual } = props.spanDetails;
+      const { kind, source, ebpf_kind: ebpfKind, is_virtual: isVirtual } = detailSpan.value;
       if (isVirtual) return t('推断');
       if (source === 'ebpf') return ebpfKind;
       return SPAN_KIND_MAPS[kind];
     }
 
+    function buildSpanLinksInfoItem(linkList: ISpanLinkItem[], isExpan?: boolean): IInfo['list'][number] {
+      return {
+        type: EListItemType.links,
+        isExpan: isExpan ?? basicInfoExpand.value.includes(EListItemType.links),
+        title: 'Links',
+        [EListItemType.links]: {
+          list: linkList,
+        },
+      };
+    }
+
+    function updateSpanLinksInfo(linkList: ISpanLinkItem[]): void {
+      const linkInfoIndex = info.list.findIndex(item => item.type === EListItemType.links);
+      if (!linkList.length) {
+        if (linkInfoIndex > -1) info.list.splice(linkInfoIndex, 1);
+        return;
+      }
+
+      const currentExpandStatus = linkInfoIndex > -1 ? info.list[linkInfoIndex].isExpan : undefined;
+      const linkInfoItem = buildSpanLinksInfoItem(linkList, currentExpandStatus);
+      if (linkInfoIndex > -1) {
+        info.list.splice(linkInfoIndex, 1, linkInfoItem);
+        return;
+      }
+
+      const eventInfoIndex = info.list.findIndex(item => item.type === EListItemType.events);
+      info.list.splice(eventInfoIndex > -1 ? eventInfoIndex : info.list.length, 0, linkInfoItem);
+    }
+
+    function buildSpanLinksRequestKey(params: SpanLinksRequestParams): string {
+      return JSON.stringify([params.requestAppName, params.requestTraceId, params.requestSpanId]);
+    }
+
+    function getSpanLinks(response: null | SpanLinksResponse): Record<string, unknown>[] {
+      if (Array.isArray(response)) return response;
+      if (Array.isArray(response?.links)) return response.links;
+      return [];
+    }
+
+    function resetSpanLinksRequestState(): void {
+      if (spanLinksCancelToken) {
+        spanLinksCancelToken();
+        spanLinksCancelToken = null;
+      }
+      spanLinksRequestKey = '';
+      spanLinksRequestSeq += 1;
+      spanLinksResponseKey = '';
+      spanLinksResponseLinks = [];
+    }
+
+    async function loadSpanLinks(params: SpanLinksRequestParams): Promise<void> {
+      const { requestAppName, requestSpanId, requestTraceId } = params;
+      if (!requestAppName || !requestSpanId || !requestTraceId) return;
+
+      const requestKey = buildSpanLinksRequestKey(params);
+      if (requestKey === spanLinksResponseKey) {
+        updateSpanLinksInfo(formatSpanLinks(spanLinksResponseLinks));
+        return;
+      }
+      if (requestKey === spanLinksRequestKey) return;
+
+      if (spanLinksCancelToken) {
+        spanLinksCancelToken();
+        spanLinksCancelToken = null;
+      }
+      spanLinksRequestKey = requestKey;
+      const requestSeq = ++spanLinksRequestSeq;
+
+      const response = await listLinks(
+        {
+          bk_biz_id: bizId.value,
+          app_name: requestAppName,
+          trace_id: requestTraceId,
+          span_id: requestSpanId,
+        },
+        {
+          cancelToken: new CancelToken((cancel: () => void) => {
+            spanLinksCancelToken = cancel;
+          }),
+        }
+      ).catch(() => null);
+      if (
+        requestSeq !== spanLinksRequestSeq ||
+        requestKey !== spanLinksRequestKey ||
+        !props.show ||
+        props.spanDetails?.app_name !== requestAppName ||
+        props.spanDetails?.span_id !== requestSpanId ||
+        (props.spanDetails?.traceID || traceId.value) !== requestTraceId
+      ) {
+        return;
+      }
+      spanLinksCancelToken = null;
+      if (!response) {
+        spanLinksRequestKey = '';
+        return;
+      }
+
+      spanLinksResponseKey = requestKey;
+      spanLinksResponseLinks = getSpanLinks(response);
+      updateSpanLinksInfo(formatSpanLinks(spanLinksResponseLinks));
+    }
+
+    async function loadSpanDetail(sourceSpan: Span): Promise<null | Record<string, any>> {
+      const sourceBizId = sourceSpan.bk_biz_id ?? viewBizId.value;
+      const sourceAppName = sourceSpan.app_name || viewAppName.value;
+      const sourceSpanId = sourceSpan.span_id || sourceSpan.spanID;
+      if (!sourceBizId || !sourceAppName || !sourceSpanId) {
+        spanDetailRequestKey = '';
+        spanDetailRequestSeq += 1;
+        spanDetailLoading.value = false;
+        return null;
+      }
+
+      const requestKey = JSON.stringify([sourceBizId, sourceAppName, sourceSpanId]);
+      if (requestKey === spanDetailResponseCache?.key) {
+        spanDetailCancel?.();
+        spanDetailRequestSeq += 1;
+        spanDetailRequestKey = '';
+        spanDetailLoading.value = false;
+        loadedSpan.value = {
+          ...sourceSpan,
+          ...spanDetailResponseCache.span,
+        };
+        return spanDetailResponseCache.originData;
+      }
+      if (requestKey === spanDetailRequestKey) return null;
+
+      spanDetailCancel?.();
+      spanDetailRequestKey = requestKey;
+      const requestSeq = ++spanDetailRequestSeq;
+      spanDetailLoading.value = true;
+      const result = await spanDetail(
+        { bk_biz_id: sourceBizId, app_name: sourceAppName, span_id: sourceSpanId },
+        {
+          cancelToken: new CancelToken((cancel: () => void) => {
+            spanDetailCancel = cancel;
+          }),
+        }
+      ).catch(() => null);
+
+      if (requestSeq !== spanDetailRequestSeq) return null;
+
+      spanDetailRequestKey = '';
+      spanDetailLoading.value = false;
+      const traceTree = result?.trace_tree;
+      if (!traceTree?.spans?.length) return null;
+
+      traceTree.traceID = traceTree.spans[0].traceID;
+      const loadedDetailSpan = transformTraceTree(traceTree)?.spans?.[0];
+      if (!loadedDetailSpan) return null;
+
+      const originData = result.origin_data ?? null;
+      spanDetailResponseCache = {
+        key: requestKey,
+        originData,
+        span: loadedDetailSpan,
+      };
+      loadedSpan.value = {
+        ...sourceSpan,
+        ...loadedDetailSpan,
+      };
+      return originData;
+    }
+
+    async function prepareDetails(): Promise<void> {
+      loadedSpan.value = null;
+      const sourceSpan = props.spanDetails;
+      if (!shouldLoadSpanDetail(sourceSpan)) {
+        spanDetailRequestKey = '';
+        spanDetailRequestSeq += 1;
+        spanDetailLoading.value = false;
+        getDetails();
+        return;
+      }
+
+      const loadedOriginData = await loadSpanDetail(sourceSpan);
+      if (!props.show || props.spanDetails !== sourceSpan || (!loadedOriginData && !loadedSpan.value)) return;
+      getDetails(loadedOriginData);
+    }
+
     /* 获取详情数据 */
-    function getDetails() {
+    function getDetails(loadedOriginData?: null | Record<string, any>) {
+      if (!detailSpan.value) return;
       const {
         span_id: originalSpanId,
         app_name: appName,
@@ -256,13 +541,20 @@ export default defineComponent({
         source,
         stage_duration,
         resource: spanResource,
-      } = props.spanDetails as any | Span;
+      } = detailSpan.value as any | Span;
       // 服务、应用 名在日志 tab 里能用到
       serviceNameProvider.value = serviceName;
-      const originalDataList = [...store.traceData.original_data, ...store.compareTraceOriginalData];
+      const originalDataList = [
+        loadedOriginData,
+        ...store.traceData.original_data,
+        ...store.compareTraceOriginalData,
+      ].filter(Boolean);
       // 根据span_id获取原始数据
       const curSpan = originalDataList.find((data: any) => data.span_id === originalSpanId);
-      if (!curSpan) return;
+      if (!curSpan) {
+        resetSpanLinksRequestState();
+        return;
+      }
       spanStartTime.value = Math.floor(curSpan.start_time / 1000) || 0;
       spanEndTime.value = Math.floor(curSpan.end_time / 1000) || 0;
       spanTime.value = Number(curSpan.time || 0);
@@ -271,6 +563,7 @@ export default defineComponent({
       if (curSpan) originalData.value = handleFormatJson(curSpan);
       const {
         kind,
+        links,
         trace_id: originTraceId,
         resource,
         is_virtual: isVirtual,
@@ -468,6 +761,14 @@ export default defineComponent({
           },
         });
       }
+      const linkList = formatSpanLinks(links);
+      /** Links 信息 */
+      updateSpanLinksInfo(linkList);
+      loadSpanLinks({
+        requestAppName: appName,
+        requestSpanId: originalSpanId,
+        requestTraceId: originTraceId,
+      });
       /** Events信息 来源：status_message & events */
       if (events?.length) {
         const eventList = [];
@@ -545,8 +846,29 @@ export default defineComponent({
 
     /* 关闭侧栏 */
     const handleHiddenChange = () => {
+      hideSelectionDecoder();
       localShow.value = false;
       emit('show', localShow.value);
+    };
+
+    /** 划选或双击选中 .right 区域文本后弹出复制 / 自动解码，纯单击忽略 */
+    const handleRightTextSelect = (event: MouseEvent) => {
+      const selection = window.getSelection();
+      const text = selection?.toString() ?? '';
+      if (!selection || !text.trim()) {
+        hideSelectionDecoder();
+        return;
+      }
+
+      if (!isSelectionDecoderTrigger(event)) {
+        return;
+      }
+
+      if (!event.currentTarget) {
+        return;
+      }
+
+      showSelectionDecoder(text, event);
     };
 
     /* 上一跳/下一跳 */
@@ -565,7 +887,14 @@ export default defineComponent({
     };
 
     const handleSmallExpanChange = (isExpan: boolean, index: number, childIndex: number) => {
-      info.list[index][EListItemType.events].list[childIndex].isExpan = !isExpan;
+      const item = info.list[index];
+      if (item.type === EListItemType.links) {
+        item[EListItemType.links].list[childIndex].isExpan = !isExpan;
+        return;
+      }
+      if (item.type === EListItemType.events) {
+        item[EListItemType.events].list[childIndex].isExpan = !isExpan;
+      }
     };
 
     /** 添加查询语句查询 */
@@ -586,11 +915,10 @@ export default defineComponent({
       window.open(url, '_blank');
     };
 
-    /* 复制kv部分文本 */
+    /* 复制kv行展示的原始值，检索条件由同行的检索按钮负责 */
     const handleCopy = (content: ITagContent) => {
-      const queryStr = `${content.query_key}: "${String(content.query_value)?.replace(/"/g, '\\"') ?? ''}"`; // value转义双引号
       copyText(
-        queryStr,
+        content.content ?? '',
         (msg: string) => {
           Message({
             message: msg,
@@ -764,8 +1092,7 @@ export default defineComponent({
       if ((typeof content === 'number' && content.toString().length < 10) || typeof content === 'undefined')
         return content;
       if (!isJson(content?.toString())) {
-        const str = typeof content === 'string' ? content : JSON.stringify(content);
-        return <DecodeDialog content={str} />;
+        return typeof content === 'string' ? content : JSON.stringify(content);
       }
       const data = JSON.parse(content?.toString() || '');
       return isFormat ? <VueJsonPretty data={handleFormatJson(data)} /> : content;
@@ -790,7 +1117,7 @@ export default defineComponent({
         <div class='tags-template'>
           {data.map((item, index) => (
             <div
-              key={index}
+              key={item.label}
               class={['tags-row', { grey: !(index % 2) }]}
             >
               <span class='left'>
@@ -818,12 +1145,18 @@ export default defineComponent({
                 </div>
               </span>
               {item.type === 'error' ? (
-                <div class='right'>
+                <div
+                  class='right'
+                  onMouseup={handleRightTextSelect}
+                >
                   <span class='error-text'>{formatContent(item.content, item.isFormat)}</span>
                   <span class='icon-monitor icon-mind-fill' />
                 </div>
               ) : (
-                <div class='right'>
+                <div
+                  class='right'
+                  onMouseup={handleRightTextSelect}
+                >
                   {UNDECODED_PROPERTY_NAMES_WHITELIST.includes(item.label)
                     ? item.content
                     : formatContent(item.content, item.isFormat)}
@@ -853,9 +1186,9 @@ export default defineComponent({
     const stageTimeTemplate = (active: string, list: IStageTimeItem['list'], content: IStageTimeItemContent[]) => (
       <div class='stage-time'>
         <div class='stage-time-list'>
-          {list.map((item, index) => (
+          {list.map(item => (
             <Popover
-              key={index}
+              key={item.id}
               content={item.errorMsg}
               disabled={!item.error || !item.errorMsg}
               placement={'left'}
@@ -875,12 +1208,12 @@ export default defineComponent({
           ))}
         </div>
         <div class='stage-time-content'>
-          {content.map((item, index) => {
+          {content.map(item => {
             if (item.type === 'useTime') {
               const times = item[item.type] as any;
               return (
                 <div
-                  key={index}
+                  key={times.gap.type}
                   class='use-time'
                 >
                   <span class='left'>{times.tags[0]}</span>
@@ -926,7 +1259,7 @@ export default defineComponent({
             if (item.type === 'gapTime') {
               return (
                 <div
-                  key={index}
+                  key={item.type}
                   class='gap-time'
                 >
                   <div class='top' />
@@ -941,7 +1274,16 @@ export default defineComponent({
       </div>
     );
 
-    const tabList = [
+    const tabList = computed(() => [
+      ...(llmDetail.value
+        ? // LLM Span 以观测数据为主，排在基础信息之前
+          [
+            {
+              label: t('LLM 观测'),
+              name: 'LlmObservation',
+            },
+          ]
+        : []),
       {
         label: t('基础信息'),
         name: 'BasicInfo',
@@ -975,7 +1317,15 @@ export default defineComponent({
       //   label: t('指标'),
       //   name: 'Index'
       // }
-    ];
+      ...(window.enable_apm_profiling
+        ? [
+            {
+              label: t('性能分析'),
+              name: 'Profiling',
+            },
+          ]
+        : []),
+    ]);
 
     // 快捷跳转文案
     const exploreButtonName = computed(() => {
@@ -986,7 +1336,7 @@ export default defineComponent({
           return spanDetailQueryStore.queryData?.bk_host_id ? t('主机监控') : '';
         case 'Log':
           return spanDetailQueryStore.queryData?.indexId || spanDetailQueryStore.queryData.unionList
-            ? t('日志检索')
+            ? t('更多日志')
             : '';
         case 'Profiling':
           return spanId.value ? t('Profiling检索') : '';
@@ -994,7 +1344,89 @@ export default defineComponent({
       return '';
     });
 
-    const sceneData = ref<BookMarkModel>({});
+    /** LLM 观测 Tab 页内搜索：状态放在详情侧，避免切 Span 后子树重建丢词 */
+    const llmSearchKeyword = shallowRef('');
+    const llmSearchActiveIndex = shallowRef(0);
+    const llmSearchMatchCount = shallowRef(0);
+    /** 第一层 Tab 已吸顶（header 滚出后）才与第二层拉开 4px，默认贴紧内容 */
+    const infoTabStuck = shallowRef(false);
+    let unbindInfoTabSticky: (() => void) | undefined;
+
+    const syncInfoTabStuck = () => {
+      const content = document.querySelector('.span-details-sideslider-content') as HTMLElement | null;
+      const header = content?.querySelector('.details-header') as HTMLElement | undefined;
+      if (!content || !header) {
+        infoTabStuck.value = false;
+        return;
+      }
+      const scroller = (content.closest('.bk-modal-content') as HTMLElement | null) || content;
+      infoTabStuck.value = header.getBoundingClientRect().bottom <= scroller.getBoundingClientRect().top + 1;
+    };
+
+    const bindInfoTabSticky = () => {
+      unbindInfoTabSticky?.();
+      const content = document.querySelector('.span-details-sideslider-content') as HTMLElement | null;
+      const scroller = (content?.closest('.bk-modal-content') as HTMLElement | null) || content;
+      if (!scroller) return;
+      scroller.addEventListener('scroll', syncInfoTabStuck, { passive: true });
+      syncInfoTabStuck();
+      unbindInfoTabSticky = () => {
+        scroller.removeEventListener('scroll', syncInfoTabStuck);
+        unbindInfoTabSticky = undefined;
+      };
+    };
+
+    /** LLM 观测外滚吸顶后切走，父级高度收回但祖先 scrollTop 仍在，整栏会被顶出视口 */
+    const resetInfoTabScroll = () => {
+      const content = document.querySelector('.span-details-sideslider-content') as HTMLElement | null;
+      let el: HTMLElement | null = content;
+      while (el && el !== document.body) {
+        if (el.scrollTop) {
+          el.scrollTop = 0;
+        }
+        el = el.parentElement;
+      }
+      infoTabStuck.value = false;
+    };
+
+    const resetLlmSearch = () => {
+      llmSearchKeyword.value = '';
+      llmSearchActiveIndex.value = 0;
+      llmSearchMatchCount.value = 0;
+    };
+
+    const handleLlmSearchKeyword = (value: string) => {
+      llmSearchKeyword.value = value;
+      // 换词后 hits 重算，序号从第一条重新数
+      llmSearchActiveIndex.value = 0;
+    };
+
+    const handleLlmSearchStep = (step: number) => {
+      const total = llmSearchMatchCount.value;
+      if (!total) return;
+      llmSearchActiveIndex.value = (llmSearchActiveIndex.value + step + total) % total;
+    };
+
+    const handleLlmSearchMatchCount = (count: number) => {
+      llmSearchMatchCount.value = count;
+      if (count > 0 && llmSearchActiveIndex.value >= count) {
+        llmSearchActiveIndex.value = count - 1;
+      }
+    };
+
+    const handleLlmSearchActiveIndex = (index: number) => {
+      if (index < 0) return;
+      llmSearchActiveIndex.value = index;
+    };
+
+    watch(
+      () => [props.show, props.spanDetails?.span_id],
+      () => {
+        resetLlmSearch();
+      }
+    );
+
+    const sceneData = deepRef<BookMarkModel>({});
     const isSingleChart = computed<boolean>(() => {
       return (
         sceneData.value?.panelCount < 2 &&
@@ -1013,7 +1445,7 @@ export default defineComponent({
     const isDisabledNext = computed(
       () => spans.value.findIndex(span => span.span_id === props.spanDetails?.span_id) === spans.value.length - 1
     );
-    const isTabPanelLoading = ref(false);
+    const isTabPanelLoading = shallowRef(false);
     const handleActiveTabChange = async () => {
       isTabPanelLoading.value = true;
       if (hostAndContainerCancelToken) {
@@ -1024,10 +1456,11 @@ export default defineComponent({
         const result = await getSceneView({
           scene_id: 'apm_trace',
           id: activeTab.value.toLowerCase(),
-          bk_biz_id: window.bk_biz_id,
-          apm_app_name: props.spanDetails.app_name,
-          apm_service_name: props.spanDetails.service_name,
+          bk_biz_id: bizId.value,
+          apm_app_name: appName.value,
+          apm_service_name: props.spanDetails.service_name || serviceNameProvider.value,
           apm_span_id: props.spanDetails.span_id,
+          apm_trace_id: traceId.value || props.spanDetails.traceID,
         }).catch(console.log);
         if (result?.overview_panels?.length) {
           result.overview_panels[0] = {
@@ -1042,15 +1475,14 @@ export default defineComponent({
           };
         }
         sceneData.value = new BookMarkModel(result);
-        isTabPanelLoading.value = false;
       }
       if (activeTab.value === 'Host') {
         const result = await getSceneView(
           {
             scene_id: 'apm_trace',
             id: 'host',
-            bk_biz_id: window.bk_biz_id,
-            apm_app_name: props.spanDetails.app_name,
+            bk_biz_id: bizId.value,
+            apm_app_name: appName.value,
             apm_service_name: props.spanDetails.service_name,
             apm_span_id: props.spanDetails.span_id,
           },
@@ -1061,7 +1493,6 @@ export default defineComponent({
           }
         ).catch(() => null);
         sceneData.value = new BookMarkModel(result);
-        isTabPanelLoading.value = false;
       }
       if (activeTab.value === 'Container') {
         const startTime = dayjs(spanTime.value).unix() - 60 * 60;
@@ -1072,8 +1503,8 @@ export default defineComponent({
           {
             scene_id: 'apm_trace',
             id: 'container',
-            bk_biz_id: window.bk_biz_id,
-            apm_app_name: props.spanDetails.app_name,
+            bk_biz_id: bizId.value,
+            apm_app_name: appName.value,
             apm_service_name: props.spanDetails.service_name,
             apm_span_id: props.spanDetails.span_id,
             start_time: startTime,
@@ -1086,14 +1517,13 @@ export default defineComponent({
           }
         ).catch(() => null);
         sceneData.value = new BookMarkModel(result);
-        isTabPanelLoading.value = false;
       }
-      if (activeTab.value === 'Profiling') {
-        if (enableProfiling.value) {
-          await getFlameGraphData();
-        }
-        isTabPanelLoading.value = false;
+      if (activeTab.value === 'Profiling' && enableProfiling.value) {
+        await getFlameGraphData();
       }
+      // 统一收口：基础信息、LLM 观测这类无需取数的页签也要清掉开头置上的 loading，
+      // 否则它会一直留着，被下一个走 loading 的页签继承
+      isTabPanelLoading.value = false;
     };
     const getProfilingTimeRange = () => {
       const halfHour = 18 * 10 ** 8;
@@ -1107,21 +1537,25 @@ export default defineComponent({
       switch (activeTab.value) {
         case 'Log': {
           if (!spanDetailQueryStore.queryData?.indexId && !spanDetailQueryStore.queryData?.unionList) return;
-          const { indexId, unionList, start_time, end_time, addition } = spanDetailQueryStore.queryData;
+          const { indexId, unionList, start_time, end_time, addition, search_mode, keyword } =
+            spanDetailQueryStore.queryData;
           const startMs = toUnixMilliseconds(start_time);
           const endMs = toUnixMilliseconds(end_time);
           let url = '';
           if (unionList) {
-            url = `${window.bk_log_search_url}#/retrieve?bizId=${window.bk_biz_id}&search_mode=ui&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}&unionList=${unionList}`;
+            url = `${window.bk_log_search_url}#/retrieve?bizId=${bizId.value}&search_mode=${search_mode}&keyword=${keyword}&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}&unionList=${unionList}`;
           } else {
-            url = `${window.bk_log_search_url}#/retrieve/${indexId}?bizId=${window.bk_biz_id}&search_mode=ui&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}`;
+            url = `${window.bk_log_search_url}#/retrieve/${indexId}?bizId=${bizId.value}&search_mode=${search_mode}&keyword=${keyword}&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}`;
           }
           window.open(url, '_blank');
           return;
         }
         case 'Host': {
           if (!spanDetailQueryStore.queryData?.bk_host_id) return;
-          window.open(`#/performance/detail/${spanDetailQueryStore.queryData.bk_host_id}`, '_blank');
+          window.open(
+            hostMonitorHash(buildHostMonitorTarget({ bkHostId: String(spanDetailQueryStore.queryData.bk_host_id) })),
+            '_blank'
+          );
           return;
         }
         case 'Container': {
@@ -1137,21 +1571,28 @@ export default defineComponent({
           if (!span_id) return;
           const { start_time, end_time } = getProfilingTimeRange();
           window.open(
-            `#/trace/profiling/?target=${encodeURIComponent(
-              JSON.stringify({
-                app_name,
-                service_name,
-                start: (start_time / 1000).toFixed(0),
-                end: (end_time / 1000).toFixed(0),
-                filter_labels: {
-                  span_id,
-                },
-              })
-            )}`
+            profilingExploreHash({
+              app_name,
+              service_name,
+              start: (start_time / 1000).toFixed(0),
+              end: (end_time / 1000).toFixed(0),
+              filter_labels: {
+                span_id,
+              },
+            })
           );
           return;
         }
       }
+    };
+
+    // 跳转服务下的关联配置
+    const handleConfigQuickJump = () => {
+      const url = location.href.replace(
+        location.hash,
+        `#/apm/service-config?app_name=${appName.value}&service_name=${props.spanDetails.service_name}`
+      );
+      window.open(url, '_blank');
     };
 
     /** 是否显示空数据提示 */
@@ -1208,19 +1649,13 @@ export default defineComponent({
         </Popover>
       </div>
     );
-    if (window.enable_apm_profiling) {
-      tabList.push({
-        label: t('性能分析'),
-        name: 'Profiling',
-      });
-    }
     const detailsMain = () => {
       // profiling 查询起始时间根据 span 开始时间前后各推半小时
       const { start_time, end_time } = getProfilingTimeRange();
       return (
         <Loading
           style='height: 100%;'
-          loading={props.isPageLoading}
+          loading={props.isPageLoading || spanDetailLoading.value}
         >
           {props.withSideSlider && showOriginalData.value ? (
             <div class='json-text-style'>
@@ -1277,9 +1712,9 @@ export default defineComponent({
                       titleInfoElem()
                     )}
                     <div class='details-others'>
-                      {info.header.others.map((item, index) => (
+                      {info.header.others.map(item => (
                         <span
-                          key={index}
+                          key={item.label}
                           class='other-item'
                         >
                           <span class='label'>{`${item.label}: `}</span>
@@ -1295,23 +1730,51 @@ export default defineComponent({
                   </div>,
                   <MonitorTab
                     key='info-tab'
-                    class='info-tab'
+                    class={['info-tab', { 'is-stuck': infoTabStuck.value }]}
                     v-slots={{
                       setting: () => {
-                        return (
-                          exploreButtonName.value && (
-                            <Button
-                              class='quick-jump'
-                              size='small'
-                              theme='primary'
-                              outline
-                              onClick={handleQuickJump}
-                            >
-                              {exploreButtonName.value}
-                              <i class='icon-monitor icon-fenxiang' />
-                            </Button>
-                          )
-                        );
+                        if (exploreButtonName.value) {
+                          return (
+                            <div class='quick-jump-container'>
+                              {activeTab.value === 'Log' && (
+                                <Button
+                                  class='quick-jump'
+                                  size='small'
+                                  theme='primary'
+                                  outline
+                                  text
+                                  onClick={handleConfigQuickJump}
+                                >
+                                  {t('关联配置')}
+                                  <i class='icon-monitor icon-fenxiang' />
+                                </Button>
+                              )}
+                              <Button
+                                class='quick-jump'
+                                size='small'
+                                theme='primary'
+                                outline
+                                text
+                                onClick={handleQuickJump}
+                              >
+                                {exploreButtonName.value}
+                                <i class='icon-monitor icon-fenxiang' />
+                              </Button>
+                            </div>
+                          );
+                        }
+                        if (activeTab.value === 'LlmObservation') {
+                          return (
+                            <ObservationSearch
+                              activeIndex={llmSearchActiveIndex.value}
+                              keyword={llmSearchKeyword.value}
+                              matchCount={llmSearchMatchCount.value}
+                              onNext={() => handleLlmSearchStep(1)}
+                              onPrev={() => handleLlmSearchStep(-1)}
+                              onUpdate:keyword={handleLlmSearchKeyword}
+                            />
+                          );
+                        }
                       },
                     }}
                     active={activeTab.value}
@@ -1320,9 +1783,9 @@ export default defineComponent({
                       handleActiveTabChange();
                     }}
                   >
-                    {tabList.map((item, index) => (
+                    {tabList.value.map(item => (
                       <Tab.TabPanel
-                        key={index}
+                        key={item.name}
                         v-slots={{
                           label: () => (
                             <div style='display: flex;'>
@@ -1354,6 +1817,7 @@ export default defineComponent({
                       'is-log-tab': activeTab.value === 'Log',
                       'is-host-tab': activeTab.value === 'Host',
                       'is-container-tab': activeTab.value === 'Container',
+                      'is-llm-tab': activeTab.value === 'LlmObservation',
                     }}
                   >
                     {info.list.map((item, index) => {
@@ -1369,6 +1833,32 @@ export default defineComponent({
                           <span class='expan-item-subtitle'>
                             {item.isExpan ? '' : content.list.map(kv => `${kv.label} = ${kv.content}`).join('  |  ')}
                           </span>,
+                          isExpan => handleExpanChange(isExpan, index)
+                        );
+                      }
+                      if (item.type === EListItemType.links && activeTab.value === 'BasicInfo') {
+                        const content = item[item.type];
+                        return expandItem(
+                          item.isExpan,
+                          item.title,
+                          <div>
+                            {content.list.map((child, childIndex) => (
+                              <div key={child.content.map(kv => `${kv.label}:${kv.content}`).join('|')}>
+                                {expanItemSmall(
+                                  child.isExpan,
+                                  child.header.name,
+                                  tagsTemplate(child.content),
+                                  <span class='expan-item-small-subtitle'>
+                                    {child.isExpan
+                                      ? ''
+                                      : child.content.map(kv => `${kv.label} = ${kv.content}`).join('  |  ')}
+                                  </span>,
+                                  isExpan => handleSmallExpanChange(isExpan, index, childIndex)
+                                )}
+                              </div>
+                            ))}
+                          </div>,
+                          '',
                           isExpan => handleExpanChange(isExpan, index)
                         );
                       }
@@ -1399,6 +1889,7 @@ export default defineComponent({
                                 handleSmallExpanChange(false, index, childIndex);
                               }
                               return (
+                                // biome-ignore lint/suspicious/noArrayIndexKey: 事件列表加载后不增删或重排，同名同时间的事件也需按原始位置区分。
                                 <div key={childIndex}>
                                   {expanItemSmall(
                                     child.isExpan,
@@ -1511,12 +2002,29 @@ export default defineComponent({
                           {/* 由于视图早于数据先加载好会导致样式错乱，故 loading 完再加载视图 */}
                           {!isTabPanelLoading.value && (
                             <div class='host-tab-container'>
-                              <DashboardPanel
-                                groupTitle={'Groups'}
-                                isSingleChart={isSingleChart.value}
-                                podName={originalData.value?.resource?.['k8s.pod.name']}
-                                sceneData={sceneData.value}
-                                sceneId={'container'}
+                              <K8sContainer sceneData={sceneData.value} />
+                            </div>
+                          )}
+                        </Loading>
+                      )
+                    }
+                    {
+                      // LLM 观测
+                      activeTab.value === 'LlmObservation' && llmDetail.value && (
+                        <Loading
+                          style='height: 100%;'
+                          loading={isTabPanelLoading.value}
+                        >
+                          {/* 由于视图早于数据先加载好会导致样式错乱，故 loading 完再加载视图 */}
+                          {!isTabPanelLoading.value && (
+                            <div class='host-tab-container'>
+                              <LlmObservation
+                                key={`${detailSpan.value.traceID}:${detailSpan.value.span_id}`}
+                                llmDetail={llmDetail.value}
+                                searchActiveIndex={llmSearchActiveIndex.value}
+                                searchKeyword={llmSearchKeyword.value}
+                                onMatchCount={handleLlmSearchMatchCount}
+                                onSearchActiveIndex={handleLlmSearchActiveIndex}
                               />
                             </div>
                           )}
@@ -1653,6 +2161,7 @@ export default defineComponent({
           ),
         }}
         transfer={(document.querySelector('.trace-list-wrapper') as HTMLDivElement) ?? true}
+        zIndex={SPAN_DETAILS_Z_INDEX}
         quick-close
         show-mask
         onHidden={handleHiddenChange}
@@ -1672,15 +2181,23 @@ export default defineComponent({
           // 根据 defaultExpand 参数决定是否强制展开所有项
           getSpanDetailExpandUserConfig();
           // 这里提前执行，如果是碰到异步加载，这里会报错，这里做了兼容处理。
-          if (!props.isPageLoading) getDetails();
+          if (!props.isPageLoading) prepareDetails();
           if (props.isFullscreen && !document.querySelector('.bk-modal-outside')) {
             const maskEle = document.createElement('div');
             maskEle.className = 'bk-modal-outside';
             document.querySelector('.span-details-sideslider')?.appendChild(maskEle);
           }
         } else {
+          spanDetailCancel?.();
+          spanDetailRequestSeq += 1;
+          spanDetailRequestKey = '';
+          spanDetailLoading.value = false;
+          hideSelectionDecoder();
+          resetSpanLinksRequestState();
           isInvokeOnceFlag = true;
           activeTab.value = 'BasicInfo';
+          // 关闭时可能还有页签数据在飞，不清掉会让下次打开的首个页签卡在 loading
+          isTabPanelLoading.value = false;
           // countOfInfo.value = {};
           fullscreen.value = false;
         }
@@ -1690,13 +2207,14 @@ export default defineComponent({
       }
     );
 
-    // 上面监听 props.show 里会直接执行 getDetails() ，这里因为要添加loading，
+    // 上面监听 props.show 里会直接执行 prepareDetails() ，这里因为要添加loading，
     // 且需要保证之前用到该组件的地方能正常运行，这里添加兼容代码。保证使用loading与否，都可以正常显示数据。
     watch(
       () => props.isPageLoading,
       (value: boolean) => {
         if (!value) {
-          getDetails();
+          if (props.show) prepareDetails();
+          else getDetails();
         }
       }
     );
@@ -1708,19 +2226,68 @@ export default defineComponent({
       }
     );
 
+    // 每次打开详情都回到首个页签：LLM Span 优先展示观测数据，切到普通 Span 时回落，避免停留在已移除的页签上
+    // 关闭时 detailSpan 不会清空，只盯首个页签名会漏掉「同一个 Span 重新打开」，因此把 show 一并纳入触发源
+    watch(
+      [() => props.show, () => tabList.value[0].name],
+      ([show, name]) => {
+        if (!show) return;
+        // Tab 的面板实例在 onUpdated 才登记，同步切 active 会命中它「active 不在面板里就回退到首个面板」的兜底，
+        // 被反向 tabChange 成旧首项，因此等面板列表登记完再切
+        nextTick(() => {
+          // 外部指定过页签（如点事件图标进来）时不接管
+          if (activeTab.value === 'BasicInfo' || activeTab.value === 'LlmObservation') {
+            activeTab.value = name as TabName;
+          }
+        });
+      },
+      { immediate: true }
+    );
+
     watch(
       () => props.spanDetails,
       val => {
         // 仅当详情面板显示时才加载数据，避免隐藏状态下的无效加载
-        if (val && props.show && (!props.withSideSlider || (props.isShowPrevNextButtons && Object.keys(val).length))) {
-          getDetails();
+        if (val && props.show && !props.isPageLoading) {
+          prepareDetails();
         }
       },
       { immediate: true, deep: true }
     );
 
+    watch(
+      () => props.show,
+      async val => {
+        if (val) {
+          await nextTick();
+          bindInfoTabSticky();
+          return;
+        }
+        unbindInfoTabSticky?.();
+        infoTabStuck.value = false;
+      }
+    );
+
+    watch(activeTab, async () => {
+      if (!props.show) return;
+      resetInfoTabScroll();
+      await nextTick();
+      resetInfoTabScroll();
+      syncInfoTabStuck();
+    });
+
     onMounted(() => {
       getSpanDetailExpandUserConfig();
+      if (props.show) {
+        nextTick(bindInfoTabSticky);
+      }
+    });
+
+    onBeforeUnmount(() => {
+      spanDetailCancel?.();
+      spanDetailRequestSeq += 1;
+      unbindInfoTabSticky?.();
+      hideSelectionDecoder();
     });
 
     return {

@@ -1,0 +1,203 @@
+/*
+ * Tencent is pleased to support the open source community by making
+ * 蓝鲸智云PaaS平台 (BlueKing PaaS) available.
+ *
+ * Copyright (C) 2017-2025 Tencent.  All rights reserved.
+ *
+ * 蓝鲸智云PaaS平台 (BlueKing PaaS) is licensed under the MIT License.
+ *
+ * License for 蓝鲸智云PaaS平台 (BlueKing PaaS):
+ *
+ * ---------------------------------------------------
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+ * to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+ * the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+import { type PropType, defineComponent, shallowRef, watch } from 'vue';
+
+import { Sideslider } from 'bkui-vue';
+import { useI18n } from 'vue-i18n';
+
+import { usePopover } from '../../components/alarm-table/hooks/use-popover';
+import { getMergeDetailPopoverOptions, showIssueExceptionPopover } from '../utils/issue-exception-popover';
+import { getIssueExceptionText } from '../utils/issue-log-content';
+import MergeContent from './components/merge-content';
+import SplitContent from './components/split-content';
+
+import type { IssueItem, IssueLogContentResponse } from '../typing';
+
+import './issues-merge-split-sideslider.scss';
+
+/** 侧栏类型：合并或拆分 */
+export type SidesliderType = 'merge' | 'split';
+
+export default defineComponent({
+  name: 'IssuesMergeSplitSideslider',
+  props: {
+    /** 是否显示侧栏 */
+    show: {
+      type: Boolean,
+      default: true,
+    },
+    /** 侧栏类型：merge-合并，split-拆分 */
+    type: {
+      type: String as PropType<SidesliderType>,
+      default: 'merge',
+    },
+    /** 已勾选的Issue */
+    issues: {
+      type: Array as PropType<IssueItem[]>,
+      default: () => [],
+    },
+  },
+  emits: ['update:show', 'mergeSuccess', 'splitSuccess', 'showDetail'],
+  setup(props, { emit }) {
+    const { t } = useI18n();
+    const hoverPopoverTools = usePopover();
+    /** 合并明细里按 issue id 回填的关联日志 */
+    const logContentByIssueId = shallowRef<IssueLogContentResponse>({});
+    /** 合并明细里已完成关联日志请求的 issue id */
+    const logContentReadyIds = shallowRef<ReadonlySet<string>>(new Set());
+
+    /** 处理侧栏显示状态变更 */
+    const handleShowChange = (isShow: boolean) => {
+      emit('update:show', isShow);
+    };
+
+    /** 处理合并成功 */
+    const handleMergeSuccess = () => {
+      emit('mergeSuccess');
+    };
+
+    /** 处理拆分成功（含批量拆分，载荷为本次真正拆出的成员 Issue ID 列表） */
+    const handleSplitSuccess = (memberIssueIds: string[]) => {
+      emit('splitSuccess', memberIssueIds);
+    };
+
+    const handleLogContentChange = (payload: { map: IssueLogContentResponse; readyIds: ReadonlySet<string> }) => {
+      logContentByIssueId.value = payload.map;
+      logContentReadyIds.value = payload.readyIds;
+    };
+
+    const showHeaderLogOverflowTip = (event: MouseEvent) => {
+      const mainIssue = props.issues[0];
+      const el = event.currentTarget as HTMLElement;
+      if (!mainIssue || !el) return;
+      showIssueExceptionPopover(event, hoverPopoverTools, {
+        onViewMore: () => emit('showDetail', mainIssue.id),
+        popoverOptions: getMergeDetailPopoverOptions(el),
+        source: {
+          anomaly_message: mainIssue.anomaly_message,
+          log_content: logContentReadyIds.value.has(mainIssue.id)
+            ? logContentByIssueId.value[mainIssue.id]?.log_content
+            : mainIssue.log_content,
+        },
+        t,
+      });
+    };
+
+    const hideHeaderLogOverflowTip = () => {
+      hoverPopoverTools.clearPopoverTimer();
+    };
+
+    const handleShowDetail = (issueId: string) => {
+      emit('showDetail', issueId);
+    };
+
+    watch(
+      () => props.show,
+      show => {
+        if (!show) {
+          hoverPopoverTools.hidePopover();
+          logContentByIssueId.value = {};
+          logContentReadyIds.value = new Set();
+        }
+      }
+    );
+
+    return {
+      logContentByIssueId,
+      logContentReadyIds,
+      handleShowChange,
+      handleMergeSuccess,
+      handleSplitSuccess,
+      handleLogContentChange,
+      showHeaderLogOverflowTip,
+      hideHeaderLogOverflowTip,
+      handleShowDetail,
+    };
+  },
+  render() {
+    return (
+      <Sideslider
+        width={800}
+        class='issues-merge-split-sideslider'
+        isShow={this.show}
+        render-directive='if'
+        showMask={true}
+        onUpdate:isShow={this.handleShowChange}
+      >
+        {{
+          header: () => {
+            if (this.type === 'merge') return <span class='header-title'>{this.$t('合并 Issue')}</span>;
+            const mainIssue = this.issues[0];
+            return (
+              <div class='split-slider-header'>
+                <span class='header-title'>{this.$t('合并明细')}</span>
+                <span class='divider' />
+                {mainIssue &&
+                  (this.logContentReadyIds.has(mainIssue.id) || mainIssue.log_content_loaded ? (
+                    <span
+                      class='header-desc'
+                      onMouseenter={this.showHeaderLogOverflowTip}
+                      onMouseleave={this.hideHeaderLogOverflowTip}
+                    >
+                      {getIssueExceptionText({
+                        log_content: this.logContentReadyIds.has(mainIssue.id)
+                          ? this.logContentByIssueId[mainIssue.id]?.log_content
+                          : mainIssue.log_content,
+                        anomaly_message: mainIssue.anomaly_message,
+                      })}
+                    </span>
+                  ) : (
+                    <span class='skeleton-element header-desc-skeleton' />
+                  ))}
+              </div>
+            );
+          },
+          default: () =>
+            this.type === 'merge' ? (
+              <MergeContent
+                issues={this.issues}
+                onClose={() => {
+                  this.handleShowChange(false);
+                }}
+                onSuccess={this.handleMergeSuccess}
+              />
+            ) : (
+              <SplitContent
+                issues={this.issues}
+                onLogContentChange={this.handleLogContentChange}
+                onShowDetail={this.handleShowDetail}
+                onSuccess={(memberIssueIds: string[]) => {
+                  this.handleShowChange(false);
+                  this.handleSplitSuccess(memberIssueIds);
+                }}
+              />
+            ),
+        }}
+      </Sideslider>
+    );
+  },
+});

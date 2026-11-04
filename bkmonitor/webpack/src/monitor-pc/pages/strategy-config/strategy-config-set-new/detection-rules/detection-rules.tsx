@@ -33,6 +33,7 @@ import MonitorSelect from '../../../../components/monitor-select/monitor-select.
 import { THRESHOLD_METHOD_LIST } from '../../../../constant/constant';
 import AbnormalCluster from '../../../../static/images/svg/abnormal-cluster.svg';
 import IntelligentDetect from '../../../../static/images/svg/intelligent-detect.svg';
+import NewSeries from '../../../../static/images/svg/new-series.svg';
 import PartialNodes from '../../../../static/images/svg/partial-nodes.svg';
 import RingRatio from '../../../../static/images/svg/ring-ratio.svg';
 import Threshold from '../../../../static/images/svg/threshold.svg';
@@ -48,6 +49,7 @@ import {
   type MetricDetail,
   DetectionRuleTypeEnum,
 } from '../typings/index';
+import { isAutoAlertLevelRule } from './alert-level';
 import RuleWrapper from './components/rule-wrapper/rule-wrapper';
 import RulesSelect from './rules-select';
 
@@ -80,6 +82,8 @@ interface IEvent {
   onModelChange: IModelData[];
   onRuleClick: number;
   onUnitChange?: string;
+  /** 用户在单位下拉框中主动切换单位（自动默认选中不触发） */
+  onUnitSelect?: string;
 }
 
 @Component({ name: 'DetectionRules' })
@@ -145,6 +149,17 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
       type: 'ai',
       name: window.i18n.tc('离群检测'),
       icon: AbnormalCluster,
+      data: undefined,
+      tip: '算法说明待产品补充',
+      modelData: undefined,
+      disabled: false,
+      disabledTip: '',
+    },
+    {
+      id: DetectionRuleTypeEnum.NewSeries,
+      type: 'ai',
+      name: window.i18n.tc('新维度值检测'),
+      icon: NewSeries,
       data: undefined,
       tip: '算法说明待产品补充',
       modelData: undefined,
@@ -256,10 +271,16 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
       obj.disabledTip = '';
     }
     const uptimeItem = this.uptimeCheckMap?.[this.uptimeCheckType];
+    const hasAutoAlertLevel = this.addType.some(item => isAutoAlertLevelRule(item.data));
     // 是否已选择离群算法
     // const hasAbnormalCluster = this.addType.some(item => item.id === DetectionRuleTypeEnum.AbnormalCluster);
     const list = this.detectionTypeList.map(item => {
       item.disabled = item.id === DetectionRuleTypeEnum.PartialNodes;
+
+      if (hasAutoAlertLevel && item.id !== DetectionRuleTypeEnum.IntelligentDetect) {
+        item.disabled = true;
+        item.disabledTip = this.$tc('自动告警等级仅支持单个智能异常检测算法');
+      }
 
       // 聚合方法为实时 只能选择静态阈值
       if (this.aggMethod === 'REAL_TIME') {
@@ -312,10 +333,27 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
 
       // 智能算法规则
       if (item.type === 'ai') {
-        const hasOne = this.addType.find(set => set.type === 'ai');
-        if (hasOne) {
-          item.disabled = true;
-          item.disabledTip = this.$tc('暂不支持设置两个智能算法');
+        if (item.id === DetectionRuleTypeEnum.NewSeries) {
+          // 新维度值检测按告警级别区分（致命/预警/提醒），支持多个级别各配一条（组件内 levelList
+          // 按已用级别去重），不计入“单个智能算法”限制；但与计算平台类智能算法互斥，且最多三个级别。
+          const newSeriesCount = this.addType.filter(set => set.id === DetectionRuleTypeEnum.NewSeries).length;
+          const hasRealAiops = this.addType.find(
+            set => set.type === 'ai' && set.id !== DetectionRuleTypeEnum.NewSeries
+          );
+          if (hasRealAiops) {
+            item.disabled = true;
+            item.disabledTip = this.$tc('暂不支持设置两个智能算法');
+          } else if (newSeriesCount >= 3) {
+            item.disabled = true;
+            item.disabledTip = this.$tc('新维度值检测最多支持三个告警级别');
+          }
+        } else {
+          // 计算平台类智能算法：单个限制，且与任意已选智能算法（含新维度值检测）互斥。
+          const hasOne = this.addType.find(set => set.type === 'ai');
+          if (hasOne) {
+            item.disabled = true;
+            item.disabledTip = this.$tc('暂不支持设置两个智能算法');
+          }
         }
       }
 
@@ -409,6 +447,11 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
   handleUnitChange(v) {
     return v;
   }
+  /** 用户主动选择单位 */
+  handleUnitSelect(v: string) {
+    if (v !== this.unit) this.$emit('unitSelect', v);
+    this.handleUnitChange(v);
+  }
   @Emit('connectorChange')
   emitConnector(v) {
     return v;
@@ -431,7 +474,9 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
       name: item.unit,
     }));
     this.unitList = list;
-    !this.unit && list[0] && this.handleUnitChange(list[0].id);
+    // 单位为空时优先选中与指标单位一致的项（如秒级指标选 s），找不到再取第一项，避免时间指标默认落到 ns
+    const defaultUnit = list.find(item => item.id === this.unitType) || list[0];
+    !this.unit && defaultUnit && this.handleUnitChange(defaultUnit.id);
   }
 
   /**
@@ -448,8 +493,10 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
   /**
    * @description: 算法规则数据变化
    */
-  handleRuleDataChange(val: IDetectionTypeRuleData, item: IDetectionTypeItem) {
+  handleRuleDataChange(val: IDetectionTypeRuleData, index: number) {
+    const item = this.addType[index];
     item.data = val;
+    this.addType.splice(index, 1, item);
     this.emitLocalValue();
   }
 
@@ -546,7 +593,7 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
                 disabled={this.readonly}
                 list={this.unitList}
                 value={this.unit}
-                onChange={this.handleUnitChange}
+                onChange={this.handleUnitSelect}
               >
                 {this.unitDisplay}
                 <span class='icon-monitor icon-mc-triangle-down' />
@@ -567,6 +614,7 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
                 index={index}
                 is-edit={this.isEdit}
                 is-realtime={this.isRealtime}
+                isKpiAnomalySdkEnabled={this.isKpiAnomalySdkEnabled}
                 metricData={this.metricData}
                 readonly={this.readonly}
                 resultTableId={this.metricData[0]?.intelligent_detect?.result_table_id}
@@ -574,7 +622,7 @@ export default class DetectionRules extends tsc<IDetectionRules, IEvent> {
                 select-rule-data={this.localValue}
                 unit={this.unitDisplay}
                 onChartTypeChange={this.handleAiopsChartTypeChange}
-                onDataChange={val => this.handleRuleDataChange(val, item)}
+                onDataChange={val => this.handleRuleDataChange(val, index)}
                 onDelete={() => this.handleDeleteRule(index)}
                 onInitVM={val => this.ruleWrapVMInit(val, index)}
                 onModelChange={data => this.handleModelChange(data, item)}

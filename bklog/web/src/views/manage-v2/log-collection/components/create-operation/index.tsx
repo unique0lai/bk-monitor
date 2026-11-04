@@ -30,6 +30,7 @@ import useLocale from '@/hooks/use-locale';
 import { useRoute, useRouter } from 'vue-router/composables';
 import { useCollectList } from '../../hook/useCollectList';
 import CollectIssuedSlider from '../business-comp/step3/collect-issued-slider';
+import V2MaskingOperation from '../masking-operation';
 import StepClassify from './step1-classify';
 import StepBkDataCollection from './step2-bk-data-collection';
 import StepConfiguration from './step2-configuration';
@@ -37,6 +38,7 @@ import StepCustomReport from './step2-custom-report';
 import StepClean from './step3-clean';
 import StepStorage from './step4-storage';
 import $http from '@/api';
+import { bkInfoBox } from 'bk-magic-vue';
 
 import './index.scss';
 
@@ -76,6 +78,7 @@ export default defineComponent({
      * 第三方日志新建流程 （计算平台、第三方ES接入)流程
      */
     const thirdLogStep = [{ title: t('采集配置'), icon: 2, components: StepBkDataCollection }];
+    const maskingStep = [{ title: t('日志脱敏'), icon: 1, components: V2MaskingOperation }];
     /**
      * 自定义日志新建流程
      */
@@ -96,6 +99,7 @@ export default defineComponent({
      *
      */
     const isClone = computed(() => route.query.type === 'clone' && !!route.query.collectorId);
+    const isMaskingRoute = computed(() => route.name === 'collectMasking' || route.query.type === 'masking');
     /**
      * 是否是编辑状态
      */
@@ -113,6 +117,10 @@ export default defineComponent({
      * - 新建模式：包含第一步（索引集分类），保持原有图标编号
      */
     const currentStep = computed(() => {
+      if (isMaskingRoute.value) {
+        return maskingStep;
+      }
+
       // 根据日志类型选择对应的步骤配置
       const targetSteps = ['bkdata', 'es'].includes(typeKey.value)
         ? thirdLogStep // 第三方日志流程（计算平台、第三方ES接入）
@@ -136,9 +144,25 @@ export default defineComponent({
       return isNeedIssue.value && step.value !== 1 && !!currentCollectorId.value;
     });
 
+    /**
+     * 步骤是否可切换
+     */
+    const isStepsControllable = computed(() => {
+      return (
+        isEdit.value &&
+        (dataConfig.value as any).storage_cluster_id !== -1 &&
+        (dataConfig.value as any).storage_cluster_id !== null
+      );
+    });
+
     const containerWidth = ref(0);
     let resizeObserver: ResizeObserver | null = null;
+    let isUnmounted = false;
     const pollingTimer = ref<number | null>(null);
+    /** 当前步骤组件的 ref */
+    const currentStepRef = ref<any>(null);
+    /** 切换步骤时的 loading 状态 */
+    const isChangeStepLoading = ref(false);
 
     // 在 setup 阶段就初始化 typeKey，避免 watch 导致组件重新挂载
     if (isEdit.value || isClone.value) {
@@ -149,7 +173,8 @@ export default defineComponent({
       if (route.query.step) {
         step.value = Number(route.query.step);
       }
-      if (step.value !== 1 && isEdit && collectId.value) {
+      if (step.value !== 1 && isEdit.value && collectId.value) {
+        currentCollectorId.value = Number(collectId.value);
         getCollectStatus(Number(collectId.value));
       }
       if (mainRef.value) {
@@ -173,6 +198,7 @@ export default defineComponent({
     };
 
     onBeforeUnmount(() => {
+      isUnmounted = true;
       if (resizeObserver) {
         resizeObserver.disconnect();
         resizeObserver = null;
@@ -216,7 +242,7 @@ export default defineComponent({
           },
         })
         .then(res => {
-          if (!res.result) {
+          if (isUnmounted || !res.result) {
             return;
           }
           const status = res.data[0]?.status;
@@ -231,9 +257,11 @@ export default defineComponent({
             // 如果已经有定时器在运行，先清除
             clearPolling();
             // 每 3 秒轮询一次
-            pollingTimer.value = window.setInterval(() => {
-              getCollectStatus(id);
-            }, 3000);
+            if (!isUnmounted) {
+              pollingTimer.value = window.setInterval(() => {
+                getCollectStatus(id);
+              }, 3000);
+            }
           } else {
             // 状态不为 running 时，停止轮询
             clearPolling();
@@ -263,7 +291,60 @@ export default defineComponent({
     const handleOpenGuide = () => {
       const docPath = 'markdown/ZH/LogSearch/4.7/UserGuide/ProductFeatures/integrations-logs/simple_log_collection.md';
       const url = (window as any).BK_DOC_URL.replace(/\/$/, '');
-      url && window.open(`${url}/${docPath}`, '_blank');
+      url && window.open(`${url}/${docPath}`, '_blank', 'noopener,noreferrer');
+    };
+
+    /**
+     * 步骤切换前的处理函数
+     * @param targetStep 目标步骤
+     * @returns Promise<boolean> 是否允许切换步骤
+     */
+    const handleStepChange = async (targetStep: number) => {
+      // 获取当前步骤组件
+      const currentComponentRef = currentStepRef.value;
+
+      // 检查是否有修改
+      const isChanged = currentComponentRef?.hasConfigChanged?.() || false;
+      if (!isChanged) {
+        step.value = targetStep;
+        return true;
+      }
+
+      return new Promise(resolve => {
+        bkInfoBox({
+          title: t('是否保存本次操作？'),
+          confirmLoading: true,
+          confirmFn: () => {
+            if (currentComponentRef?.handleSubmitSave) {
+              if (isChangeStepLoading.value) return;
+              isChangeStepLoading.value = true;
+
+              return new Promise<boolean>(infoResolve => {
+                currentComponentRef.handleSubmitSave({
+                  action: 'saveOnly',
+                  callback: (success: boolean) => {
+                    isChangeStepLoading.value = false;
+                    if (success) {
+                      // 保存成功后切换步骤
+                      step.value = targetStep;
+                    }
+                    // 保存流程结束后关闭确认弹窗，保存结果仅用于控制是否切换步骤
+                    infoResolve(true);
+                    resolve(success);
+                  },
+                });
+              });
+            }
+            step.value = targetStep;
+            resolve(true);
+          },
+          cancelFn: () => {
+            // 放弃修改，直接切换步骤
+            step.value = targetStep;
+            resolve(true);
+          },
+        });
+      });
     };
 
     watch([() => isEdit.value, () => isClone.value], ([editVal, cloneVal]) => {
@@ -273,6 +354,10 @@ export default defineComponent({
     return () => {
       const currentStepInfo = currentStep.value.find(item => item.icon === step.value);
       const Component = currentStepInfo?.components;
+      const stepStatusProps =
+        Component === StepClean
+          ? { attrs: { collectStatus: isNeedIssue.value ? currentStatus.value.status : '' } }
+          : {};
       return (
         <div
           ref={mainRef}
@@ -303,30 +388,36 @@ export default defineComponent({
               <span class='status-txt'>{currentStatus.value.text}</span>
             </div>
           )}
-          <div
-            style={{ width: `${containerWidth.value - 60}px` }}
-            class='create-step'
-          >
+          {!isMaskingRoute.value && (
             <div
-              style={{ width: `${currentStep.value.length * 200}px` }}
-              class='step-main'
+              style={{ width: `${containerWidth.value - 60}px` }}
+              class='create-step'
             >
-              <bk-steps
-                ext-cls='custom-icon'
-                cur-step={step.value}
-                line-type={'solid'}
-                steps={currentStep.value}
-              />
+              <div
+                style={{ width: `${currentStep.value.length * 200}px` }}
+                class='step-main'
+              >
+                <bk-steps
+                  ext-cls='custom-icon'
+                  cur-step={step.value}
+                  line-type={'solid'}
+                  before-change={handleStepChange}
+                  controllable={isStepsControllable.value}
+                  steps={currentStep.value}
+                />
+              </div>
+              <span
+                class='step-tips'
+                on-click={handleOpenGuide}
+              >
+                <i class='bklog-icon bklog-help help-icon' />
+                {t('接入指引')}
+              </span>
             </div>
-            <span
-              class='step-tips'
-              on-click={handleOpenGuide}
-            >
-              <i class='bklog-icon bklog-help help-icon' />
-              {t('接入指引')}
-            </span>
-          </div>
+          )}
           <Component
+            {...stepStatusProps}
+            ref={currentStepRef}
             configData={dataConfig.value}
             scenarioId={typeKey.value}
             on-cancel={handleCancel}
@@ -335,8 +426,12 @@ export default defineComponent({
             isClone={isClone.value}
             on-next={data => {
               dataConfig.value = data;
-              if (isNeedIssue.value && ((step.value === 2 && !isEdit.value) || (isEdit.value && step.value === 1))) {
+              if (isNeedIssue.value && Component === StepConfiguration) {
                 currentCollectorId.value = data.collector_config_id;
+                currentStatus.value = {
+                  status: 'running',
+                  text: t('采集下发中...'),
+                };
                 getCollectStatus(data.collector_config_id);
               }
               step.value = step.value + 1;

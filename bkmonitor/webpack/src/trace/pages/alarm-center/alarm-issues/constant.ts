@@ -26,9 +26,11 @@
 
 import dispatchIcon from '../../../static/img/issues/dispatch.png';
 import firstIcon from '../../../static/img/issues/first.png';
+import mergeIcon from '../../../static/img/issues/merge.png';
+import splitIcon from '../../../static/img/issues/split.png';
 import statusIcon from '../../../static/img/issues/status.png';
 
-import type { IssuePriorityType, IssueStatusType, MapEntry } from './typing';
+import type { IssuePriorityType, IssueStatusType, MapEntry, TrendRangeType } from './typing';
 
 // ===================== 枚举常量 =====================
 
@@ -40,6 +42,8 @@ export const IssueDetailTabEnum = {
   EARLIEST: 'earliest',
   /** 告警列表 */
   LIST: 'list',
+  /** AI 分析 */
+  AI_ANALYSIS: 'ai_analysis',
 } as const;
 
 /** Issues 优先级枚举 */
@@ -63,6 +67,12 @@ export const IssueStatusEnum = {
   /** 归档 */
   ARCHIVED: 'archived',
 } as const;
+
+/** 已结束的 issue 状态集合 */
+export const ENDED_STATUS_SET: ReadonlySet<(typeof IssueStatusEnum)[keyof typeof IssueStatusEnum]> = new Set([
+  IssueStatusEnum.RESOLVED,
+  IssueStatusEnum.ARCHIVED,
+]);
 
 /** Issues 详情操作功能枚举 */
 export const IssueActionEnum = {
@@ -132,10 +142,14 @@ export const IssueActiveNodeTypeEnum = {
   PRIORITY_CHANGE: 'priority_change',
   /** 状态变更 */
   STATUS_CHANGE: 'status_change',
-  /** 拆分 */
-  SPLIT: 'split',
+  /** 名称变更 */
+  NAME_CHANGE: 'name_change',
   /** 合并 */
-  MERGE: 'merge',
+  MERGED_INTO: 'merged_into',
+  /** 拆分 */
+  SPLIT_FROM: 'split_from',
+  TAPD_LINK: 'tapd_link',
+  CREATE_TAPD: 'create_tapd',
 } as const;
 
 /** 影响范围资源类型枚举 */
@@ -284,15 +298,15 @@ export const ISSUES_ASSIGNEE_MAP = {
 /** Issues 回归类型映射（key 为 is_regression 布尔值的字符串形式） */
 export const ISSUES_REGRESSION_MAP: Record<string, MapEntry> = {
   false: {
-    alias: window.i18n.t('新问题'),
-    bgColor: '#E1F5F0',
-    color: '#21A380',
+    alias: window.i18n.t('新类问题'),
+    bgColor: '#78AB89',
+    color: '#fff',
     icon: 'icon-monitor icon-New',
   },
   true: {
     alias: window.i18n.t('回归问题'),
-    bgColor: '#FFEDD1',
-    color: '#F09305',
+    bgColor: '#E5B571',
+    color: '#fff',
     icon: 'icon-monitor icon-lishi',
   },
 };
@@ -319,4 +333,60 @@ export const ISSUES_ACTIVE_NODE_ICON_MAP = {
     icon: statusIcon,
     alias: window.i18n.t('状态流转'),
   },
+  [IssueActiveNodeTypeEnum.NAME_CHANGE]: {
+    icon: '',
+    alias: window.i18n.t('名称变更'),
+  },
+  [IssueActiveNodeTypeEnum.MERGED_INTO]: {
+    icon: mergeIcon,
+    alias: window.i18n.t('Issue 合并'),
+  },
+  [IssueActiveNodeTypeEnum.SPLIT_FROM]: {
+    icon: splitIcon,
+    alias: window.i18n.t('Issue 拆分'),
+  },
+};
+
+export const TapdTypeEnum = {
+  BUG: 'bug',
+  STORY: 'story',
+  TASK: 'task',
+} as const;
+
+export const TAPDWorkspaceBoundEnum = {
+  BOUND: 'bound',
+  IMPORTABLE: 'importable',
+  MANUALLY_UNBOUND: 'manually_unbound',
+  STALE: 'stale',
+  UNBOUND: 'unbound',
+} as const;
+
+export const TapdTypeMap = [
+  { label: window.i18n.t('需求'), value: TapdTypeEnum.STORY },
+  { label: window.i18n.t('缺陷'), value: TapdTypeEnum.BUG },
+  // { label: window.i18n.t('任务'), value: TapdTypeEnum.TASK },
+];
+
+// ===================== 错误码枚举 =====================
+
+/** Issue 操作业务错误码枚举 */
+export const IssueErrorCodeEnum = {
+  /** 重命名 Issue 失败：该名称已被其他 Issue 占用 */
+  RENAME_NAME_EXISTS: 3327001,
+} as const;
+
+// ===================== 趋势范围 =====================
+
+/** Issues 趋势时间范围枚举 */
+export const TrendRangeEnum = {
+  /** 24 小时 */
+  HOURS_24: '24h',
+  /** 7 天 */
+  DAYS_7: '7d',
+} as const;
+
+/** Issues 趋势时间范围 → 秒数映射 */
+export const TREND_RANGE_SECONDS_MAP: Record<TrendRangeType, number> = {
+  [TrendRangeEnum.HOURS_24]: 24 * 60 * 60,
+  [TrendRangeEnum.DAYS_7]: 7 * 24 * 60 * 60,
 };

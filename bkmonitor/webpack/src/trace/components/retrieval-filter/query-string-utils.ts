@@ -27,7 +27,7 @@
 import { shallowRef } from 'vue';
 
 import { createGlobalState } from '@vueuse/core';
-import { Debounce } from 'monitor-common/utils';
+import { Debounce, xssFilter } from 'monitor-common/utils';
 
 import { EFieldType, EQueryStringTokenType } from './typing';
 
@@ -398,7 +398,7 @@ export class QueryStringEditor {
         (item, index) =>
           `<span token-type="${item.type}" token-index="${index}" style="color: ${
             queryStringColorMap[item.type]?.color || defaultColor
-          };" class="str-item">${item.value.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>`
+          };" class="str-item">${xssFilter(item.value)}</span>`
       )
       .join('');
     replaceContent(this.editorEl, content, isLast);
@@ -407,6 +407,18 @@ export class QueryStringEditor {
       this.options?.onChange?.(this.queryString.replace(/^\s+|\s+$/g, ''));
     }
   }
+}
+
+/**
+ * 追加 queryString 条件前先移除同名字段已有条件
+ */
+export function appendQueryStringCondition(queryString: string, fieldKey: string, newClause: string) {
+  const base = removeQueryStringConditionsByField(queryString, fieldKey);
+  const clause = newClause.trim();
+  if (!clause) {
+    return base;
+  }
+  return base ? `${base} AND ${clause}` : clause;
 }
 
 export function getQueryStringMethods(fieldType: EFieldType) {
@@ -433,7 +445,7 @@ export function parseQueryString(query: string): IStrItem[] {
   const tokenRegex = /(\s+)|([(){}[\]])|(AND\s+NOT|AND|OR)|(<=|>=|:|>|<)|(".*?")|(\S+)/gi;
 
   let match: null | RegExpExecArray;
-  while ((match = tokenRegex.exec(query)) !== null) {
+  for (match = tokenRegex.exec(query); match !== null; match = tokenRegex.exec(query)) {
     const [_full, space, bracket, condition, method, quoted, word] = match;
     if (space) {
       tokens.push({ value: space, type: EQueryStringTokenType.split });
@@ -515,6 +527,30 @@ export function parseQueryString(query: string): IStrItem[] {
   return tokens;
 }
 
+/**
+ * 移除 queryString 中指定字段的条件（含 eq / neq）
+ */
+export function removeQueryStringConditionsByField(queryString: string, fieldKey: string) {
+  const trimmed = queryString?.trim() || '';
+  if (!trimmed || !fieldKey) {
+    return trimmed;
+  }
+
+  const escapedKey = escapeRegExp(fieldKey);
+  const clausePattern = new RegExp(`(?:^|\\s+AND\\s+)-?${escapedKey}\\s*:\\s*(?:"[^"]*"|\\S+)`, 'gi');
+
+  return trimmed
+    .replace(clausePattern, '')
+    .replace(/^\s+AND\s+/i, '')
+    .replace(/\s+AND\s+$/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function escapeRegExp(str: string) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // 获取光标全局字符偏移量
 function getGlobalOffset(editor) {
   const ownerDocument = document.activeElement.shadowRoot || document;
@@ -560,7 +596,7 @@ function replaceContent(editor, content: string, isLast = false) {
   let newContentLength = 0;
   const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
   let node: Node;
-  while ((node = walker.nextNode())) {
+  for (node = walker.nextNode(); node; node = walker.nextNode()) {
     newContentLength += node.textContent.length;
   }
   let adjustedOffset = Math.min(originalOffset, newContentLength);
@@ -580,7 +616,7 @@ function setGlobalOffset(editor, targetOffset) {
   // 遍历所有文本节点
   const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null);
   let node: Node;
-  while ((node = walker.nextNode())) {
+  for (node = walker.nextNode(); node; node = walker.nextNode()) {
     const nodeLength = node.textContent.length;
     if (currentOffset + nodeLength > targetOffset) {
       targetNode = node;
@@ -590,7 +626,7 @@ function setGlobalOffset(editor, targetOffset) {
     currentOffset += nodeLength;
   }
   // 处理越界情况（放置到最后一个位置）
-  if (!targetNode || targetNode.nodeType !== Node.TEXT_NODE) {
+  if (targetNode?.nodeType !== Node.TEXT_NODE) {
     const allChildren = editor.childNodes;
     targetNode = editor;
     targetNodeOffset = allChildren.length;

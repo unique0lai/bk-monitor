@@ -26,8 +26,8 @@
 
 <template>
   <div
-    class="access-manage-container"
     v-bkloading="{ isLoading: basicLoading }"
+    class="access-manage-container"
   >
     <auth-container-page
       v-if="authPageInfo"
@@ -60,13 +60,13 @@
       </basic-tab>
       <keep-alive>
         <component
+          :is="dynamicComponent"
           class="tab-content"
           :collector-data="collectorData"
           :edit-auth="editAuth"
           :edit-auth-data="editAuthData"
           :index-set-data="collectorData"
           :index-set-id="collectorData.index_set_id"
-          :is="dynamicComponent"
           :is-show-edit-btn="!['bkdata', 'es', 'custom_report'].includes($route.query.typeKey)"
           @update-active-panel="activePanel = $event"
         ></component>
@@ -78,15 +78,21 @@
 <script>
   import BasicTab from '@/components/basic-tab';
   import AuthContainerPage from '@/components/common/auth-container-page';
-  import UsageDetails from '@/views/manage/manage-access/components/usage-details';
-  import IndexSetBasicInfo from '@/views/manage/manage-access/components/index-set/manage/basic-info';
-
   import * as authorityMap from '../../../../../../common/authority-map';
-  import BasicInfo from './basic-info';
-  import CollectionStatus from './collection-status';
-  import DataStatus from './data-status';
-  import DataStorage from './data-storage';
-  import FieldInfo from './field-info.tsx';
+
+  const BasicInfo = () => import(/* webpackChunkName: 'manage-collection-basic-info' */ './basic-info');
+  const CollectionStatus = () => import(/* webpackChunkName: 'manage-collection-status' */ './collection-status');
+  const DataStorage = () => import(/* webpackChunkName: 'manage-collection-data-storage' */ './data-storage');
+  const DataStatus = () => import(/* webpackChunkName: 'manage-collection-data-status' */ './data-status');
+  const FieldInfo = () => import(/* webpackChunkName: 'manage-collection-field-info' */ './field-info.tsx');
+  const UsageDetails = () =>
+    import(
+      /* webpackChunkName: 'manage-collection-usage-details' */ '@/views/manage/manage-access/components/usage-details'
+    );
+  const IndexSetBasicInfo = () =>
+    import(
+      /* webpackChunkName: 'manage-index-set-basic-info' */ '@/views/manage/manage-access/components/index-set/manage/basic-info'
+    );
 
   export default {
     name: 'CollectionItem',
@@ -111,12 +117,11 @@
         editAuth: false,
         /** 编辑无权限时的弹窗数据 */
         editAuthData: null,
-
       };
     },
     computed: {
       panels() {
-        const type = this.$route.query.typeKey
+        const type = this.$route.query.typeKey;
         // 第三方ES / 计算平台：仅3个 tab（与旧版 index-set/manage 对齐）
         if (['bkdata', 'es'].includes(type)) {
           return [
@@ -161,56 +166,70 @@
     },
     created() {
       this.initPage();
-      const typeKey = this.$route.query.typeKey;
-      if (!['bkdata', 'es'].includes(typeKey)) {
-        this.getEditAuth();
-      }
     },
     methods: {
       async initPage() {
-        // 进入路由需要先判断权限
+        // 进入路由需要先判断权限（查看 + 编辑权限合并为一次 check_allowed 请求）
         try {
           const typeKey = this.$route.query.typeKey;
           const isBkDataOrEs = ['bkdata', 'es'].includes(typeKey);
           const collectorId = this.$route.params.collectorId;
+          const resourceType = isBkDataOrEs ? 'indices' : 'collection';
+          const resources = [{ type: resourceType, id: collectorId }];
 
-          const paramData = {
-            action_ids: [isBkDataOrEs ? authorityMap.MANAGE_INDICES_AUTH : authorityMap.VIEW_COLLECTION_AUTH],
-            resources: [
-              {
-                type: isBkDataOrEs ? 'indices' : 'collection',
-                id: collectorId,
-              },
-            ],
-          };
-          const res = await this.$store.dispatch('checkAndGetData', paramData);
-          if (res.isAllowed === false) {
-            this.authPageInfo = res.data;
-            // 显示无权限页面
-          } else {
-            // 正常显示页面
-            // bkdata/es 的 initPage 已用 MANAGE_INDICES_AUTH 校验，直接复用结果
-            if (isBkDataOrEs) {
-              this.editAuth = true;
-              const [{ data: indexSetData }] = await Promise.all([
-                this.$http.request('indexSet/info', {
-                  params: {
-                    index_set_id: collectorId,
-                  },
-                }),
-                this.fetchScenarioMap(),
-              ]);
-              this.collectorData = indexSetData;
-              this.$store.commit('collect/updateCurIndexSet', indexSetData);
-            } else {
-              const { data: collectorData } = await this.$http.request('collect/details', {
+          const viewAction = isBkDataOrEs ? authorityMap.MANAGE_INDICES_AUTH : authorityMap.VIEW_COLLECTION_AUTH;
+          const manageAction = isBkDataOrEs ? authorityMap.MANAGE_INDICES_AUTH : authorityMap.MANAGE_COLLECTION_AUTH;
+          const actionIds = isBkDataOrEs ? [viewAction] : [viewAction, manageAction];
+
+          const { data: checkResult } = await this.$http.request('auth/checkAllowed', {
+            data: { action_ids: actionIds, resources },
+          });
+
+          const allowedMap = {};
+          (checkResult || []).forEach(item => {
+            allowedMap[item.action_id] = item.is_allowed;
+          });
+
+          const canView = Boolean(allowedMap[viewAction]);
+          const canManage = Boolean(allowedMap[manageAction]);
+
+          if (!canView) {
+            const applyRes = await this.$store.dispatch('getApplyData', {
+              action_ids: [viewAction],
+              resources,
+            });
+            this.authPageInfo = applyRes.data;
+            return;
+          }
+
+          this.editAuth = isBkDataOrEs ? true : canManage;
+          if (!canManage && !isBkDataOrEs) {
+            const applyRes = await this.$store.dispatch('getApplyData', {
+              action_ids: [manageAction],
+              resources,
+            });
+            this.editAuthData = applyRes.data;
+          }
+
+          if (isBkDataOrEs) {
+            const [{ data: indexSetData }] = await Promise.all([
+              this.$http.request('indexSet/info', {
                 params: {
-                  collector_config_id: collectorId,
+                  index_set_id: collectorId,
                 },
-              });
-              this.collectorData = collectorData;
-              this.$store.commit('collect/setCurCollect', collectorData);
-            }
+              }),
+              this.fetchScenarioMap(),
+            ]);
+            this.collectorData = indexSetData;
+            this.$store.commit('collect/updateCurIndexSet', indexSetData);
+          } else {
+            const { data: collectorData } = await this.$http.request('collect/details', {
+              params: {
+                collector_config_id: collectorId,
+              },
+            });
+            this.collectorData = collectorData;
+            this.$store.commit('collect/setCurCollect', collectorData);
           }
         } catch (err) {
           console.warn(err);
@@ -242,26 +261,6 @@
             map[item.scenario_id] = item.scenario_name;
           });
           this.$store.commit('collect/updateScenarioMap', map);
-        }
-      },
-      async getEditAuth() {
-        try {
-          const typeKey = this.$route.query.typeKey;
-          const isBkDataOrEs = ['bkdata', 'es'].includes(typeKey);
-          const paramData = {
-            action_ids: [isBkDataOrEs ? authorityMap.MANAGE_INDICES_AUTH : authorityMap.MANAGE_COLLECTION_AUTH],
-            resources: [
-              {
-                type: isBkDataOrEs ? 'indices' : 'collection',
-                id: this.$route.params.collectorId,
-              },
-            ],
-          };
-          const res = await this.$store.dispatch('checkAndGetData', paramData);
-          if (!res.isAllowed) this.editAuthData = res.data;
-          this.editAuth = res.isAllowed;
-        } catch (error) {
-          this.editAuth = false;
         }
       },
     },

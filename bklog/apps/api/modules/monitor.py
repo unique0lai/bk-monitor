@@ -41,6 +41,13 @@ class _MonitorApi:
     MODULE = _("Monitor监控平台")
 
     def __init__(self):
+        self.kernel_rpc_call = DataAPI(
+            method="POST",
+            url=f"{MONITOR_APIGATEWAY_ROOT_NEW}app/kernel_rpc/call/",
+            module=self.MODULE,
+            description="查询监控 Kernel RPC 只读取证",
+            before_request=add_esb_info_before_request,
+        )
         self.search_user_groups = DataAPI(
             method="POST",
             url=self._build_url("user_group/search/", "search_user_groups/"),
@@ -171,6 +178,15 @@ class _MonitorApi:
             default_return_value=None,
             before_request=add_esb_info_before_request,
             after_request=save_to_dashboard_after,
+            bk_tenant_id=biz_to_tenant_getter(),
+        )
+        self.list_resource_candidates = DataAPI(
+            method="POST",
+            url=self._build_url("k8s_resource/list_resource_candidates/", "list_resource_candidates/"),
+            module=self.MODULE,
+            description="容器资源过滤候选值检索",
+            default_return_value=None,
+            before_request=add_esb_info_before_request,
             bk_tenant_id=biz_to_tenant_getter(),
         )
 

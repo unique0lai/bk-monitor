@@ -14,7 +14,7 @@ from django.db import models
 from django.db.models import F
 from django.db.models.functions import Greatest
 
-from constants.apm import TelemetryDataType
+from constants.apm import TelemetryDataType, ApmGlobalTablePrefix
 
 
 class BaseSharedDataSource(models.Model):
@@ -141,6 +141,7 @@ class SharedTraceDataSource(BaseSharedDataSource):
 
     index_set_id = models.IntegerField("索引集 ID", null=True)
     index_set_name = models.CharField("索引集名称", max_length=512, null=True)
+    bkdata_datalink_config = models.JSONField("BkData链路配置", default=dict)
 
     class Meta:
         verbose_name = "Trace 共享数据源"
@@ -151,18 +152,20 @@ class SharedTraceDataSource(BaseSharedDataSource):
 
     @property
     def table_id(self) -> str:
-        return f"apm_global.shared_{self.DATASOURCE_TYPE}_{self.pk:04d}"
+        return f"{ApmGlobalTablePrefix.SHARED}_{self.DATASOURCE_TYPE}_{self.pk:04d}"
 
     def to_shared_info(self) -> dict[str, Any]:
         info = super().to_shared_info()
         info["index_set_id"] = self.index_set_id
         info["index_set_name"] = self.index_set_name
+        info["bkdata_datalink_config"] = self.bkdata_datalink_config
         return info
 
     def activate(self, link_info: dict[str, Any]) -> None:
         """填充链路元数据并启用（含 Trace 特有字段）。"""
         self.index_set_id = link_info.get("index_set_id")
         self.index_set_name = link_info.get("index_set_name")
+        self.bkdata_datalink_config = link_info.get("bkdata_datalink_config") or {}
         super().activate(link_info)
 
 

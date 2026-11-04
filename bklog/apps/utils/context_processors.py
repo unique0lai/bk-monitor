@@ -33,6 +33,13 @@ from django.utils import translation  # noqa
 from django.utils.translation import gettext_lazy as _  # noqa
 
 
+def _get_guide_url(request, configured_url, doc_path):
+    if request.headers.get("Is-External", "false") == "false" and configured_url:
+        return configured_url
+    doc_url = (settings.BK_DOC_URL or "").rstrip("/")
+    return f"{doc_url}/{doc_path}" if doc_url else ""
+
+
 def mysetting(request):
     bk_login_url_prefix = settings.PAAS_API_HOST if settings.DEPLOY_MODE == "kubernetes" else settings.BK_PAAS_HOST
     if settings.DEFAULT_HTTPS_HOST and settings.BK_COMPONENT_API_URL:
@@ -82,6 +89,16 @@ def mysetting(request):
         if translation.get_language() == "en"
         else settings.TITLE_MENU_CONFIG["zh"],
         "BK_DOC_URL": settings.BK_DOC_URL,
+        "BK_LOG_ACCESS_GUIDE_URL": _get_guide_url(
+            request,
+            settings.BK_LOG_ACCESS_GUIDE_URL,
+            "markdown/ZH/LogSearch/4.7/UserGuide/QuickStart/guideline_log.md",
+        ),
+        "BK_LOG_PERMISSION_GUIDE_URL": _get_guide_url(
+            request,
+            settings.BK_LOG_PERMISSION_GUIDE_URL,
+            "markdown/ZH/LogSearch/4.7/UserGuide/QuickStart/perm.md",
+        ),
         "BK_DOC_QUERY_URL": settings.BK_DOC_QUERY_URL,
         "BK_FAQ_URL": settings.BK_FAQ_URL
         if request.headers.get("Is-External", "false") == "false"
@@ -106,5 +123,11 @@ def mysetting(request):
         "VERSION": settings.VERSION,
         "BK_USER_URL": settings.BK_USER_HOST,
         "BK_IAM_URL": settings.BK_IAM_SAAS_HOST,
+        "SHOW_PERSONAL_SETTINGS": "true" if settings.SHOW_PERSONAL_SETTINGS else "false",
         "TGPA_SDK_DOC_URL": settings.TGPA_SDK_DOC_URL,
+        # RUM 配置
+        "BKLOG_RUM_SDK": settings.BKLOG_RUM_SDK,
+        "BKLOG_RUM_ENDPOINT": settings.BKLOG_RUM_ENDPOINT,
+        "BKLOG_RUM_TOKEN": settings.BKLOG_RUM_TOKEN,
+        "BKLOG_RUM_ENABLED": str(settings.BKLOG_RUM_ENABLED).lower(),
     }

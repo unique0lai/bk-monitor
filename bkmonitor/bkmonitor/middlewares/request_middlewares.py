@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -17,7 +16,7 @@ from django.utils.deprecation import MiddlewareMixin
 from audit.instance import push_event
 from bkmonitor.utils.common_utils import fetch_biz_id_from_request
 from bkmonitor.utils.local import local
-from bkmonitor.utils.request import is_ajax_request
+from bkmonitor.utils.request import MCP_TRACEPARENT_ATTR, ensure_mcp_trace_context, get_mcp_trace_id, is_ajax_request
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +28,7 @@ class RequestProvider(MiddlewareMixin):
 
     def process_request(self, request):
         local.current_request = _get_request()
+        ensure_mcp_trace_context(request)
         return None
 
     def process_view(self, request, view_func, view_args, view_kwargs):
@@ -36,7 +36,8 @@ class RequestProvider(MiddlewareMixin):
         request.biz_id = biz_id
         # 记录非monitor_api未获取到biz_id的请求
         if biz_id and request.resolver_match.namespace == "monitor_web":
-            request.session["bk_biz_id"] = biz_id
+            if request.session.get("bk_biz_id") != biz_id:
+                request.session["bk_biz_id"] = biz_id
             return None
 
         if request.resolver_match.namespace == "monitor_adapter":
@@ -50,7 +51,15 @@ class RequestProvider(MiddlewareMixin):
             return None
 
     def process_response(self, request, response):
-        push_event(request)
+        trace_id = get_mcp_trace_id(request)
+        if trace_id:
+            response["X-Bk-Trace-Id"] = trace_id
+            response["X-Bkapi-Trace-Id"] = trace_id
+            traceparent = getattr(request, MCP_TRACEPARENT_ATTR, "")
+            if traceparent:
+                response["Traceparent"] = traceparent
+        audit_request = getattr(request, "_audit_request", request)
+        push_event(audit_request, response)
         local.clear()
         response["X-Content-Type-Options"] = "nosniff"
         return response

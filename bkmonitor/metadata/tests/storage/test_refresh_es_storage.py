@@ -11,6 +11,7 @@ specific language governing permissions and limitations under the License.
 from datetime import datetime
 from unittest import mock
 
+import elasticsearch5
 import pytest
 from dateutil import tz
 from elasticsearch import NotFoundError
@@ -56,7 +57,6 @@ def es_storage():
     es_storage_ins.warm_phase_days = 0
 
     es_storage_ins.is_mapping_same = mock.Mock(return_value=True)
-
     # 使用 patch.object 来模拟 now 属性
     with mock.patch.object(ESStorage, "now", new_callable=mock.PropertyMock) as mock_now:
         # 定义 now 属性返回的模拟值
@@ -77,6 +77,63 @@ EXPECTED_CURRENT_ALIAS = "write_20241015_2_bklog_test_rotation"
 EXPECTED_FUTURE_ALIAS = "write_20241016_2_bklog_test_rotation"
 EXPECTED_FUTURE_INDEX = "v2_2_bklog_test_rotation_20241016_0"
 PAST_AVAILABLE_INDEX = "v2_2_bklog_test_rotation_20241015_0"
+PREFIX_COLLISION_TABLE_ID = "2_bklog.application"
+PREFIX_COLLISION_V2_INDEX = "v2_2_bklog_application_extra_20260915_0"
+PREFIX_COLLISION_V1_INDEX = "2_bklog_application_extra_20260915_0"
+VALID_V2_INDEX = "v2_2_bklog_application_20260915_0"
+VALID_V1_INDEX = "2_bklog_application_20260915_0"
+
+
+@pytest.fixture
+def prefix_collision_es_storage():
+    storage = ESStorage(table_id=PREFIX_COLLISION_TABLE_ID, time_zone=0, date_format="%Y%m%d")
+    storage.es_client = mock.Mock()
+    return storage
+
+
+def test_get_index_stats_filters_longer_v2_index_prefix(prefix_collision_es_storage):
+    valid_index_info = {"primaries": {"store": {"size_in_bytes": 1}}}
+    prefix_collision_es_storage.es_client.indices.stats.return_value = {
+        "indices": {
+            PREFIX_COLLISION_V2_INDEX: {"primaries": {"store": {"size_in_bytes": 2}}},
+            VALID_V2_INDEX: valid_index_info,
+        }
+    }
+
+    index_info_map, index_version = prefix_collision_es_storage.get_index_stats()
+
+    assert index_version == "v2"
+    assert index_info_map == {VALID_V2_INDEX: valid_index_info}
+    prefix_collision_es_storage.es_client.indices.stats.assert_called_once_with(
+        index=prefix_collision_es_storage.search_format_v2()
+    )
+
+
+def test_get_index_stats_falls_back_to_v1_after_v2_prefix_collision(prefix_collision_es_storage):
+    valid_index_info = {"primaries": {"store": {"size_in_bytes": 1}}}
+    prefix_collision_es_storage.es_client.indices.stats.side_effect = [
+        {"indices": {PREFIX_COLLISION_V2_INDEX: {}}},
+        {"indices": {VALID_V1_INDEX: valid_index_info}},
+    ]
+
+    index_info_map, index_version = prefix_collision_es_storage.get_index_stats()
+
+    assert index_version == "v1"
+    assert index_info_map == {VALID_V1_INDEX: valid_index_info}
+    assert prefix_collision_es_storage.es_client.indices.stats.call_args_list == [
+        mock.call(index=prefix_collision_es_storage.search_format_v2()),
+        mock.call(index=prefix_collision_es_storage.search_format_v1()),
+    ]
+
+
+def test_current_index_info_treats_prefix_collisions_as_not_found(prefix_collision_es_storage):
+    prefix_collision_es_storage.es_client.indices.stats.side_effect = [
+        {"indices": {PREFIX_COLLISION_V2_INDEX: {}}},
+        {"indices": {PREFIX_COLLISION_V1_INDEX: {}}},
+    ]
+
+    with pytest.raises(elasticsearch5.NotFoundError):
+        ESStorage.current_index_info.__wrapped__(prefix_collision_es_storage)
 
 
 @pytest.mark.django_db(databases="__all__")
@@ -174,6 +231,47 @@ def test_create_or_update_aliases_index_not_ready(es_storage, mock_es_client):
     assert first_call_args["actions"][0]["add"]["index"] == PAST_AVAILABLE_INDEX
 
     assert mock_es_client.indices.update_aliases.call_count == 1
+
+
+def test_is_index_ready_rejects_empty_health_response(es_storage, mock_es_client):
+    es_storage.es_client = mock_es_client
+    mock_es_client.cluster.health.return_value = {"indices": {}}
+
+    assert ESStorage.is_index_ready.__wrapped__(es_storage, EXPECTED_FUTURE_INDEX) is False
+
+
+def test_create_or_update_aliases_strict_mode_raises_when_index_not_ready(es_storage, mock_es_client):
+    es_storage.es_client = mock_es_client
+    es_storage.is_index_ready = mock.Mock(side_effect=RetryError(mock.Mock()))
+    mock_es_client.indices.get_alias.side_effect = NotFoundError
+
+    with pytest.raises(RetryError):
+        es_storage.create_or_update_aliases(ahead_time=0, strict=True)
+
+    mock_es_client.indices.update_aliases.assert_not_called()
+
+
+def test_update_aliases_rejects_unacknowledged_response(es_storage, mock_es_client):
+    es_storage.es_client = mock_es_client
+    es_storage.is_index_ready = mock.Mock(return_value=True)
+    mock_es_client.indices.update_aliases.return_value = {"acknowledged": False}
+
+    with pytest.raises(RuntimeError, match="未被集群确认"):
+        ESStorage._update_aliases_with_retry.__wrapped__(
+            es_storage,
+            actions=[{"add": {"index": EXPECTED_FUTURE_INDEX, "alias": EXPECTED_CURRENT_ALIAS}}],
+            new_index_name=EXPECTED_FUTURE_INDEX,
+        )
+
+
+def test_strict_mode_ignores_diagnostic_alias_read_failure(es_storage, mock_es_client):
+    es_storage.es_client = mock_es_client
+    es_storage.is_index_ready = mock.Mock(return_value=True)
+    es_storage._update_aliases_with_retry = mock.Mock(return_value=None)
+    mock_es_client.indices.get_alias.side_effect = [NotFoundError, RuntimeError("diagnostic read failed")]
+
+    assert es_storage.create_or_update_aliases(ahead_time=0, strict=True) is True
+    es_storage._update_aliases_with_retry.assert_called_once()
 
 
 @pytest.mark.django_db(databases="__all__")

@@ -35,7 +35,7 @@ from bkm_space.api import Space, SpaceApi
 from bkmonitor.utils.tenant import get_tenant_default_biz_id
 from core.drf_resource import api
 from core.errors.api import BKAPIError
-from metadata.models import BCSClusterInfo, DataSource, DataSourceResultTable, ResultTable
+from metadata.models import BCSClusterInfo, DataIdConfig, DataSource, DataSourceResultTable, ResultTable
 from metadata.models.constants import DataIdCreatedFromSystem
 from metadata.models.data_link.constants import (
     BKBASE_NAMESPACE_BK_LOG,
@@ -43,17 +43,16 @@ from metadata.models.data_link.constants import (
     DataLinkResourceStatus,
 )
 from metadata.models.data_link.data_link import DataLink
-from metadata.models.data_link.service import get_data_id_v2
-from metadata.models.data_link.utils import compose_bkdata_data_id_name
+from metadata.models.data_link.service import get_data_id_status_by_name
+from metadata.models.data_link.utils import get_registered_bkdata_data_id_name
 from metadata.models.space.constants import (
     DATA_LABEL_TO_RESULT_TABLE_KEY,
+    EtlConfigs,
     LOG_EVENT_ETL_CONFIGS,
     RESULT_TABLE_DETAIL_KEY,
     SPACE_TO_RESULT_TABLE_KEY,
-    SYSTEM_BASE_DATA_ETL_CONFIGS,
 )
 from metadata.utils.redis_tools import RedisTools
-from monitor_web.models.custom_report import CustomEventGroup
 
 
 class DataScene(enum.Enum):
@@ -146,26 +145,32 @@ def get_data_id_status(bk_tenant_id: str, bk_biz_id: int, bk_data_id: int, with_
     # 数据源来源为bkdata，检查bkbase配置状态
     namespace = BKBASE_NAMESPACE_BK_MONITOR
     if data_id_status.created_from == DataIdCreatedFromSystem.BKDATA:
-        is_base = ds.etl_config in SYSTEM_BASE_DATA_ETL_CONFIGS
         event_type = "metric" if ds.etl_config not in LOG_EVENT_ETL_CONFIGS else "log"
-        namespace = BKBASE_NAMESPACE_BK_LOG if event_type == "log" else BKBASE_NAMESPACE_BK_MONITOR
-
-        # 组装bkbase数据源名称
-        if is_base:  # 如果是基础数据源（1000,1001）,那么沿用固定格式的data_name，会以此name作为bkbase申请时的唯一键
-            data_id_name = ds.data_name
-        else:  # 用户自定义数据源，需要进行二次处理，主要为避免超过meta长度限制和特殊字符
-            data_id_name = compose_bkdata_data_id_name(ds.data_name)
-        data_id_status.bkbase_data_id_name = data_id_name
+        if ds.etl_config == EtlConfigs.BK_CUSTOM_FORMAT.value:
+            namespace = (
+                DataIdConfig.objects.filter(
+                    bk_tenant_id=bk_tenant_id,
+                    bk_data_id=bk_data_id,
+                    namespace__in=[BKBASE_NAMESPACE_BK_MONITOR, BKBASE_NAMESPACE_BK_LOG],
+                )
+                .order_by("namespace")
+                .values_list("namespace", flat=True)
+                .first()
+                or BKBASE_NAMESPACE_BK_MONITOR
+            )
+        else:
+            namespace = BKBASE_NAMESPACE_BK_LOG if event_type == "log" else BKBASE_NAMESPACE_BK_MONITOR
 
         try:
-            data_id_config = get_data_id_v2(
+            data_id_name = get_registered_bkdata_data_id_name(ds, namespace)
+            data_id_status.bkbase_data_id_name = data_id_name
+            data_id_config = get_data_id_status_by_name(
                 bk_tenant_id=bk_tenant_id,
-                data_name=ds.data_name,
-                is_base=is_base,
                 namespace=namespace,
+                name=data_id_name,
                 with_detail=with_detail,
             )
-        except BKAPIError as e:
+        except (BKAPIError, DataIdConfig.DoesNotExist, ValueError) as e:
             data_id_status.bkbase_status = "Error"
             data_id_status.message = str(e)
             return data_id_status
@@ -236,9 +241,12 @@ def get_bkdata_status(bk_tenant_id: str, data_link_name: str, with_detail: bool 
 
     # 检查组件配置
     status_ok = True
-    for component_cls in datalink.STRATEGY_RELATED_COMPONENTS[datalink.data_link_strategy]:
+
+    for component_cls in datalink.get_related_component_classes():
         components = component_cls.objects.filter(data_link_name=data_link_name, bk_tenant_id=bk_tenant_id)
-        for component in components:
+        component_list = list(components)
+
+        for component in component_list:
             component_status = DataLinkComponentStatus(name=component.name, kind=component.kind)
 
             # 将组件状态添加到数据链路状态列表
@@ -664,6 +672,8 @@ def get_datalink_status_by_scene(
             with_detail=with_detail,
         )
     elif scene == DataScene.CUSTOM_EVENT:
+        from monitor_web.models.custom_report import CustomEventGroup
+
         # 自定义事件场景：按业务查询所有自定义事件组
         # 查询业务下的所有自定义事件组
         event_groups = CustomEventGroup.objects.filter(

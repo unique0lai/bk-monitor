@@ -23,6 +23,7 @@ from apm_web.models import (
     CodeRedefinedConfigRelation,
 )
 from apm_web.handlers.service_handler import ServiceHandler
+from bkmonitor.models import UserGroup
 from bkmonitor.utils.common_utils import count_md5
 from core.drf_resource import api
 from monitor_web.data_explorer.event.constants import EventDomain, EventSource
@@ -77,10 +78,27 @@ class ServiceApdexConfigSerializer(serializers.Serializer):
     apdex_value = serializers.CharField()
 
 
+class IncrementalK8sRelationSerializer(serializers.Serializer):
+    bcs_cluster_id = serializers.CharField(label=_("BCS 集群 ID"), max_length=64)
+    namespace = serializers.CharField(label=_("命名空间"), max_length=63)
+    kind = serializers.CharField(label=_("Workload 类型"), max_length=64)
+    name = serializers.CharField(label=_("Workload 名称"), max_length=253)
+
+
+class IncrementalCICDRelationSerializer(serializers.Serializer):
+    project_id = serializers.CharField(label=_("项目 ID"), max_length=128)
+    pipeline_id = serializers.CharField(label=_("流水线 ID"), max_length=128)
+    pipeline_name = serializers.CharField(label=_("流水线名称"), max_length=255)
+
+
+def build_service_notice_group_name(app_name: str, service_name: str) -> str:
+    return f"【APM】 {app_name}/{service_name} 服务告警组"
+
+
 class ServiceConfigSerializer(serializers.Serializer):
     bk_biz_id = serializers.IntegerField(label=_("业务 ID"))
-    app_name = serializers.CharField(label=_("应用名"))
-    service_name = serializers.CharField(label=_("服务名"))
+    app_name = serializers.CharField(label=_("应用名"), max_length=50)
+    service_name = serializers.CharField(label=_("服务名"), max_length=512)
 
     app_relation = AppServiceRelationSerializer(allow_null=True, default=None)
     cmdb_relation = CMDBServiceRelationSerializer(allow_null=True, default=None)
@@ -88,9 +106,47 @@ class ServiceConfigSerializer(serializers.Serializer):
     apdex_relation = ServiceApdexConfigSerializer(allow_null=True, default=None)
     uri_relation = serializers.ListSerializer(default=[], child=serializers.CharField())
     event_relation = serializers.ListSerializer(default=[], child=EventServiceRelationSerializer())
+    incremental_cicd_relations = serializers.ListSerializer(required=False, child=IncrementalCICDRelationSerializer())
+    incremental_k8s_relations = serializers.ListSerializer(required=False, child=IncrementalK8sRelationSerializer())
     labels = serializers.ListSerializer(required=False, allow_null=True, child=serializers.CharField())
+    # 仅显式提交 owners 时维护服务告警组；空列表表示清空通知人。
+    owners = serializers.ListField(
+        label=_("服务负责人列表"),
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+    )
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        request_fields: set[str] = set(self.initial_data)
+        incremental_fields: set[str] = request_fields & {
+            "incremental_cicd_relations",
+            "incremental_k8s_relations",
+        }
+        full_relation_fields: set[str] = request_fields & {
+            "app_relation",
+            "cmdb_relation",
+            "log_relation_list",
+            "apdex_relation",
+            "uri_relation",
+            "event_relation",
+        }
+        # owners 独立维护告警组通知人，可以与增量关系一起提交，不参与关系配置模式互斥判断。
+        if incremental_fields and (full_relation_fields or "labels" in request_fields):
+            raise serializers.ValidationError(_("增量事件关联字段不能与其他服务配置字段同时提交"))
+
+        if "owners" in request_fields:
+            # 生成的名称最终写入 UserGroup.name，先按模型字段限制拒绝超长名称。
+            group_name: str = build_service_notice_group_name(attrs["app_name"], attrs["service_name"])
+            group_name_max_length = UserGroup._meta.get_field("name").max_length  # pyright: ignore[reportAttributeAccessIssue]
+            if group_name_max_length is not None and len(group_name) > group_name_max_length:
+                raise serializers.ValidationError(
+                    {
+                        "owners": _("指定 owners 后生成的服务告警组名称不能超过 %(max_length)s 个字符")
+                        % {"max_length": group_name_max_length}
+                    }
+                )
+
         uri_relations: list[str] = attrs["uri_relation"]
         if len(set(uri_relations)) != len(uri_relations):
             raise serializers.ValidationError(_("uri 含有重复配置项"))
@@ -99,6 +155,11 @@ class ServiceConfigSerializer(serializers.Serializer):
             attrs["apdex_relation"]["apdex_key"] = ServiceHandler.get_service_apdex_key(
                 attrs["bk_biz_id"], attrs["app_name"], attrs["service_name"]
             )
+
+        if incremental_fields or not full_relation_fields:
+            # 增量、空请求和仅标签请求只处理显式字段，避免完整保存协议的默认值清空其他配置。
+            for field in set(attrs) - request_fields:
+                attrs.pop(field)
 
         return super().validate(attrs)
 

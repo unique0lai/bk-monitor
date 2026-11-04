@@ -34,7 +34,8 @@ import OverflowTips from 'trace/directive/overflow-tips';
 import { useI18n } from 'vue-i18n';
 
 import EmptyStatus from '../empty-status/empty-status';
-import TimeConsuming from './time-consuming';
+import CascadeSelector from './cascade-selector';
+import ScopeInput from './scope-input';
 import {
   type IFilterField,
   type IFilterItem,
@@ -45,15 +46,18 @@ import {
   ECondition,
   EFieldType,
   EMethod,
+  SCOPE_INPUT_TYPE,
   UI_SELECTOR_OPTIONS_EMITS,
   UI_SELECTOR_OPTIONS_PROPS,
 } from './typing';
 import {
   DEFAULT_GROUP_RELATION,
   fieldTypeMap,
+  getCascadeValueSplit,
   GROUP_RELATION_KEY,
   isNumeric,
   NOT_VALUE_METHODS,
+  setCascadeValueSplit,
   WILDCARD_KEY,
 } from './utils';
 import ValueTagSelector from './value-tag-selector';
@@ -70,9 +74,12 @@ export default defineComponent({
   setup(props, { emit }) {
     const { t } = useI18n();
     const elRef = useTemplateRef<HTMLDivElement>('el');
-    // const searchInputRef = useTemplateRef<InstanceType<typeof Input>>('searchInput');
+    /** 字段搜索框模板引用（fieldSearchAutoFocus 打开时用于自动聚焦） */
+    const searchInputRef = useTemplateRef<InstanceType<typeof Input>>('searchInput');
     const valueSelectorRef = useTemplateRef<HTMLDivElement>('valueSelector');
     const allInputRef = useTemplateRef<HTMLDivElement>('allInput');
+    const numberInputRef =
+      useTemplateRef<InstanceType<typeof Input>>('numberInput'); /** 数字输入框模板引用（numberInput 类型专用） */
     const searchValue = shallowRef('');
     const searchLocalFields = shallowRef<IFilterField[]>([]);
     const cursorIndex = shallowRef(0);
@@ -97,12 +104,16 @@ export default defineComponent({
     );
     const isWildcard = shallowRef(wildcardItem.value?.default || false);
     const groupRelation = shallowRef(groupRelationItem.value?.default || DEFAULT_GROUP_RELATION);
-    /* 耗时字段数据 */
-    const timeConsumingValue = shallowRef({
+    /* 范围输入（耗时 / 字节量）字段的数据：{ key, method, value } */
+    const scopeInputValue = shallowRef({
       key: '',
       method: '',
       value: [],
     });
+    /** 数字输入框绑定值（numberInput 类型字段使用原生数字输入，而非 tag 选择） */
+    const numberInputValue = shallowRef<number>(null);
+    /** 级联选择器绑定值 */
+    const cascadeSelectorValue = shallowRef<string[][]>([]);
     /* 是否为数字类型 */
     const isTypeInteger = computed(() => checkedItem.value?.type === EFieldType.integer);
     /* 是否输入了非数字 */
@@ -125,9 +136,19 @@ export default defineComponent({
     const placeholderStr = computed(() => {
       return checkedItem.value?.methods?.find(item => item.value === method.value)?.placeholder || '';
     });
-    /* 是否选择了耗时 */
-    const isDurationKey = computed(() => {
-      return checkedItem.value?.type === EFieldType.duration;
+    /* 当前字段是否为范围输入（耗时 / 字节量） */
+    const isScopeInputKey = computed(() => {
+      return [EFieldType.duration, EFieldType.bytesScope].includes(checkedItem.value?.type);
+    });
+    /** 范围输入的子类型，决定 ScopeInput 内部渲染耗时还是字节量输入，其余字段兜底为耗时 */
+    const scopeInputType = computed(() => {
+      if (checkedItem.value?.type === EFieldType.duration) {
+        return SCOPE_INPUT_TYPE.duration;
+      }
+      if (checkedItem.value?.type === EFieldType.bytesScope) {
+        return SCOPE_INPUT_TYPE.bytes;
+      }
+      return SCOPE_INPUT_TYPE.duration;
     });
     const noValueMethods = computed(() => (props.noValueOfMethods.length ? props.noValueOfMethods : NOT_VALUE_METHODS));
     /* 是否选择了无需检索值的操作符 */
@@ -137,6 +158,18 @@ export default defineComponent({
     /* 是否选择了全文检索或者同类型的输入形式 */
     const isTextarea = computed(() => {
       return checkedItem.value?.name === '*' || [EFieldType.all, EFieldType.text].includes(checkedItem.value?.type);
+    });
+    /* 是否为 textWithMethods 类型（文本输入框，带有方法选择） */
+    const isTextareaWithMethods = computed(() => {
+      return checkedItem.value?.type === EFieldType.textWithMethods;
+    });
+    /** 是否为 numberInput 数字输入框类型（直接输入数值，不走候选项列表） */
+    const isNumberInput = computed(() => {
+      return checkedItem.value?.type === EFieldType.numberInput;
+    });
+    /** 是否为级联选择器类型（业务拓扑等树形字段） */
+    const isCascade = computed(() => {
+      return checkedItem.value?.type === EFieldType.cascade;
     });
 
     const enterSelectionDebounce = useDebounceFn((isFocus = false) => {
@@ -188,14 +221,27 @@ export default defineComponent({
               }
             }
           } else {
-            if (props.fields?.[0]) {
-              handleCheck(props.fields[0]);
+            /* 新增条件：autoFocus 模式不预选字段，改为聚焦字段搜索框 */
+            if (props.fieldSearchAutoFocus) {
+              // 需要等待popover 动画执行完毕 300ms
+              setTimeout(() => {
+                searchInputRef.value?.focus();
+              }, 300);
+            } else {
+              /* 否则沿用默认行为：自动选中第一个字段 */
+              if (props.fields?.[0]) {
+                handleCheck(
+                  props.fields[0],
+                  '',
+                  [],
+                  {
+                    isWildcard: false,
+                    groupRelation: '',
+                  },
+                  true
+                );
+              }
             }
-
-            // 需要等待popover 动画执行完毕 300ms
-            // setTimeout(() => {
-            //   searchInputRef.value?.focus();
-            // }, 300);
           }
         } else {
           cleanup?.();
@@ -223,8 +269,10 @@ export default defineComponent({
       isWildcard.value = false;
       groupRelation.value = DEFAULT_GROUP_RELATION;
       rightFocus.value = false;
+      numberInputValue.value = null;
+      cascadeSelectorValue.value = [];
       cacheCheckedName.value = '';
-      timeConsumingValue.value = {
+      scopeInputValue.value = {
         key: '',
         method: 'between',
         value: [],
@@ -244,10 +292,16 @@ export default defineComponent({
     ) {
       checkedItem.value = JSON.parse(JSON.stringify(item));
       values.value = value || [];
-      /* 耗时字段特殊处理 */
-      if (isDurationKey.value) {
+      if (isNumberInput.value && values.value.length) {
+        numberInputValue.value = isNumeric(values.value?.[0]?.id) ? values.value[0].id : null;
+      }
+      if (isCascade.value && values.value.length) {
+        cascadeSelectorValue.value = values.value.map(item => getCascadeValueSplit(item.id));
+      }
+      /* 范围输入字段特殊处理 */
+      if (isScopeInputKey.value) {
         // method.value = 'between';
-        timeConsumingValue.value = {
+        scopeInputValue.value = {
           key: item.name,
           method: methodP || 'between',
           value: (value || []).map(item => item.id),
@@ -258,7 +312,7 @@ export default defineComponent({
       isWildcard.value = options?.isWildcard || false;
       groupRelation.value = options?.groupRelation || DEFAULT_GROUP_RELATION;
       const index = searchLocalFields.value.findIndex(f => f.name === item.name) || 0;
-      if (isTextarea.value) {
+      if (isTextarea.value || isTextareaWithMethods.value) {
         queryString.value = value[0]?.id || '';
       } else {
         if (cacheCheckedName.value !== item.name) {
@@ -268,6 +322,7 @@ export default defineComponent({
         if (isFocus) {
           nextTick(() => {
             valueSelectorRef.value?.focusFn?.();
+            numberInputRef.value?.focus?.();
             rightFocus.value = true;
           });
         }
@@ -276,7 +331,7 @@ export default defineComponent({
     }
 
     async function handleConfirm() {
-      if (isDurationKey.value) {
+      if (isScopeInputKey.value) {
         await promiseTimeout(300);
       } else {
         await promiseTimeout(50);
@@ -295,7 +350,10 @@ export default defineComponent({
       if (
         noValueMethods.value.includes(method.value) ||
         values.value.length ||
-        (isDurationKey.value && timeConsumingValue.value.value.length)
+        (isScopeInputKey.value && scopeInputValue.value.value.length) ||
+        (isNumberInput.value && isNumeric(numberInputValue.value)) ||
+        (isCascade.value && cascadeSelectorValue.value.length) ||
+        (isTextareaWithMethods.value && queryString.value)
       ) {
         const methodName = checkedItem.value.methods.find(item => item.value === method.value)?.alias;
         const opt = {};
@@ -307,18 +365,46 @@ export default defineComponent({
         }
         const value: IFilterItem = {
           key: { id: checkedItem.value.name, name: checkedItem.value.alias },
-          method: { id: method.value as any, name: methodName || '=' },
+          method: { id: method.value, name: methodName || '=' },
           value: values.value,
           condition: { id: ECondition.and, name: 'AND' },
           options: opt,
         };
-        /* 耗时字段特殊处理 */
-        if (isDurationKey.value) {
-          if (timeConsumingValue.value.value.length) {
-            value.method = { id: timeConsumingValue.value.method as EMethod, name: timeConsumingValue.value.method };
-            value.value = timeConsumingValue.value.value.map(item => ({ id: item, name: item }));
+        /* 范围输入字段特殊处理 */
+        if (isScopeInputKey.value) {
+          if (scopeInputValue.value.value.length) {
+            /* 操作符展示名取 alias，取不到时回退为操作符值本身 */
+            const methodName = checkedItem.value.methods.find(
+              item => item.value === scopeInputValue.value.method
+            )?.alias;
+            value.method = {
+              id: scopeInputValue.value.method as EMethod,
+              name: methodName || scopeInputValue.value.method,
+            };
+            value.value = scopeInputValue.value.value.map(item => ({ id: item, name: item }));
             emit('confirm', value);
           }
+          return;
+        }
+        if (isNumberInput.value) {
+          value.value = [{ id: numberInputValue.value, name: numberInputValue.value }];
+          emit('confirm', value);
+          return;
+        }
+        if (isCascade.value) {
+          value.value = cascadeSelectorValue.value.map(item => {
+            return {
+              id: setCascadeValueSplit(item),
+              // 级联值 name 统一使用 setCascadeValueSplit 编码，与回填/展示逻辑保持一致（原实现为 item.join('/')）
+              name: setCascadeValueSplit(item),
+            };
+          });
+          emit('confirm', value);
+          return;
+        }
+        if (isTextareaWithMethods.value) {
+          value.value = [{ id: queryString.value, name: queryString.value }];
+          emit('confirm', value);
           return;
         }
         emit('confirm', value);
@@ -332,8 +418,15 @@ export default defineComponent({
     function handleValueChange(v: IValue[]) {
       values.value = v;
     }
-    function handleTimeConsumingValueChange(v) {
-      timeConsumingValue.value = v;
+    /** 范围输入变更回调，v 为 { key, method, value } */
+    function handlescopeInputValueChange(v) {
+      scopeInputValue.value = v;
+    }
+    function handleNumberInputChange(v: number) {
+      numberInputValue.value = v;
+    }
+    function handleCascadeSelectorChange(v: string[][]) {
+      cascadeSelectorValue.value = v;
     }
 
     function handleKeydownEvent(event: KeyboardEvent) {
@@ -411,7 +504,8 @@ export default defineComponent({
       }
     }
     function handleSearchChange() {
-      cursorIndex.value = -1;
+      /** 过滤结果变化后光标落回首项：与 initData 的初始值一致，回车可直接选中第一条命中项 */
+      cursorIndex.value = 0;
       if (!searchValue.value) {
         searchLocalFields.value = props.fields.slice();
       } else {
@@ -523,6 +617,13 @@ export default defineComponent({
       }
     }
 
+    /** 文本输入框键盘事件：Ctrl/Cmd + Enter 触发确认 */
+    function handleTextAreaKeydown(_v, event: KeyboardEvent) {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+        handleConfirm();
+      }
+    }
+
     return {
       checkedItem,
       queryString,
@@ -539,14 +640,20 @@ export default defineComponent({
       searchLocalFields,
       cursorIndex,
       isMacSystem,
+      isNumberInput,
       placeholderStr,
-      timeConsumingValue,
+      scopeInputValue,
       notValueOfMethod,
-      isDurationKey,
+      isScopeInputKey,
       isTextarea,
+      isTextareaWithMethods,
+      numberInputValue,
+      cascadeSelectorValue,
+      isCascade,
+      scopeInputType,
       getValueFnProxy,
       handleValueChange,
-      handleTimeConsumingValueChange,
+      handlescopeInputValueChange,
       handleValueSelectorBlur,
       handleSelectorFocus,
       handleSearchChangeDebounce,
@@ -556,6 +663,9 @@ export default defineComponent({
       defaultOptions,
       handleClearSearch,
       handleMethodChange,
+      handleNumberInputChange,
+      handleCascadeSelectorChange,
+      handleTextAreaKeydown,
       t,
     };
   },
@@ -575,6 +685,7 @@ export default defineComponent({
                 placeholder={this.t('请输入')}
                 rows={15}
                 type={'textarea'}
+                onKeydown={this.handleTextAreaKeydown}
               />
             </div>
           </div>,
@@ -582,7 +693,7 @@ export default defineComponent({
       }
       return this.checkedItem
         ? [
-            !this.isDurationKey && (
+            !this.isScopeInputKey && (
               <div
                 key={'method'}
                 class='form-item mt-34'
@@ -613,7 +724,7 @@ export default defineComponent({
               <>
                 <div
                   key={'value'}
-                  class={['form-item', this.isDurationKey ? 'mt-34' : 'mt-16']}
+                  class={['form-item', this.isScopeInputKey ? 'mt-34' : 'mt-16']}
                 >
                   <div class='form-item-label'>
                     <span class='left'>{this.t('检索值')}</span>
@@ -629,34 +740,88 @@ export default defineComponent({
                     )}
                   </div>
                   <div class='form-item-content mt-6'>
-                    {this.isDurationKey ? (
-                      <TimeConsuming
-                        key={this.rightRefreshKey}
-                        fieldInfo={
-                          {
-                            field: this.checkedItem.name,
-                          } as any
-                        }
-                        styleType={'form'}
-                        value={this.timeConsumingValue as INormalWhere}
-                        onChange={this.handleTimeConsumingValueChange}
-                      />
-                    ) : (
-                      <ValueTagSelector
-                        key={this.rightRefreshKey}
-                        ref='valueSelector'
-                        fieldInfo={this.valueSelectorFieldInfo}
-                        getValueFn={this.getValueFnProxy}
-                        limit={this.limit}
-                        loadDelay={this.loadDelay}
-                        placeholder={''}
-                        value={this.values}
-                        autoFocus
-                        onChange={this.handleValueChange}
-                        onSelectorBlur={this.handleValueSelectorBlur}
-                        onSelectorFocus={this.handleSelectorFocus}
-                      />
-                    )}
+                    {(() => {
+                      if (this.isScopeInputKey) {
+                        return (
+                          <ScopeInput
+                            key={this.rightRefreshKey}
+                            fieldInfo={
+                              {
+                                field: this.checkedItem.name,
+                                alias: this.checkedItem.alias,
+                                unit: this.checkedItem?.unit || '',
+                              } as any
+                            }
+                            styleType={'form'}
+                            type={this.scopeInputType}
+                            value={this.scopeInputValue as INormalWhere}
+                            onChange={this.handlescopeInputValueChange}
+                          />
+                        );
+                      }
+                      if (this.isNumberInput) {
+                        return (
+                          <Input
+                            key={this.rightRefreshKey}
+                            ref='numberInput'
+                            modelValue={this.numberInputValue}
+                            type={'number'}
+                            onBlur={this.handleValueSelectorBlur}
+                            onFocus={this.handleSelectorFocus}
+                            onKeydown={this.handleTextAreaKeydown}
+                            onUpdate:modelValue={this.handleNumberInputChange}
+                          />
+                        );
+                      }
+                      if (this.isCascade) {
+                        return (
+                          <CascadeSelector
+                            fieldInfo={this.valueSelectorFieldInfo}
+                            getValueFn={this.getValueFnProxy}
+                            modelValue={this.cascadeSelectorValue}
+                            onToggle={v => {
+                              if (v) {
+                                this.handleSelectorFocus();
+                              } else {
+                                this.handleValueSelectorBlur();
+                              }
+                            }}
+                            onUpdate:modelValue={this.handleCascadeSelectorChange}
+                          />
+                        );
+                      }
+                      if (this.isTextareaWithMethods) {
+                        return (
+                          <Input
+                            ref={'allInput'}
+                            v-model={this.queryString}
+                            placeholder={this.t('请输入')}
+                            rows={5}
+                            type={'textarea'}
+                            onBlur={this.handleValueSelectorBlur}
+                            onFocus={this.handleSelectorFocus}
+                            onKeydown={this.handleTextAreaKeydown}
+                          />
+                        );
+                      }
+                      return (
+                        <ValueTagSelector
+                          key={this.rightRefreshKey}
+                          ref='valueSelector'
+                          fieldInfo={this.valueSelectorFieldInfo}
+                          getValueFn={this.getValueFnProxy}
+                          limit={this.limit}
+                          loadDelay={this.loadDelay}
+                          /* 按当前选中的操作符给出对应的输入提示（如「等于」与「包含」提示不同） */
+                          placeholder={this.placeholderStr || ''}
+                          value={this.values}
+                          autoFocus
+                          onChange={this.handleValueChange}
+                          onSelectorBlur={this.handleValueSelectorBlur}
+                          onSelectorFocus={this.handleSelectorFocus}
+                        />
+                      );
+                    })()}
                   </div>
                   {this.isIntegerError ? <div class='error-msg'>{this.t('仅支持输入数值类型')}</div> : undefined}
                 </div>

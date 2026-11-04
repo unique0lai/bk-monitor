@@ -42,6 +42,7 @@ BkMonitorQuerySchema = Schema(
             DataSourceLabel.BK_FTA,
             DataSourceLabel.BK_LOG_SEARCH,
             DataSourceLabel.BK_APM,
+            DataSourceLabel.BK_RUM,
             DataSourceLabel.PROMETHEUS,
             DataSourceLabel.DASHBOARD,
         ),
@@ -50,6 +51,19 @@ BkMonitorQuerySchema = Schema(
         ),
         Optional("expression", default="a"): str,
         Optional("functions", default=lambda: []): [str],
+        Optional("query_output_config"): Or(
+            None,
+            {
+                "response_contract": "named_outputs/v1",
+                "legacy_output_ref": Regex(r"^[A-Za-z_][A-Za-z0-9_]*$"),
+                "output_list": [
+                    {
+                        "reference_name": Regex(r"^[A-Za-z_][A-Za-z0-9_]*$"),
+                        "expression": And(str, lambda value: bool(value.strip())),
+                    }
+                ],
+            },
+        ),
         "query_configs": [
             {
                 Optional("metric", default=""): str,
@@ -60,6 +74,7 @@ BkMonitorQuerySchema = Schema(
                 Optional("functions", default=lambda: []): [str],
                 Optional("where", default=""): str,
                 Optional("alias", default="a"): str,
+                Optional("expression_mode"): "promql",
                 Optional("time_field"): str,
                 Optional("unit", default=""): str,
                 Optional("dashboard_uid", default=""): str,
@@ -98,6 +113,18 @@ IssueConfigSchema = {
     Optional("conditions", default=""): str,
 }
 
+
+def validate_strategy_version(data):
+    if "query_output_config" in data["query"] and data["version"] != MaxVersion.STRATEGY:
+        raise SchemaError([], "query.query_output_config requires strategy version 1.1 or later")
+    if (
+        any("expression_mode" in config for config in data["query"]["query_configs"])
+        and data["version"] != MaxVersion.STRATEGY
+    ):
+        raise SchemaError([], "query.query_configs[].expression_mode requires strategy version 1.1 or later")
+    return True
+
+
 StrategySchema = Schema(
     {
         "name": And(str, lambda p: 128 >= len(p) > 0),
@@ -105,7 +132,7 @@ StrategySchema = Schema(
             "version",
             default=MinVersion.STRATEGY,
             description=f"策略支持版本号范围：{MinVersion.STRATEGY}-{MaxVersion.STRATEGY}",
-        ): And(Use(str), lambda s: MinVersion.STRATEGY <= s <= MaxVersion.STRATEGY),
+        ): And(Use(str), lambda s: s in {MinVersion.STRATEGY, MaxVersion.STRATEGY}),
         Optional("labels", default=lambda: []): [str],
         Optional("enabled", default=True): bool,
         Optional("active_time", default="00:00 -- 23:59"): Regex(
@@ -172,6 +199,9 @@ StrategySchema = Schema(
             Optional("chart_image_enabled", default=True): bool,
             Optional("interval_mode", default="standard"): Or("standard", "increasing"),
             Optional("interval", default=120): int,
+            # 不设 default：未声明时让 validate 不写入字段，parse_yaml 据此判定"用户未显式配置"，
+            # 透传到 DB 后由 fta_action 运行时落默认 parallel（与 NotifyActionConfigSlz 行为对齐）
+            Optional("voice_notice"): Or("parallel", "serial"),
             Optional(
                 "template",
                 default=lambda: {
@@ -212,6 +242,7 @@ StrategySchema = Schema(
     },
     ignore_extra_keys=True,
 )
+StrategySchema = Schema(And(StrategySchema, validate_strategy_version))
 
 TimeRangeSchema = Schema(Regex(r"^\d{2}:\d{2}(:\d{2})? *-- *\d{2}:\d{2}(:\d{2})?$"))
 

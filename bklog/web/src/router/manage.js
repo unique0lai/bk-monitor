@@ -24,6 +24,8 @@
  * IN THE SOFTWARE.
  */
 
+import { isFeatureToggleOn } from '@/hooks/use-feature-toggle';
+
 // 嵌套路由视图组件声明（用于实现多层嵌套路由结构时，多级 children 路由的占位）
 const LogCollectionView = { name: 'LogCollection', template: '<router-view></router-view>' };
 const CollectionItemView = { name: 'CollectionItemView', template: '<router-view></router-view>' };
@@ -68,7 +70,8 @@ const cleanList = () => import(/* webpackChunkName: 'sdk-track' */ '@/views/mana
 const cleanCreate = () => import(/* webpackChunkName: 'sdk-track' */ '@/views/manage/log-clean/clean-manage/create');
 const cleanTempCreate = () =>
   import(/* webpackChunkName: 'sdk-track' */ '@/views/manage/log-clean/clean-template/create');
-const cleanTemplate = () => import(/* webpackChunkName: 'sdk-track' */ '@/views/manage/log-clean/clean-template/list');
+const cleanTemplate = () =>
+  import(/* webpackChunkName: 'v2-sdk-track' */ '@/views/manage-v2/log-clean/clean-template/list');
 const ArchiveRepository = () =>
   import(/* webpackChunkName: 'sdk-track' */ '@/views/manage-v2/log-archive/archive-repository/index.tsx');
 const ArchiveList = () =>
@@ -94,6 +97,10 @@ const DataLinkConf = () =>
   import(/* webpackChunkName: 'manage-data-link-conf' */ '@/views/manage/manage-data-link/manage-data-link-conf');
 const MaskingEdit = () =>
   import(/* webpackChunkName: 'field-masking-separate' */ '@/views/manage/field-masking-separate');
+const V2MaskingEdit = () =>
+  import(
+    /* webpackChunkName: 'v2-field-masking-separate' */ '@/views/manage-v2/log-collection/components/masking-operation'
+  );
 const MaskingList = () =>
   import(/* webpackChunkName: 'manage-data-link-conf' */ '@/views/manage/log-clean/clean-masking/list');
 const ClientLogView = { name: 'ClientLogView', template: '<router-view></router-view>' };
@@ -102,6 +109,7 @@ const v2CleanTempCreate = () =>
   import(/* webpackChunkName: 'v2-sdk-track' */ '@/views/manage-v2/log-clean/create-temp-clean');
 
 const v2CleanCreate = () => import(/* webpackChunkName: 'v2-sdk-track' */ '@/views/manage-v2/log-clean/create-clean');
+const GrokManage = () => import(/* webpackChunkName: 'grok-manage' */ '@/views/manage-v2/grok-manage/index.tsx');
 
 /**
  * log_manage_v2 特性开关判定 mixin
@@ -114,21 +122,9 @@ const v2CleanCreate = () => import(/* webpackChunkName: 'v2-sdk-track' */ '@/vie
 const logManageV2Mixin = {
   computed: {
     isV2Enabled() {
-      const featureToggle = window.FEATURE_TOGGLE?.log_manage_v2;
-
-      if (featureToggle === 'on') return true;
-      if (featureToggle === 'off' || !featureToggle) return false;
-
-      if (featureToggle === 'debug') {
-        const whiteList = window.FEATURE_TOGGLE_WHITE_LIST?.log_manage_v2 ?? [];
-        const bizId = this.$store.state.bkBizId;
-        const spaceUid = this.$store.state.spaceUid;
-        // 用 String() 统一类型，兼容白名单为数字数组（后端 JSON）而 bizId/spaceUid 为字符串的情况
-        const normalizedWhiteList = whiteList.map(id => String(id));
-        return normalizedWhiteList.includes(String(bizId)) || normalizedWhiteList.includes(String(spaceUid));
-      }
-
-      return false;
+      const bizId = this.$store.state.bkBizId;
+      const spaceUid = this.$store.state.spaceUid;
+      return isFeatureToggleOn('log_manage_v2', [String(bizId), String(spaceUid)]);
     },
   },
 };
@@ -370,7 +366,7 @@ const getManageRoutes = () => [
                   backName: 'log-index-set-list',
                   navId: 'log-collection',
                 },
-                component: MaskingEdit,
+                component: createVersionedComponent(V2MaskingEdit, MaskingEdit),
               },
             ],
           },
@@ -469,7 +465,7 @@ const getManageRoutes = () => [
               backName: 'bkdata-index-set-list',
               navId: 'bk-data-collection',
             },
-            component: MaskingEdit,
+            component: createVersionedComponent(V2MaskingEdit, MaskingEdit),
           },
         ],
       },
@@ -536,7 +532,7 @@ const getManageRoutes = () => [
               backName: 'es-index-set-list',
               navId: 'es-collection',
             },
-            component: MaskingEdit,
+            component: createVersionedComponent(V2MaskingEdit, MaskingEdit),
           },
         ],
       },
@@ -603,7 +599,7 @@ const getManageRoutes = () => [
               backName: 'custom-report-list',
               navId: 'custom-report',
             },
-            component: MaskingEdit,
+            component: createVersionedComponent(V2MaskingEdit, MaskingEdit),
           },
         ],
       },
@@ -711,6 +707,16 @@ const getManageRoutes = () => [
             },
           },
         ],
+      },
+      // Grok管理
+      {
+        path: 'grok-manage',
+        name: 'grok-manage',
+        component: GrokManage,
+        meta: {
+          title: 'Grok管理',
+          navId: 'grok-manage',
+        },
       },
       // 日志归档-归档仓库
       {

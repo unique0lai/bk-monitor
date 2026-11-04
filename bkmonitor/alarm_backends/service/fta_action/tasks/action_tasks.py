@@ -20,7 +20,6 @@ from django.db.models import Q
 from django.utils.translation import gettext as _
 
 from alarm_backends.constants import CONST_MINUTES
-from alarm_backends.core.cache.action_config import ActionConfigCacheManager
 from alarm_backends.core.cache.key import (
     DEMO_ACTION_KEY_LOCK,
     LATEST_TIME_OF_SYNC_ACTION_KEY,
@@ -31,6 +30,7 @@ from alarm_backends.core.lock.service_lock import service_lock
 from alarm_backends.service.fta_action import (
     ActionAlreadyFinishedError,
     BaseActionProcessor,
+    get_action_timeout_setting,
 )
 from alarm_backends.service.fta_action.utils import PushActionProcessor, to_document
 from alarm_backends.service.scheduler.app import app
@@ -41,11 +41,32 @@ from bkmonitor.documents import ActionInstanceDocument, AlertDocument
 from bkmonitor.documents.base import BulkActionType
 from bkmonitor.models import ActionInstance, ConvergeRelation
 from bkmonitor.models.strategy import DutyRule, DutyRuleRelation, UserGroup
+from bkmonitor.utils.tenant import (
+    bk_biz_id_to_bk_tenant_id,
+    get_local_tenant_id,
+    set_local_tenant_id,
+)
 from constants.action import ActionPluginType, ActionSignal, ActionStatus, ConvergeType, FailureType
 from core.errors.alarm_backends import LockError
 from core.prometheus import metrics
 
 logger = logging.getLogger("fta_action.run")
+
+
+def _resolve_action_tenant_id(processor) -> str | None:
+    """
+    解析 action 所属租户ID。
+
+    优先使用 processor.bk_tenant_id；个别 processor（如 message_queue）自定义 __init__ 未设置该属性时，
+    按 action 所属业务兜底推导；processor 初始化提前 return（连 action 都没有）时返回 None，由调用方跳过设置。
+    """
+    bk_tenant_id = getattr(processor, "bk_tenant_id", None)
+    if bk_tenant_id:
+        return bk_tenant_id
+    action = getattr(processor, "action", None)
+    if action is not None:
+        return bk_biz_id_to_bk_tenant_id(action.bk_biz_id)
+    return None
 
 
 @app.task(ignore_result=True, queue="celery_running_action")
@@ -79,8 +100,26 @@ def run_action(action_type, action_info):
     processor = None
     is_finished = False
     start_time = time.time()
+    # 多租户：当前任务运行在 celery worker 中，无 HTTP request 上下文。需将 action 所属租户写入
+    # thread-local，否则下游（如作业平台轮询 GetJobInstanceStatusResource）调用 get_request_tenant_id()
+    # 时在多租户模式下会抛 "cannot get tenant_id"。worker 线程会被后续任务复用，故在 finally 里恢复，
+    # 避免污染同线程的后续任务。
+    previous_tenant_id = get_local_tenant_id()
     try:
         processor: BaseActionProcessor = module.ActionProcessor(action_info["id"], alerts=action_info.get("alerts"))
+        # 解析并注入 action 所属租户。租户推导失败（如业务无对应空间）不应中断动作执行，
+        # 退回改动前的"不设租户"行为并仅记录告警，避免把原本可执行的动作误标为失败。
+        try:
+            bk_tenant_id = _resolve_action_tenant_id(processor)
+            if bk_tenant_id:
+                set_local_tenant_id(bk_tenant_id)
+        except Exception as tenant_error:  # NOCC:broad-except(设计如此:)
+            logger.warning(
+                "[run_action_worker] action(%s) action_type(%s) resolve tenant failed: %s",
+                action_info["id"],
+                action_type,
+                tenant_error,
+            )
         # 如果带了执行函数，则执行执行函数，没有的话，直接做执行操作
         func_name = action_info.get("function", "execute")
         func = getattr(processor, func_name)
@@ -112,6 +151,9 @@ def run_action(action_type, action_info):
         )
         is_finished = True
         exc = error
+    finally:
+        # 恢复线程本地租户，避免污染同 worker 线程复用时的后续任务
+        set_local_tenant_id(previous_tenant_id)
 
     if processor:
         if getattr(processor, "is_finished", True):
@@ -417,6 +459,8 @@ def check_timeout_actions():
     """
     清除最近3天内的超时任务
     """
+    # Keep the indexed lookback bounded. It covers the current configuration cap in steady state; legacy instances
+    # created with a longer timeout remain a rollout concern.
     three_days_ago = datetime.now(tz=timezone.utc) - timedelta(days=3)
     try:
         with service_lock(TIMEOUT_ACTION_KEY_LOCK):
@@ -427,33 +471,33 @@ def check_timeout_actions():
                     create_time__lt=ten_minutes_ago,
                     create_time__gte=three_days_ago,
                 )
-                .only("status", "id", "action_config_id", "create_time")
+                .only("status", "id", "action_config", "action_config_id", "create_time")
                 .order_by("create_time")
+                .iterator(chunk_size=1000)
             )
             timeout_actions = []
             for running_action in running_actions:
-                action_config = ActionConfigCacheManager.get_action_config_by_id(running_action.action_config_id)
-                timeout_setting = action_config.get("execute_config", {}).get("timeout", 0)
                 if running_action.status == ActionStatus.WAITING:
                     timeout_setting = 30 * CONST_MINUTES
+                else:
+                    timeout_setting = get_action_timeout_setting(running_action) or 0
                 timeout_timestamp = (ten_minutes_ago - timedelta(seconds=timeout_setting)).timestamp()
                 if int(timeout_timestamp) >= int(running_action.create_time.timestamp()):
                     timeout_actions.append(running_action.id)
             if timeout_actions:
                 step = 100
+                updated_action_count = 0
                 for idx in range(0, len(timeout_actions), step):
-                    ActionInstance.objects.filter(id__in=timeout_actions[idx : idx + step]).update(
+                    updated_action_count += ActionInstance.objects.filter(
+                        id__in=timeout_actions[idx : idx + step], status__in=ActionStatus.PROCEED_STATUS
+                    ).update(
                         end_time=datetime.now(tz=timezone.utc),
                         update_time=datetime.now(tz=timezone.utc),
                         status=ActionStatus.FAILURE,
                         failure_type=FailureType.TIMEOUT,
-                        ex_data=dict(
-                            message=_("处理执行时间超过套餐配置的最大时长{}分钟, 按失败处理").format(
-                                timeout_setting // 60 or 10
-                            )
-                        ),
+                        ex_data=dict(message=_("任务执行超时")),
                     )
-                logger.info("setting actions(%s) to failure because of timeout", len(timeout_actions))
+                logger.info("setting actions(%s) to failure because of timeout", updated_action_count)
     except LockError:
         # 加锁失败
         logger.info("[get service lock fail] check timeout action. will process later")

@@ -29,9 +29,11 @@ import { Component as tsc } from 'vue-tsx-support';
 
 import { TABLE_LOG_FIELDS_SORT_REGULAR, getRegExp } from '@/common/util';
 import { builtInInitHiddenList } from '@/const/index.js';
+import { isFeatureToggleOn } from '@/hooks/use-feature-toggle';
 import VueDraggable from 'vuedraggable';
 
 import EmptyStatus from '../../../components/empty-status/index.vue';
+import { storeRuntimeCacheService } from '../../../store/services/runtime-cache.service';
 import { BK_LOG_STORAGE } from '../../../store/store.type';
 import FieldItem from './field-item';
 // import FieldSelectConfig from './components/field-select-config.vue';
@@ -64,6 +66,7 @@ export default class FieldFilterComp extends tsc<object> {
   };
   dragVisibleFields = [];
   expandedNodes = {}; // 用于存储展开节点的 key
+  expandedFieldIds = {}; // 按 fullName 记录已展开节点，只挂载下一层 children
   builtInHeaderList = ['log', 'ip', 'utctime', 'path'];
   builtInInitHiddenList = builtInInitHiddenList;
 
@@ -72,21 +75,29 @@ export default class FieldFilterComp extends tsc<object> {
 
   isShowErrInfo = false;
   get errInfo() {
-    const key = 'retrieve/getLogTableHead';
+    const isScene = this.$store.getters.isSceneMode;
+    const key = isScene ? 'retrieve/getSceneFields' : 'retrieve/getLogTableHead';
     return this.$store.state.apiErrorInfo[key] || '';
+  }
+  get isFieldLoading() {
+    return this.$store.state.indexFieldInfo.is_loading;
+  }
+  get hasFilterVisibleFields() {
+    return this.totalFields.length > 0;
   }
   /** 可选字段 */
   get hiddenFields() {
-    return this.totalFields.filter(item => !this.visibleFields.some(visibleItem => item === visibleItem));
+    const visibleFieldNames = new Set(this.visibleFields.map(item => item.field_name));
+    return this.totalFields.filter(item => !visibleFieldNames.has(item.field_name));
   }
   /** 显示字段 */
   get showFields() {
     return this.objectHierarchy(this.visibleFields);
   }
   get statisticalFieldsData() {
-    // 这里避免初始化的时候数据已经更新，但视图却未更新，加入请求完毕的loading进行监听
-    // this.$store.state.indexSetQueryResult.is_loading;
-    return this.$store.state.retrieveDropdownData;
+    // 版本号用于触发视图更新，实际大对象存放在 runtime cache / IndexedDB 镜像中。
+    void this.$store.state.retrieveDropdownDataVersion;
+    return storeRuntimeCacheService.getRetrieveDropdownData(this.$store.state.indexId || 'default');
   }
 
   /** 内置字段 */
@@ -152,58 +163,12 @@ export default class FieldFilterComp extends tsc<object> {
   }
   /** object格式字段的层级展示 */
   objectHierarchy(arrData) {
-    const [objArr, otherArr] = arrData.reduce(
-      // biome-ignore lint/nursery/noShadow: reason
-      ([objArr, otherArr], item) => {
-        item.field_name.includes('.') ? objArr.push(item) : otherArr.push(item);
-        return [objArr, otherArr];
-      },
-      [[], []],
-    );
-    if (!objArr.length) {
-      return arrData;
-    }
-    const objectField: any[] = [];
-    for (const item of objArr) {
-      this.addToNestedStructure(objectField, item);
-    }
-    return [
-      ...objectField,
-      ...otherArr.filter((item) => {
-        return !objectField.map(field => field.field_name).includes(item.field_name);
-      }),
-    ];
-  }
-  /** 递归将数组变成tree */
-  addToNestedStructure(targetArray, originalObject) {
-    const parts = originalObject.field_name.split('.');
-    let currentLevel = targetArray;
-    let parentFieldName: null | string = null; // 用于存储父节点的名称
-    parts.forEach((part, index) => {
-      let existingPart = currentLevel.find(item => item.field_name === part);
-      if (!existingPart) {
-        existingPart = { field_name: part, filterVisible: true, field_type: 'object' };
-        if (parentFieldName !== null) {
-          existingPart.parentFieldName = parentFieldName;
-        }
-        existingPart.fullName = parentFieldName
-          ? `${parentFieldName}.${existingPart.field_name}`
-          : existingPart.field_name;
-        if (index < parts.length - 1) {
-          existingPart.children = [];
-        }
-        currentLevel.push(existingPart);
-      }
-      parentFieldName = parentFieldName ? `${parentFieldName}.${part}` : part;
-      if (index === parts.length - 1) {
-        Object.assign(existingPart, originalObject);
-      }
-      currentLevel = existingPart.children;
-    });
+    const tree = this.$store.getters.fieldTree;
+    return this.pickFieldTree(tree, arrData);
   }
   /** 递归将tree变回数组 */
   convertNestedStructureToArray(nestedArray) {
-    const flatten = (nodes) => {
+    const flatten = nodes => {
       const result: any[] = [];
       for (const node of nodes) {
         const currentPath = node.field_name;
@@ -241,8 +206,8 @@ export default class FieldFilterComp extends tsc<object> {
     );
 
     const visibleBuiltLength = builtInFieldsValue.filter(item => item.filterVisible).length;
-    const hiddenFieldVisible = !!initHiddenList.filter(item => item.filterVisible).length
-      && visibleBuiltLength === builtInFieldsValue.length;
+    const hiddenFieldVisible =
+      !!initHiddenList.filter(item => item.filterVisible).length && visibleBuiltLength === builtInFieldsValue.length;
 
     return {
       // 若没找到初始隐藏的内置字段且内置字段不足10条则不展示展开按钮
@@ -251,18 +216,75 @@ export default class FieldFilterComp extends tsc<object> {
       builtInShowFields: this.isShowAllBuiltIn || this.searchKeyword ? [...otherList, ...initHiddenList] : [],
     };
   }
-  getIsShowIndexSetExpand() {
-    return this.indexSetFields().filter(item => item.filterVisible && !item.field_name.includes('.')).length > 10;
+  get indexSetFieldTree() {
+    return this.objectHierarchy(this.indexSetFields());
   }
-  /** 展示的可选字段 */
-  get showIndexSetFields() {
-    if (this.searchKeyword) {
-      return this.objectHierarchy(this.indexSetFields());
+  getIsShowIndexSetExpand() {
+    const tree = this.indexSetFieldTree;
+    return tree.length > 10 || tree.some(item => item.children?.length);
+  }
+  get expandedFieldIdSet() {
+    return new Set(Object.keys(this.expandedFieldIds).filter(id => this.expandedFieldIds[id]));
+  }
+  /** 只把已展开节点的下一层 children 交给树，避免一次挂上全部后代 */
+  hydrateVisibleTree(node, expandedSet) {
+    const childList = node.children || [];
+    if (!childList.length) {
+      return { ...node, children: undefined };
     }
-    const result = this.objectHierarchy(
-      this.isShowAllIndexSet ? this.indexSetFields() : this.sliceFields(this.indexSetFields()),
-    );
-    return result;
+    const nodeId = node.fullName || node.full_name || node.field_name;
+    if (!expandedSet.has(nodeId)) {
+      return {
+        ...node,
+        children: childList.map(child => ({
+          ...child,
+          children: undefined,
+        })),
+      };
+    }
+    return {
+      ...node,
+      children: childList.map(child => this.hydrateVisibleTree(child, expandedSet)),
+    };
+  }
+  markSearchExpanded(nodes, keyword, expanded, ancestors = []) {
+    if (!keyword) {
+      return false;
+    }
+    const regExp = getRegExp(keyword.trim());
+    let matched = false;
+    for (const node of nodes || []) {
+      const nodeId = node.fullName || node.full_name || node.field_name;
+      const selfMatch =
+        regExp.test(node.field_name || '') ||
+        regExp.test(node.field_alias || '') ||
+        regExp.test(node.query_alias || '');
+      const childMatch = this.markSearchExpanded(node.children, keyword, expanded, [...ancestors, nodeId]);
+      if (selfMatch || childMatch) {
+        matched = true;
+        ancestors.forEach(id => {
+          expanded[id] = true;
+        });
+      }
+    }
+    return matched;
+  }
+  getLazyFieldTree(nodes) {
+    const expanded = { ...this.expandedFieldIds };
+    if (this.searchKeyword) {
+      this.markSearchExpanded(nodes, this.searchKeyword, expanded);
+    }
+    const expandedSet = new Set(Object.keys(expanded).filter(id => expanded[id]));
+    return (nodes || []).map(node => this.hydrateVisibleTree(node, expandedSet));
+  }
+  /** 折叠时最多 10 个根；展开全部也只按层挂载，不一次渲染 1117 个节点 */
+  get showIndexSetFields() {
+    const tree = this.indexSetFieldTree;
+    const roots = this.searchKeyword || this.isShowAllIndexSet ? tree : tree.slice(0, 10);
+    return this.getLazyFieldTree(roots);
+  }
+  get builtInLazyShowFields() {
+    return this.getLazyFieldTree(this.builtInFieldsShowObj().builtInShowFields);
   }
   get filterTypeCount() {
     // 过滤的条件数量
@@ -300,10 +322,11 @@ export default class FieldFilterComp extends tsc<object> {
         isFront = true;
         break;
       default: {
-        const { scenario_id_white_list: scenarioIdWhiteList } = (window as any).FIELD_ANALYSIS_CONFIG;
-        const { field_analysis_config: fieldAnalysisConfig } = (window as any).FEATURE_TOGGLE_WHITE_LIST;
+        const { scenario_id_white_list: scenarioIdWhiteList } = (window as any).FIELD_ANALYSIS_CONFIG || {};
         const scenarioID = this.indexSetItem.items?.[0]?.scenario_id;
-        isFront = !(scenarioIdWhiteList?.includes(scenarioID) && fieldAnalysisConfig?.includes(Number(this.bkBizId)));
+        isFront = !(
+          scenarioIdWhiteList?.includes(scenarioID) && isFeatureToggleOn('field_analysis_config', this.bkBizId)
+        );
         break;
       }
     }
@@ -321,6 +344,8 @@ export default class FieldFilterComp extends tsc<object> {
     this.fieldType = 'any';
     this.isShowAllBuiltIn = false;
     this.isShowAllIndexSet = false;
+    this.expandedNodes = {};
+    this.expandedFieldIds = {};
   }
 
   @Watch('showFieldAlias')
@@ -349,9 +374,10 @@ export default class FieldFilterComp extends tsc<object> {
     for (const fieldList of [this.visibleFields, this.hiddenFields]) {
       for (const fieldItem of fieldList) {
         regExp.lastIndex = 0; // 重置lastIndex,这个正则有全局标志
-        fieldItem.filterVisible = regExp.test(fieldItem.field_name)
-          || regExp.test(fieldItem.field_alias)
-          || regExp.test(fieldItem.query_alias || '');
+        fieldItem.filterVisible =
+          regExp.test(fieldItem.field_name) ||
+          regExp.test(fieldItem.field_alias) ||
+          regExp.test(fieldItem.query_alias || '');
       }
     }
     this.$nextTick(() => {
@@ -371,33 +397,45 @@ export default class FieldFilterComp extends tsc<object> {
   handleVisibleMoveEnd() {
     this.$emit('fields-updated', this.dragVisibleFields);
   }
+  getFieldFullName(fieldItem) {
+    if (fieldItem.full_name || fieldItem.fullName) {
+      return fieldItem.full_name || fieldItem.fullName;
+    }
+
+    const parentFieldName = fieldItem.parentFieldName || fieldItem.parent_field_name;
+    const fieldName = fieldItem.field_name;
+    if (parentFieldName && typeof fieldName === 'string' && !fieldName.startsWith(`${parentFieldName}.`)) {
+      return `${parentFieldName}.${fieldName}`;
+    }
+
+    return fieldName;
+  }
+
+  getDisplayFieldName(fieldItem) {
+    return fieldItem.field_type === 'object' ? this.getFieldFullName(fieldItem) : fieldItem.field_name;
+  }
+
   // 字段显示或隐藏
   handleToggleItem(type: string, fieldItem) {
     const displayFieldNames = this.visibleFields.map(item => item.field_name);
-    // object格式单独处理
-    if (fieldItem.field_type === 'object') {
-      const fieldName = fieldItem.parentFieldName
-        ? `${fieldItem.parentFieldName}.${fieldItem.field_name}`
-        : fieldItem.field_name;
+    const fieldName = this.getDisplayFieldName(fieldItem);
 
-      if (type === 'visible') {
-        // 需要隐藏字段
-        const index = this.visibleFields.findIndex(item => fieldName === item.field_name);
-        displayFieldNames.splice(index, 1);
-      } else {
-        // 需要显示字段 如果已存在不进行操作
-        if (this.visibleFields.some(item => item.field_name === fieldName)) {
-          return;
-        }
-        displayFieldNames.push(fieldName);
-      }
-    } else if (type === 'visible') {
+    if (!fieldName) {
+      return;
+    }
+
+    if (type === 'visible') {
       // 需要隐藏字段
-      const index = this.visibleFields.findIndex(item => fieldItem.field_name === item.field_name);
-      displayFieldNames.splice(index, 1);
+      const index = displayFieldNames.findIndex(item => item === fieldName);
+      if (index > -1) {
+        displayFieldNames.splice(index, 1);
+      }
     } else {
-      // 需要显示字段
-      displayFieldNames.push(fieldItem.field_name);
+      // 需要显示字段 如果已存在不进行操作
+      if (displayFieldNames.includes(fieldName)) {
+        return;
+      }
+      displayFieldNames.push(fieldName);
     }
     this.$emit('fields-updated', displayFieldNames);
   }
@@ -418,25 +456,6 @@ export default class FieldFilterComp extends tsc<object> {
     }
     return sortList;
   }
-  /**
-   * @desc: 分割展示字段名（排除object字段名）
-   * @param {Array} list
-   * @returns {Array}
-   */
-  sliceFields(Fields) {
-    const { withDot, withoutDot } = Fields.reduce(
-      (acc, str) => {
-        if (str.field_name.includes('.')) {
-          acc.withDot.push(str);
-        } else {
-          acc.withoutDot.push(str);
-        }
-        return acc;
-      },
-      { withDot: [], withoutDot: [] },
-    );
-    return [...withDot, ...withoutDot.slice(0, 10)];
-  }
   handleSearchException(type: string) {
     if (type === 'clear-filter') {
       this.searchKeyword = '';
@@ -448,16 +467,25 @@ export default class FieldFilterComp extends tsc<object> {
   // 记录bigTree展开节点
   expandChange(TreeNode, ref) {
     this.expandedNodes[ref] = this.expandedNodes[ref] || [];
+    const nodeId = TreeNode.id;
     if (TreeNode.expanded) {
-      if (!this.expandedNodes[ref].includes(TreeNode.id)) {
-        this.expandedNodes[ref].push(TreeNode.id);
+      if (!this.expandedNodes[ref].includes(nodeId)) {
+        this.expandedNodes[ref].push(nodeId);
+      }
+      if (nodeId) {
+        this.$set(this.expandedFieldIds, nodeId, true);
       }
     } else {
-      this.expandedNodes[ref] = this.expandedNodes[ref].filter(id => id !== TreeNode.id);
+      this.expandedNodes[ref] = this.expandedNodes[ref].filter(id => id !== nodeId);
+      if (nodeId) {
+        this.$delete(this.expandedFieldIds, nodeId);
+      }
     }
   }
   bigTreeRender(field, index) {
-    const defaultExpandedNodes = this.expandedNodes[`bigTreeRef-${index}`];
+    const defaultExpandedNodes = Array.from(
+      new Set([...(this.expandedNodes[`bigTreeRef-${index}`] || []), ...Array.from(this.expandedFieldIdSet)]),
+    );
     const scopedSlots = {
       default: ({ data }) => (
         <FieldItem
@@ -491,6 +519,29 @@ export default class FieldFilterComp extends tsc<object> {
       />
     );
   }
+  pickFieldTree(treeData, arrData) {
+    if (!treeData?.length || !arrData?.length) {
+      return [];
+    }
+
+    const sourceByName = new Map(arrData.map(item => [item.field_name, item]));
+    const visit = node => {
+      const children = (node.children ?? []).map(visit).filter(Boolean);
+      const fieldName = node.full_name || node.fullName || node.field_name;
+      const sourceField = sourceByName.get(fieldName);
+      if (!sourceField && !children.length) {
+        return null;
+      }
+
+      return {
+        ...(sourceField ?? node),
+        filterVisible: sourceField?.filterVisible ?? node.filterVisible ?? true,
+        children: children.length ? children : undefined,
+      };
+    };
+
+    return treeData.map(visit).filter(Boolean);
+  }
   render() {
     return (
       <div class='field-filter-box'>
@@ -503,14 +554,14 @@ export default class FieldFilterComp extends tsc<object> {
             right-icon='icon-search'
             clearable
             onChange={() => this.filterListByCondition()}
-          // onClear={() => this.handleSearchException('clear-filter')}
+            // onClear={() => this.handleSearchException('clear-filter')}
           />
         </div>
         <div
           ref='fieldFilter'
           class='field-filter-container-new'
         >
-          {!this.totalFields.filter(item => item.filterVisible).length && (
+          {!this.isFieldLoading && !this.hasFilterVisibleFields && (
             <EmptyStatus
               style={{ marginTop: '20%' }}
               emptyType={this.searchKeyword ? 'search-empty' : '500'}
@@ -537,7 +588,7 @@ export default class FieldFilterComp extends tsc<object> {
               )}
             </EmptyStatus>
           )}
-          {!!this.totalFields.filter(item => item.filterVisible).length && (
+          {this.hasFilterVisibleFields && (
             <div class='fields-container is-selected'>
               <div class='title'>
                 <span>{this.$t('显示字段')}</span>
@@ -577,27 +628,28 @@ export default class FieldFilterComp extends tsc<object> {
             </div>
           )}
           <div class='field-filter-roll'>
-            {!!this.indexSetFields().filter(item => item.filterVisible).length && (
+            {!!this.indexSetFieldTree.some(item => item.filterVisible) && (
               <div class='fields-container not-selected optional-field'>
                 <div class='title'>{this.$t('可选字段')}</div>
                 <ul class='filed-list'>
-                  {this.showIndexSetFields.map((item, index) => (item.children?.length ? (
-                    this.bigTreeRender(item, `${index}select`)
-                  ) : (
-                    <FieldItem
-                      key={`${index}-${item}`}
-                      v-show={item.filterVisible}
-                      date-picker-value={this.datePickerValue}
-                      field-alias-map={this.fieldAliasMap}
-                      field-item={item}
-                      is-front-statistics={this.isFrontStatistics}
-                      retrieve-params={this.retrieveParams}
-                      show-field-alias={this[BK_LOG_STORAGE.SHOW_FIELD_ALIAS]}
-                      statistical-field-data={this.statisticalFieldsData[item.field_name]}
-                      type='hidden'
-                      onToggleItem={({ type, fieldItem }) => this.handleToggleItem(type, fieldItem)}
-                    />
-                  )),
+                  {this.showIndexSetFields.map((item, index) =>
+                    item.children?.length ? (
+                      this.bigTreeRender(item, `${index}select`)
+                    ) : (
+                      <FieldItem
+                        key={`${index}-${item}`}
+                        v-show={item.filterVisible}
+                        date-picker-value={this.datePickerValue}
+                        field-alias-map={this.fieldAliasMap}
+                        field-item={item}
+                        is-front-statistics={this.isFrontStatistics}
+                        retrieve-params={this.retrieveParams}
+                        show-field-alias={this[BK_LOG_STORAGE.SHOW_FIELD_ALIAS]}
+                        statistical-field-data={this.statisticalFieldsData[item.field_name]}
+                        type='hidden'
+                        onToggleItem={({ type, fieldItem }) => this.handleToggleItem(type, fieldItem)}
+                      />
+                    ),
                   )}
                   {this.getIsShowIndexSetExpand() && (
                     <div
@@ -621,23 +673,24 @@ export default class FieldFilterComp extends tsc<object> {
                   {(this.$t('label-内置字段') as string).replace('label-', '')}
                 </div>
                 <ul class='filed-list'>
-                  {this.builtInFieldsShowObj().builtInShowFields.map((item, index) => (item.children?.length ? (
-                    this.bigTreeRender(item, `${index}built`)
-                  ) : (
-                    <FieldItem
-                      key={`${index}-${item}`}
-                      v-show={item.filterVisible}
-                      date-picker-value={this.datePickerValue}
-                      field-alias-map={this.fieldAliasMap}
-                      field-item={item}
-                      is-front-statistics={this.isFrontStatistics}
-                      retrieve-params={this.retrieveParams}
-                      show-field-alias={this[BK_LOG_STORAGE.SHOW_FIELD_ALIAS]}
-                      statistical-field-data={this.statisticalFieldsData[item.field_name]}
-                      type='hidden'
-                      onToggleItem={({ type, fieldItem }) => this.handleToggleItem(type, fieldItem)}
-                    />
-                  )),
+                  {this.builtInLazyShowFields.map((item, index) =>
+                    item.children?.length ? (
+                      this.bigTreeRender(item, `${index}built`)
+                    ) : (
+                      <FieldItem
+                        key={`${index}-${item}`}
+                        v-show={item.filterVisible}
+                        date-picker-value={this.datePickerValue}
+                        field-alias-map={this.fieldAliasMap}
+                        field-item={item}
+                        is-front-statistics={this.isFrontStatistics}
+                        retrieve-params={this.retrieveParams}
+                        show-field-alias={this[BK_LOG_STORAGE.SHOW_FIELD_ALIAS]}
+                        statistical-field-data={this.statisticalFieldsData[item.field_name]}
+                        type='hidden'
+                        onToggleItem={({ type, fieldItem }) => this.handleToggleItem(type, fieldItem)}
+                      />
+                    ),
                   )}
                   {/* {this.builtInFieldsShowObj().isShowBuiltExpandBtn && (
                     <div

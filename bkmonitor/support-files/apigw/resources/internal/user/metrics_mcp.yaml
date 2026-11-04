@@ -24,7 +24,7 @@ paths:
                   description: Number of items to retrieve 获取的条数
                 is_platform:
                   type: boolean
-                  default: 'false'
+                  default: false
                   description: Whether to query platform-level data ID 是否查询公共数据
         required: false
         description: ''
@@ -42,8 +42,9 @@ paths:
         pluginConfigs: []
         authConfig:
           userVerifiedRequired: true
-          appVerifiedRequired: true
+          appVerifiedRequired: false
           resourcePermissionRequired: true
+          oauth2PersonalClientEnabled: true
   /mcp/list_time_series_metrics/:
     get:
       operationId: list_time_series_metrics
@@ -71,14 +72,15 @@ paths:
         backend:
           name: default
           method: get
-          path: /api/v3/meta/get_time_series_metrics/
+          path: /api/v4/mcp/list_time_series_metrics/
           matchSubpath: false
           timeout: 63
         pluginConfigs: []
         authConfig:
           userVerifiedRequired: true
-          appVerifiedRequired: true
+          appVerifiedRequired: false
           resourcePermissionRequired: true
+          oauth2PersonalClientEnabled: true
   /mcp/execute_range_query/:
     post:
       operationId: execute_range_query
@@ -128,8 +130,9 @@ paths:
         pluginConfigs: []
         authConfig:
           userVerifiedRequired: true
-          appVerifiedRequired: true
+          appVerifiedRequired: false
           resourcePermissionRequired: true
+          oauth2PersonalClientEnabled: true
   /mcp/execute_sql_query/:
     post:
       operationId: execute_sql_query
@@ -187,5 +190,6 @@ paths:
         pluginConfigs: []
         authConfig:
           userVerifiedRequired: true
-          appVerifiedRequired: true
+          appVerifiedRequired: false
           resourcePermissionRequired: true
+          oauth2PersonalClientEnabled: true

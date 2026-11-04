@@ -100,7 +100,7 @@ export default defineComponent({
 
     const indexFieldInfo = computed(() => store.state.indexFieldInfo);
     const indexSetFieldConfig = computed(() => store.state.indexSetFieldConfig);
-    const totalFields = computed(() => (indexFieldInfo.value.fields || []) as Array<any>);
+    const totalFields = computed(() => store.getters.rawFieldList as Array<any>);
     const globalLoading = computed(() => indexFieldInfo.value.is_loading || isFieldInit.value);
     const clusteringConfig = computed(() => indexSetFieldConfig.value.clustering_config);
     const clusterSwitch = computed(() => clusteringConfig.value?.is_active || false);
@@ -410,7 +410,8 @@ export default defineComponent({
                       cluster-step-data={clusterStepData.value}
                     />
                   );
-                } else if (!clusterSwitch.value) {
+                }
+                if (!clusterSwitch.value) {
                   // 快速开启日志聚类
                   return (
                     <QuickOpenCluster
@@ -419,19 +420,18 @@ export default defineComponent({
                       on-create-cluster={handleClusterCreate}
                     />
                   );
-                } else {
-                  return (
-                    <log-table
-                      ref={logTableRef}
-                      indexId={indexSetId.value}
-                      isShowClusterStep={isShowClusterStep.value}
-                      cluster-switch={clusterSwitch.value}
-                      is-cluster-active={isClusterActive.value}
-                      request-data={requestData.value}
-                      on-open-cluster-config={handleOpenClusterConfig}
-                    />
-                  );
                 }
+                return (
+                  <log-table
+                    ref={logTableRef}
+                    indexId={indexSetId.value}
+                    isShowClusterStep={isShowClusterStep.value}
+                    cluster-switch={clusterSwitch.value}
+                    is-cluster-active={isClusterActive.value}
+                    request-data={requestData.value}
+                    on-open-cluster-config={handleOpenClusterConfig}
+                  />
+                );
               })()
             ) : (
               // 无text的空聚类

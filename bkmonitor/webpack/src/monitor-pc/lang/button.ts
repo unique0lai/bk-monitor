@@ -113,6 +113,11 @@ export default {
   设为默认: 'Set as default',
   取消默认: 'Remove default',
   取消选择: 'Cancel Selection',
+  修改全局配置: 'Modify Global Configuration',
+  全局生效规则: 'Global Effective Rules',
+  备注: 'Remark',
+  返回码备注: 'Return Code Remark',
+  全局生效: 'Global Effective',
 
   // 规范：平台特性 术语
   新建节点: 'New Probe',
@@ -322,6 +327,7 @@ export default {
   查看上报数据: 'View Reported Data',
   查看分派规则: 'View',
   查看数据: 'View Data',
+  查看数组列表: 'View Array List',
   查看原始数据: 'View Raw Data',
   查看变更历史: 'View Change History',
   查看告警列表: 'View Alarms',
@@ -331,6 +337,7 @@ export default {
   查看更多相关的日志: 'More Related Log',
   查看更多语法规则: 'More Grammar',
   查看监控目标: 'View Scope',
+  查看全部字段: 'View All Fields',
   查看迁移内容: 'View Migration',
   查看风险点: 'View Risk',
   查看更多文档: 'More Documentations',
@@ -525,6 +532,7 @@ export default {
   上一个: 'Previous',
   下一个: 'Next',
   分析详情: 'Analysis Details',
+  'SDK 接入指引': 'SDK Access Guide',
 
   // ISSUES
   标为已解决: 'Mark as Resolved',
@@ -537,4 +545,41 @@ export default {
   'button-中': 'Medium',
   'button-低': 'Low',
   'button-富文本编辑': 'Rich Text Editor',
+
+  确认拆分: 'Confirm Split',
+  '拆分为新 Issue': 'Split to New Issue',
+  批量拆分: 'Batch Split',
+  确认合并: 'Confirm Merge',
+  '设为主 Issue': 'Set as Main Issue',
+  了解更多: 'Learn More',
+  合并: 'Merge',
+  创建单据: 'Create Document',
+  关联更多项目: 'Related More Project',
+  取消授权: 'Cancel Authorization',
+  取消关联: 'Cancel Association',
+  去关联: 'Go to Association',
+  恢复默认: 'Restore Default',
+  删除分组: 'Delete Group',
+
+  // AI设置
+  刷新状态: 'Refresh Status',
+  立即添加: 'Add Now',
+  新增智能体: 'Add Agent',
+  新增Skill: 'Add Skill',
+  新增知识库: 'Add Knowledge Base',
+
+  查看完整报告: 'View Full Report',
+  重新分析: 'Reanalyze',
+  查看配置: 'View Configuration',
+  去配置: 'Go to Configuration',
+  '去配置 AI 设置': 'Go to AI Settings',
+  '已配置，立即分析': 'Configured, Analyze Now',
+  立即分析: 'Analyze Now',
+  修改配置: 'Modify Configuration',
+  分析中···: 'Analyzing...',
+  '返回 Issue': 'Return to Issue',
+  重新分派: 'Reassign',
+  // RUM 检索--详情
+  复制完整地址: 'Copy Full Address',
+  查看官方定义: 'Check the official definition',
 };

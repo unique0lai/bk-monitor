@@ -26,14 +26,14 @@
 
 <template>
   <div
-    class="basic-info-container"
     v-bkloading="{ isLoading: basicLoading }"
+    class="basic-info-container"
   >
     <div>
       <div
         v-if="!isContainer"
-        class="deploy-sub"
         v-en-class="'en-deploy'"
+        class="deploy-sub"
       >
         <!-- 数据ID -->
         <div>
@@ -54,8 +54,8 @@
                 class="loading"
               ></span>
               <bk-button
-                class="view-btn"
                 v-cursor="{ active: !editAuth }"
+                class="view-btn"
                 :loading="tokenLoading"
                 text
                 @click="handleGetToken"
@@ -291,9 +291,9 @@
     </div>
     <div>
       <bk-button
+        v-cursor="{ active: !editAuth }"
         style="min-width: 88px; color: #3a84ff"
         class="mr10"
-        v-cursor="{ active: !editAuth }"
         :theme="'default'"
         @click="handleClickEdit"
       >
@@ -377,30 +377,34 @@
         return this.params.winlog_name?.join(',') || '';
       },
       isHaveEventValue() {
-        return this.params.winlog_event_id.length || this.params.winlog_level.length;
+        return this.params.winlog_event_id?.length || 0 || this.params.winlog_level?.length || 0;
       },
       isContainer() {
         return this.collectorData.environment === 'container';
       },
       // 自定义上报基本信息
       isCustomReport() {
-        return this.$route.name === 'custom-report-detail' || this.$route.query.typeKey === 'custom_report';
+        return this.$route.name === 'custom-report-detail' || this.collectorData.log_access_type === 'custom_report';
       },
       isWinEventLog() {
         return this.collectorData.collector_scenario_id === 'wineventlog';
       },
       isNotWinAndHaveFilter() {
         if (this.isWinEventLog || this.params.type === 'none') return false;
-        return this.conditions && !!this.conditions?.separator_filters.length;
+        return !!this.conditions.separator_filters.length;
       },
       isMatchType() {
         return this.conditions.type === 'match';
       },
       params() {
-        return this.collectorData.params;
+        return this.collectorData.params || {};
       },
       conditions() {
-        return this.collectorData.params.conditions;
+        return {
+          type: 'none',
+          separator_filters: [],
+          ...(this.params.conditions || {}),
+        };
       },
       filterGroup() {
         const filters = this.conditions?.separator_filters;
@@ -429,7 +433,7 @@
             {
               key: 'updated_by',
               label: this.$t('更新人'),
-              isUserAccount: true
+              isUserAccount: true,
             },
             {
               key: 'updated_at',
@@ -438,7 +442,7 @@
             {
               key: 'created_by',
               label: this.$t('创建人'),
-              isUserAccount: true
+              isUserAccount: true,
             },
             {
               key: 'created_at',
@@ -478,7 +482,7 @@
       },
       handleClickEdit() {
         if (!this.editAuth && this.editAuthData) {
-          this.$store.commit('updateState', { 'authDialogData': this.editAuthData});
+          this.$store.commit('updateState', { authDialogData: this.editAuthData });
           return;
         }
         const params = {};
@@ -497,13 +501,14 @@
             spaceUid: this.$store.state.spaceUid,
             backRoute,
             type: 'basicInfo',
-            typeKey: this.$route.query.typeKey,
+            typeKey: this.collectorData.log_access_type,
+            indexSetId: this.$route.query.indexSetId,
           },
         });
       },
       async handleGetToken() {
         if (!this.editAuth && this.editAuthData) {
-          this.$store.commit('updateState', { 'authDialogData': this.editAuthData});
+          this.$store.commit('updateState', { authDialogData: this.editAuthData });
           return;
         }
         try {

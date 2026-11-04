@@ -20,7 +20,13 @@ BKBASE_V4_KIND_STORAGE_CONFIGS = [
     {
         "kind": DataLinkKind.get_choice_value(DataLinkKind.ELASTICSEARCH.value),
         "namespace": BKBASE_NAMESPACE_BK_LOG,
-        "field_mappings": {"domain_name": "host", "port": "port", "username": "user", "password": "password"},
+        "field_mappings": {
+            "domain_name": "host",
+            "port": "port",
+            "username": "user",
+            "password": "password",
+            "schema": "schema",
+        },
         "cluster_type": models.ClusterInfo.TYPE_ES,
     },
     {
@@ -31,8 +37,21 @@ BKBASE_V4_KIND_STORAGE_CONFIGS = [
             "port": "insertPort",
             "username": "user",
             "password": "password",
+            "bk_biz_id": "bkBizId",
         },
         "cluster_type": models.ClusterInfo.TYPE_VM,
+    },
+    {
+        "kind": DataLinkKind.get_choice_value(DataLinkKind.SURREALDB.value),
+        "namespace": BKBASE_NAMESPACE_BK_MONITOR,
+        "field_mappings": {
+            "domain_name": "host",
+            "port": "port",
+            "username": "user",
+            "password": "password",
+            "version": "version",
+        },
+        "cluster_type": models.ClusterInfo.TYPE_SURREALDB,
     },
     {
         "kind": DataLinkKind.get_choice_value(DataLinkKind.DORIS.value),
@@ -42,6 +61,7 @@ BKBASE_V4_KIND_STORAGE_CONFIGS = [
             "port": "port",
             "username": "user",
             "password": "password",
+            "bk_biz_id": "bk_biz_id",
         },
         "cluster_type": models.ClusterInfo.TYPE_DORIS,
     },

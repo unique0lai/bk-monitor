@@ -11,11 +11,22 @@ specific language governing permissions and limitations under the License.
 from django.urls import include, re_path
 
 from core.drf_resource.routers import ResourceRouter
-from fta_web.issue.views import IssueViewSet
+from fta_web.issue.resources import tapd_app_install_callback, tapd_user_oauth_callback
+from fta_web.issue.views import (
+    IssueViewSet,
+    SourceAnalysisConfigViewSet,
+    SourceAnalysisOptionsViewSet,
+    SourceAnalysisRulesViewSet,
+)
 
 router = ResourceRouter()
 router.register(r"", IssueViewSet, basename="issue")
+router.register(r"source_analysis_options", SourceAnalysisOptionsViewSet, basename="source_analysis_options")
+router.register(r"source_analysis_config", SourceAnalysisConfigViewSet, basename="source_analysis_config")
+router.register(r"source_analysis_rules", SourceAnalysisRulesViewSet, basename="source_analysis_rules")
 
 urlpatterns = [
+    re_path(r"^tapd/oauth_callback/$", tapd_user_oauth_callback, name="tapd_user_oauth_callback"),
+    re_path(r"^tapd/app_install_callback/$", tapd_app_install_callback, name="tapd_app_install_callback"),
     re_path(r"^", include(router.urls)),
 ]

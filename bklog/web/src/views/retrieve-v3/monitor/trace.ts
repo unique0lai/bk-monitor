@@ -23,9 +23,6 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-window.__IS_MONITOR_COMPONENT__ = true;
-window.__IS_MONITOR_TRACE__ = true;
-window.__IS_MONITOR_APM__ = false;
 import Vue from 'vue';
 import {
   bkBackTop,
@@ -108,6 +105,11 @@ import {
 } from 'bk-magic-vue';
 
 import i18n from '@/language/i18n';
+import JsonFormatWrapper from '@/global/json-format-wrapper.vue';
+import useStore from '@/hooks/use-store';
+import { performanceMonitorService } from '@/storage';
+
+import MonitorTraceLog from './monitor';
 
 if (!window.mainComponent?.$t) {
   window.mainComponent = {
@@ -115,14 +117,10 @@ if (!window.mainComponent?.$t) {
     $i18n: i18n,
   };
 }
-import JsonFormatWrapper from '@/global/json-format-wrapper.vue';
-import useStore from '@/hooks/use-store';
-
-import MonitorTraceLog from './monitor';
 
 const logStore = useStore();
 
-const initMonitorState = (payload) => {
+const initMonitorState = payload => {
   logStore.commit('initMonitorState', payload);
 };
 const initGlobalComponents = () => {
@@ -205,12 +203,12 @@ const initGlobalComponents = () => {
   Vue.component('BkVirtualScroll', bkVirtualScroll);
   Vue.component('BkZoomImage', bkZoomImage);
 };
-const Vue2 = Vue;
-export {
-  MonitorTraceLog,
-  logStore,
-  i18n,
-  Vue2,
-  initMonitorState,
-  initGlobalComponents,
+const initWindowState = () => {
+  window.__IS_MONITOR_COMPONENT__ = true;
+  window.__IS_MONITOR_TRACE__ = true;
+  window.__IS_MONITOR_APM__ = false;
+  // 为嵌入运行时注册 workerManager / __BKLOG_WORKERS__ 诊断 API。
+  performanceMonitorService.init();
 };
+const Vue2 = Vue;
+export { MonitorTraceLog, logStore, i18n, Vue2, initMonitorState, initWindowState, initGlobalComponents };

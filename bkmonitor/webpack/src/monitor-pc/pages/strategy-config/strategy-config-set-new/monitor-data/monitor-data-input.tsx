@@ -91,7 +91,6 @@ class MericDataInput extends Mixins(metricTipsContentMixin) {
 
   hoverDeleteItemIndex = -1;
   levelIconMap: string[] = ['', 'icon-danger', 'icon-mind-fill', 'icon-tips'];
-  contentLoading = false;
   metricpopoerInstance: any = null;
   isShowExpress = false; // 此值用与单指标时可选填表达式
   dimensionPopInstance = null;
@@ -309,17 +308,15 @@ class MericDataInput extends Mixins(metricTipsContentMixin) {
     }
   }
 
-  handleRenderDimensionList(node, ctx, highlightKeyword) {
-    const parentClass = 'bk-selector-node bk-selector-member';
-    const textClass = 'text';
-    const innerHtml = `${highlightKeyword(node.name)}`;
+  handleRenderDimensionList(node) {
     return (
-      <div class={parentClass}>
+      <div class='bk-selector-node bk-selector-member'>
         <span
-          class={textClass}
-          domPropsInnerHTML={innerHtml}
+          class='text'
           onMouseenter={e => this.handleDimensionMouseEnter(e, node)}
-        />
+        >
+          {node.name}
+        </span>
       </div>
     );
   }
@@ -389,10 +386,7 @@ class MericDataInput extends Mixins(metricTipsContentMixin) {
               // on-mouseleave={() => (this.hoverDeleteItemIndex = -1)}
             >
               {!this.isRealTimeModel && <span class='item-key'>{item.alias}</span>}
-              <div
-                class='item-content'
-                v-bkloading={{ isLoading: this.contentLoading }}
-              >
+              <div class='item-content'>
                 {/* =======指标====== */}
                 {
                   <div class='form metric-name'>
@@ -488,6 +482,7 @@ class MericDataInput extends Mixins(metricTipsContentMixin) {
                     <CycleInput
                       class='form-interval'
                       v-model={item.agg_interval}
+                      minSec={item.collect_interval}
                       needAuto={false}
                       onChange={(v: number) => this.handleAggIntervalChange(item, v)}
                     />
@@ -556,7 +551,6 @@ class MericDataInput extends Mixins(metricTipsContentMixin) {
                     hasLeftLabel={true}
                     isHasNullOption={true}
                     on-change={v => this.handleConditionChange(item, v)}
-                    onKeyLoading={v => (this.contentLoading = v)}
                   />
                 )}
                 {/* =======函数====== */}

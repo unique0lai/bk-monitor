@@ -34,11 +34,14 @@ import GuidePage from '../../components/guide-page/guide-page';
 
 import './apm.scss';
 
-Component.registerHooks(['beforeRouteLeave']);
+Component.registerHooks(['beforeRouteLeave', 'deactivated']);
 @Component
 export default class ApmPage extends tsc<object> {
   loading = false;
   appkey = 'apm';
+  unmountCallback: () => void;
+  /** 微应用内注册的离开页面前回调（由 apm/index.ts 注册） */
+  apmLeaveHandlers: Array<() => void> = [];
   // 侧栏详情信息
   detailInfo: { bizId: number; id: string; isShow: boolean; type: 'eventDetail' } = {
     isShow: false,
@@ -47,7 +50,7 @@ export default class ApmPage extends tsc<object> {
     bizId: +window.bk_biz_id,
   };
   get apmHost() {
-    return process.env.NODE_ENV === 'development' ? `http://${process.env.devHost}:7002` : location.origin;
+    return process.env.NODE_ENV === 'development' ? `http://${process.env.devHost}:7003` : location.origin;
   }
   get apmUrl() {
     return process.env.NODE_ENV === 'development'
@@ -89,6 +92,12 @@ export default class ApmPage extends tsc<object> {
         parentRoute: '/apm/',
         $baseStore: this.$store,
         showDetailSlider: this.handleShowDetail,
+        setUnmountCallback: (callback: () => void) => {
+          this.unmountCallback = callback;
+        },
+        registerApmLeaveHandler: (handler: () => void) => {
+          this.apmLeaveHandlers.push(handler);
+        },
       },
     });
     activated(this.appkey, this.$refs.apmPageWrap as HTMLElement);
@@ -96,18 +105,37 @@ export default class ApmPage extends tsc<object> {
       this.loading = false;
     });
   }
-  beforeRouteLeave(_to, _fromm, next) {
+  flushApmLeaveHandlers() {
+    for (const handler of this.apmLeaveHandlers) {
+      try {
+        handler();
+      } catch (_) {
+        // ignore
+      }
+    }
+  }
+  unmountApm() {
+    const callback = this.unmountCallback;
+    this.unmountCallback = undefined;
+    callback?.();
+  }
+  beforeRouteLeave(_to, _from, next) {
+    this.flushApmLeaveHandlers();
     next();
   }
   async activated() {
     if (this.showGuidePage || this.loading) return;
     activated(this.appkey, this.$refs.apmPageWrap as HTMLElement);
   }
-  beforeDestroy() {
+  deactivated() {
+    this.flushApmLeaveHandlers();
     if (this.showGuidePage) return;
+    this.unmountApm();
     this.$route.name !== 'application-add' && deactivated(this.appkey);
   }
-  deactivate() {
+  beforeDestroy() {
+    if (this.showGuidePage) return;
+    this.unmountApm();
     this.$route.name !== 'application-add' && deactivated(this.appkey);
   }
   /**

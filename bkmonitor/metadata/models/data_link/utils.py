@@ -12,18 +12,75 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any
+import secrets
+import string
+from typing import TYPE_CHECKING, Any
 
 from django.conf import settings
+from django.db import IntegrityError, transaction
 from jinja2.sandbox import SandboxedEnvironment as Environment
 from pypinyin import lazy_pinyin
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from core.drf_resource import api
 from metadata import models
-from metadata.models.data_link.constants import MATCH_DATA_NAME_PATTERN
+from metadata.config import DATABASE_CONNECTION_NAME
+from metadata.models.data_link.constants import MATCH_DATA_NAME_PATTERN, DataLinkNameScene
 
 logger = logging.getLogger("metadata")
+
+if TYPE_CHECKING:
+    from metadata.models.data_source import DataSource
+
+BKBASE_RESULT_TABLE_FIELD_TYPE_MAP = {
+    # flattened 是 ES mapping 类型，BKBase V4 ResultTable 字段类型使用 string 表达。
+    "flattened": "string",
+}
+
+RANDOM_NAME_STRATEGIES = {
+    "bk_standard_v2_time_series": DataLinkNameScene.STANDARD_V2_TIME_SERIES,
+    "bk_standard_time_series": DataLinkNameScene.STANDARD_PLUGIN,
+    "bk_exporter_time_series": DataLinkNameScene.EXPORTER_PLUGIN,
+    "graph_relation_time_series": DataLinkNameScene.GRAPH,
+    "bcs_federal_proxy_time_series": DataLinkNameScene.FEDERAL_PROXY,
+    "bcs_federal_subset_time_series": DataLinkNameScene.FEDERAL_SUBSET,
+}
+
+
+def generate_bkdata_resource_name(scene: DataLinkNameScene, source_id: int) -> str:
+    """仅为首次创建生成候选名；已分配的身份必须从持久化关系读取。"""
+    # 场景和数值 ID 用于辨识来源，随机串区分同一来源的不同资源；调用方负责保存和复用。
+    # 限定场景码与 ID 范围，使最长名称也满足 BKBase 的 40 字符限制。
+    if not isinstance(scene, DataLinkNameScene) or type(source_id) is not int or not 0 < source_id <= 2**63 - 1:
+        raise ValueError(f"invalid resource name source: scene={scene!r}, source_id={source_id!r}")
+    suffix = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(12))
+    return f"bkm_{scene.value}_{source_id}_{suffix}"
+
+
+def create_resource_with_random_name(
+    model, scene: DataLinkNameScene, source_id: int, *, name_field="name", conflict_models=(), **fields
+):
+    """通过唯一约束分配名称；只重试确定的同名冲突，其他数据库异常原样抛出。"""
+    manager = model.objects.using(DATABASE_CONNECTION_NAME)
+    for _ in range(5):
+        name = generate_bkdata_resource_name(scene, source_id)
+        identity = {name_field: name}
+        # DataLink 名称是全局主键，组件名称则在租户和 namespace 内唯一。
+        if name_field != "data_link_name":
+            identity.update(bk_tenant_id=fields["bk_tenant_id"], namespace=fields["namespace"])
+        # 新建的 Binding/Databus 可能沿用 RT 候选名，需同时避开这些组件种类中已占用的名称。
+        if manager.filter(**identity).exists() or any(
+            other.objects.using(DATABASE_CONNECTION_NAME).filter(**identity).exists() for other in conflict_models
+        ):
+            continue
+        try:
+            with transaction.atomic(using=DATABASE_CONNECTION_NAME):
+                return manager.create(**{name_field: name}, **fields)
+        except IntegrityError:
+            # 预查后仍可能被并发占名；只对该名称确实已存在的情况重试，其他约束错误原样抛出。
+            if not manager.filter(**identity).exists():
+                raise
+    raise ValueError(f"unable to allocate resource name: {model.__name__}, scene={scene}, source_id={source_id}")
 
 
 def clean_redundant_underscores(table_id: str) -> str:
@@ -130,6 +187,9 @@ def compose_bkdata_data_id_name(data_name: str, strategy: str | None = None) -> 
     # 将减号替换为下划线
     refine_data_name = refine_data_name.replace("-", "_")
 
+    # 去除所有非字母、数字、下划线、减号字符
+    refine_data_name = re.sub(r"[^a-zA-Z0-9_-]", "", refine_data_name)
+
     # 替换连续的下划线为单个下划线
     data_id_name = f"bkm_{re.sub(r'_+', '_', refine_data_name)}"
 
@@ -148,33 +208,153 @@ def compose_bkdata_data_id_name(data_name: str, strategy: str | None = None) -> 
     return data_id_name
 
 
-def get_bkbase_raw_data_id_name(data_source, table_id):
-    """
-    获取计算平台对应的data_id_name，适配V3迁移V4场景
-    @param data_source: 数据源
-    @param table_id: 监控平台结果表ID
-    """
-    try:
-        bkbase_data_id = models.AccessVMRecord.objects.filter(result_table_id=table_id).first().bk_base_data_id
-        raw_data_name = api.bkdata.get_bkbase_raw_data_with_data_id(bkbase_data_id=bkbase_data_id).get("raw_data_name")
-    except Exception as e:  # pylint: disable=broad-except
-        logger.info(
-            "get_bkbase_raw_data_id_name: data_source->[%s] table_id->[%s] error->[%s],use new rule to "
-            "generate data_id_name",
-            data_source,
-            table_id,
-            e,
+def find_registered_bkdata_data_id_name(data_source: "DataSource", namespace: str) -> str | None:
+    """在租户和命名空间范围内按 Data ID 查找最近更新的已注册资源名。"""
+    data_id_config = (
+        models.DataIdConfig.objects.filter(
+            bk_tenant_id=data_source.bk_tenant_id,
+            namespace=namespace,
+            bk_data_id=data_source.bk_data_id,
         )
-        raw_data_name = compose_bkdata_data_id_name(data_source.data_name)
+        .exclude(name="")
+        .only("name")
+        .order_by("-last_modify_time", "-id")
+        .first()
+    )
+    return data_id_config.name if data_id_config is not None else None
 
-    logger.info(
-        "get_bkbase_raw_data_id_name: data_source->[%s] table_id->[%s] raw_data_name->[%s]",
-        data_source,
-        table_id,
-        raw_data_name,
+
+def get_registered_bkdata_data_id_name(
+    data_source: "DataSource",
+    namespace: str,
+) -> str:
+    """获取 DataLink 依赖的已注册 BKBase DataId 名称。
+
+    DataLink 是 DataId 的调用方，不能在依赖缺失时自行生成名称继续执行。当前租户和
+    命名空间下没有对应 ``DataIdConfig`` 时直接抛错，由上层中止链路配置流程。
+
+    Args:
+        data_source: 待接入 DataLink 的监控数据源。
+        namespace: BKBase 资源命名空间。
+
+    Returns:
+        已注册且可供 DataBus source 引用的 DataId 名称。
+
+    Raises:
+        DataIdConfig.DoesNotExist: 当前作用域内没有该 ``bk_data_id`` 的注册记录。
+    """
+    data_id_name = find_registered_bkdata_data_id_name(data_source, namespace)
+    if data_id_name:
+        logger.info(
+            "get_registered_bkdata_data_id_name: use DataIdConfig name, tenant->[%s], namespace->[%s], "
+            "bk_data_id->[%s], name->[%s]",
+            data_source.bk_tenant_id,
+            namespace,
+            data_source.bk_data_id,
+            data_id_name,
+        )
+        return data_id_name
+
+    raise models.DataIdConfig.DoesNotExist(
+        "DataIdConfig not found, "
+        f"bk_tenant_id={data_source.bk_tenant_id}, namespace={namespace}, bk_data_id={data_source.bk_data_id}"
     )
 
-    return raw_data_name
+
+def compose_transfer_consumer_group(data_source: "DataSource") -> str:
+    """按 transfer 规则生成消费组：配置前缀 + 数据源 Kafka topic。"""
+    topic = data_source.mq_config.topic
+    if not topic:
+        logger.warning(
+            "compose_transfer_consumer_group: data_source->[%s] mq topic is empty, not generate consumer group",
+            data_source.bk_data_id,
+        )
+        return ""
+    return f"{settings.TRANSFER_CONSUMER_GROUP_ID}{topic}"
+
+
+def get_federal_vm_table_id(bk_tenant_id: str, namespace: str, table_id: str) -> str:
+    """读取联邦目标的完整 VMRT；Subset 的 ConditionalSink 映射不是结果表。"""
+    # BkBaseResultTable 不含 namespace，需要借助关联链路或实际 RT 判断映射的作用域。
+    links = {
+        link.pk: link
+        for link in models.DataLink.objects.filter(
+            data_link_name__in=models.BkBaseResultTable.objects.filter(
+                bk_tenant_id=bk_tenant_id, monitor_table_id=table_id
+            ).values("data_link_name")
+        )
+    }
+    table_ids = set()
+    for record in models.BkBaseResultTable.objects.filter(
+        bk_tenant_id=bk_tenant_id, monitor_table_id=table_id, storage_type=models.ClusterInfo.TYPE_VM
+    ).exclude(bkbase_table_id__in=["", None]):
+        link = links.get(record.data_link_name)
+        if link is not None:
+            # Subset 的映射可能借用 ConditionalSink 名称，只接受普通或 Proxy 的真实 VMRT。
+            if (link.bk_tenant_id, link.namespace) != (bk_tenant_id, namespace) or link.data_link_strategy not in {
+                models.DataLink.BCS_FEDERAL_PROXY_TIME_SERIES,
+                models.DataLink.BK_STANDARD_V2_TIME_SERIES,
+            }:
+                continue
+        elif not models.ResultTableConfig.objects.filter(
+            bk_tenant_id=bk_tenant_id, namespace=namespace, bkbase_table_id=record.bkbase_table_id
+        ).exists():
+            # 没有链路时，通过实际 RT 确认 namespace，避免拿到另一 namespace 的映射。
+            continue
+        if record.bkbase_table_id:
+            table_ids.add(record.bkbase_table_id)
+    configured_table_ids = table_ids.copy()
+    # AccessVMRecord 可能同时保留旧清洗表和当前联邦输出表。
+    table_ids.update(
+        models.AccessVMRecord.objects.filter(bk_tenant_id=bk_tenant_id, result_table_id=table_id)
+        .exclude(vm_result_table_id="")
+        .values_list("vm_result_table_id", flat=True)
+    )
+    if len(table_ids) > 1:
+        # 优先使用当前命名空间中实际存在的 RT；Binding 的归属与存储由调用方继续确认。
+        component_table_ids = set(
+            models.ResultTableConfig.objects.filter(
+                bk_tenant_id=bk_tenant_id,
+                namespace=namespace,
+                bkbase_table_id__in=table_ids,
+                data_type="metric",
+            ).values_list("bkbase_table_id", flat=True)
+        )
+        if len(component_table_ids) == 1 and configured_table_ids <= component_table_ids:
+            return component_table_ids.pop()
+        raise ValueError(f"conflicting federation VMRTs: table={table_id}, vmrts={sorted(table_ids)}")
+    return next(iter(table_ids), "")
+
+
+def get_bkbase_raw_data_id_name(data_source, table_id, namespace=settings.DEFAULT_VM_DATA_LINK_NAMESPACE):
+    """读取联邦 source 的真实身份，兼容 V3 独立申请的额外 DataId。"""
+    record = models.AccessVMRecord.objects.filter(
+        bk_tenant_id=data_source.bk_tenant_id,
+        result_table_id=table_id,
+    ).last()
+    # 先确定实际消费的 DataId，再查它的登记名；V3 额外 DataId 与监控 DataId 不能互换。
+    source_data_id = record.bk_base_data_id if record and record.bk_base_data_id > 0 else data_source.bk_data_id
+    registered_names = set(
+        models.DataIdConfig.objects.filter(
+            bk_tenant_id=data_source.bk_tenant_id,
+            namespace=namespace,
+            bk_data_id=source_data_id,
+        )
+        .exclude(name="")
+        .values_list("name", flat=True)
+    )
+    if len(registered_names) > 1:
+        raise ValueError(f"ambiguous federation DataId names: data_id={source_data_id}")
+    if registered_names:
+        return registered_names.pop()
+    # V3 额外 DataId 可能尚未镜像到本地；查询真实来源，失败时不能猜测另一个资源名。
+    if record and record.bk_base_data_id > 0:
+        raw_name = get_bkbase_raw_data_name_for_v3_datalink(data_source.bk_tenant_id, source_data_id)
+        if raw_name:
+            return raw_name
+    raise models.DataIdConfig.DoesNotExist(
+        f"federation DataId not found: tenant={data_source.bk_tenant_id}, namespace={namespace}, data_id={source_data_id}"
+    )
 
 
 @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=1, max=10))
@@ -258,7 +438,7 @@ def generate_result_table_field_list(table_id, bk_tenant_id):
         field_alias = field["description"]
         if field_alias == "":
             field_alias = field_name
-        field_type = field["field_type"]
+        field_type = BKBASE_RESULT_TABLE_FIELD_TYPE_MAP.get(field["field_type"], field["field_type"])
         tag = field["tag"]
 
         # 比较字段名，忽略大小写

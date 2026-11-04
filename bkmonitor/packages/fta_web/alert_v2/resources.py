@@ -9,6 +9,8 @@ specific language governing permissions and limitations under the License.
 """
 
 import abc
+import operator
+from functools import reduce
 from typing import Any
 from collections.abc import Callable, Iterable
 
@@ -27,7 +29,13 @@ from bkmonitor.utils.alert_drilling import (
     merge_dimensions_into_conditions,
 )
 from bkmonitor.utils.thread_backend import ThreadPool
-from constants.alert import APMTargetType, K8STargetType
+from constants.alert import (
+    APMTargetType,
+    EventTargetType,
+    K8S_RESOURCE_TYPE,
+    K8S_RESOURCE_TYPE_SCENARIO_MAP,
+    K8STargetType,
+)
 from constants.apm import ApmAlertHelper
 from constants.data_source import DataTypeLabel, DataSourceLabel
 from core.drf_resource import Resource, resource, api
@@ -47,7 +55,7 @@ from apm_web.event.resources import (
     EventTimeSeriesResource as APMEventTimeSeriesResource,
 )
 
-from monitor_web.data_explorer.event.utils import get_cluster_table_map
+from monitor_web.data_explorer.event.utils import get_cluster_table_map, k8s_cond_handler
 
 
 class AlertDetailResource(BaseAlertDetailResource):
@@ -148,41 +156,74 @@ class AlertEventBaseResource(Resource, abc.ABC):
     def build_k8s_query(
         cls, alert: AlertDocument, target: BaseTarget, q: QueryConfigBuilder
     ) -> QueryConfigBuilder | None:
-        """
-        构建 K8S 事件查询。
+        """构建 K8S 事件查询。
+
+        基于目标关联的 K8S 资源列表，校验并构造合法查询对象，确定 K8S 事件结果表并构建 OR 语义的 where 条件。
+
         :param alert: 告警文档对象
         :param target: 目标对象
         :param q: 查询构建器
-        :return: 构建好的查询配置，如果无关联 K8S 资源则返回 None
+        :return: 构建好的查询配置，如果无合法的关联 K8S 资源则返回 None
         """
-        related_targets: list[dict[str, Any]] = target.list_related_k8s_targets().get("target_list", [])
-        if not related_targets:
+        valid_k8s_targets: list[dict[str, Any]] = []
+        # 主机告警场景
+        if target.TARGET_TYPE == EventTargetType.HOST:
+            try:
+                k8s_node_info = resource.scene_view.get_kubernetes_node(
+                    {
+                        "bk_biz_id": alert.event.bk_biz_id,
+                        "node_ip": target.list_related_host_targets()[0]["bk_target_ip"],
+                    }
+                )
+            except Exception:  # noqa
+                return None
+            k8s_node_map: dict[str, Any] = {item["key"]: item["value"] for item in k8s_node_info}
+            if k8s_node_map.get("bcs_cluster_id") and k8s_node_map.get("name"):
+                valid_k8s_targets.append(
+                    {
+                        "bcs_cluster_id": k8s_node_map["bcs_cluster_id"]["value"],
+                        "host": k8s_node_map["name"],
+                    }
+                )
+        else:
+            related_k8s_targets = target.list_related_k8s_targets()
+            resource_type: str = related_k8s_targets["resource_type"]
+            for related_target in related_k8s_targets["target_list"]:
+                bcs_cluster_id: str | None = related_target.get("bcs_cluster_id")
+                if not bcs_cluster_id:
+                    continue
+
+                # Node 对象（集群级别的资源，无 namespace 属性）
+                if resource_type == K8S_RESOURCE_TYPE[K8STargetType.NODE]:
+                    node: str = related_target.get("node", "")
+                    if node:
+                        valid_k8s_targets.append({"bcs_cluster_id": bcs_cluster_id, "host": node})
+                    continue
+
+                if not related_target.get("namespace"):
+                    continue
+
+                workload: str = related_target.pop("workload", "")
+                # workload 对象
+                if resource_type == K8S_RESOURCE_TYPE[K8STargetType.WORKLOAD]:
+                    if not workload:
+                        continue
+                    kind, name = workload.split(":", 1)
+                    related_target["kind"] = kind
+                    related_target["name"] = name
+
+                valid_k8s_targets.append(related_target)
+
+        if not valid_k8s_targets:
             return None
 
-        # 非服务类告警只有一个 k8s 目标，服务类告警直接复用服务关联事件检索，不走此逻辑。
-        related_k8s_target: dict[str, Any] = related_targets[0]
-
-        bcs_cluster_id: str = related_k8s_target.get("bcs_cluster_id", "")
-        if not bcs_cluster_id:
-            # 没有集群 ID，无法查询事件
-            return None
-
+        bcs_cluster_id: str = valid_k8s_targets[0]["bcs_cluster_id"]
         table: str = get_cluster_table_map((bcs_cluster_id,)).get(bcs_cluster_id, "")
         if not table:
             return None
 
-        filter_q: Q = Q()
-        workload: str | None = related_k8s_target.pop("workload", "")
-        if workload and target.TARGET_TYPE == K8STargetType.WORKLOAD:
-            # 工作负载类型，按 kind 和 name 查询
-            kind, name = workload.split(":")
-            filter_q &= Q(kind=kind, name=name)
-            if related_k8s_target.get("namespace"):
-                filter_q &= Q(namespace=related_k8s_target["namespace"])
-        else:
-            # 其他类型（Pod、Node、Service等），按资源类型字段查询。
-            filter_q &= Q(**{key: value for key, value in related_k8s_target.items()})
-
+        # 通过 k8s_cond_handler 展开关联的查询条件
+        filter_q: Q = reduce(operator.or_, [k8s_cond_handler(k8s_target) for k8s_target in valid_k8s_targets])
         return q.table(table).conditions(q_to_conditions(filter_q))
 
     @classmethod
@@ -520,93 +561,6 @@ class AlertEventTagDetailResource(AlertEventBaseResource):
         return event_tag_detail_resource_cls().request(query_params)
 
 
-class AlertK8sScenarioListResource(Resource):
-    """
-    K8S容器场景列表资源类
-
-    根据告警ID获取告警关联的容器观测场景列表
-    不同类型的K8S资源支持不同的观测场景
-    """
-
-    # K8S目标类型与观测场景的映射关系
-    K8sTargetScenarioMap = {
-        K8STargetType.POD: ["performance", "network"],  # Pod支持性能和网络场景
-        K8STargetType.WORKLOAD: ["performance", "network"],  # 工作负载支持性能和网络场景
-        K8STargetType.NODE: ["capacity"],  # 节点支持容量场景
-        K8STargetType.SERVICE: ["network"],  # 服务支持网络场景
-    }
-
-    class RequestSerializer(serializers.Serializer):
-        """请求参数序列化器"""
-
-        alert_id = serializers.CharField(label="告警 id", help_text="要查询的告警ID")
-
-    def perform_request(self, validated_request_data):
-        """
-        执行K8S场景列表查询请求
-
-        根据告警的目标类型返回对应支持的观测场景列表
-
-        Args:
-            validated_request_data: 验证后的请求参数
-
-        Returns:
-            list: 支持的观测场景列表
-
-        Raises:
-            list: 当目标类型不支持时返回空列表
-        """
-        alert_id: str = validated_request_data["alert_id"]
-        # 根据告警ID获取告警文档对象
-        alert: AlertDocument = AlertDocument.get(alert_id)
-        target_type: str = alert.event.target_type
-
-        # 检查是否为支持的K8S目标类型
-        if target_type in [K8STargetType.POD, K8STargetType.WORKLOAD, K8STargetType.NODE, K8STargetType.SERVICE]:
-            return self.K8sTargetScenarioMap[target_type]
-
-        # 检查是否为 APM 目标类型
-        if target_type == APMTargetType.SERVICE:
-            return self.K8sTargetScenarioMap[K8STargetType.WORKLOAD]
-
-        # 目前不支持的类型返回空列表
-        return []
-
-
-class AlertK8sMetricListResource(Resource):
-    """
-    K8S容器指标列表资源类
-
-    根据容器观测场景获取对应场景配置的指标列表
-    用于前端展示特定场景下可用的监控指标
-    """
-
-    class RequestSerializer(serializers.Serializer):
-        """请求参数序列化器"""
-
-        bk_biz_id = serializers.IntegerField(label="业务ID", help_text="业务ID")
-        scenario = serializers.CharField(
-            label="场景", help_text="观测场景名称，如：performance（性能）、network（网络）、capacity（容量）"
-        )
-
-    def perform_request(self, validated_request_data):
-        """
-        执行K8S指标列表查询请求
-
-        调用K8S资源的场景指标列表接口获取指定场景的指标配置
-
-        Args:
-            validated_request_data: 验证后的请求参数
-
-        Returns:
-            list: 指定场景下的指标列表
-        """
-        # 调用K8S资源模块的场景指标列表接口
-        return resource.k8s.scenario_metric_list(
-            bk_biz_id=validated_request_data["bk_biz_id"], scenario=validated_request_data["scenario"]
-        )
-
-
 class AlertK8sTargetResource(Resource):
     """
     K8S容器目标对象资源类
@@ -636,7 +590,11 @@ class AlertK8sTargetResource(Resource):
         # 根据告警ID获取告警文档对象
         alert: AlertDocument = AlertDocument.get(alert_id)
         target: BaseTarget = get_target_instance(alert)
-        return target.list_related_k8s_targets()
+        result: dict[str, Any] = target.list_related_k8s_targets()
+        scenario_list: list[str] = K8S_RESOURCE_TYPE_SCENARIO_MAP.get(result.get("resource_type", ""), [])
+        for item in result.get("target_list", []):
+            item["scenario_list"] = list(scenario_list)
+        return result
 
 
 class AlertHostTargetResource(Resource):
@@ -836,6 +794,8 @@ class AlertTracesResource(Resource):
                 }
             )
 
+        # 错误 Trace 优先于耗时 Trace，两类 Trace 内部均按耗时降序展示。
+        processed_traces.sort(key=lambda trace: (not trace["error"], -trace["trace_duration"]))
         return {"query_config": query_config, "list": processed_traces}
 
     @classmethod

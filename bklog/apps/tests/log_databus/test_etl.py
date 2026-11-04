@@ -20,7 +20,7 @@ the project delivered to anyone in the future.
 """
 
 import copy
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.conf import settings
 from django.test import TestCase
@@ -34,7 +34,10 @@ from apps.log_databus.constants import (
 from apps.log_databus.handlers.etl import EtlHandler
 from apps.log_databus.handlers.etl_storage import EtlStorage
 from apps.log_databus.models import CollectorConfig
-from apps.log_databus.serializers import CollectorEtlStorageSerializer
+from apps.log_databus.serializers import (
+    CollectorEtlSerializer,
+    CollectorEtlStorageSerializer,
+)
 from apps.log_databus.utils.es_config import is_version_less_than
 from apps.log_search.constants import (
     ISO_8601_TIME_FORMAT_NAME,
@@ -43,6 +46,7 @@ from apps.log_search.constants import (
 )
 from apps.tests.utils import FakeRedis
 from apps.utils.db import array_group
+from apps.utils.drf import custom_params_valid
 
 # 采集相关
 COLLECTOR_CONFIG_ID = 1
@@ -149,6 +153,7 @@ ETL_CONFIG_REGEXP = "bk_log_regexp"
 ETL_PARAMS_REGEXP = {
     "separator_regexp": "(?P<request_ip>[\\d\\.]+)[^[]+\\[(?P<request_time>[^]]+)\\]",
     "retain_original_text": True,
+    "bk_biz_id": 2,
 }
 ETL_REGEXP_CONTENT = '127.0.0.1 - - [30/Nov/2019:21:07:10 +0800] "GET /api/v3/object/statistics HTTP/1.0" "200"'
 FIELDS_REGEXP = [
@@ -190,6 +195,30 @@ FIELDS_ERROR_BUILT = [
         "field_name": "ip",
         "field_type": "string",
         "alias_name": "",
+        "is_time": False,
+        "is_analyzed": False,
+        "is_dimension": True,
+        "is_delete": False,
+    }
+]
+
+FIELDS_ERROR_RESERVED = [
+    {
+        "field_name": "signature",
+        "field_type": "string",
+        "alias_name": "",
+        "is_time": False,
+        "is_analyzed": False,
+        "is_dimension": True,
+        "is_delete": False,
+    }
+]
+
+FIELDS_ERROR_RESERVED_ALIAS = [
+    {
+        "field_name": "message",
+        "field_type": "string",
+        "alias_name": "signature",
         "is_time": False,
         "is_analyzed": False,
         "is_dimension": True,
@@ -460,7 +489,7 @@ ETL_PREVIEW_V4_JSON_EXPECTED = [
 ]
 
 # V4版本正则表达式清洗测试数据
-ETL_PREVIEW_V4_REGEXP_INPUT = '192.168.1.1 [25/Oct/2023:10:30:45 +0800] "GET /api/test HTTP/1.1" - status:200 user:admin up_status:ok ms:150 up:192.168.1.2 rs:1 rid:req-123 realip:192.168.1.3 host:example.com region:us-west service:api agent:Mozilla/5.0 up_stream:backend upstream_response_time:0.150 refer:https://example.com http_x_forwarded_for:192.168.1.4 original_host:api.example.com project_id:12345 tag:prod'
+ETL_PREVIEW_V4_REGEXP_INPUT = '127.0.0.1 [25/Oct/2023:10:30:45 +0800] "GET /api/test HTTP/1.1" - status:200 user:admin up_status:ok ms:150 up:127.0.0.2 rs:1 rid:req-123 realip:127.0.0.3 host:example.com region:us-west service:api agent:Mozilla/5.0 up_stream:backend upstream_response_time:0.150 refer:https://example.com http_x_forwarded_for:127.0.1.10 original_host:api.example.com project_id:12345 tag:prod'
 ETL_PREVIEW_V4_REGEXP_PARAMS = {
     "separator_regexp": '(?P<remote_addr>\\d+\\.\\d+\\.\\d+\\.\\d+) \\[(?P<logdate>[\\s\\S]+)\\] "(?P<request_method>[\\S]+) (?P<request_uri>[\\S]+) (?P<request_version>.*)" - status\\:(?P<status>\\d+) user:(?P<user>.*) up_status:(?P<up_status>.*) ms:(?P<ms>\\d+) up:(?P<up>.*) rs:(?P<rs>\\d+) rid:(?P<rid>.*) realip:(?P<realip>.*) host:(?P<host>.*) region:(?P<region>.*) service:(?P<service>.*) agent:(?P<agent>.*) up_stream:(?P<up_stream>.*)upstream_response_time:(?P<upstream_response_time>.*?) refer:(?P<refer>.*) http_x_forwarded_for:(?P<http_x_forwarded_for>.*) original_host:(?P<original_host>.*) project_id:(?P<project_id>.*) tag:(?P<route_tag>.*)',
     "retain_original_text": True,
@@ -483,7 +512,7 @@ ETL_PREVIEW_V4_REGEXP_API_RESPONSE = {
     "rules_output": [
         {
             "value": {
-                "remote_addr": "192.168.1.1",
+                "remote_addr": "127.0.0.1",
                 "logdate": "25/Oct/2023:10:30:45 +0800",
                 "request_method": "GET",
                 "request_uri": "/api/test",
@@ -492,10 +521,10 @@ ETL_PREVIEW_V4_REGEXP_API_RESPONSE = {
                 "user": "admin",
                 "up_status": "ok",
                 "ms": "150",
-                "up": "192.168.1.2",
+                "up": "127.0.0.2",
                 "rs": "1",
                 "rid": "req-123",
-                "realip": "192.168.1.3",
+                "realip": "127.0.0.3",
                 "host": "example.com",
                 "region": "us-west",
                 "service": "api",
@@ -503,7 +532,7 @@ ETL_PREVIEW_V4_REGEXP_API_RESPONSE = {
                 "up_stream": "backend",
                 "upstream_response_time": "0.150",
                 "refer": "https://example.com",
-                "http_x_forwarded_for": "192.168.1.4",
+                "http_x_forwarded_for": "127.0.1.10",
                 "original_host": "api.example.com",
                 "project_id": "12345",
                 "route_tag": "prod",
@@ -538,7 +567,7 @@ ETL_PREVIEW_V4_REGEXP_API_RESPONSE = {
     ]
 }
 ETL_PREVIEW_V4_REGEXP_EXPECTED = [
-    {"field_index": 1, "field_name": "remote_addr", "value": "192.168.1.1"},
+    {"field_index": 1, "field_name": "remote_addr", "value": "127.0.0.1"},
     {"field_index": 2, "field_name": "logdate", "value": "25/Oct/2023:10:30:45 +0800"},
     {"field_index": 3, "field_name": "request_method", "value": "GET"},
     {"field_index": 4, "field_name": "request_uri", "value": "/api/test"},
@@ -547,10 +576,10 @@ ETL_PREVIEW_V4_REGEXP_EXPECTED = [
     {"field_index": 7, "field_name": "user", "value": "admin"},
     {"field_index": 8, "field_name": "up_status", "value": "ok"},
     {"field_index": 9, "field_name": "ms", "value": "150"},
-    {"field_index": 10, "field_name": "up", "value": "192.168.1.2"},
+    {"field_index": 10, "field_name": "up", "value": "127.0.0.2"},
     {"field_index": 11, "field_name": "rs", "value": "1"},
     {"field_index": 12, "field_name": "rid", "value": "req-123"},
-    {"field_index": 13, "field_name": "realip", "value": "192.168.1.3"},
+    {"field_index": 13, "field_name": "realip", "value": "127.0.0.3"},
     {"field_index": 14, "field_name": "host", "value": "example.com"},
     {"field_index": 15, "field_name": "region", "value": "us-west"},
     {"field_index": 16, "field_name": "service", "value": "api"},
@@ -558,7 +587,7 @@ ETL_PREVIEW_V4_REGEXP_EXPECTED = [
     {"field_index": 18, "field_name": "up_stream", "value": "backend"},
     {"field_index": 19, "field_name": "upstream_response_time", "value": "0.150"},
     {"field_index": 20, "field_name": "refer", "value": "https://example.com"},
-    {"field_index": 21, "field_name": "http_x_forwarded_for", "value": "192.168.1.4"},
+    {"field_index": 21, "field_name": "http_x_forwarded_for", "value": "127.0.1.10"},
     {"field_index": 22, "field_name": "original_host", "value": "api.example.com"},
     {"field_index": 23, "field_name": "project_id", "value": "12345"},
     {"field_index": 24, "field_name": "route_tag", "value": "prod"},
@@ -613,6 +642,15 @@ FIELDS = [
         "is_delete": True,
     },
 ]
+
+
+def set_time_field_format(fields, time_format):
+    time_field = next(field for field in fields if field["field_name"] == "time1")
+    time_field["option"]["time_format"] = time_format
+
+
+FIELDS_NANOS = copy.deepcopy(FIELDS)
+set_time_field_format(FIELDS_NANOS, "yyyy-MM-dd HH:mm:ss.SSSSSS")
 # 时间字段的来源直接设为非维度
 FIELDS_NOT_ES_DOC_VALUES_KEYS = ["key1", "time1"]
 FIELDS_TIME_FIELD_ALIAS_NAME = "time1"
@@ -644,6 +682,68 @@ LOG_INDEX_DATA = {
 
 
 class TestEtl(TestCase):
+    def test_base_handler_forwards_result_table_labels(self):
+        collector_config = CollectorConfig.objects.create(**COLLECTOR_CONFIG)
+        handler = EtlHandler(collector_config.collector_config_id)
+        labels = {"scene": "k8s", "cluster_id": "BCS-NEW"}
+        etl_storage = MagicMock()
+        etl_storage.update_or_create_result_table.return_value = {"table_id": TABLE_ID}
+
+        with (
+            patch.object(handler, "check_es_storage_capacity"),
+            patch.object(CollectorConfig, "get_result_table_by_id", return_value=None),
+            patch(
+                "apps.log_databus.handlers.etl.base.StorageHandler.get_cluster_info_by_id",
+                return_value={"cluster_config": {"version": "7.x"}},
+            ),
+            patch("apps.log_databus.handlers.etl.base.EtlStorage.get_instance", return_value=etl_storage),
+            patch.object(
+                handler,
+                "_update_or_create_index_set",
+                return_value={"index_set_id": 1, "scenario_id": "log"},
+            ),
+            patch("apps.log_databus.handlers.etl.base.user_operation_record.delay"),
+        ):
+            handler.update_or_create(
+                etl_config=ETL_CONFIG,
+                table_id=TABLE_ID,
+                storage_cluster_id=STORAGE_CLUSTER_ID,
+                retention=RETENTION_TIME,
+                allocation_min_days=ALLOCATION_MIN_DAYS,
+                storage_replies=1,
+                etl_params={},
+                fields=[],
+                labels=labels,
+            )
+
+        self.assertEqual(etl_storage.update_or_create_result_table.call_args.kwargs["labels"], labels)
+
+    @patch("apps.api.TransferApi.create_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.modify_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.get_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.get_cluster_info", lambda _: [CLUSTER_INFO])
+    @FakeRedis("apps.utils.cache.cache")
+    @patch("apps.log_databus.tasks.collector.modify_result_table.delay", return_value=None)
+    def test_result_table_labels_are_included_when_explicit(self, _mock_modify_delay):
+        collector_config = CollectorConfig.objects.create(**COLLECTOR_CONFIG)
+        etl_storage = EtlStorage.get_instance(ETL_CONFIG)
+
+        for labels in ({}, {"scene": "k8s", "stream": "stdout"}):
+            with self.subTest(labels=labels):
+                result = etl_storage.update_or_create_result_table(
+                    collector_config,
+                    table_id=TABLE_ID,
+                    storage_cluster_id=STORAGE_CLUSTER_ID,
+                    retention=RETENTION_TIME,
+                    allocation_min_days=0,
+                    storage_replies=1,
+                    fields=copy.deepcopy(FIELDS),
+                    etl_params=copy.deepcopy(ETL_PARAMS),
+                    labels=labels,
+                )
+
+                self.assertEqual(result["params"]["labels"], labels)
+
     def test_etl_time(self):
         formsts = FieldDateFormatEnum.get_choices_list_dict()
         for format in formsts:
@@ -673,6 +773,11 @@ class TestEtl(TestCase):
         with self.assertRaises(ValidationError):
             etl_param["fields"] = FIELDS_ERROR_BUILT
             CollectorEtlStorageSerializer(data=etl_param).is_valid(raise_exception=True)
+
+        for fields in (FIELDS_ERROR_RESERVED, FIELDS_ERROR_RESERVED_ALIAS):
+            with self.assertRaises(ValidationError):
+                etl_param["fields"] = fields
+                CollectorEtlStorageSerializer(data=etl_param).is_valid(raise_exception=True)
 
         with self.assertRaises(ValidationError):
             etl_param["fields"] = FIELDS_ERROR_ANALYZED
@@ -731,10 +836,115 @@ class TestEtl(TestCase):
             "es_doc_values" not in result["params"]["time_option"], "time_option必须设置且不可设置doc_values"
         )
 
+        # IaaS 兼容: index_set 应为最终注册 RT id（库名.表名 → 下划线），
+        # 直接对比 build_result_table_id 的派生值，避免依赖被 mock 覆盖的 params["table_id"]。
+        from apps.log_databus.handlers.collector.base import CollectorHandler
+
+        expected_index_set = CollectorHandler.build_result_table_id(collector_config.bk_biz_id, TABLE_ID).replace(
+            ".", "_"
+        )
+        self.assertEqual(
+            result["params"]["default_storage_config"]["index_set"],
+            expected_index_set,
+        )
+        self.assertNotIn("labels", result["params"])
+        self.assertIn("need_add_time", result["params"]["option"])
+        self.assertTrue(result["params"]["option"]["need_add_time"])
+        self.assertIn("time_field", result["params"]["option"])
+        self.assertEqual(result["params"]["option"]["time_field"]["name"], "dtEventTimeStamp")
+
         etl_config = etl_storage.parse_result_table_config(result["params"])
         self.assertIsInstance(etl_config["etl_params"]["es_unique_field_list"], list)
         self.assertEqual(etl_config["etl_params"]["separator_node_action"], "")
         return True
+
+    @patch("apps.api.TransferApi.create_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.modify_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.get_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.get_cluster_info", lambda _: [CLUSTER_INFO])
+    @FakeRedis("apps.utils.cache.cache")
+    @patch("apps.log_databus.handlers.etl.EtlHandler._update_or_create_index_set")
+    @patch("apps.log_databus.tasks.collector.modify_result_table.delay", return_value=None)
+    def test_is_nanos_can_fall_back_to_false(self, mock_modify_delay, mock_index_set):
+        """切换回非纳秒时间字段时，应清除采集项的纳秒标记。"""
+        collector_config = CollectorConfig.objects.create(**COLLECTOR_CONFIG)
+        mock_index_set.return_value = LOG_INDEX_DATA
+        etl_storage = EtlStorage.get_instance(ETL_CONFIG_JSON)
+        nanos_fields = copy.deepcopy(FIELDS_NANOS)
+        non_nanos_fields = copy.deepcopy(FIELDS_NANOS)
+        set_time_field_format(non_nanos_fields, "yyyy-MM-dd HH:mm:ss")
+
+        etl_storage.update_or_create_result_table(
+            collector_config,
+            table_id=TABLE_ID,
+            storage_cluster_id=STORAGE_CLUSTER_ID,
+            retention=RETENTION_TIME,
+            allocation_min_days=ALLOCATION_MIN_DAYS,
+            storage_replies=1,
+            fields=nanos_fields,
+            etl_params=ETL_PARAMS_JSON,
+            hot_warm_config=HOT_WARM_CONFIG,
+        )
+        collector_config.refresh_from_db()
+        self.assertTrue(collector_config.is_nanos)
+
+        etl_storage.update_or_create_result_table(
+            collector_config,
+            table_id=TABLE_ID,
+            storage_cluster_id=STORAGE_CLUSTER_ID,
+            retention=RETENTION_TIME,
+            allocation_min_days=ALLOCATION_MIN_DAYS,
+            storage_replies=1,
+            fields=non_nanos_fields,
+            etl_params=ETL_PARAMS_JSON,
+            hot_warm_config=HOT_WARM_CONFIG,
+        )
+        collector_config.refresh_from_db()
+        self.assertFalse(collector_config.is_nanos)
+
+    @patch("apps.api.TransferApi.create_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.modify_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.get_result_table", lambda _: {"table_id": TABLE_ID})
+    @patch("apps.api.TransferApi.get_cluster_info", lambda _: [CLUSTER_INFO])
+    @FakeRedis("apps.utils.cache.cache")
+    @patch("apps.log_databus.handlers.etl.EtlHandler._update_or_create_index_set")
+    @patch("apps.log_databus.tasks.collector.modify_result_table.delay", return_value=None)
+    def test_rt_option_from_index_set(self, mock_modify_delay, mock_index_set):
+        """time_field / need_add_time 应从 index_set 动态获取"""
+        from unittest.mock import MagicMock
+
+        collector_config = CollectorConfig.objects.create(**COLLECTOR_CONFIG)
+        collector_config.index_set_id = 999
+        collector_config.save()
+        mock_index_set.return_value = LOG_INDEX_DATA
+
+        fake_index_set = MagicMock()
+        fake_index_set.time_field = "custom_time"
+        fake_index_set.time_field_type = "long"
+        fake_index_set.time_field_unit = "second"
+
+        with patch(
+            "apps.log_search.models.LogIndexSet.objects.filter",
+            return_value=MagicMock(first=MagicMock(return_value=fake_index_set)),
+        ):
+            etl_storage = EtlStorage.get_instance(ETL_CONFIG)
+            result = etl_storage.update_or_create_result_table(
+                collector_config,
+                table_id=TABLE_ID,
+                storage_cluster_id=STORAGE_CLUSTER_ID,
+                retention=RETENTION_TIME,
+                allocation_min_days=ALLOCATION_MIN_DAYS,
+                storage_replies=1,
+                fields=FIELDS,
+                etl_params=ETL_PARAMS,
+                hot_warm_config=HOT_WARM_CONFIG,
+            )
+
+        tf = result["params"]["option"]["time_field"]
+        self.assertEqual(tf["name"], "custom_time")
+        self.assertEqual(tf["type"], "long")
+        self.assertEqual(tf["unit"], "second")
+        self.assertTrue(result["params"]["option"]["need_add_time"])
 
     @patch("apps.api.TransferApi.create_result_table", lambda _: {"table_id": TABLE_ID})
     @patch("apps.api.TransferApi.modify_result_table", lambda _: {"table_id": TABLE_ID})
@@ -972,6 +1182,7 @@ class TestEtl(TestCase):
         etl_params = {
             "separator_regexp": "(?P<request_ip>[\\d\\.]+)[^[]+\\[(?P<request_time>[^]]+)\\]",
             "retain_original_text": True,
+            "bk_biz_id": 2,
         }
 
         # 创建EtlStorage实例
@@ -1311,3 +1522,66 @@ class TestEtl(TestCase):
         expected_fields = ["level", "message", "user", "context"]
         for expected_field in expected_fields:
             self.assertIn(expected_field, field_names)
+
+    def test_etl_preview_serializer_keeps_trailing_newline(self):
+        """
+        测试字段提取预览入参保留原文末尾换行
+        """
+        raw_log = f"{ETL_PREVIEW_V4_DELIMITER_INPUT}\n"
+        params = custom_params_valid(
+            serializer=CollectorEtlSerializer,
+            params={"etl_config": "bk_log_delimiter", "etl_params": {"separator": " "}, "data": raw_log},
+        )
+
+        self.assertEqual(params["data"], raw_log)
+
+    def test_etl_preview_serializer_keeps_surrounding_whitespace(self):
+        """
+        测试字段提取预览入参保留原文首尾空白
+        """
+        raw_log = f" \t{ETL_PREVIEW_V4_DELIMITER_INPUT}\r\n"
+        params = custom_params_valid(
+            serializer=CollectorEtlSerializer,
+            params={"etl_config": "bk_log_delimiter", "etl_params": {"separator": " "}, "data": raw_log},
+        )
+
+        self.assertEqual(params["data"], raw_log)
+
+    def test_etl_preview_serializer_accepts_whitespace_only_log(self):
+        """
+        测试仅含空白的原文不再被当作空值拒绝，交由下游清洗判定
+        """
+        params = custom_params_valid(
+            serializer=CollectorEtlSerializer,
+            params={"etl_config": "bk_log_delimiter", "etl_params": {"separator": " "}, "data": "\n"},
+        )
+
+        self.assertEqual(params["data"], "\n")
+
+    @patch("apps.api.BkDataDatabusApi.databus_clean_debug")
+    def test_etl_preview_v4_delimiter_keeps_raw_log(self, mock_api):
+        """
+        测试V4版本分隔符格式下发BKBase调试的原文未被预处理
+        """
+        from apps.log_databus.handlers.etl_storage.bk_log_delimiter import BkLogDelimiterEtlStorage
+
+        mock_api.return_value = ETL_PREVIEW_V4_DELIMITER_API_RESPONSE
+        raw_log = f"{ETL_PREVIEW_V4_DELIMITER_INPUT}\n"
+
+        BkLogDelimiterEtlStorage().etl_preview_v4(raw_log, ETL_PREVIEW_V4_DELIMITER_PARAMS)
+
+        self.assertEqual(mock_api.call_args[0][0]["input"], raw_log)
+
+    @patch("apps.api.BkDataDatabusApi.databus_clean_debug")
+    def test_etl_preview_v4_json_keeps_raw_log(self, mock_api):
+        """
+        测试V4版本JSON格式下发BKBase调试的原文未被预处理
+        """
+        from apps.log_databus.handlers.etl_storage.bk_log_json import BkLogJsonEtlStorage
+
+        mock_api.return_value = ETL_PREVIEW_V4_JSON_API_RESPONSE
+        raw_log = f"{ETL_PREVIEW_V4_JSON_INPUT}\n"
+
+        BkLogJsonEtlStorage().etl_preview_v4(raw_log, ETL_PREVIEW_V4_JSON_PARAMS)
+
+        self.assertEqual(mock_api.call_args[0][0]["input"], raw_log)

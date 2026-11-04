@@ -148,7 +148,8 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
   @Prop({ default: '' }) readonly defaultValue?: string;
   @Prop({ default: 'promql' }) readonly language?: string;
   @Prop({ default: 'vs' }) readonly theme?: null | string;
-  @Prop({ default: () => defalutOptions }) readonly options: object;
+  /** 在 defalutOptions 之上浅合并的编辑器配置，嵌套对象需整体覆盖；建议传模块级常量，避免每次 render 产生新引用而频繁触发 updateOptions。 */
+  @Prop({ default: () => ({}) }) readonly options: object;
   @Prop({ default: () => ({}) }) readonly overrideServices?: object;
   @Prop({ default: null }) readonly className?: null | string;
   @Prop({ default: () => null }) readonly executeQuery: (v: boolean) => void;
@@ -164,6 +165,11 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
   roInstance = null;
 
   throttleUpdateLayout = () => {};
+
+  /** 默认配置与消费方 options 的浅合并结果，为编辑器配置的唯一来源。 */
+  get mergeOptions(): object {
+    return { ...defalutOptions, ...this.options };
+  }
 
   created() {
     this.throttleUpdateLayout = throttle(300, this.updateLayout);
@@ -201,12 +207,15 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
     this.editor.onDidContentSizeChange(_event => {
       this.updateLayout();
     });
-    const placeholderWidget = new PlaceholderWidget(this.editor);
+    if (this.readonly) {
+      this.editor.getContribution('editor.contrib.readOnlyMessageController')?.dispose();
+    }
+    const placeholderWidget = this.readonly ? null : new PlaceholderWidget(this.editor);
     this.editor.onDidChangeModelContent(_event => {
       if (!this.preventTriggerChangeEvent) {
         this.onChange(this.editor.getValue());
       }
-      placeholderWidget.update();
+      placeholderWidget?.update();
       const model = this.editor.getModel();
       if (!model) {
         return;
@@ -228,20 +237,22 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
     this.editor.onDidFocusEditorText(() => {
       this.$emit('focus');
     });
-    this.editor.addAction({
-      keybindings: [monaco.KeyCode.Enter],
-      id: 'enter',
-      label: 'enter',
-      run: (editor: monaco.editor.ICodeEditor): Promise<void> | void => {
-        const suggestController = editor.getContribution('editor.contrib.suggestController') as any;
-        const suggestCount = suggestController.widget.value._state || 0;
-        if (suggestCount <= 0) {
-          this.executeQuery(this.getLinterStatus());
-        } else {
-          editor.trigger('keyboard', 'acceptSelectedSuggestion', {});
-        }
-      },
-    });
+    if (!this.readonly) {
+      this.editor.addAction({
+        keybindings: [monaco.KeyCode.Enter],
+        id: 'enter',
+        label: 'enter',
+        run: (editor: monaco.editor.ICodeEditor): Promise<void> | void => {
+          const suggestController = editor.getContribution('editor.contrib.suggestController') as any;
+          const suggestCount = suggestController.widget.value._state || 0;
+          if (suggestCount <= 0) {
+            this.executeQuery(this.getLinterStatus());
+          } else {
+            editor.trigger('keyboard', 'acceptSelectedSuggestion', {});
+          }
+        },
+      });
+    }
     setTimeout(() => {
       this.updateLayout();
     }, 0);
@@ -260,7 +271,7 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
   initMonaco() {
     const finalValue = this.value !== null ? this.value : this.defaultValue;
     if (this.containerElement) {
-      const finalOptions = { ...this.options, ...editorWillMount(monaco) };
+      const finalOptions = { ...this.mergeOptions, ...editorWillMount(monaco) };
       const modelUri = this.uri?.(monaco);
       let model = null;
       if (modelUri) {
@@ -280,6 +291,7 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
           ...finalOptions,
           ...(this.theme ? { theme: this.theme } : {}),
           readOnly: this.readonly,
+          domReadOnly: this.readonly,
         },
         this.overrideServices
       );
@@ -336,7 +348,7 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
   @Watch('className')
   onClassChanged() {
     if (this.editor) {
-      const { model, ...optionsWithoutModel } = this.options as any;
+      const { model, ...optionsWithoutModel } = this.mergeOptions as any;
       this.editor.updateOptions({
         ...(this.className ? { extraEditorClassName: this.className } : {}),
         ...optionsWithoutModel,
@@ -346,7 +358,7 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
   @Watch('options')
   onOptionsChanged() {
     if (this.editor) {
-      const { model, ...optionsWithoutModel } = this.options as any;
+      const { model, ...optionsWithoutModel } = this.mergeOptions as any;
       this.editor.updateOptions({
         ...(this.className ? { extraEditorClassName: this.className } : {}),
         ...optionsWithoutModel,
@@ -361,8 +373,10 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
     }
   }
   destroyMonaco() {
+    // model 在 monaco 中全局注册，只销毁本实例的 model，否则同页其他编辑器内容会被清空。
+    const model = this.editor?.getModel();
     this.editor?.dispose?.();
-    monaco.editor.getModels().forEach(model => model.dispose());
+    model?.dispose();
     this.roInstance?.disconnect?.();
   }
 
@@ -393,7 +407,7 @@ export default class PromqlMonacoEditor extends tsc<IPromqlMonacoEditorProps> {
           minHeight: `${this.minHeight}px`,
           height: `${this.wrapHeight <= 0 ? this.minHeight : this.wrapHeight}px`,
         }}
-        class={['promql-editor-component', { 'is-error': this.isError }]}
+        class={['promql-editor-component', { 'is-error': this.isError, 'is-readonly': this.readonly }]}
       >
         <div
           ref='containerElement'

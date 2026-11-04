@@ -29,7 +29,7 @@
  * @Description:
  */
 
-import { docCookies, LANGUAGE_COOKIE_KEY, LOCAL_BIZ_STORE_KEY } from 'monitor-common/utils';
+import { docCookies, getBizRouteHref, LANGUAGE_COOKIE_KEY, LOCAL_BIZ_STORE_KEY } from 'monitor-common/utils';
 import { getModule, Module, Mutation, VuexModule } from 'vuex-module-decorators';
 
 import store from '@store/store';
@@ -76,7 +76,7 @@ class AppStore extends VuexModule implements IAppState {
       const { needClearQuery } = ctx.$route.meta;
       // 清空query查询条件
       if (needClearQuery) {
-        location.href = `${location.origin}${location.pathname}?bizId=${window.cc_biz_id}#${ctx.$route.path}`;
+        location.href = getBizRouteHref(ctx.$route.path, window.cc_biz_id);
       } else {
         location.search = `?bizId=${window.cc_biz_id}`;
       }
@@ -85,7 +85,7 @@ class AppStore extends VuexModule implements IAppState {
     if (navId !== ctx.$route.name) {
       const parentRoute = ctx.$router.options.routes.find(item => item.name === navId);
       if (parentRoute) {
-        location.href = `${location.origin}${location.pathname}?bizId=${window.cc_biz_id}#${parentRoute.path}`;
+        location.href = getBizRouteHref(parentRoute.path, window.cc_biz_id);
       } else {
         handleReload();
       }
@@ -96,6 +96,14 @@ class AppStore extends VuexModule implements IAppState {
   @Mutation
   SET_APP_STATE(data: IAppState) {
     Object.keys(data).forEach(key => {
+      if (key === 'bizList') {
+        const value = data.bizList || [];
+        const list = Object.isFrozen(value) ? value : value.slice();
+        // 在写入 Vuex 前冻结根数组，阻止 Vue 2 深度观测海量业务对象
+        Object.freeze(list);
+        this.bizList = list;
+        return;
+      }
       this[key] = data[key];
     });
   }

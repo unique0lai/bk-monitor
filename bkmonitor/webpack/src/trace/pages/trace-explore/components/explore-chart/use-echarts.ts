@@ -24,17 +24,18 @@
  * IN THE SOFTWARE.
  */
 
-import { type MaybeRef, type Ref, computed, inject, shallowRef, toValue, watch } from 'vue';
+import { type MaybeRef, type Ref, computed, inject, onBeforeUnmount, onMounted, shallowRef, toValue, watch } from 'vue';
 
 import dayjs from 'dayjs';
 import { CancelToken } from 'monitor-api/cancel';
 import { random } from 'monitor-common/utils';
 import { arraysEqual } from 'monitor-common/utils/equal';
-import { COLOR_LIST_BAR } from 'monitor-ui/chart-plugins/constants/charts';
+import { COLOR_LIST, COLOR_LIST_BAR } from 'monitor-ui/chart-plugins/constants/charts';
 import { getValueFormat } from 'monitor-ui/monitor-echarts/valueFormats/valueFormats';
 
 import { DEFAULT_TIME_RANGE, handleTransformToTimestamp } from '../../../../components/time-range/utils';
 import { useChartTooltips } from './use-chart-tooltips';
+import { useChartViewOption } from './use-chart-view-option';
 import {
   handleGetMinPrecision,
   handleSetMarkPoints,
@@ -42,7 +43,10 @@ import {
   handleSetThresholdArea,
   handleSetThresholdLine,
   mergeOverlappingArrays,
+  processLineSymbols,
 } from './utils';
+import { withEmbedQuery } from '@/common/embed-context';
+import { resolveVariables } from '@/pages/host/components/dashbords/variables/resolve';
 
 import type { EchartSeriesItem, FormatterFunc, SeriesItem } from './types';
 import type { IDataQuery } from '@/plugins/typings';
@@ -56,13 +60,19 @@ export interface ChartInteractionState {
   isMouseOver: MaybeRef<boolean>;
 }
 export interface ChartOptions {
+  // biome-ignore lint/suspicious/noExplicitAny: API 返回类型通用
   $api: Record<string, () => Promise<any>>;
   chartRef: Ref<HTMLElement>;
   customOptions: CustomOptions;
   interactionState?: ChartInteractionState;
   panel: MaybeRef<PanelModel>;
+  // biome-ignore lint/suspicious/noExplicitAny: API 参数类型通用
   params: MaybeRef<Record<string, any>>;
   downSampleRangeComputed?: (timeRange: number[]) => string | undefined;
+  viewportRequest?: {
+    el: Ref<HTMLElement>;
+    enable: boolean;
+  };
 }
 
 export interface CustomOptions {
@@ -170,7 +180,6 @@ export const createSeries = (series: SeriesItem[], customSeries?: CustomOptions[
       type: data.type,
       stack: data.stack,
       unit: data.unit,
-      // @ts-expect-error
       connectNulls: false,
       sampling: 'none',
       showAllSymbol: 'auto',
@@ -220,6 +229,9 @@ export const createSeries = (series: SeriesItem[], customSeries?: CustomOptions[
       xAxisDataMap.set(reuseAxisIndex, [...xData]);
     }
   }
+  // 用补了 null 后的 data 判断孤立点并设置最终 symbol 大小
+  processLineSymbols(seriesData);
+
   return {
     xData: Array.from(xAllData).sort(),
     seriesData: customSeries?.(seriesData) ?? seriesData,
@@ -346,10 +358,12 @@ export const createYAxis = (yData: EchartSeriesItem[], type?: string) => {
   });
 };
 export const createOptions = (xAxis, yAxis, series, customOptions?: CustomOptions['options']) => {
+  const hasShowSymbol = series.some(item => item.showSymbol);
+  const hasBarChart = series.some(item => item.type === 'bar');
   const options = {
     useUTC: false,
-    animation: false,
-    animationThreshold: 2000,
+    animation: hasShowSymbol,
+    animationThreshold: hasShowSymbol ? 1 : 2000,
     animationDurationUpdate: 0,
     animationDuration: 20,
     animationDelay: 300,
@@ -357,7 +371,7 @@ export const createOptions = (xAxis, yAxis, series, customOptions?: CustomOption
       text: '',
       show: false,
     },
-    color: COLOR_LIST_BAR,
+    color: hasBarChart ? COLOR_LIST_BAR : COLOR_LIST,
     legend: {
       show: false,
     },
@@ -412,7 +426,7 @@ export const createOptions = (xAxis, yAxis, series, customOptions?: CustomOption
       containLabel: true,
       left: 10,
       right: 10,
-      top: 10,
+      top: 20,
       bottom: 10,
       backgroundColor: 'transparent',
     },
@@ -446,17 +460,103 @@ export const useEcharts = ({
   params,
   customOptions,
   interactionState,
+  viewportRequest,
   downSampleRangeComputed,
 }: ChartOptions) => {
   /** 图表id，每次重新请求会修改该值 */
   const chartId = shallowRef(random(8));
   const timeRange = inject('timeRange', DEFAULT_TIME_RANGE);
+  const timezone = inject('timezone', '');
+  const timeOffset = inject('timeOffset', []);
   const refreshImmediate = inject('refreshImmediate');
-
+  const { applyPeakMarkPoint, watchHighlightPeak } = useChartViewOption();
   let cancelTokens = [];
   /** 请求版本号，用于丢弃 lazyRender 阶段的过期回调 */
   let currentRequestId = 0;
+
+  const intersectionObserver = shallowRef<IntersectionObserver>(null);
+  const isInViewPort = el => {
+    if (!el) return false;
+    const { top, bottom } = el.getBoundingClientRect();
+    return (top > 0 && top <= innerHeight) || (bottom >= 0 && bottom < innerHeight);
+  };
+
+  // 注册Intersection监听
+  const registerObserver = el => {
+    if (intersectionObserver.value) {
+      unregisterObserver(el);
+    }
+    intersectionObserver.value = new IntersectionObserver(async entries => {
+      for (const entry of entries) {
+        if (intersectionObserver.value && entry.intersectionRatio > 0) {
+          await getEchartOptions();
+        }
+      }
+    });
+    // 临时使用此方法解决，自定义指标直接全选分组时，偶现前两个图表不会请求数据
+    setTimeout(() => {
+      intersectionObserver.value?.observe(el);
+    }, 50);
+  };
+
+  const unregisterObserver = el => {
+    if (intersectionObserver.value) {
+      intersectionObserver.value.unobserve(el);
+      intersectionObserver.value.disconnect();
+      intersectionObserver.value = null;
+    }
+  };
+
+  // 转换time_shift显示
+  const handleTransformTimeShift = (val: string) => {
+    const timeMatch = val.match(/(-?\d+)(\w+)/);
+    const hasMatch = timeMatch && timeMatch.length > 2;
+    return hasMatch
+      ? dayjs
+          .tz()
+          .add(-timeMatch[1], timeMatch[2] as dayjs.ManipulateType)
+          .fromNow()
+          .replace(/\s*/g, '')
+      : val.replace('current', window.i18n.t('当前'));
+  };
+  /** 处理时间对比时线条名字 */
+  const handleTimeOffset = (timeOffset: string) => {
+    const match = timeOffset.match(/(current|(\d+)([hdwM]))/);
+    if (match) {
+      const [target, , num, type] = match;
+      const map: Record<string, string> = {
+        d: window.i18n.t('{n} 天前', { n: num }),
+        w: window.i18n.t('{n} 周前', { n: num }),
+        M: window.i18n.t('{n} 月前', { n: num }),
+        current: window.i18n.t('当前'),
+      };
+      return map[type || target];
+    }
+    return timeOffset;
+  };
+  // 设置series 名称
+  const handleSeriesName = (
+    item: DataQuery,
+    set: { dimensions?: any; dimensions_translation?: any; time_offset?: any }
+  ) => {
+    const { dimensions = {}, dimensions_translation: dimensionsTranslation = {} } = set;
+    if (!item.alias) {
+      return set.time_offset
+        ? handleTimeOffset(set.time_offset)
+        : Object.values({
+            ...dimensions,
+            ...dimensionsTranslation,
+          }).join('|');
+    }
+
+    const aliasFix = Object.values(dimensions).join('|');
+    if (!aliasFix.length) return item.alias;
+    return `${item.alias}-${aliasFix}`;
+  };
+
   const loading = shallowRef(false);
+  /** 当前图表请求是否全部失败（部分成功仍保留可用结果） */
+  const loadError = shallowRef(false);
   /** 接口请求耗时 */
   const duration = shallowRef(0);
   const options = shallowRef();
@@ -472,12 +572,43 @@ export const useEcharts = ({
   });
   const series = shallowRef([]);
 
-  const getEchartOptions = async () => {
+  /** 根据已合并的 series 列表构建 echarts options */
+  const buildOptions = (seriesList: any[]) => {
+    if (!seriesList.length) return undefined;
+    const { xAxis, seriesData, xData } = createSeries(seriesList, customOptions.series);
+    applyPeakMarkPoint(seriesData, xData, xAxis);
+    const yAxis = createYAxis(seriesData, toValue(panel).options?.time_series?.type);
+    const echartOptions = createOptions(xAxis, yAxis, seriesData, customOptions.options);
+    const { tooltipsOptions } = useChartTooltips(chartRef, {
+      isMouseOver: interactionState?.isMouseOver ?? true,
+      hoverAllTooltips: interactionState?.hoverAllTooltips ?? false,
+      options: echartOptions,
+      customTooltipsOptions: customOptions.tooltips,
+    });
+    return {
+      ...echartOptions,
+      tooltip: tooltipsOptions.value,
+    };
+  };
+
+  const fetchEchartOptions = async () => {
+    const requestId = ++currentRequestId;
+    loadError.value = false;
     for (const cb of cancelTokens) {
       cb?.();
     }
+    /** 是否开启视口请求判断 */
+    if (viewportRequest?.enable) {
+      if (!isInViewPort(viewportRequest.el.value)) {
+        if (intersectionObserver.value) {
+          unregisterObserver(viewportRequest.el.value);
+        }
+        viewportRequest.el.value && registerObserver(viewportRequest.el.value);
+        return;
+      }
+      unregisterObserver(viewportRequest.el.value);
+    }
     cancelTokens = [];
-    const requestId = ++currentRequestId;
     const startDate = Date.now();
     loading.value = true;
     metricList.value = [];
@@ -485,31 +616,22 @@ export const useEcharts = ({
     const [startTime, endTime] = handleTransformToTimestamp(toValue(timeRange) || DEFAULT_TIME_RANGE);
 
     /** 单个 target 请求 + 数据格式化 */
-    const queryTarget = (target: DataQuery) => {
+    const queryTarget = (target: DataQuery, time_shift: string) => {
+      const data = resolveVariables(target.data, { time_shift: time_shift });
       const resultParams = {
         start_time: startTime,
         end_time: endTime,
-        ...target.data,
+        ...data,
         ...(toValue(params) ?? {}),
       };
 
       if (downSampleRangeComputed) {
         resultParams.down_sample_range = downSampleRangeComputed([resultParams.start_time, resultParams.end_time]);
       }
-      // #if IS_APM_MONITOR
+      // 告警趋势图与告警中心服务层同一查询口径：被宿主嵌入时收敛到宿主的业务与过滤范围
       if (target.apiFunc === 'alertDateHistogram') {
-        if (resultParams.bk_biz_ids) {
-          resultParams.bk_biz_ids = [window.bk_biz_id];
-        }
-        if (resultParams.query_string) {
-          // 语句模式
-          resultParams.query_string = `(${resultParams.query_string}) AND ${window.APM_QUERY_STRING || ''}`;
-        } else {
-          // ui 模式
-          resultParams.query_string = window.APM_QUERY_STRING || '';
-        }
+        Object.assign(resultParams, withEmbedQuery(resultParams));
       }
-      // #endif
       return $api[target.apiModule]
         [target.apiFunc](resultParams, {
           cancelToken: new CancelToken((cb: () => void) => cancelTokens.push(cb)),
@@ -522,40 +644,27 @@ export const useEcharts = ({
               metricList.value.push(metric);
             }
           }
+          metricList.value = [...metricList.value];
           const targetCopy = { ...target };
           if (query_config) {
             targetCopy.data = query_config;
           }
           targets.value.push(targetCopy);
           return series?.length
-            ? series.map(item => ({
-                ...item,
-                alias: target.alias || item.alias,
-                type: target.chart_type || toValue(panel).options?.time_series?.type || item.type || 'line',
-                stack: target.data?.stack || item.stack,
-                unit: item.unit || (toValue(panel)?.options as { unit?: string })?.unit,
-              }))
+            ? series.map(item => {
+                return {
+                  ...item,
+                  name: `${toValue(timeOffset).length ? `${handleTransformTimeShift(time_shift || 'current')}-` : ''}${
+                    handleSeriesName(target, item) || item.target || ''
+                  }`,
+                  alias: target.alias || item.alias,
+                  type: target.chart_type || toValue(panel).options?.time_series?.type || item.type || 'line',
+                  stack: target.data?.stack || item.stack,
+                  unit: item.unit || (toValue(panel)?.options as { unit?: string })?.unit,
+                };
+              })
             : [];
-        })
-        .catch(() => []);
-    };
-
-    /** 根据已合并的 series 列表构建 echarts options */
-    const buildOptions = (seriesList: any[]) => {
-      if (!seriesList.length) return undefined;
-      const { xAxis, seriesData } = createSeries(seriesList, customOptions.series);
-      const yAxis = createYAxis(seriesData, toValue(panel).options?.time_series?.type);
-      const echartOptions = createOptions(xAxis, yAxis, seriesData, customOptions.options);
-      const { tooltipsOptions } = useChartTooltips(chartRef, {
-        isMouseOver: interactionState?.isMouseOver ?? true,
-        hoverAllTooltips: interactionState?.hoverAllTooltips ?? false,
-        options: echartOptions,
-        customTooltipsOptions: customOptions.tooltips,
-      });
-      return {
-        ...echartOptions,
-        tooltip: tooltipsOptions.value,
-      };
+        });
     };
 
     /** 把 Promise.allSettled 结果展开为 series 列表 */
@@ -569,23 +678,35 @@ export const useEcharts = ({
       return list;
     };
 
+    const timeShiftList = ['', ...toValue(timeOffset)];
+
     const allTargets = toValue(panel)?.targets ?? [];
     const syncTargets = allTargets.filter(t => !t.lazyRender);
     const lazyTargets = allTargets.filter(t => t.lazyRender);
-
-    // 阶段一：先等同步 target，得到首屏渲染数据
-    const syncResList = await Promise.allSettled(syncTargets.map(queryTarget)).finally(() => {
-      loading.value = false;
-    });
+    // 阶段一：先等同步 target，得到首屏渲染数据（对每个 time_shift 迭代请求）
+    const syncPromiseList = timeShiftList.flatMap(time_shift =>
+      syncTargets.map(target => queryTarget(target, time_shift))
+    );
+    const syncResList = await Promise.allSettled(syncPromiseList);
+    if (requestId !== currentRequestId) return options.value;
+    const hasSyncSuccess = syncResList.some(item => item.status === 'fulfilled');
+    const hasSyncFailure = syncResList.some(item => item.status === 'rejected');
+    loadError.value = !hasSyncSuccess && hasSyncFailure;
     const syncSeriesList = flattenSeries(syncResList);
     duration.value = Date.now() - startDate;
     series.value = syncSeriesList;
 
     // 阶段二：lazyRender target 后台请求，到达后合并并刷新图表
     if (lazyTargets.length) {
-      Promise.allSettled(lazyTargets.map(queryTarget)).then(lazyResList => {
+      const lazyPromiseList = timeShiftList.flatMap(time_shift =>
+        lazyTargets.map(target => queryTarget(target, time_shift))
+      );
+      Promise.allSettled(lazyPromiseList).then(lazyResList => {
         // 期间已有新请求触发，丢弃过期数据
         if (requestId !== currentRequestId) return;
+        const hasLazySuccess = lazyResList.some(item => item.status === 'fulfilled');
+        const hasLazyFailure = lazyResList.some(item => item.status === 'rejected');
+        loadError.value = !(hasSyncSuccess || hasLazySuccess) && (hasSyncFailure || hasLazyFailure);
         const lazySeriesList = flattenSeries(lazyResList);
         if (!lazySeriesList.length) return;
         const merged = [...series.value, ...lazySeriesList];
@@ -599,19 +720,57 @@ export const useEcharts = ({
     }
     return buildOptions(syncSeriesList);
   };
-  watch(
-    [() => toValue(timeRange), () => toValue(refreshImmediate), () => toValue(panel), () => toValue(params)],
-    async () => {
-      loading.value = true;
-      options.value = await getEchartOptions();
+  const getEchartOptions = async () => {
+    const request = fetchEchartOptions();
+    const requestId = currentRequestId;
+    try {
+      const nextOptions = await request;
+      if (requestId !== currentRequestId) return options.value;
+      options.value = nextOptions;
       chartId.value = random(8);
-      loading.value = false;
-    },
+      return nextOptions;
+    } finally {
+      if (requestId === currentRequestId) loading.value = false;
+    }
+  };
+
+  watch(
+    [
+      () => toValue(timeRange),
+      () => toValue(timezone),
+      () => toValue(refreshImmediate),
+      () => toValue(panel),
+      () => toValue(params),
+      () => toValue(timeOffset),
+    ],
+    getEchartOptions,
     {
       immediate: true,
     }
   );
+  watchHighlightPeak(() => {
+    const nextOptions = buildOptions(series.value);
+    if (nextOptions) {
+      options.value = nextOptions;
+      chartId.value = random(8);
+    }
+  });
+
+  onMounted(() => {
+    if (viewportRequest?.enable) {
+      registerObserver(viewportRequest.el.value);
+    }
+  });
+
+  onBeforeUnmount(() => {
+    currentRequestId += 1;
+    for (const cancel of cancelTokens) cancel?.();
+    if (intersectionObserver.value) {
+      unregisterObserver(viewportRequest.el.value);
+    }
+  });
   return {
+    loadError,
     loading,
     options,
     metricList,

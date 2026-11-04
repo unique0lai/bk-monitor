@@ -67,6 +67,7 @@ export default {
   屏蔽原因: 'Mute Reason',
   当前周期剩余时长: 'Current cycle remaining',
   状态: 'Status',
+  '用户 ID': 'User ID',
   屏蔽内容: 'Mute Content',
   结束时间: 'End Time',
   告警ID: 'Alarm ID',
@@ -181,7 +182,7 @@ export default {
   消费场景: 'Consumption Scenario',
 
   被调服务: 'Called server',
-  被调service: 'Called service',
+  '被调 Service': 'Called Service',
   被调接口: 'Called interface',
   返回码: 'Return code',
 
@@ -197,9 +198,23 @@ export default {
   '根 Span 接口': 'Root Span Interface',
   入口服务接口: 'Entry Service Interface',
 
+  // RUM
+  展示名称: 'Display Name',
+  应用状态: 'Application Status',
   // ISSUES 最后出现时间UES 列表
   最后出现时间: 'Last Occurrence Time',
   最早发生时间: 'Earliest Occurrence Time',
   趋势: 'Trend',
+  '24h 趋势': '24h Trend',
   影响范围: 'Affected Range',
+
+  // host
+  未恢复的告警: 'Unresolved Alarms',
+  运行用户: 'Running User',
+  'CPU 总占用': 'CPU Total Usage',
+  'RSS 总内存': 'RSS Total Memory',
+  连接数: 'Connection Number',
+  文件句柄: 'File Descriptor',
+  运行时长范围: 'Running Time Range',
+  名称匹配: 'Name Match',
 };

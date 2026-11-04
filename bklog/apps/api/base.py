@@ -56,6 +56,7 @@ from apps.utils.local import (
     get_request_username,
 )
 from apps.utils.log import logger
+from apps.utils.log_sanitization import sanitize_headers
 from apps.utils.time_handler import timestamp_to_datetime
 
 API_AUTH_KEYS = ["bk_app_code", "bk_app_secret", "bk_username", "bk_token", "access_token", "bk_ticket"]
@@ -68,7 +69,7 @@ def get_request_api_headers(params):
     api_headers = {
         "bk_app_code": settings.APP_CODE,
         "bk_app_secret": settings.SECRET_KEY,
-        "bk_username": get_request_username(),
+        "bk_username": params.get("bk_username") or get_request_username(),
     }
     api_headers.update(params)
     return json.dumps(api_headers)
@@ -131,6 +132,8 @@ class DataApiRetryClass:
     @property
     def retry_on_exception(self):
         def wraps(exception):
+            if not self.fail_exceptions:
+                return False
             for fail_exception in self.fail_exceptions:
                 if isinstance(exception, fail_exception):
                     return False
@@ -310,13 +313,17 @@ class DataAPI:
 
             # 统一处理返回内容，根据平台既定规则，断定成功与否
             if raise_exception and not response.is_success():
-                raise ApiResultError(
+                error = ApiResultError(
                     self.get_error_message(response.message), code=response.code, errors=response.errors
                 )
+                error.request_id = response.request_id
+                raise error
 
             return response.data
         except DataAPIException as e:
-            raise ApiRequestError(e.error_message, request_id)
+            error = ApiRequestError(e.error_message, request_id)
+            error.request_id = request_id
+            raise error
 
     def get_error_message(self, error_message):
         url_path = ""
@@ -462,7 +469,7 @@ class DataAPI:
                 "method": self.method,
                 "method_override": self.method_override,
                 "query_params": params,
-                "headers": self.headers,
+                "headers": sanitize_headers(self.headers),
                 "response_result": response_result,
                 "response_code": response_code,
                 "response_data": response_data,

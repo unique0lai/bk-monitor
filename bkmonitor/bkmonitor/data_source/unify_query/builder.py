@@ -10,7 +10,6 @@ specific language governing permissions and limitations under the License.
 
 import copy
 import itertools
-import logging
 from typing import Any
 from collections.abc import Callable
 
@@ -33,9 +32,6 @@ from bkmonitor.data_source.models.sql import Query
 from bkmonitor.data_source.models.sql.query import get_limit_range
 from bkmonitor.data_source.models.sql.where import WhereNode
 from bkmonitor.data_source.unify_query.query import UnifyQuery
-
-logger = logging.getLogger(__name__)
-
 
 """
 做了什么：复用已有 datasource 模块，支持使用类 ORM 模式进行 UnifyQuery 查询
@@ -180,6 +176,7 @@ class QueryHelper:
             offset=query_body["offset"],
             search_after_key=query_body["search_after_key"],
             time_alignment=query_body["is_time_align"],
+            is_es_batch=query_body["is_es_batch"],
         )
         return data
 
@@ -253,8 +250,6 @@ class QueryHelper:
 
     @classmethod
     def query(cls, table_id: str, query_body: dict[str, Any]) -> list[dict[str, Any]]:
-        logger.info("[QueryHelper] table_id -> %s query_body -> %s", table_id, query_body)
-
         data_sources: list[DataSource] = []
         for query_config in query_body["query_configs"]:
             data_source_class = load_data_source(query_config["data_source_label"], query_config["data_type_label"])
@@ -327,6 +322,7 @@ class UnifyQueryCompiler(SQLCompiler):
             "end_time": self.query.end_time,
             "search_after_key": self.query.search_after_key,
             "is_time_align": self.query.is_time_align,
+            "is_es_batch": self.query.is_es_batch,
         }
 
 
@@ -355,6 +351,7 @@ class UnifyQueryConfig:
         self.instant: bool = False
         self.is_time_agg: bool = True
         self.is_time_align: bool = True
+        self.is_es_batch: bool = False
         self.expression: str = ""
         self.functions: list[dict[str, Any]] = []
         self.query_configs: list[QueryConfig] = []
@@ -373,6 +370,7 @@ class UnifyQueryConfig:
         obj.instant = self.instant
         obj.is_time_agg = self.is_time_agg
         obj.is_time_align = self.is_time_align
+        obj.is_es_batch = self.is_es_batch
         obj.expression = self.expression
         obj.functions = self.functions[:]
         obj.query_configs = self.query_configs[:]
@@ -402,6 +400,9 @@ class UnifyQueryConfig:
 
     def set_time_align(self, is_time_align: bool):
         self.is_time_align = is_time_align
+
+    def set_is_es_batch(self, is_es_batch: bool):
+        self.is_es_batch = is_es_batch
 
     def set_expression(self, expression: str | None):
         if expression:
@@ -526,6 +527,11 @@ class UnifyQuerySet(IterMixin, CompilerMixin):
         """"""
         clone = self._clone()
         clone.query.set_time_align(is_time_align)
+        return clone
+
+    def is_es_batch(self, is_es_batch: bool = True) -> "UnifyQuerySet":
+        clone = self._clone()
+        clone.query.set_is_es_batch(is_es_batch)
         return clone
 
     def func(self, _id: str, params: list[dict[str, Any]]) -> "UnifyQuerySet":

@@ -23,7 +23,7 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { type PropType, defineComponent, onMounted, provide, shallowReactive, shallowRef, watch } from 'vue';
+import { type PropType, defineComponent, onMounted, onUnmounted, provide, shallowReactive, shallowRef, watch } from 'vue';
 
 import { Sideslider } from 'bkui-vue';
 import * as authMap from 'monitor-pc/pages/event-center/authority-map';
@@ -38,6 +38,7 @@ import EventDetailHead from './components/event-detail-head';
 import { useAlarmCenterDetailStore } from '@/store/modules/alarm-center-detail';
 import { getAuthorityMap, useAuthorityStore } from '@/store/modules/authority';
 
+import type { AlarmCenterPanelTabType } from '@/pages/alarm-center/utils/constant';
 import type { IAuthority } from '@/typings/authority';
 
 import './alarm-detail-sideslider.scss';
@@ -58,7 +59,7 @@ export default defineComponent({
       default: AlarmType.ALERT,
     },
     defaultTab: {
-      type: String,
+      type: String as PropType<'' | AlarmCenterPanelTabType>,
       default: '',
     },
     show: {
@@ -75,8 +76,7 @@ export default defineComponent({
   setup(props, { emit }) {
     const isFullscreen = shallowRef(false);
     const alarmCenterDetailStore = useAlarmCenterDetailStore();
-    const { alarmId, actionId, alarmType, defaultTab, alarmDetail, actionDetail, bizId } =
-      storeToRefs(alarmCenterDetailStore);
+    const { alarmId, actionId, alarmType, bizId } = storeToRefs(alarmCenterDetailStore);
     const authorityStore = useAuthorityStore();
     const authority = shallowReactive<IAuthority>({
       map: authMap,
@@ -89,50 +89,22 @@ export default defineComponent({
     provide('authority', authority);
 
     watch(
-      () => props.alarmType,
-      newVal => {
-        if (newVal !== alarmType.value) {
-          alarmType.value = newVal;
+      () => [props.show, props.alarmId, props.alarmBizId, props.alarmType],
+      () => {
+        if (!props.show) {
+          if (alarmId.value === props.alarmId || actionId.value === props.alarmId) alarmCenterDetailStore.reset();
+          return;
         }
-      },
-      { immediate: true }
-    );
-
-    watch(
-      () => props.defaultTab,
-      newVal => {
-        defaultTab.value = newVal || '';
-      },
-      { immediate: true }
-    );
-
-    watch(
-      () => props.alarmId,
-      newVal => {
         bizId.value = props.alarmBizId;
-        if (alarmType.value === AlarmType.ALERT && newVal && newVal !== alarmId.value) {
-          alarmId.value = newVal;
-          return;
-        }
-        if (alarmType.value === AlarmType.ACTION && newVal && newVal !== actionId.value) {
-          actionId.value = newVal;
-          return;
-        }
+        alarmType.value = props.alarmType;
+        if (props.alarmType === AlarmType.ALERT) alarmId.value = props.alarmId;
+        else actionId.value = props.alarmId;
       },
       { immediate: true }
     );
-
-    watch(
-      () => props.show,
-      newVal => {
-        if (!newVal) {
-          alarmId.value = '';
-          actionId.value = '';
-          alarmDetail.value = null;
-          actionDetail.value = null;
-        }
-      }
-    );
+    onUnmounted(() => {
+      if (alarmId.value === props.alarmId || actionId.value === props.alarmId) alarmCenterDetailStore.reset();
+    });
 
     const init = async () => {
       authority.auth = await getAuthorityMap(authMap);
@@ -198,7 +170,7 @@ export default defineComponent({
         case AlarmType.ALERT:
           return (
             <div class='alarm-center-detail-wrapper'>
-              <DetailCommon />
+              <DetailCommon defaultTab={props.defaultTab} />
               {showAiAnalysis.value && <DiagnosticAnalysis onClose={() => handleAiAnalysisShowChange(false)} />}
             </div>
           );

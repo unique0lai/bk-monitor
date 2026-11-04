@@ -93,6 +93,7 @@ class ItemModel(Model):
     meta = models.JSONField("查询配置元数据", default=list)
     metric_type = models.CharField("指标类型", max_length=32, default="", blank=True)
     time_delay = models.IntegerField("策略等待时间", default=0)
+    access_lookback_periods = models.IntegerField("Access 回看周期数", null=True, blank=True, default=None)
 
     class Meta:
         verbose_name = "监控项配置V2"
@@ -296,6 +297,12 @@ class StrategyLabel(Model):
         verbose_name_plural = "策略标签"
         db_table = "alarm_strategy_label"
         index_together = (("label_name", "strategy_id"),)
+        # 覆盖索引：标签计数查询按 strategy_id 过滤、label_name 聚合（见 get_strategy_label_list）。
+        # 原 index_together 的 leading 列是 label_name 而非过滤列 strategy_id，IN 过滤无法走索引 seek；
+        # 本索引以过滤列 strategy_id 为 leading 列并覆盖 label_name，使该计数查询成为覆盖索引 seek。
+        indexes = [
+            models.Index(fields=["strategy_id", "label_name"], name="idx_strlabel_sid_lname"),
+        ]
 
     @classmethod
     def get_label_dict(cls, strategy_id=None):

@@ -25,18 +25,13 @@
  */
 
 import CancelToken from 'axios/lib/cancel/CancelToken';
+import { parseBizId } from 'monitor-common/utils';
 import { random } from 'monitor-common/utils/utils';
 
 import axios from './axios/axios';
 import { axiosError, bkMessage, makeMessage } from './utils/index';
 
-interface ApiError {
-  code?: number | string;
-  error_details?: string;
-  message?: string;
-}
-
-interface RequestConfig {
+export interface RequestConfig {
   /* cancelToken */
   cancelToken?: any;
   /* 是否需要配置header */
@@ -60,6 +55,12 @@ interface RequestConfig {
   cancelFn?: () => void;
   /* 上传进度 */
   onUploadProgress?: (progressEvent: any) => void;
+}
+
+interface ApiError {
+  code?: number | string;
+  error_details?: string;
+  message?: string;
 }
 
 type RequestMethod = 'delete' | 'get' | 'head' | 'options' | 'patch' | 'post' | 'put';
@@ -122,7 +123,8 @@ export const request = (method: RequestMethod, url: string): RequestFunction => 
   ): Promise<T> => {
     let newUrl = url;
     let data: FormData | Record<string, any> = {};
-    const hasBizId = !(window.cc_biz_id === -1 || !window.cc_biz_id);
+    const parsedBizId = parseBizId(window.cc_biz_id);
+    const hasBizId = Boolean(parsedBizId) && parsedBizId !== -1;
 
     if (typeof id === 'number' || typeof id === 'string') {
       newUrl = url.replace('{pk}', String(id));
@@ -157,7 +159,7 @@ export const request = (method: RequestMethod, url: string): RequestFunction => 
 
     if (methodType === 'get') {
       if (hasBizId && !('bk_biz_id' in data)) {
-        (data as Record<string, any>).bk_biz_id = window.cc_biz_id;
+        (data as Record<string, any>).bk_biz_id = parsedBizId;
       } else if (window.space_uid) {
         (data as Record<string, any>).space_uid = window.space_uid;
       }
@@ -205,13 +207,13 @@ export const request = (method: RequestMethod, url: string): RequestFunction => 
     if (config.needBiz && !('bk_biz_id' in data)) {
       if (data instanceof FormData) {
         if (hasBizId) {
-          !data.has('bk_biz_id') && data.append('bk_biz_id', String(window.cc_biz_id));
+          !data.has('bk_biz_id') && data.append('bk_biz_id', String(parsedBizId));
         } else if (window.space_uid) {
           !data.has('space_uid') && data.append('space_uid', window.space_uid);
         }
       } else {
         if (hasBizId) {
-          (data as Record<string, any>).bk_biz_id = window.cc_biz_id;
+          (data as Record<string, any>).bk_biz_id = parsedBizId;
         } else if (window.space_uid) {
           (data as Record<string, any>).space_uid = window.space_uid;
         }

@@ -23,24 +23,37 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { computed, defineComponent, onMounted, ref, type Ref } from 'vue';
-
-import(/* webpackChunkName: 'appload-import' */ './common/appload-import');
-import(/* webpackChunkName: 'demand-import' */ './common/demand-import');
-
-import AuthDialog from '@/components/common/auth-dialog.vue';
-import GlobalSettingDialog from '@/components/global-setting/index';
-import HeadNav from '@/global/head-navi/index';
-import NoticeComponent from '@blueking/notice-component-vue2';
+import { computed, defineAsyncComponent, defineComponent, nextTick, onMounted, ref, type Ref } from 'vue';
 import jsCookie from 'js-cookie';
 import { useRoute } from 'vue-router/composables';
 
+import { getFeatureToggleStatus } from './hooks/use-feature-toggle';
+import { isMonitorIframeContext } from './common/embed-layout-query';
 import useLocale from './hooks/use-locale';
 import useStore from './hooks/use-store';
 import { join } from '@/global/utils/path';
 
-import '@blueking/notice-component-vue2/dist/style.css';
 import './app.scss';
+
+import(/* webpackChunkName: 'appload-import' */ './common/appload-import');
+const NoticeComponent = defineAsyncComponent(() =>
+  Promise.all([
+    import(/* webpackChunkName: 'notice-component' */ '@blueking/notice-component-vue2'),
+    import(/* webpackChunkName: 'notice-component' */ '@blueking/notice-component-vue2/dist/style.css'),
+  ]).then(([component]) => (component as any).default ?? component),
+);
+const AuthDialog = () => import(/* webpackChunkName: 'auth-dialog' */ '@/components/common/auth-dialog.vue');
+const GlobalSettingDialog = () =>
+  import(/* webpackChunkName: 'global-setting-dialog' */ '@/components/global-setting/index');
+const HeadNav = () => import(/* webpackChunkName: 'head-nav' */ '@/global/head-navi/index');
+
+const isHeadlessEntry = () =>
+  new URLSearchParams(window.location.hash.split('?')[1] || window.location.search).get('hl') === '1';
+if (isHeadlessEntry()) {
+  import(/* webpackChunkName: 'demand-import-lite' */ './common/demand-import-lite');
+} else {
+  import(/* webpackChunkName: 'demand-import' */ './common/demand-import');
+}
 
 export default defineComponent({
   setup() {
@@ -52,13 +65,17 @@ export default defineComponent({
     const refNoticeComponent: Ref<any | null> = ref(null);
     const welcomePageData = ref(null);
 
-    const rootClass = computed(() => ({ 'clear-min-height': route.name === 'retrieve' }));
+    const isHeadless = computed(() => route.query.hl === '1');
+    const rootClass = computed(() => ({
+      'clear-min-height': route.name === 'retrieve',
+      'is-headless-app': isHeadless.value,
+    }));
 
     const noticeComponentStyle = computed(() => ({
       '--notice-component-height': `${noticeComponentHeight.value}px`,
     }));
 
-    const isAsIframe = computed(() => route.query.from === 'monitor');
+    const isAsIframe = computed(() => isMonitorIframeContext(route.query));
     const showAlert = computed(() => store.state.showAlert);
 
     const isShowGlobalDialog = computed(() => store.state.isShowGlobalDialog);
@@ -68,29 +85,22 @@ export default defineComponent({
     const appBodyClassName = computed(() => [
       'log-search-container',
       isAsIframe.value && 'as-iframe',
+      isHeadless.value && 'is-headless',
       { 'is-show-notice': showAlert.value },
     ]);
 
     /** 初始化脱敏灰度相关的数据 */
     const initMaskingToggle = () => {
-      const { log_desensitize: logDesensitize } = window.FEATURE_TOGGLE;
-      let toggleList = window.FEATURE_TOGGLE_WHITE_LIST?.log_desensitize || [];
-      switch (logDesensitize) {
-        case 'on':
-          toggleList = [];
-          break;
-        case 'off': {
-          toggleList = [];
-          store.commit('updateState', { globalSettingList: [] });
-          break;
-        }
-        default:
-          break;
+      const logDesensitize = getFeatureToggleStatus('log_desensitize');
+
+      if (logDesensitize === 'off') {
+        store.commit('updateState', { globalSettingList: [] });
       }
+
       store.commit('updateState', {
         maskingToggle: {
           toggleString: logDesensitize,
-          toggleList,
+          toggleList: [],
         },
       });
 
@@ -112,22 +122,21 @@ export default defineComponent({
      * 公告状态变化
      * @param v
      */
-    const showAlertChange = (v: boolean) => {
+    const showAlertChange = async (v: boolean) => {
       store.commit('updateState', { showAlert: v });
 
-      if (refNoticeComponent.value) {
-        noticeComponentHeight.value = refNoticeComponent.value.$el.offsetHeight;
-      }
+      await nextTick();
+      noticeComponentHeight.value = v ? (refNoticeComponent.value?.$el?.offsetHeight ?? 0) : 0;
     };
 
     /**
      * 渲染公告组件
      */
     const renderNoticeComponent = () => {
-      if (!isAsIframe.value) {
+      if (!isAsIframe.value && !isHeadless.value) {
         return (
           <NoticeComponent
-            ref='refNoticeComponent'
+            ref={refNoticeComponent}
             api-url={join((window as any).SITE_URL, '/notice/announcements/')}
             on-show-alert-change={showAlertChange}
           />
@@ -147,7 +156,7 @@ export default defineComponent({
      * 渲染头部组件
      */
     const renderHeadComponent = () => {
-      if (!isAsIframe.value && route.path !== '/') {
+      if (!isAsIframe.value && !isHeadless.value && route.path !== '/') {
         return (
           <HeadNav
             welcome-data={welcomePageData.value}
@@ -180,7 +189,10 @@ export default defineComponent({
      * @returns
      */
     const renderAuthDialog = () => {
-      return <AuthDialog />;
+      if (!isHeadless.value) {
+        return <AuthDialog />;
+      }
+      return null;
     };
 
     /**
@@ -194,6 +206,9 @@ export default defineComponent({
      * 渲染全局设置弹窗
      */
     const renderGlobalSettingDialog = () => {
+      if (isHeadless.value) {
+        return null;
+      }
       return (
         <GlobalSettingDialog
           active-menu={globalActiveLabel.value}
@@ -220,9 +235,10 @@ export default defineComponent({
 
     onMounted(() => {
       const platform = window.navigator.platform.toLowerCase();
-      const fontFamily =        platform.indexOf('win') === 0
-        ? 'Microsoft Yahei, pingFang-SC, Helvetica, Aria, sans-serif'
-        : 'pingFang-SC, Microsoft Yahei, Helvetica, Aria, sans-serif';
+      const fontFamily =
+        platform.indexOf('win') === 0
+          ? 'Microsoft Yahei, pingFang-SC, Helvetica, Aria, sans-serif'
+          : 'pingFang-SC, Microsoft Yahei, Helvetica, Aria, sans-serif';
       document.body.style['font-family'] = fontFamily;
       store.commit('updateState', { runVersion: window.RUN_VER || '' });
 

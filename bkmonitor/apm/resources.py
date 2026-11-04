@@ -23,12 +23,13 @@ from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 from apm.constants import (
+    ACTIVE_PROFILING_DEPLOYMENT_DEPLOYING,
+    ACTIVE_PROFILING_DEPLOYMENT_EXPIRED,
+    ACTIVE_PROFILING_DEPLOYMENT_SUCCESS,
+    ACTIVE_PROFILING_TASK_STATUS_BY_ENABLED,
     GLOBAL_CONFIG_BK_BIZ_ID,
-    AggregatedMethod,
     ApmCacheType,
     ConfigTypes,
-    EnabledStatisticsDimension,
-    StatisticsProperty,
     VisibleEnum,
 )
 from apm.core.discover.instance import InstanceDiscover
@@ -36,11 +37,20 @@ from apm.core.handlers.apm_cache_handler import ApmCacheHandler
 from apm.core.handlers.application_hepler import ApplicationHelper, SharedDatasourceRuleFactory
 from apm.core.handlers.bk_data.helper import FlowHelper
 from apm.core.handlers.discover_handler import DiscoverHandler
+from apm.core.handlers.profile.active_profiling import (
+    ActiveProfilingCancelHandler,
+    ActiveProfilingExecutionQueryHandler,
+    ActiveProfilingImmediateHandler,
+    ActiveProfilingNodeManHandler,
+)
+from apm.core.handlers.profile.active_profiling_es import ActiveProfilingEventQueryHandler
 from apm.core.handlers.query.base import FilterOperator
 from apm.core.handlers.query.define import QueryMode
 from apm.core.handlers.query.ebpf_query import DeepFlowQuery
 from apm.core.handlers.query.proxy import QueryProxy
 from apm.models import (
+    ActiveProfilingExecution,
+    ActiveProfilingTask,
     ApdexConfig,
     ApmApplication,
     ApmDataSourceConfigBase,
@@ -71,11 +81,25 @@ from apm.models import (
 from apm.models.profile import ProfileService
 from apm.serializers import FilterSerializer as TraceFilterSerializer
 from apm.serializers import (
+    ActiveProfilingExecutionCancelRequestSerializer,
+    ActiveProfilingExecutionDetailRequestSerializer,
+    ActiveProfilingExecutionRenameRequestSerializer,
+    ActiveProfilingListRequestSerializer,
+    ActiveProfilingTaskEditRequestSerializer,
+    ActiveProfilingTaskListRequestSerializer,
+    ActiveProfilingTaskRequestSerializer,
+    ActiveProfilingTaskSubmitRequestSerializer,
+    ActiveProfilingTaskSwitchRequestSerializer,
+    ActiveProfilingTopKRequestSerializer,
     TraceFieldStatisticsGraphRequestSerializer,
     TraceFieldStatisticsInfoRequestSerializer,
     TraceFieldsTopkRequestSerializer,
 )
-from apm.task.tasks import create_or_update_tail_sampling, delete_application_async
+from apm.task.tasks import (
+    create_or_update_tail_sampling,
+    delete_application_async,
+    refresh_active_profiling_consul_config,
+)
 from apm.utils.ui_optimizations import HistogramNiceNumberGenerator
 from bkm_space.api import SpaceApi
 from bkm_space.utils import space_uid_to_bk_biz_id
@@ -85,6 +109,9 @@ from bkmonitor.utils.request import get_request_tenant_id, get_request_username
 from bkmonitor.utils.tenant import bk_biz_id_to_bk_tenant_id
 from bkmonitor.utils.thread_backend import InheritParentThread, ThreadPool, run_threads
 from constants.apm import (
+    BUILTIN_EVENT_GROUP_LABEL,
+    BUILTIN_EVENT_GROUP_NAME,
+    BUILTIN_PROFILING_APP_NAME,
     DataSamplingLogTypeChoices,
     FlowType,
     TailSamplingSupportMethod,
@@ -92,10 +119,13 @@ from constants.apm import (
     TraceListQueryMode,
     TraceWaterFallDisplayKey,
 )
+from constants.data_source import DataSourceLabel, DataTypeLabel
+from constants.otel_query import EnabledStatisticsDimension, AggregatedMethod, StatisticsProperty
 from core.drf_resource import Resource, api, resource
 from core.drf_resource.exceptions import CustomException
 from metadata import models
 from metadata.models import DataSource
+from metadata.models.space.constants import EtlConfigs
 
 logger = logging.getLogger("apm")
 
@@ -130,6 +160,13 @@ class CreateApplicationResource(Resource):
         enabled_trace = serializers.BooleanField(label="是否开启 Trace 功能", required=True)
         enabled_metric = serializers.BooleanField(label="是否开启 Metric 功能", required=True)
         enabled_log = serializers.BooleanField(label="是否开启 Log 功能", required=True)
+        owners = serializers.ListField(
+            label="负责人列表",
+            child=serializers.CharField(),
+            required=False,
+            default=list,
+            allow_empty=True,
+        )
         # 共享数据源类型
         shared_datasource_types = serializers.ListField(
             label="共享数据源类型列表",
@@ -169,6 +206,7 @@ class CreateApplicationResource(Resource):
                 "is_enabled_metric": validated_data.get("enabled_metric", False),
                 "is_enabled_log": validated_data.get("enabled_log", False),
                 "shared_datasource_types": shared_datasource_types,
+                "owners": validated_data.get("owners") or [],
             },
         )
 
@@ -779,7 +817,17 @@ class QueryTopoNodeResource(Resource):
     class NodeResponseSerializer(serializers.ModelSerializer):
         class Meta:
             model = TopoNode
-            fields = ("extra_data", "system", "platform", "sdk", "topo_key", "created_at", "updated_at")
+            fields = (
+                "extra_data",
+                "system",
+                "platform",
+                "sdk",
+                "source",
+                "heartbeat",
+                "topo_key",
+                "created_at",
+                "updated_at",
+            )
 
         def to_representation(self, instance):
             data = super().to_representation(instance)
@@ -807,6 +855,58 @@ class QueryTopoNodeResource(Resource):
 
             res.append(self.NodeResponseSerializer(instance=n).data)
         return res
+
+
+class SearchServiceNamesResource(Resource):
+    """在业务范围内匹配服务名称，由调用方校验命中应用的权限。"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_ids = serializers.ListField(
+            label="业务ID列表，空列表表示全量授权", child=serializers.IntegerField(), allow_empty=True
+        )
+        app_names = serializers.ListField(
+            label="应用名称列表",
+            child=serializers.CharField(max_length=50),
+            required=False,
+            allow_empty=True,
+            max_length=100,
+        )
+        query = serializers.CharField(label="服务名称关键字")
+        limit = serializers.IntegerField(label="返回数量", min_value=1, max_value=100, default=20)
+
+    def perform_request(self, data):
+        scope = {"bk_biz_id__in": data["bk_biz_ids"]} if data["bk_biz_ids"] else {}
+        if data.get("app_names"):
+            scope["app_name__in"] = data["app_names"]
+        limit = data.get("limit", 20)
+        services = {}
+        nodes = (
+            TopoNode.objects.filter(
+                **scope,
+                topo_key__icontains=data["query"],
+                updated_at__gte=datetime.datetime.now() - datetime.timedelta(days=TopoNode.EXPIRED_DAYS),
+            )
+            .order_by("id")
+            .values("bk_biz_id", "app_name", "topo_key")[:limit]
+        )
+        for node in nodes:
+            key = (node["bk_biz_id"], node["app_name"], node["topo_key"])
+            services[key] = {"bk_biz_id": key[0], "app_name": key[1], "service_name": key[2]}
+            if len(services) >= limit:
+                return list(services.values())
+
+        profiles = (
+            ProfileService.objects.filter(**scope, name__icontains=data["query"])
+            .order_by("bk_biz_id", "app_name", "name")
+            .values("bk_biz_id", "app_name", "name")
+            .distinct()[:limit]
+        )
+        for profile in profiles:
+            key = (profile["bk_biz_id"], profile["app_name"], profile["name"])
+            services[key] = {"bk_biz_id": key[0], "app_name": key[1], "service_name": key[2]}
+            if len(services) >= limit:
+                break
+        return list(services.values())
 
 
 class DiscoverQueryResource(Resource):
@@ -1234,8 +1334,8 @@ class QueryEventResource(Resource):
 class QuerySerializer(serializers.Serializer):
     bk_biz_id = serializers.IntegerField(label="业务id")
     app_name = serializers.CharField(label="应用名称", max_length=50)
-    start_time = serializers.IntegerField(required=True, label="数据开始时间")
-    end_time = serializers.IntegerField(required=True, label="数据开始时间")
+    start_time = serializers.IntegerField(required=False, allow_null=True, default=None, label="数据开始时间")
+    end_time = serializers.IntegerField(required=False, allow_null=True, default=None, label="数据开始时间")
     offset = serializers.IntegerField(required=False, label="偏移量", default=0)
     limit = serializers.IntegerField(required=False, label="每页数量", default=10)
     filters = serializers.ListSerializer(required=False, label="查询条件", child=TraceFilterSerializer())
@@ -1250,6 +1350,15 @@ class QuerySerializer(serializers.Serializer):
     sort = serializers.ListSerializer(label="排序字段", required=False, child=serializers.CharField())
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        has_start_time: bool = attrs.get("start_time") is not None
+        has_end_time: bool = attrs.get("end_time") is not None
+        if has_start_time != has_end_time:
+            raise ValidationError(_("start_time 和 end_time 必须同时提供"))
+        if not has_start_time and not QueryProxy.is_trace_or_span_id_query(
+            attrs.get("filters"), attrs.get("query_string")
+        ):
+            raise ValidationError(_("仅 TraceID / SpanID 精确查询允许省略时间范围"))
+
         processed_sort: list[str] = []
         for ordering in attrs.get("sort") or []:
             if not ordering:
@@ -1405,20 +1514,6 @@ class QuerySpanDetailResource(Resource):
         )
 
 
-class QueryFieldsResource(Resource):
-    class RequestSerializer(serializers.Serializer):
-        bk_biz_id = serializers.IntegerField(label="业务id")
-        app_name = serializers.CharField(label="应用名称", max_length=50)
-
-    def perform_request(self, validated_request_data):
-        bk_biz_id = validated_request_data["bk_biz_id"]
-        app_name = validated_request_data["app_name"]
-        application = ApmApplication.objects.filter(bk_biz_id=bk_biz_id, app_name=app_name).first()
-        if not application:
-            raise CustomException(_("业务下的应用: {} 不存在").format(app_name))
-        return application.trace_datasource.fields()
-
-
 class UpdateMetricFieldsResource(Resource):
     class RequestSerializer(serializers.Serializer):
         bk_biz_id = serializers.IntegerField(label="业务id")
@@ -1432,19 +1527,6 @@ class UpdateMetricFieldsResource(Resource):
         if not application:
             raise CustomException(_("业务下的应用: {} 不存在").format(app_name))
         return application.metric_datasource.update_fields(validated_request_data["field_list"])
-
-
-class QueryEsMappingResource(Resource):
-    class RequestSerializer(serializers.Serializer):
-        bk_biz_id = serializers.IntegerField()
-        app_name = serializers.CharField()
-
-    def perform_request(self, data):
-        datasource = TraceDataSource.objects.get(bk_biz_id=data["bk_biz_id"], app_name=data["app_name"])
-        if not datasource:
-            return None
-
-        return datasource.es_client.indices.get_mapping(datasource.index_name)
 
 
 class ListEsClusterInfoResource(Resource):
@@ -1898,6 +1980,234 @@ class QueryBuiltinProfileDatasourceResource(Resource):
         return self.ProfileDataSourceSerializer(builtin_source).data
 
 
+class EnableActiveProfilingResource(Resource):
+    """按业务幂等创建主动 Profiling 的 Profiling 数据源与事件分组，并同步事件分组 DataID 到 consul"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(label="业务ID")
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        self._enable_profiling_datasource(bk_biz_id)
+        self._enable_event_datasource(bk_biz_id, get_request_username())
+        refresh_active_profiling_consul_config.delay(bk_biz_id)
+
+    def _enable_profiling_datasource(self, bk_biz_id):
+        """开通业务的 Profiling 数据源，只建数据源不建应用，重复调用由 apply_datasource 内部短路"""
+        ProfileDataSource.apply_datasource(bk_biz_id=bk_biz_id, app_name=BUILTIN_PROFILING_APP_NAME, option=True)
+
+    def _enable_event_datasource(self, bk_biz_id, operator):
+        """开通业务的事件分组，不写 monitor_web 自定义事件表"""
+        if resource.metadata.query_event_group(bk_biz_id=bk_biz_id, event_group_name=BUILTIN_EVENT_GROUP_NAME):
+            return
+
+        resource.metadata.create_event_group(
+            operator=operator,
+            bk_data_id=self._get_or_create_event_data_id(bk_biz_id, operator),
+            bk_biz_id=bk_biz_id,
+            event_group_name=BUILTIN_EVENT_GROUP_NAME,
+            label=BUILTIN_EVENT_GROUP_LABEL,
+            data_label=BUILTIN_EVENT_GROUP_NAME,
+        )
+
+    def _get_or_create_event_data_id(self, bk_biz_id, operator):
+        """DataID 与事件分组分两次调用创建，先复用上一次可能已创建成功的 DataID"""
+        data_name = f"{bk_biz_id}_{BUILTIN_EVENT_GROUP_NAME}"
+        try:
+            return resource.metadata.query_data_source(data_name=data_name, with_rt_info=False)["bk_data_id"]
+        except DataSource.DoesNotExist:
+            pass
+
+        return resource.metadata.create_data_id(
+            bk_biz_id=bk_biz_id,
+            data_name=data_name,
+            data_description="主动 Profiling 内置资源，请勿删除",
+            etl_config=EtlConfigs.BK_STANDARD_V2_EVENT.value,
+            operator=operator,
+            type_label=DataTypeLabel.EVENT,
+            source_label=DataSourceLabel.CUSTOM,
+            option={"inject_local_time": True},
+        )["bk_data_id"]
+
+
+# 查询默认读 MySQL 执行表，source=es 时按 Event ES 聚合
+ACTIVE_PROFILING_QUERY_HANDLERS = {
+    "mysql": ActiveProfilingExecutionQueryHandler,
+    "es": ActiveProfilingEventQueryHandler,
+}
+
+
+class QueryActiveProfilingHostsResource(Resource):
+    """查询主动 Profiling 已采数据：一台主机的一次执行一行"""
+
+    RequestSerializer = ActiveProfilingListRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        handler = ACTIVE_PROFILING_QUERY_HANDLERS[validated_request_data["source"]](validated_request_data["bk_biz_id"])
+        return handler.query_hosts(validated_request_data)
+
+
+class ListActiveProfilingExecutionsResource(Resource):
+    """查询主动 Profiling 任务历史：一次执行一行"""
+
+    RequestSerializer = ActiveProfilingListRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        handler = ACTIVE_PROFILING_QUERY_HANDLERS[validated_request_data["source"]](validated_request_data["bk_biz_id"])
+        return handler.list_executions(validated_request_data)
+
+
+class QueryActiveProfilingTopKResource(Resource):
+    """查询主动 Profiling 两个列表搜索框的候选值"""
+
+    RequestSerializer = ActiveProfilingTopKRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        handler = ACTIVE_PROFILING_QUERY_HANDLERS[validated_request_data["source"]](validated_request_data["bk_biz_id"])
+        return handler.query_topk(validated_request_data)
+
+
+class QueryActiveProfilingExecutionDetailResource(Resource):
+    """查询主动 Profiling 单次执行详情及全部主机"""
+
+    RequestSerializer = ActiveProfilingExecutionDetailRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        handler = ACTIVE_PROFILING_QUERY_HANDLERS[validated_request_data["source"]](validated_request_data["bk_biz_id"])
+        return handler.query_execution_detail(validated_request_data)
+
+
+class CancelActiveProfilingExecutionResource(Resource):
+    """取消主动 Profiling 执行"""
+
+    RequestSerializer = ActiveProfilingExecutionCancelRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        ActiveProfilingCancelHandler(validated_request_data["bk_biz_id"]).cancel(validated_request_data)
+
+
+class RenameActiveProfilingExecutionResource(Resource):
+    """修改单次执行的任务名：只改执行行上的任务名快照，计划本身的名字不变，允许重复；
+    BMW 与执行汇总重算都不改任务名，不会被覆盖"""
+
+    RequestSerializer = ActiveProfilingExecutionRenameRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        execution = ActiveProfilingExecution.get_execution(
+            get_request_tenant_id(),
+            validated_request_data["bk_biz_id"],
+            validated_request_data["scheduled_at"],
+            validated_request_data.get("task_id"),
+        )
+        execution.task_name = validated_request_data["task_name"]
+        execution.save(update_fields=["task_name", "updated_at"])
+
+
+class ListActiveProfilingTasksResource(Resource):
+    """查询主动 Profiling 的指定时间/周期计划"""
+
+    RequestSerializer = ActiveProfilingTaskListRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        page = validated_request_data["page"]
+        page_size = validated_request_data["page_size"]
+        # 同一时间写入的计划靠 id 兜底定序，避免翻页时行序抖动
+        queryset = ActiveProfilingTask.objects.filter(bk_biz_id=validated_request_data["bk_biz_id"]).order_by(
+            "-update_time", "-id"
+        )
+        offset = (page - 1) * page_size
+        return {
+            "data": [self._serialize_task(task) for task in queryset[offset : offset + page_size]],
+            "page": page,
+            "page_size": page_size,
+            "total": queryset.count(),
+        }
+
+    def _serialize_task(self, task):
+        config = {field: getattr(task, field) for field in ActiveProfilingTask.CONFIG_FIELDS}
+        return {
+            "task_id": task.id,
+            "task_status": ACTIVE_PROFILING_TASK_STATUS_BY_ENABLED[task.is_enabled],
+            "deployment_status": self._display_deployment_status(task),
+            "creator": task.create_user,
+            "updated_at": int(task.update_time.timestamp() * 1000),
+            **config,
+        }
+
+    @staticmethod
+    def _display_deployment_status(task):
+        """计划时间已过时列表显示已过期，不写库，定时清理仍按库里的成功状态拆除配置"""
+        if task.deployment_status != ACTIVE_PROFILING_DEPLOYMENT_SUCCESS:
+            return task.deployment_status
+        schedule = task.schedule
+        if schedule["type"] == "once_at":
+            last_run_at = schedule["execute_at"]
+        elif schedule["type"] == "cron":
+            last_run_at = schedule.get("effective_end_at")
+        else:
+            last_run_at = None
+        if last_run_at is not None and last_run_at < int(time.time() * 1000):
+            return ACTIVE_PROFILING_DEPLOYMENT_EXPIRED
+        return task.deployment_status
+
+
+class SubmitActiveProfilingTaskResource(Resource):
+    """提交主动 Profiling 的立即、指定时间或周期采集"""
+
+    RequestSerializer = ActiveProfilingTaskSubmitRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        if validated_request_data["schedule"]["type"] == "immediate":
+            ActiveProfilingImmediateHandler(bk_biz_id).execute(validated_request_data)
+            return
+
+        handler = ActiveProfilingNodeManHandler(bk_biz_id)
+        task = ActiveProfilingTask.create_task(bk_biz_id, validated_request_data)
+        handler.deploy(task)
+
+
+class EditActiveProfilingTaskResource(Resource):
+    """编辑主动 Profiling 计划"""
+
+    RequestSerializer = ActiveProfilingTaskEditRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        task = ActiveProfilingTask.get_task(validated_request_data["bk_biz_id"], validated_request_data["task_id"])
+        handler = ActiveProfilingNodeManHandler(validated_request_data["bk_biz_id"])
+        task.update_config(validated_request_data)
+        handler.deploy(task)
+
+
+class DeleteActiveProfilingTaskResource(Resource):
+    """删除主动 Profiling 计划"""
+
+    RequestSerializer = ActiveProfilingTaskRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        task = ActiveProfilingTask.get_task(validated_request_data["bk_biz_id"], validated_request_data["task_id"])
+        if task.is_enabled:
+            raise ValueError(_("删除前请先停用计划"))
+
+        if not ActiveProfilingNodeManHandler(validated_request_data["bk_biz_id"]).uninstall(task):
+            raise ValueError(_("节点管理卸载失败，请稍后重试"))
+        task.delete()
+
+
+class SwitchActiveProfilingTaskResource(Resource):
+    """启停主动 Profiling 计划"""
+
+    RequestSerializer = ActiveProfilingTaskSwitchRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        task = ActiveProfilingTask.get_task(validated_request_data["bk_biz_id"], validated_request_data["task_id"])
+        handler = ActiveProfilingNodeManHandler(validated_request_data["bk_biz_id"])
+        task.is_enabled = validated_request_data["enabled"]
+        task.deployment_status = ACTIVE_PROFILING_DEPLOYMENT_DEPLOYING
+        task.save()
+        handler.switch(task)
+
+
 class GetBkDataFlowDetailResource(Resource):
     """获取APM在计算平台中创建的Flow列表"""
 
@@ -2085,7 +2395,7 @@ class QueryEbpfProfileResource(Resource):
         )
 
 
-""""后端直接调用的类"""
+# ==================== 外部 API（网关侧对外简化调用入口） ====================
 
 
 class CreateApplicationSimpleResource(Resource):
@@ -2100,7 +2410,7 @@ class CreateApplicationSimpleResource(Resource):
 
     class RequestSerializer(serializers.Serializer):
         bk_biz_id = serializers.IntegerField(label="业务id", required=False)
-        app_name = serializers.RegexField(label="应用名称", max_length=50, regex=r"^[a-z0-9_-]+$")
+        app_name = serializers.RegexField(label="应用名称", max_length=50, regex=r"^[a-zA-Z0-9_.-]+$")
         app_alias = serializers.CharField(label="应用别名", max_length=255, required=False)
         description = serializers.CharField(label="描述", required=False, max_length=255, default="", allow_blank=True)
         plugin_id = serializers.CharField(label="插件ID", max_length=255, required=False)
@@ -2113,6 +2423,12 @@ class CreateApplicationSimpleResource(Resource):
         enabled_trace = serializers.BooleanField(label="是否开启 Trace 功能", required=False, default=True)
         enabled_metric = serializers.BooleanField(label="是否开启 Metric 功能", required=False, default=True)
         enabled_log = serializers.BooleanField(label="是否开启 Log 功能", required=False, default=False)
+        owners = serializers.ListField(
+            label="负责人列表",
+            child=serializers.CharField(),
+            required=False,
+            allow_empty=True,
+        )
 
     def fill_default(self, validate_data):
         if not validate_data.get("bk_biz_id"):
@@ -2145,6 +2461,84 @@ class CreateApplicationSimpleResource(Resource):
         self.fill_default(validated_request_data)
         app = CreateApplicationResource()(**validated_request_data)
         return ApplicationInfoResource()(application_id=app["application_id"])["token"]
+
+
+class UpdateApplicationSimpleResource(Resource):
+    """外部系统更新 APM 应用信息（支持修改别名/描述/负责人，并对新增负责人主动授权）"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(label="业务id", required=False)
+        space_uid = serializers.CharField(label="空间唯一标识", required=False, default="")
+        app_name = serializers.CharField(label="应用名称", max_length=50)
+        app_alias = serializers.CharField(label="应用别名", max_length=255, required=False)
+        description = serializers.CharField(label="描述", required=False, max_length=255, allow_blank=True)
+        owners = serializers.ListField(
+            label="负责人列表",
+            child=serializers.CharField(),
+            required=False,
+            allow_empty=True,
+        )
+
+    def perform_request(self, validated_request_data):
+        if validated_request_data.get("space_uid"):
+            validated_request_data["bk_biz_id"] = space_uid_to_bk_biz_id(validated_request_data["space_uid"])
+
+        from apm_web.models import Application
+        from apm_web.meta.resources import SetupResource
+
+        application = Application.origin_objects.filter(
+            bk_biz_id=validated_request_data["bk_biz_id"],
+            app_name=validated_request_data["app_name"],
+        ).first()
+        if not application:
+            raise ValueError(
+                f"应用不存在: bk_biz_id={validated_request_data['bk_biz_id']}, "
+                f"app_name={validated_request_data['app_name']}"
+            )
+
+        setup_params = {"application_id": application.application_id}
+        for field in ("app_alias", "description", "owners"):
+            if field in validated_request_data:
+                setup_params[field] = validated_request_data[field]
+
+        if len(setup_params) == 1:
+            # 只传了 application_id，没有任何可更新字段
+            return {"application_id": application.application_id}
+
+        SetupResource()(**setup_params)
+        return {"application_id": application.application_id}
+
+
+class DetailApplicationSimpleResource(Resource):
+    """外部系统查询 APM 应用详情（在原详情基础上补充 SaaS 层的 owners 字段）"""
+
+    RequestSerializer = ApplicationRequestSerializer
+
+    def perform_request(self, validated_request_data):
+        # 复用现有详情接口，拿到数据链路层的完整信息
+        data = ApplicationInfoResource()(**validated_request_data)
+
+        # 补充 SaaS 层管理属性 owners（数据层模型无此字段，需反查 apm_web.Application）
+        owners: list = []
+        try:
+            from apm_web.models import Application as WebApplication
+
+            web_app = WebApplication.origin_objects.filter(
+                bk_biz_id=data.get("bk_biz_id"),
+                app_name=data.get("app_name"),
+            ).first()
+            if web_app and web_app.owners:
+                owners = list(web_app.owners)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "get application owners failed, bk_biz_id=%s, app_name=%s, err=%s",
+                data.get("bk_biz_id"),
+                data.get("app_name"),
+                exc,
+            )
+
+        data["owners"] = owners
+        return data
 
 
 class DeleteApplicationSimpleResource(Resource):
@@ -2277,11 +2671,7 @@ class QueryFieldStatisticsInfoResource(Resource):
     @classmethod
     def _is_number_field(cls, field: dict[str, Any]) -> bool:
         """判断一个字段是否为数值类型。"""
-        return field["field_type"] in [
-            EnabledStatisticsDimension.LONG.value,
-            EnabledStatisticsDimension.DOUBLE.value,
-            EnabledStatisticsDimension.INTEGER.value,
-        ]
+        return EnabledStatisticsDimension.from_value(field["field_type"]).is_numeric()
 
     def perform_request(self, validated_data):
         proxy = QueryProxy(validated_data["bk_biz_id"], validated_data["app_name"])
@@ -2323,15 +2713,7 @@ class QueryFieldStatisticsInfoResource(Resource):
 
     @classmethod
     def query_statistics_info(cls, proxy, validated_data, property_name, statistics_info) -> None:
-        query_property_method_map = {
-            StatisticsProperty.TOTAL_COUNT.value: AggregatedMethod.COUNT.value,
-            StatisticsProperty.FIELD_COUNT.value: AggregatedMethod.COUNT.value,
-            StatisticsProperty.DISTINCT_COUNT.value: AggregatedMethod.DISTINCT.value,
-            StatisticsProperty.AVG.value: AggregatedMethod.AVG.value,
-            StatisticsProperty.MAX.value: AggregatedMethod.MAX.value,
-            StatisticsProperty.MIN.value: AggregatedMethod.MIN.value,
-            StatisticsProperty.MEDIAN.value: AggregatedMethod.CP50.value,
-        }
+        query_property_method_map = StatisticsProperty.method_mapping()
         if property_name not in query_property_method_map:
             raise ValueError(_(f"未知的字段统计属性: {property_name}"))
 
@@ -2339,10 +2721,9 @@ class QueryFieldStatisticsInfoResource(Resource):
         field: dict[str, Any] = validated_data["field"]
         filters: list[dict[str, Any]] = copy.deepcopy(validated_data["filters"])
         if property_name == StatisticsProperty.FIELD_COUNT.value:
-            exclude_empty_operator: str = FilterOperator.NOT_EQUAL
-            if cls._is_number_field(validated_data["field"]):
-                exclude_empty_operator: str = FilterOperator.EXISTS
-
+            # 数值类型与布尔类型使用 exists 判断，其余类型排除空字符串
+            use_exists = cls._is_number_field(field) or field["field_type"] == EnabledStatisticsDimension.BOOLEAN.value
+            exclude_empty_operator: str = FilterOperator.EXISTS if use_exists else FilterOperator.NOT_EQUAL
             filters.append({"key": field["field_name"], "value": [""], "operator": exclude_empty_operator})
 
         statistics_info[property_name] = proxy.query_field_aggregated_value(
@@ -2357,7 +2738,7 @@ class QueryFieldStatisticsInfoResource(Resource):
 
     @classmethod
     def process_statistics_info(cls, statistics_info: dict[str, Any]) -> dict[str, Any]:
-        processed_statistics_info = {}
+        processed_statistics_info: dict[str, Any] = {}
         # 分类并处理结果
         for statistics_property, value in statistics_info.items():
             value = format_percent(value, 3, 3, 3)
@@ -2400,7 +2781,7 @@ class QueryFieldStatisticsGraphResource(Resource):
             "filters": validated_data["filters"],
             "field": field["field_name"],
         }
-        if field["field_type"] == EnabledStatisticsDimension.KEYWORD.value:
+        if not EnabledStatisticsDimension.from_value(field["field_type"]).is_numeric():
             base_query_params["filters"].append(
                 {
                     "key": field["field_name"],
@@ -2429,9 +2810,10 @@ class QueryFieldStatisticsGraphResource(Resource):
             distinct_count <= interval_num or (max_value - min_value + 1) <= interval_num
         ):
             field_topk = proxy.query_field_topk(**base_query_params, limit=distinct_count)
+            value_parser = float if EnabledStatisticsDimension.from_value(field["field_type"]).is_float() else int
             return self.process_graph_info(
                 [
-                    [topk_item["count"], int(topk_item["field_value"])]
+                    [topk_item["count"], value_parser(topk_item["field_value"])]
                     for topk_item in sorted(field_topk, key=lambda topk_item: topk_item["field_value"])
                 ]
             )
@@ -2489,7 +2871,8 @@ class QueryFieldStatisticsGraphResource(Resource):
                 for interval in intervals
             ]
         )
-        return sorted(buckets, key=lambda data_point: int(data_point[1].split("-")[0]))
+        buckets.sort(key=lambda item: item[0])
+        return [data_point for _start, data_point in buckets]
 
     @classmethod
     def collect_interval_buckets(cls, base_query_params, proxy, bucket, interval: tuple[int, int]):
@@ -2505,4 +2888,4 @@ class QueryFieldStatisticsGraphResource(Resource):
         interval_count = proxy.query_field_aggregated_value(
             **interval_query_params,
         )
-        bucket.append([interval_count, f"{interval[0]}-{interval[1]}"])
+        bucket.append((interval[0], [interval_count, f"{interval[0]}-{interval[1]}"]))

@@ -30,6 +30,13 @@ THRESHOLD_ALGORITHM = {
     "config": [[{"method": "gte", "threshold": 10.0}]],
     "unit_prefix": "",
 }
+NEW_SERIES_ALGORITHM = {
+    "id": 9,
+    "type": "NewSeries",
+    "level": 1,
+    "config": {"detect_range": 86400, "effective_delay": 86400, "max_series": 100000},
+    "unit_prefix": "",
+}
 
 
 @pytest.fixture
@@ -149,6 +156,20 @@ def test_only_aiops(strategy):
         assert expected_trigger_count == actual_trigger_count
 
 
+def test_new_series_force_count_one(strategy):
+    """
+    NewSeries 每个维度生命周期只产生首次异常点：后端强制 trigger_count=1，
+    但 check_window_size 保留用户配置(非 aiops 的 5)。
+    """
+    algorithms = [NEW_SERIES_ALGORITHM]
+    strategy_config = create_strategy_config(algorithms, algorithms)
+    trigger_config = strategy.get_trigger_configs(strategy_config)
+    # level 1 含 NewSeries -> count 强制为 1
+    assert trigger_config["1"].get("trigger_count") == 1
+    # check_window_size 保留用户配置(15)，不被写成 aiops 的 5
+    assert trigger_config["1"].get("check_window_size") == 15
+
+
 def test_not_only_aiops(strategy):
     """
     测试有AIOPS算法和非AIOPS算法的情况
@@ -246,22 +267,12 @@ def test_empty_and_aiops_algorithms(strategy):
 
 def execute_strategy_test(strategy_config, strategy_cache):
     """执行策略测试的通用方法"""
-    with mock.patch("alarm_backends.core.cache.strategy.Strategy.from_models") as mock_from_models:
-        mock_strategy = MagicMock()
-        mock_strategy.to_dict.return_value = strategy_config
-        mock_from_models.return_value = [mock_strategy]
-
-        with mock.patch("alarm_backends.core.cache.strategy.BusinessManager.keys") as mock_biz_keys:
-            mock_biz_keys.return_value = [2]
-
-            with mock.patch(
-                "alarm_backends.core.cache.strategy.StrategyCacheManager.handle_strategy"
-            ) as mock_handle_strategy:
-                mock_handle_strategy.return_value = True
-
-                with mock.patch("alarm_backends.core.cache.strategy.StrategyCacheManager.check_related_strategy"):
-                    result_map = strategy_cache.get_strategies_map()
-                    return result_map
+    with (
+        mock.patch("alarm_backends.core.cache.strategy.list_strategy", return_value={"data": [strategy_config]}),
+        mock.patch("alarm_backends.core.cache.strategy.StrategyModel.objects.filter"),
+        mock.patch("alarm_backends.core.cache.strategy.StrategyCacheManager.handle_strategy", return_value=True),
+    ):
+        return strategy_cache.get_strategies_map()
 
 
 def test_only_aiops_cache(strategy_cache):

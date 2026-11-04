@@ -22,6 +22,7 @@ from rest_framework.exceptions import ValidationError
 
 from bkm_ipchooser.handlers import topo_handler
 from bkmonitor.data_source import load_data_source
+from bkmonitor.data_source.unify_query.query import UnifyQuery
 from bkmonitor.models import (
     BCSCluster,
     BCSContainer,
@@ -46,6 +47,7 @@ from monitor_web.grafana.utils import get_cookies_filter, is_global_k8s_event
 from monitor_web.models import CollectConfigMeta
 from monitor_web.strategies.constant import CORE_FILE_SIGNAL_LIST
 from monitor_web.strategies.default_settings.k8s_event import DEFAULT_K8S_EVENT_NAME
+from monitor_web.strategies.metric_cache.process_dimensions import get_process_extra_dimensions
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,7 @@ def query_data(params):
 
     data_source = data_source_class(
         bk_biz_id=params["bk_biz_id"],
+        bk_tenant_id=get_request_tenant_id(),
         table=params["result_table_id"],
         data_label=params.get("data_label", ""),
         metrics=metrics,
@@ -248,6 +251,9 @@ class TimeSeriesMetric(Resource):
         custom_event_data_ids = set()
         data_source_dict = {}
         metric_configs: list[dict] = []
+        # 进程采集：按 result_table_id 懒加载真实上报维度（仅进程表触发 metadata 查询），随循环按需补全；
+        # 不在循环前对全量指标 materialize/预查，避免大业务下被 flat_format 100 截断前的无谓开销
+        process_extra_cache: dict = {}
 
         for metric in metrics:
             if (metric.data_source_label, metric.data_type_label) not in self.DisplayDataSource:
@@ -271,6 +277,17 @@ class TimeSeriesMetric(Resource):
                     {"id": "event_name", "name": _("事件名称"), "is_dimension": True, "type": "string"}
                 )
 
+            # 进程采集等场景：合并真实上报但不在静态指标缓存里的维度（按 id 去重）
+            dimensions = list(metric.dimensions)
+            rt = metric.result_table_id
+            if rt not in process_extra_cache:
+                process_extra_cache[rt] = (
+                    get_process_extra_dimensions(get_request_tenant_id(), params["bk_biz_id"], {rt}).get(rt) or []
+                )
+            if process_extra_cache[rt]:
+                existing_ids = {d["id"] for d in dimensions}
+                dimensions += [d for d in process_extra_cache[rt] if d["id"] not in existing_ids]
+
             metric_config = {
                 "result_table_label": metric.result_table_label,
                 "result_table_label_name": metric.result_table_label_name,
@@ -279,7 +296,7 @@ class TimeSeriesMetric(Resource):
                 "result_table_name": metric.result_table_name,
                 "metric_field": metric.metric_field,
                 "metric_field_name": metric.metric_field_name,
-                "dimensions": metric.dimensions,
+                "dimensions": dimensions,
                 "default_dimensions": metric.default_dimensions,
                 "default_condition": metric.default_condition,
                 "readable_name": metric.readable_name or metric.get_human_readable_name(),
@@ -654,7 +671,7 @@ class GetVariableValue(Resource):
 
         return [{"label": k, "value": v} for v, k in value_dict.items()]
 
-    def query_dimension(self, bk_biz_id, params):
+    def query_dimension(self, bk_biz_id: int, params: dict[str, Any]) -> list[dict[str, Any]]:
         """
         查询维度
         """
@@ -756,12 +773,13 @@ class GetVariableValue(Resource):
                 params["filter_dict"] = {}
             params["filter_dict"]["cookies"] = cookies_filter
 
-        # 6、查询维度的值，通过调用对应data_source的query_dimensions方法查询
+        # 6、查询维度的值，通过调用 UnifyQuery 的 query_dimensions 方法查询
         # 其中，CustomTimeSeriesDataSource和BkMonitorTimeSeriesDataSource是
         # 调用InfluxdbDimensionFetcher.query_dimensions查询维度的值
         data_source_class = load_data_source(data_source_label, data_type_label)
         data_source = data_source_class(
             bk_biz_id=bk_biz_id,
+            bk_tenant_id=get_request_tenant_id(),
             table=params["result_table_id"],
             data_label=params.get("data_label", ""),
             metrics=[{"field": params["metric_field"], "method": "COUNT"}],
@@ -771,7 +789,13 @@ class GetVariableValue(Resource):
             index_set_id=index_set_id,
             query_string=params.get("query_string", ""),
         )
-        records = data_source.query_dimensions(
+        query = UnifyQuery(
+            bk_biz_id=bk_biz_id,
+            bk_tenant_id=data_source.bk_tenant_id,
+            data_sources=[data_source],
+            expression="",
+        )
+        records = query.query_dimensions(
             dimension_field=fields,
             limit=GRAPH_MAX_SLIMIT,
             start_time=start_time * 1000,
@@ -884,12 +908,11 @@ class GetVariableValue(Resource):
             obj_id_to_obj_name = {n.bk_obj_id: n.bk_obj_name for n in topo_tree.convert_to_flat_nodes()}
             result = [{"label": obj_id_to_obj_name.get(str(v), v), "value": v} for v in dimensions]
         elif dimension_field == "bk_target_service_instance_id":
-            bk_target_service_instance_list = api.cmdb.get_service_instance_by_id(
-                bk_biz_id=bk_biz_id, service_instance_ids=dimensions
+            service_instances = api.cmdb.get_service_instance_by_id(
+                bk_biz_id=bk_biz_id, service_instance_ids=[v for v in dimensions if str(v).isdecimal()]
             )
-            result = [
-                {"label": item.name, "value": item.service_instance_id} for item in bk_target_service_instance_list
-            ]
+            id_to_names = {str(item.service_instance_id): item.name for item in service_instances}
+            result = [{"label": id_to_names.get(str(v), v), "value": v} for v in dimensions]
         elif dimension_field == "bk_inst_id":
             topo_tree = api.cmdb.get_topo_tree(bk_biz_id=bk_biz_id)
             id_to_names = {}
@@ -940,8 +963,19 @@ class GetVariableValue(Resource):
                     {"label": task_name_mapping.get(v, _("任务({})已删除").format(v)), "value": v} for v in dimensions
                 ]
             elif dimension_field == "node_id":
-                nodes = list_nodes(bk_tenant_id=bk_tenant_id, query={"node_ids": dimensions})
-                result = [{"label": node.name, "value": str(node.id)} for node in nodes]
+                # 拨测 node_id 维度值有两种上报格式：数字主键（旧版 uptimecheckbeat 上报）
+                # 与 bk_cloud_id:ip（新版 bkmonitorbeat 上报）。底座 list_nodes 的 node_ids
+                # 过滤按整数主键匹配，若把 bk_cloud_id:ip 直接传入会触发
+                # "Field 'id' expected a number" 的 ValueError，因此一次性取出业务下的拨测节点，
+                # 同时按两种格式建立 label 映射，未命中的维度值原样返回，避免整个变量查询失败。
+                # include_common=True：业务可使用公共拨测节点，公共节点维度值同样需要翻译，
+                # 否则其数字 ID / bk_cloud_id:ip 会原样展示。
+                node_label_mapping: dict[str, str] = {}
+                for node in list_nodes(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id, query={"include_common": True}):
+                    node_label_mapping[str(node.id)] = node.name
+                    if node.plat_id is not None and node.ip:
+                        node_label_mapping[f"{node.plat_id}:{node.ip}"] = node.name
+                result = [{"label": node_label_mapping.get(str(v), str(v)), "value": str(v)} for v in dimensions]
 
         result = result or [{"label": v, "value": v} for v in dimensions]
 

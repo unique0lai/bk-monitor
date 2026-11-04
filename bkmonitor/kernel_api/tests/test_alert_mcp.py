@@ -1,0 +1,1166 @@
+"""
+Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
+Copyright (C) 2017-2025 Tencent. All rights reserved.
+Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+"""
+
+import sys
+from copy import deepcopy
+from types import ModuleType, SimpleNamespace
+
+import pytest
+from django.http import QueryDict
+from rest_framework.exceptions import ValidationError
+
+from kernel_api.resource import alert
+
+
+@pytest.mark.parametrize(("timeout", "expected_valid"), [(7200, True), (7201, False)])
+def test_action_execute_config_timeout_limit(timeout, expected_valid):
+    serializer = alert.ActionExecuteConfigSerializer(data={"template_detail": {}, "timeout": timeout})
+
+    assert serializer.is_valid() is expected_valid
+
+
+def test_business_scoped_serializer_preserves_backend_fields():
+    serializer = alert.BusinessScopedSerializer(
+        data={"bk_biz_id": "2", "conditions": [{"key": "strategy_status", "value": ["ON"]}]}
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data == {
+        "bk_biz_id": 2,
+        "conditions": [{"key": "strategy_status", "value": ["ON"]}],
+    }
+
+
+def test_confirmed_serializer_requires_true():
+    serializer = alert.ConfirmedBusinessScopedSerializer(data={"bk_biz_id": 2, "confirm": False})
+
+    assert not serializer.is_valid()
+    assert "confirm" in serializer.errors
+
+
+def test_get_alarm_strategy_condition_requires_value_list():
+    serializer = alert.GetAlarmStrategyResource.RequestSerializer(
+        data={
+            "bk_biz_id": 2,
+            "conditions": [{"key": "strategy_id", "value": 1}],
+        }
+    )
+
+    assert not serializer.is_valid()
+    assert "conditions" in serializer.errors
+
+
+def test_pass_through_serializer_flattens_get_query_params():
+    serializer = alert.BusinessScopedSerializer(data=QueryDict("bk_biz_id=2&page=3&order=-id"))
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data == {"bk_biz_id": 2, "page": "3", "order": "-id"}
+
+
+def test_merge_nested_dict_preserves_omitted_fields_and_replaces_arrays():
+    result = alert.merge_nested_dict(
+        {
+            "template_detail": {
+                "url": "https://old.example.com",
+                "headers": [{"key": "Authorization", "value": "old"}],
+                "authorize": {"auth_type": "none"},
+            },
+            "timeout": 600,
+        },
+        {
+            "template_detail": {
+                "url": "https://new.example.com",
+                "headers": [],
+            }
+        },
+    )
+
+    assert result == {
+        "template_detail": {
+            "url": "https://new.example.com",
+            "headers": [],
+            "authorize": {"auth_type": "none"},
+        },
+        "timeout": 600,
+    }
+
+
+def test_normalize_strategy_metric_ids_preserves_special_id_until_query_changes():
+    current_config = {
+        "items": [
+            {
+                "query_configs": [
+                    {
+                        "id": 20,
+                        "data_source_label": "bk_monitor",
+                        "data_type_label": "time_series",
+                        "result_table_id": "system.proc_port",
+                        "metric_field": "proc_exists",
+                        "metric_id": "bk_monitor.proc_port",
+                    }
+                ]
+            }
+        ]
+    }
+    request_data = deepcopy(current_config)
+
+    alert.normalize_strategy_metric_ids(request_data, current_config)
+    assert request_data["items"][0]["query_configs"][0]["metric_id"] == "bk_monitor.proc_port"
+
+    query_config = request_data["items"][0]["query_configs"][0]
+    query_config.update(
+        {
+            "data_source_label": "prometheus",
+            "data_type_label": "time_series",
+            "promql": "avg(cpu_usage)",
+        }
+    )
+    alert.normalize_strategy_metric_ids(request_data, current_config)
+    assert query_config["metric_id"] == "avg(cpu_usage)"
+
+
+def test_build_strategy_from_simplified_request():
+    result = alert.build_strategy_from_simplified_request(
+        {
+            "bk_biz_id": 2,
+            "name": "CPU 使用率高",
+            "scenario": "os",
+            "metric": {
+                "name": "CPU 使用率",
+                "data_source_label": "bk_monitor",
+                "data_type_label": "time_series",
+                "result_table_id": "system.cpu_summary",
+                "metric_field": "usage",
+                "unit": "percent",
+            },
+            "detect": {
+                "level": 2,
+                "algorithm_type": "Threshold",
+                "method": "gt",
+                "threshold": 80,
+                "trigger_count": 5,
+                "check_window": 5,
+            },
+            "notice_group_ids": [1],
+            "action_config_ids": [3],
+        }
+    )
+
+    assert result["items"][0]["query_configs"][0]["alias"] == "a"
+    assert result["items"][0]["algorithms"][0]["config"] == [[{"method": "gt", "threshold": 80}]]
+    assert result["detects"][0]["trigger_config"] == {"count": 5, "check_window": 5}
+    assert result["notice"]["user_groups"] == [1]
+    assert result["actions"][0]["config_id"] == 3
+    assert "metric" not in result
+    assert "detect" not in result
+
+
+def test_update_alarm_strategy_prevalidates_issue_config(monkeypatch):
+    class CandidateStrategy:
+        public_dimensions = []
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def convert(self):
+            pass
+
+    monkeypatch.setattr(alert, "Strategy", CandidateStrategy)
+
+    with pytest.raises(ValidationError, match="alert_levels"):
+        alert._validate_strategy_before_write({"issue_config": {}})
+
+
+def test_update_alarm_strategy_requires_complete_config():
+    serializer = alert.UpdateAlarmStrategyResource.RequestSerializer(
+        data={
+            "bk_biz_id": 2,
+            "ids": [1],
+            "edit_data": {"algorithms": []},
+            "confirm": True,
+        }
+    )
+
+    assert not serializer.is_valid()
+    assert {"id", "name", "scenario", "items", "detects", "notice", "actions"} <= set(serializer.errors)
+
+
+def test_update_alarm_strategy_uses_full_save(monkeypatch):
+    captured = {}
+    request_data = {
+        "bk_biz_id": 2,
+        "id": 1,
+        "name": "CPU 使用率高",
+        "type": "monitor",
+        "source": "bkmonitorv3",
+        "scenario": "os",
+        "is_enabled": True,
+        "is_invalid": False,
+        "invalid_type": "",
+        "items": [
+            {
+                "id": 10,
+                "query_configs": [
+                    {
+                        "id": 20,
+                        "data_source_label": "prometheus",
+                        "data_type_label": "time_series",
+                        "metric_id": "old_query",
+                        "promql": "avg(cpu_usage)",
+                    }
+                ],
+            }
+        ],
+        "detects": [{"id": 30}],
+        "notice": {"user_groups": []},
+        "actions": [],
+        "labels": [],
+        "app": "",
+        "path": "",
+        "priority": None,
+        "priority_group_key": "",
+        "metric_type": "time_series",
+        "issue_config": None,
+        "update_time": "2026-07-21 18:00:00+0800",
+        "config_version": "version-1",
+        "confirm": True,
+    }
+    fake_resource = SimpleNamespace(
+        strategies=SimpleNamespace(
+            save_strategy_v2=SimpleNamespace(request=lambda **kwargs: captured.update(kwargs) or {"id": kwargs["id"]})
+        )
+    )
+    monkeypatch.setattr(alert, "resource", fake_resource)
+    monkeypatch.setattr(alert, "ensure_strategy_relations_belong_to_biz", lambda _bk_biz_id, _data: None)
+    monkeypatch.setattr(alert, "get_strategy_config_version", lambda _value: "version-1")
+    current_strategy_config = {
+        "items": [
+            {
+                "query_configs": [
+                    {
+                        "id": 20,
+                        "data_source_label": "prometheus",
+                        "data_type_label": "time_series",
+                        "metric_id": "old_query",
+                        "promql": "old_query",
+                    }
+                ]
+            }
+        ]
+    }
+    current_strategy_obj = SimpleNamespace(
+        restore=lambda: None,
+        to_dict=lambda convert_dashboard: current_strategy_config,
+    )
+    monkeypatch.setattr(
+        alert.Strategy,
+        "from_models",
+        lambda _models: [current_strategy_obj],
+    )
+    monkeypatch.setattr(
+        alert,
+        "StrategyModel",
+        SimpleNamespace(
+            DoesNotExist=type("DoesNotExist", (Exception,), {}),
+            objects=SimpleNamespace(get=lambda **_kwargs: SimpleNamespace(update_time=object())),
+        ),
+    )
+
+    serializer = alert.UpdateAlarmStrategyResource.RequestSerializer(data=request_data)
+    assert serializer.is_valid(), serializer.errors
+    result = alert.UpdateAlarmStrategyResource().perform_request(serializer.validated_data)
+
+    assert result == {"id": 1}
+    assert captured["items"][0]["query_configs"][0]["promql"] == "avg(cpu_usage)"
+    assert captured["items"][0]["query_configs"][0]["metric_id"] == "avg(cpu_usage)"
+    assert "confirm" not in captured
+    assert "edit_data" not in captured
+
+
+def test_update_alarm_strategy_rejects_stale_snapshot(monkeypatch):
+    monkeypatch.setattr(alert, "get_strategy_config_version", lambda _value: "new-version")
+    monkeypatch.setattr(
+        alert.Strategy,
+        "from_models",
+        lambda _models: [SimpleNamespace(restore=lambda: None, to_dict=lambda convert_dashboard: {})],
+    )
+    monkeypatch.setattr(
+        alert,
+        "StrategyModel",
+        SimpleNamespace(
+            DoesNotExist=type("DoesNotExist", (Exception,), {}),
+            objects=SimpleNamespace(get=lambda **_kwargs: SimpleNamespace(id=1, bk_biz_id=2)),
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="重新调用 get_alarm_strategy"):
+        alert.UpdateAlarmStrategyResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "id": 1,
+                "items": [
+                    {
+                        "query_configs": [
+                            {
+                                "data_source_label": "prometheus",
+                                "data_type_label": "time_series",
+                                "promql": "avg(cpu_usage)",
+                            }
+                        ]
+                    }
+                ],
+                "update_time": "old-update-time",
+                "config_version": "old-version",
+                "confirm": True,
+            }
+        )
+
+
+def test_update_alarm_strategy_avoids_select_for_update(monkeypatch):
+    """BackendRouter 下 select_for_update 会因事务库不一致 500，更新路径不得调用它。"""
+
+    calls = {"select_for_update": 0, "get": 0}
+
+    class FakeManager:
+        def select_for_update(self):
+            calls["select_for_update"] += 1
+            raise AssertionError("update_alarm_strategy must not use select_for_update")
+
+        def get(self, **_kwargs):
+            calls["get"] += 1
+            return SimpleNamespace(id=1, bk_biz_id=2)
+
+    monkeypatch.setattr(
+        alert,
+        "StrategyModel",
+        SimpleNamespace(DoesNotExist=type("DoesNotExist", (Exception,), {}), objects=FakeManager()),
+    )
+    monkeypatch.setattr(
+        alert.Strategy,
+        "from_models",
+        lambda _models: [
+            SimpleNamespace(
+                restore=lambda: None,
+                to_dict=lambda convert_dashboard: {
+                    "items": [
+                        {
+                            "query_configs": [
+                                {
+                                    "id": 20,
+                                    "data_source_label": "prometheus",
+                                    "data_type_label": "time_series",
+                                    "metric_id": "avg(cpu_usage)",
+                                    "promql": "avg(cpu_usage)",
+                                }
+                            ]
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    monkeypatch.setattr(alert, "get_strategy_config_version", lambda _value: "version-1")
+    monkeypatch.setattr(alert, "ensure_strategy_relations_belong_to_biz", lambda _bk_biz_id, _data: None)
+    monkeypatch.setattr(
+        alert,
+        "resource",
+        SimpleNamespace(strategies=SimpleNamespace(save_strategy_v2=SimpleNamespace(request=lambda **kwargs: kwargs))),
+    )
+
+    result = alert.UpdateAlarmStrategyResource().perform_request(
+        {
+            "bk_biz_id": 2,
+            "id": 1,
+            "name": "CPU",
+            "type": "monitor",
+            "source": "bkmonitorv3",
+            "scenario": "os",
+            "is_enabled": True,
+            "is_invalid": False,
+            "invalid_type": "",
+            "items": [
+                {
+                    "id": 10,
+                    "query_configs": [
+                        {
+                            "id": 20,
+                            "data_source_label": "prometheus",
+                            "data_type_label": "time_series",
+                            "metric_id": "avg(cpu_usage)",
+                            "promql": "avg(cpu_usage)",
+                        }
+                    ],
+                }
+            ],
+            "detects": [{"id": 30}],
+            "notice": {"user_groups": []},
+            "actions": [],
+            "labels": [],
+            "app": "",
+            "path": "",
+            "priority": None,
+            "priority_group_key": "",
+            "metric_type": "time_series",
+            "issue_config": None,
+            "update_time": "2026-07-22 11:00:00+0800",
+            "config_version": "version-1",
+            "confirm": True,
+        }
+    )
+
+    assert calls == {"select_for_update": 0, "get": 1}
+    assert result["id"] == 1
+
+
+def test_get_alarm_strategy_returns_candidates_when_not_unique(monkeypatch):
+    class FakeQuerySet(list):
+        def filter(self, **kwargs):
+            strategies = self
+            for key, value in kwargs.items():
+                if key == "id__in":
+                    strategies = [strategy for strategy in strategies if strategy.id in value]
+                elif key == "name__in":
+                    strategies = [strategy for strategy in strategies if strategy.name in value]
+                else:
+                    strategies = [strategy for strategy in strategies if getattr(strategy, key) == value]
+            return FakeQuerySet(strategies)
+
+        def count(self):
+            return len(self)
+
+        def order_by(self, *_args):
+            return self
+
+    strategies = FakeQuerySet(
+        [
+            SimpleNamespace(
+                id=1,
+                name="CPU",
+                bk_biz_id=2,
+                scenario="os",
+                is_enabled=True,
+                update_time=None,
+            ),
+            SimpleNamespace(
+                id=2,
+                name="CPU-2",
+                bk_biz_id=2,
+                scenario="os",
+                is_enabled=False,
+                update_time=None,
+            ),
+        ]
+    )
+    monkeypatch.setattr(alert, "StrategyModel", SimpleNamespace(objects=strategies))
+
+    result = alert.GetAlarmStrategyResource().perform_request(
+        {"bk_biz_id": 2, "conditions": [{"key": "strategy_name", "value": ["CPU", "CPU-2"]}]}
+    )
+
+    assert result["total"] == 2
+    assert result["candidates"] == [
+        {
+            "id": 1,
+            "name": "CPU",
+            "bk_biz_id": 2,
+            "scenario": "os",
+            "is_enabled": True,
+            "update_time": None,
+        },
+        {
+            "id": 2,
+            "name": "CPU-2",
+            "bk_biz_id": 2,
+            "scenario": "os",
+            "is_enabled": False,
+            "update_time": None,
+        },
+    ]
+
+
+def test_ensure_shield_belongs_to_biz_rejects_cross_biz(monkeypatch):
+    fake_resource = SimpleNamespace(
+        shield=SimpleNamespace(
+            shield_detail=SimpleNamespace(request=lambda **kwargs: {"id": kwargs["id"], "bk_biz_id": 3}),
+        )
+    )
+    monkeypatch.setattr(alert, "resource", fake_resource)
+
+    with pytest.raises(ValidationError):
+        alert.ensure_shield_belongs_to_biz(2, 10)
+
+
+def test_strategy_snapshot_rejects_cross_biz(monkeypatch):
+    monkeypatch.setattr(
+        alert.AlertDocument,
+        "get",
+        lambda _id: SimpleNamespace(event=SimpleNamespace(bk_biz_id=3)),
+    )
+
+    with pytest.raises(ValidationError):
+        alert.ListStrategySnapshotResource().perform_request({"bk_biz_id": 2, "id": 10})
+
+
+def test_search_alert_events_rejects_cross_biz_before_query(monkeypatch):
+    called = False
+
+    class FakeBackendResource:
+        def request(self, **kwargs):
+            nonlocal called
+            called = True
+            return {"events": []}
+
+    monkeypatch.setattr(
+        alert.AlertDocument,
+        "get",
+        lambda _id: SimpleNamespace(event=SimpleNamespace(bk_biz_id=3)),
+    )
+    resource_instance = alert.SearchAlertEventsResource()
+    resource_instance.backend_resource_class = FakeBackendResource
+
+    with pytest.raises(ValidationError):
+        resource_instance.perform_request({"bk_biz_id": 2, "alert_id": "alert-b", "page": 1})
+
+    assert called is False
+
+
+def test_search_alert_events_requires_business_id():
+    serializer = alert.SearchAlertEventsResource.RequestSerializer(data={"alert_id": "alert-1"})
+
+    assert serializer.is_valid() is False
+    assert "bk_biz_id" in serializer.errors
+
+
+def test_alert_related_resource_checks_biz_and_strips_auth_param(monkeypatch):
+    captured = {}
+
+    class FakeBackendResource:
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        alert.AlertDocument,
+        "get",
+        lambda _id: SimpleNamespace(event=SimpleNamespace(bk_biz_id=2)),
+    )
+    resource_instance = alert.ListAlertEventsResource()
+    resource_instance.backend_resource_class = FakeBackendResource
+
+    result = resource_instance.perform_request({"bk_biz_id": 2, "alert_id": "alert-1", "limit": 5})
+
+    assert result == {"ok": True}
+    assert captured == {"alert_id": "alert-1", "limit": 5}
+
+
+def test_create_alarm_shield_defaults_one_time_cycle():
+    serializer = alert.CreateAlarmShieldResource.RequestSerializer(
+        data={
+            "bk_biz_id": 2,
+            "category": "strategy",
+            "begin_time": "2026-07-20 20:00:00",
+            "end_time": "2026-07-20 21:00:00",
+            "shield_notice": False,
+            "dimension_config": {"id": [1]},
+            "confirm": True,
+        }
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data["cycle_config"]["type"] == 1
+
+
+@pytest.mark.parametrize(
+    "category,dimension_config",
+    [
+        ("scope", {"scope_type": "unknown", "target": [1]}),
+        ("scope", {"scope_type": "ip", "target": []}),
+        ("scope", {"scope_type": "ip", "target": [{"ip": "127.0.0.1"}]}),
+        ("scope", {"scope_type": "dynamic_group", "target": [{}]}),
+        ("scope", {"scope_type": "instance", "target": [0]}),
+        ("dimension", {"dimension_conditions": []}),
+    ],
+)
+def test_create_alarm_shield_rejects_unsafe_targets(category, dimension_config):
+    serializer = alert.CreateAlarmShieldResource.RequestSerializer(
+        data={
+            "bk_biz_id": 2,
+            "category": category,
+            "begin_time": "2026-07-20 20:00:00",
+            "end_time": "2026-07-20 21:00:00",
+            "shield_notice": False,
+            "dimension_config": dimension_config,
+            "confirm": True,
+        }
+    )
+
+    assert not serializer.is_valid()
+    assert any(field.startswith("dimension_config") for field in serializer.errors)
+
+
+def test_create_alarm_shield_requires_complete_notice_config():
+    serializer = alert.CreateAlarmShieldResource.RequestSerializer(
+        data={
+            "bk_biz_id": 2,
+            "category": "strategy",
+            "begin_time": "2026-07-20 20:00:00",
+            "end_time": "2026-07-20 21:00:00",
+            "shield_notice": True,
+            "notice_config": {"notice_time": 5},
+            "dimension_config": {"id": [1]},
+            "confirm": True,
+        }
+    )
+
+    assert not serializer.is_valid()
+    assert "notice_config" in serializer.errors
+
+
+def test_create_alert_shield_rejects_cross_biz(monkeypatch):
+    monkeypatch.setattr(
+        alert.AlertDocument,
+        "get",
+        lambda _id: SimpleNamespace(event=SimpleNamespace(bk_biz_id=3)),
+    )
+
+    with pytest.raises(ValidationError):
+        alert.CreateAlarmShieldResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "category": "alert",
+                "dimension_config": {"alert_ids": ["alert-1"]},
+                "confirm": True,
+            }
+        )
+
+
+def test_create_alert_shield_rejects_two_id_forms():
+    with pytest.raises(ValidationError):
+        alert.CreateAlarmShieldResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "category": "alert",
+                "dimension_config": {"alert_id": "alert-1", "alert_ids": ["alert-2"]},
+                "confirm": True,
+            }
+        )
+
+
+def test_normalize_shield_notice_config_converts_stored_receivers():
+    result = alert.normalize_shield_notice_config(
+        {
+            "notice_time": 5,
+            "notice_way": ["weixin"],
+            "notice_receiver": ["user#alice", {"type": "group", "id": "bk_biz_maintainer"}],
+        }
+    )
+
+    assert result["notice_receiver"] == [
+        {"type": "user", "id": "alice"},
+        {"type": "group", "id": "bk_biz_maintainer"},
+    ]
+
+
+def test_strategy_relation_validation_rejects_non_list_actions():
+    with pytest.raises(ValidationError):
+        alert.ensure_strategy_relations_belong_to_biz(2, {"actions": True})
+
+
+def test_ensure_duty_rules_belong_to_current_or_public_biz(monkeypatch):
+    class FakeQuerySet:
+        def values_list(self, *_args, **_kwargs):
+            return [1, 2]
+
+    class FakeManager:
+        def filter(self, **kwargs):
+            assert kwargs["bk_biz_id__in"] == [0, 2]
+            return FakeQuerySet()
+
+    monkeypatch.setattr(alert, "DutyRule", SimpleNamespace(objects=FakeManager()))
+
+    alert.ensure_duty_rules_belong_to_biz(2, [1, 2])
+    with pytest.raises(ValidationError):
+        alert.ensure_duty_rules_belong_to_biz(2, [1, 3])
+
+
+def test_get_alarm_strategy_honors_convert_dashboard(monkeypatch):
+    class FakeQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def count(self):
+            return 1
+
+        def first(self):
+            return SimpleNamespace(id=1)
+
+    fake_strategy = SimpleNamespace(
+        update_time=object(),
+        restore=lambda: None,
+        to_dict=lambda convert_dashboard: {
+            "convert_dashboard": convert_dashboard,
+            "actions": [],
+            "notice": {},
+        },
+    )
+    monkeypatch.setattr(alert, "StrategyModel", SimpleNamespace(objects=FakeQuerySet()))
+    monkeypatch.setattr(alert.Strategy, "from_models", lambda _models: [fake_strategy])
+    monkeypatch.setattr(alert, "get_strategy_config_version", lambda _value: "version-1")
+
+    result = alert.GetAlarmStrategyResource().perform_request(
+        {
+            "bk_biz_id": 2,
+            "conditions": [{"key": "strategy_id", "value": ["1"]}],
+            "with_user_group": False,
+            "with_user_group_detail": False,
+            "convert_dashboard": False,
+        }
+    )
+
+    assert result["convert_dashboard"] is False
+    assert result["config_version"] == "version-1"
+
+
+def test_update_action_config_merges_nested_config_and_preserves_plugin(monkeypatch):
+    captured = {}
+    current_config = {
+        "id": 9,
+        "bk_biz_id": 2,
+        "name": "HTTP callback",
+        "desc": "",
+        "plugin_id": 2,
+        "is_enabled": True,
+        "execute_config": {
+            "template_detail": {
+                "method": "POST",
+                "url": "https://old.example.com",
+                "headers": [{"key": "Authorization", "value": "token"}],
+                "authorize": {"auth_type": "none"},
+            },
+            "timeout": 600,
+        },
+    }
+
+    class FakeGetActionConfigResource:
+        def request(self, **_kwargs):
+            return current_config
+
+    class FakeEditActionConfigResource:
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            return kwargs
+
+    fake_module = ModuleType("kernel_api.views.v4.action_config")
+    fake_module.GetActionConfigResource = FakeGetActionConfigResource
+    fake_module.EditActionConfigResource = FakeEditActionConfigResource
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.action_config", fake_module)
+
+    request_data = {
+        "bk_biz_id": 2,
+        "id": 9,
+        "name": "HTTP callback",
+        "desc": "updated",
+        "execute_config": {
+            "template_detail": {"url": "https://new.example.com"},
+            "timeout": 600,
+        },
+        "is_enabled": False,
+        "confirm": True,
+    }
+    serializer = alert.UpdateMCPActionConfigResource.RequestSerializer(data=request_data)
+    assert serializer.is_valid(), serializer.errors
+
+    alert.UpdateMCPActionConfigResource().perform_request(serializer.validated_data)
+
+    assert captured["plugin_id"] == 2
+    assert captured["is_enabled"] is False
+    assert captured["execute_config"]["template_detail"] == {
+        "method": "POST",
+        "url": "https://new.example.com",
+        "headers": [{"key": "Authorization", "value": "token"}],
+        "authorize": {"auth_type": "none"},
+    }
+
+
+def test_update_action_config_rejects_plugin_change(monkeypatch):
+    class FakeGetActionConfigResource:
+        def request(self, **_kwargs):
+            return {
+                "id": 9,
+                "bk_biz_id": 2,
+                "plugin_id": 2,
+                "execute_config": {"template_detail": {}, "timeout": 600},
+            }
+
+    fake_module = ModuleType("kernel_api.views.v4.action_config")
+    fake_module.GetActionConfigResource = FakeGetActionConfigResource
+    fake_module.EditActionConfigResource = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.action_config", fake_module)
+
+    with pytest.raises(ValidationError):
+        alert.UpdateMCPActionConfigResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "id": 9,
+                "name": "HTTP callback",
+                "desc": "",
+                "plugin_id": 3,
+                "execute_config": {"template_detail": {}, "timeout": 600},
+                "is_enabled": True,
+                "confirm": True,
+            }
+        )
+
+
+def test_search_alarm_shields_filters_source_without_changing_backend_serializer(monkeypatch):
+    captured = {}
+
+    class FakeQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def values_list(self, *_args, **_kwargs):
+            return [11, 12]
+
+    fake_resource = SimpleNamespace(
+        shield=SimpleNamespace(
+            shield_list=SimpleNamespace(
+                request=lambda **kwargs: captured.update(kwargs)
+                or {"count": 2, "shield_list": [{"id": 11}, {"id": 12}]}
+            )
+        )
+    )
+    monkeypatch.setattr(alert, "resource", fake_resource)
+    monkeypatch.setattr(alert, "Shield", SimpleNamespace(objects=FakeQuerySet()))
+
+    result = alert.SearchAlarmShieldsResource().perform_request({"bk_biz_id": 2, "source": "mcp"})
+
+    assert result["count"] == 2
+    assert "source" not in captured
+    assert {"key": "id", "value": [11, 12]} in captured["conditions"]
+
+
+def _fake_user_group_queryset(existing_ids):
+    class FakeQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def values_list(self, *_args, **_kwargs):
+            return existing_ids
+
+    return SimpleNamespace(objects=FakeQuerySet())
+
+
+def test_save_assign_group_requires_confirm():
+    serializer = alert.SaveAlarmAssignGroupResource.RequestSerializer(
+        data={"bk_biz_id": 2, "name": "CPU 分派", "priority": 10, "confirm": False}
+    )
+
+    assert not serializer.is_valid()
+    assert "confirm" in serializer.errors
+
+
+def test_save_assign_group_create_requires_name_and_priority():
+    with pytest.raises(ValidationError) as create_without_name:
+        alert.SaveAlarmAssignGroupResource().perform_request({"bk_biz_id": 2, "priority": 10, "confirm": True})
+    assert "name" in create_without_name.value.detail
+
+    with pytest.raises(ValidationError) as create_without_priority:
+        alert.SaveAlarmAssignGroupResource().perform_request({"bk_biz_id": 2, "name": "CPU 分派", "confirm": True})
+    assert "priority" in create_without_priority.value.detail
+
+
+def test_save_assign_group_fills_omitted_fields_on_update(monkeypatch):
+    captured = {}
+    current_group = {
+        "id": 8,
+        "name": "CPU 分派",
+        "priority": 10,
+        "source": "bkmonitorv3",
+        "rules": [
+            {
+                "id": 1,
+                "user_groups": [29],
+                "conditions": [{"field": "alert.name", "value": ["CPU"], "method": "eq"}],
+            }
+        ],
+    }
+
+    class FakeSearch:
+        def request(self, **kwargs):
+            if kwargs.get("group_ids") == [8]:
+                return [current_group]
+            return []
+
+    class FakeSave:
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            return {"assign_group_id": 8, "rules": [1], "aborted_rules": []}
+
+    fake_module = ModuleType("kernel_api.views.v4.assign")
+    fake_module.SearchRuleGroupResource = FakeSearch
+    fake_module.SaveRuleGroupResource = FakeSave
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.assign", fake_module)
+    monkeypatch.setattr(alert, "UserGroup", _fake_user_group_queryset([29]))
+
+    result = alert.SaveAlarmAssignGroupResource().perform_request(
+        {"bk_biz_id": 2, "assign_group_id": 8, "confirm": True}
+    )
+
+    assert result["assign_group_id"] == 8
+    assert captured["name"] == "CPU 分派"
+    assert captured["priority"] == 10
+    assert captured["rules"] == current_group["rules"]
+    assert "confirm" not in captured
+
+
+def test_save_assign_group_rejects_missing_and_builtin_groups(monkeypatch):
+    class FakeSearch:
+        def request(self, **kwargs):
+            if kwargs.get("group_ids") == [9]:
+                return [{"id": 9, "name": "内置", "priority": 1, "source": "__datalink_collecting__", "rules": []}]
+            return []
+
+    fake_module = ModuleType("kernel_api.views.v4.assign")
+    fake_module.SearchRuleGroupResource = FakeSearch
+    fake_module.SaveRuleGroupResource = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.assign", fake_module)
+
+    with pytest.raises(ValidationError) as missing:
+        alert.SaveAlarmAssignGroupResource().perform_request({"bk_biz_id": 2, "assign_group_id": 8, "confirm": True})
+    assert "assign_group_id" in missing.value.detail
+
+    with pytest.raises(ValidationError) as builtin:
+        alert.SaveAlarmAssignGroupResource().perform_request({"bk_biz_id": 2, "assign_group_id": 9, "confirm": True})
+    assert "assign_group_id" in builtin.value.detail
+
+
+def test_save_assign_group_rejects_foreign_user_groups(monkeypatch):
+    class FakeSearch:
+        def request(self, **_kwargs):
+            return [{"id": 8, "name": "CPU 分派", "priority": 10, "source": "bkmonitorv3", "rules": []}]
+
+    fake_module = ModuleType("kernel_api.views.v4.assign")
+    fake_module.SearchRuleGroupResource = FakeSearch
+    fake_module.SaveRuleGroupResource = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.assign", fake_module)
+    monkeypatch.setattr(alert, "UserGroup", _fake_user_group_queryset([]))
+
+    with pytest.raises(ValidationError) as exc:
+        alert.SaveAlarmAssignGroupResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "assign_group_id": 8,
+                "rules": [
+                    {
+                        "user_groups": [29],
+                        "conditions": [{"field": "alert.name", "value": ["CPU"]}],
+                    }
+                ],
+                "confirm": True,
+            }
+        )
+    assert "user_groups" in exc.value.detail
+
+
+def test_delete_assign_group_rejects_missing_and_builtin_groups(monkeypatch):
+    class FakeSearch:
+        def request(self, **kwargs):
+            group_ids = set(kwargs.get("group_ids") or [])
+            groups = []
+            if 8 in group_ids:
+                groups.append({"id": 8, "source": "bkmonitorv3"})
+            if 9 in group_ids:
+                groups.append({"id": 9, "source": "__datalink_collecting__"})
+            return groups
+
+    fake_module = ModuleType("kernel_api.views.v4.assign")
+    fake_module.SearchRuleGroupResource = FakeSearch
+    fake_module.DeleteRuleGroupResource = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.assign", fake_module)
+
+    with pytest.raises(ValidationError) as missing:
+        alert.DeleteAlarmAssignGroupResource().perform_request({"bk_biz_id": 2, "group_ids": [8, 10], "confirm": True})
+    assert "group_ids" in missing.value.detail
+
+    with pytest.raises(ValidationError) as builtin:
+        alert.DeleteAlarmAssignGroupResource().perform_request({"bk_biz_id": 2, "group_ids": [9], "confirm": True})
+    assert "group_ids" in builtin.value.detail
+
+
+def test_delete_assign_group_calls_backend_after_biz_check(monkeypatch):
+    captured = {}
+
+    class FakeSearch:
+        def request(self, **_kwargs):
+            return [{"id": 8, "source": "bkmonitorv3"}]
+
+    class FakeDelete:
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            return {"deleted_group_ids": [8]}
+
+    fake_module = ModuleType("kernel_api.views.v4.assign")
+    fake_module.SearchRuleGroupResource = FakeSearch
+    fake_module.DeleteRuleGroupResource = FakeDelete
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.assign", fake_module)
+
+    result = alert.DeleteAlarmAssignGroupResource().perform_request({"bk_biz_id": 2, "group_ids": [8], "confirm": True})
+
+    assert result == {"deleted_group_ids": [8]}
+    assert captured == {"bk_biz_id": 2, "group_ids": [8]}
+
+
+def test_create_notice_group_requires_confirm():
+    serializer = alert.CreateNoticeGroupResource.RequestSerializer(
+        data={"bk_biz_id": 2, "name": "SRE 值班", "receivers": [{"id": "alice", "type": "user"}], "confirm": False}
+    )
+
+    assert not serializer.is_valid()
+    assert "confirm" in serializer.errors
+
+
+def test_create_notice_group_rejects_id_and_missing_receivers(monkeypatch):
+    class FakeQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def exists(self):
+            return False
+
+    monkeypatch.setattr(alert, "UserGroup", SimpleNamespace(objects=FakeQuerySet()))
+
+    with pytest.raises(ValidationError) as with_id:
+        alert.CreateNoticeGroupResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "id": 9,
+                "name": "SRE 值班",
+                "receivers": [{"id": "alice", "type": "user"}],
+                "confirm": True,
+            }
+        )
+    assert "id" in with_id.value.detail
+
+    with pytest.raises(ValidationError) as missing_receivers:
+        alert.CreateNoticeGroupResource().perform_request({"bk_biz_id": 2, "name": "SRE 值班", "confirm": True})
+    assert "receivers" in missing_receivers.value.detail
+
+
+def test_create_notice_group_maps_receivers_and_defaults(monkeypatch):
+    captured = {}
+
+    class FakeQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def exists(self):
+            return False
+
+    class FakeSave:
+        def request(self, **kwargs):
+            captured.update(kwargs)
+            return {"id": 21, "name": kwargs["name"], "bk_biz_id": kwargs["bk_biz_id"]}
+
+    fake_module = ModuleType("kernel_api.views.v4.notice_group")
+    fake_module.SaveUserGroupResource = FakeSave
+    monkeypatch.setitem(sys.modules, "kernel_api.views.v4.notice_group", fake_module)
+    monkeypatch.setattr(alert, "UserGroup", SimpleNamespace(objects=FakeQuerySet()))
+
+    result = alert.CreateNoticeGroupResource().perform_request(
+        {
+            "bk_biz_id": 2,
+            "name": "SRE 值班",
+            "receivers": [{"id": "alice", "type": "user"}, {"id": "bk_biz_maintainer", "type": "group"}],
+            "confirm": True,
+        }
+    )
+
+    assert result["id"] == 21
+    assert captured["duty_arranges"] == [
+        {"users": [{"id": "alice", "type": "user"}, {"id": "bk_biz_maintainer", "type": "group"}]}
+    ]
+    assert captured["alert_notice"][0]["notify_config"][0]["type"] == ["mail"]
+    assert captured["action_notice"][0]["notify_config"][0]["type"] == ["mail"]
+    assert captured["need_duty"] is False
+    assert "receivers" not in captured
+    assert "confirm" not in captured
+
+
+def test_create_notice_group_rejects_duplicate_name(monkeypatch):
+    class FakeQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def exists(self):
+            return True
+
+    monkeypatch.setattr(alert, "UserGroup", SimpleNamespace(objects=FakeQuerySet()))
+
+    with pytest.raises(ValidationError) as exc:
+        alert.CreateNoticeGroupResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "name": "SRE 值班",
+                "receivers": [{"id": "alice", "type": "user"}],
+                "confirm": True,
+            }
+        )
+    assert "name" in exc.value.detail
+
+
+def test_create_notice_group_rejects_foreign_duty_rules(monkeypatch):
+    class FakeQuerySet:
+        def filter(self, **_kwargs):
+            return self
+
+        def exists(self):
+            return False
+
+        def values_list(self, *_args, **_kwargs):
+            return [11]
+
+    monkeypatch.setattr(alert, "UserGroup", SimpleNamespace(objects=FakeQuerySet()))
+    monkeypatch.setattr(alert, "DutyRule", SimpleNamespace(objects=FakeQuerySet()))
+
+    with pytest.raises(ValidationError) as foreign_rule:
+        alert.CreateNoticeGroupResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "name": "SRE 轮值",
+                "need_duty": True,
+                "duty_rules": [11, 99],
+                "confirm": True,
+            }
+        )
+    assert "duty_rules" in foreign_rule.value.detail
+
+    with pytest.raises(ValidationError) as missing_rules:
+        alert.CreateNoticeGroupResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "name": "SRE 轮值",
+                "need_duty": True,
+                "confirm": True,
+            }
+        )
+    assert "duty_rules" in missing_rules.value.detail
+
+    with pytest.raises(ValidationError) as mixed_inputs:
+        alert.CreateNoticeGroupResource().perform_request(
+            {
+                "bk_biz_id": 2,
+                "name": "SRE 值班",
+                "receivers": [{"id": "alice", "type": "user"}],
+                "duty_arranges": [{"users": [{"id": "bob", "type": "user"}]}],
+                "confirm": True,
+            }
+        )
+    assert "receivers" in mixed_inputs.value.detail

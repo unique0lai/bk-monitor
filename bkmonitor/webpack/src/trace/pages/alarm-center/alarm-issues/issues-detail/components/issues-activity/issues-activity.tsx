@@ -27,6 +27,8 @@ import { type PropType, defineComponent, nextTick, shallowRef, useTemplateRef } 
 
 import { Button, Dialog, Input, Message } from 'bkui-vue';
 import dayjs from 'dayjs';
+import { editIssueFollowUp } from 'monitor-api/modules/issue';
+import { storeToRefs } from 'pinia';
 import { useI18n } from 'vue-i18n';
 
 import MarkdownEditor from '../../../../../../components/markdown-editor/editor';
@@ -38,7 +40,12 @@ import {
   ISSUES_STATUS_MAP,
 } from '../../../constant';
 import { followUpIssues } from '../../../services/issues-operations';
+import IssuesLoading from '../issues-loading';
+import { DetailLoadStatus } from '../../../../common-detail/detail-loading';
+
 import BasicCard from '../basic-card/basic-card';
+import RelationTapdItem from '../issues-relation-tapd/relation-tapd-item';
+import { useAppStore } from '@/store/modules/app';
 
 import type { IssueActivityItem, IssueDetail } from '../../../typing';
 
@@ -47,6 +54,8 @@ import './issues-activity.scss';
 export default defineComponent({
   name: 'IssuesActivity',
   props: {
+    loaded: Boolean,
+    error: Boolean,
     detail: {
       type: Object as PropType<IssueDetail>,
       default: () => ({}),
@@ -61,11 +70,13 @@ export default defineComponent({
     },
   },
   emits: {
+    retry: () => true,
     commentChange: (_activities: IssueActivityItem[]) => true,
   },
   setup(props, { emit }) {
     const { t } = useI18n();
-
+    const appStore = useAppStore();
+    const { userName } = storeToRefs(appStore);
     const commonInput = useTemplateRef<InstanceType<typeof Input>>('commonInput');
     const activeNodeMap = ISSUES_ACTIVE_NODE_ICON_MAP;
 
@@ -74,8 +85,9 @@ export default defineComponent({
     /** 评论内容 */
     const commentContent = shallowRef('');
     /** 富文本编辑弹窗显示 */
-    const isMarkdownDialogShow = shallowRef(false);
-    const isEditMarkdown = shallowRef(false);
+    const markdownDialogShow = shallowRef(false);
+    /** 评论操作类型 */
+    const commentOperation = shallowRef<'create' | 'edit' | 'view'>('create');
     /** 富文本内容 */
     const markdownContent = shallowRef('');
     /** 评论loading */
@@ -93,7 +105,7 @@ export default defineComponent({
     const handleCommentInputBlur = () => {
       // 延迟失焦，以便点击工具栏按钮
       setTimeout(() => {
-        if (!commentContent.value && !isMarkdownDialogShow.value) {
+        if (!commentContent.value && !markdownDialogShow.value) {
           isCommentInputFocus.value = false;
         }
       }, 200);
@@ -104,37 +116,39 @@ export default defineComponent({
       commentContent.value = value;
     };
 
-    /** 创建评论 */
-    const handleCreateComment = () => {
-      handleOpenMarkdownDialog(commentContent.value);
-    };
-
-    /** 查看评论 */
-    const handleViewComment = (content: string) => {
-      handleOpenMarkdownDialog(content, false);
+    /** 编辑评论Id */
+    const editCommentId = shallowRef('');
+    /** 编辑评论 */
+    const handleOpenEditCommentDialog = (activity: IssueActivityItem) => {
+      editCommentId.value = activity.activity_id;
+      handleOpenMarkdownDialog(activity.content, 'edit');
     };
 
     /** 打开富文本编辑弹窗 */
-    const handleOpenMarkdownDialog = (content: string, isEdit = true) => {
-      isMarkdownDialogShow.value = true;
+    const handleOpenMarkdownDialog = (content: string, type: 'create' | 'edit' | 'view') => {
+      markdownDialogShow.value = true;
       markdownContent.value = content;
-      isEditMarkdown.value = isEdit;
+      commentOperation.value = type;
     };
 
     /** 关闭富文本编辑弹窗 */
     const handleCloseMarkdownDialog = () => {
-      isMarkdownDialogShow.value = false;
+      markdownDialogShow.value = false;
     };
 
     /** 确认富文本编辑 */
     const handleConfirmMarkdown = () => {
-      commentContent.value = markdownContent.value;
-      isMarkdownDialogShow.value = false;
+      if (commentOperation.value === 'create') {
+        commentContent.value = markdownContent.value;
+        markdownDialogShow.value = false;
+        return;
+      }
+      handleEditComment();
     };
 
     /** 发送评论 */
     const handleSendComment = () => {
-      if (!commentContent.value) return;
+      if (!commentContent.value || commentLoading.value) return;
       commentLoading.value = true;
       followUpIssues({
         issues: [
@@ -156,6 +170,31 @@ export default defineComponent({
           Message({
             message: t(activeItem ? '评论发送成功' : failed[0]?.message),
             theme: activeItem ? 'success' : 'error',
+          });
+        })
+        .finally(() => {
+          commentLoading.value = false;
+        });
+    };
+
+    /** 编辑评论 */
+    const handleEditComment = () => {
+      if (commentLoading.value) return;
+      commentLoading.value = true;
+      editIssueFollowUp({
+        bk_biz_id: props.detail?.bk_biz_id,
+        issue_id: props.detail?.id,
+        activity_id: editCommentId.value,
+        content: markdownContent.value,
+      })
+        .then(data => {
+          markdownContent.value = '';
+          isCommentInputFocus.value = false;
+          markdownDialogShow.value = false;
+          emit('commentChange', data.activities);
+          Message({
+            message: t('评论编辑成功'),
+            theme: 'success',
           });
         })
         .finally(() => {
@@ -187,7 +226,9 @@ export default defineComponent({
                 <div class='comment-input-toolbar'>
                   <div
                     class='rich-text-btn'
-                    onClick={handleCreateComment}
+                    onClick={() => {
+                      handleOpenMarkdownDialog(commentContent.value, 'create');
+                    }}
                   >
                     <i class='icon-monitor icon-switch1 switch-icon' />
                     <span>{t('button-富文本编辑')}</span>
@@ -228,14 +269,20 @@ export default defineComponent({
         <Dialog
           width={800}
           class='comment-markdown-dialog'
-          v-model:isShow={isMarkdownDialogShow.value}
-          title={t(isEditMarkdown.value ? '输入评论' : '查看完整评论')}
+          v-model:isShow={markdownDialogShow.value}
+          title={t(
+            commentOperation.value === 'create'
+              ? '输入评论'
+              : commentOperation.value === 'edit'
+                ? '编辑评论'
+                : '查看完整评论'
+          )}
           onClosed={handleCloseMarkdownDialog}
         >
           {{
             default: () => (
               <div class='markdown-editor-wrapper'>
-                {isEditMarkdown.value ? (
+                {commentOperation.value !== 'view' ? (
                   <MarkdownEditor
                     height='420px'
                     value={markdownContent.value}
@@ -254,9 +301,10 @@ export default defineComponent({
             ),
             footer: () => (
               <div class='dialog-footer'>
-                {isEditMarkdown.value && (
+                {commentOperation.value !== 'view' && (
                   <>
                     <Button
+                      loading={commentLoading.value}
                       theme='primary'
                       onClick={handleConfirmMarkdown}
                     >
@@ -324,10 +372,10 @@ export default defineComponent({
     };
 
     /**
-     * 渲染 Issue 拆分（二期功能）
+     * 渲染 Issue 拆分
      */
     // const renderSplitActivity = (item: IssueActivityItem) => {
-    //   const splitNode = activeNodeMap[IssueActiveNodeTypeEnum.SPLIT];
+    //   const splitNode = activeNodeMap[IssueActiveNodeTypeEnum.SPLIT_FROM];
     //   return renderActivityItem({
     //     icon: (
     //       <img
@@ -346,12 +394,12 @@ export default defineComponent({
     //         >
     //           {splitNode.alias}
     //         </span>
-    //         {renderActivityItemTime(item.time)}
+    //         {renderActivityItemTime(item)}
     //       </div>
     //     ),
     //     content: (
     //       <div class='split-content'>
-    //         <div class='desc'>{t('拆分为 {0} 个 Issue:', [2])}</div>
+    //         <div class='desc'>{t('拆分为 {0} 个 Issue：', [2])}</div>
     //         <ul class='issue-list'>
     //           <li class='issue-item'>
     //             <span class='link'>异常登录日志告警</span>
@@ -366,10 +414,10 @@ export default defineComponent({
     // };
 
     /**
-     * 渲染 Issue 合并（二期功能）
+     * 渲染 Issue 合并
      */
     // const renderMergeActivity = (item: IssueActivityItem) => {
-    //   const mergeNode = activeNodeMap[IssueActiveNodeTypeEnum.MERGE];
+    //   const mergeNode = activeNodeMap[IssueActiveNodeTypeEnum.MERGED_INTO];
     //   return renderActivityItem({
     //     icon: (
     //       <img
@@ -388,12 +436,12 @@ export default defineComponent({
     //         >
     //           {mergeNode.alias}
     //         </span>
-    //         {renderActivityItemTime(item.time)}
+    //         {renderActivityItemTime(item)}
     //       </div>
     //     ),
     //     content: (
     //       <div class='merge-content'>
-    //         <span class='desc'>{t('合并进 Issue:')}</span>
+    //         <span class='desc'>{t('合并进 Issue：')}</span>
     //         <span class='link'>异常登录日志告警</span>
     //       </div>
     //     ),
@@ -421,13 +469,53 @@ export default defineComponent({
               class='comment-view-markdown'
               value={item.content}
             />
-            <i
-              class='icon-monitor icon-xiangqing1 detail-icon'
-              onClick={() => {
-                handleViewComment(item.content);
-              }}
-            />
+
+            <div class='comment-actions'>
+              <i
+                class='icon-monitor icon-xiangqing1 detail-icon action-btn'
+                onClick={() => {
+                  handleOpenMarkdownDialog(item.content, 'view');
+                }}
+              />
+              {userName.value === item.operator && (
+                <i
+                  class='icon-monitor icon-bianji edit-icon action-btn'
+                  onClick={() => {
+                    handleOpenEditCommentDialog(item);
+                  }}
+                />
+              )}
+            </div>
           </div>
+        ),
+        showLine,
+      });
+    };
+
+    /**
+     * 渲染 TAPD 关联/创建活动
+     */
+    const renderTapdActivity = (item: IssueActivityItem, showLine = true) => {
+      let tapdItem = null;
+      try {
+        tapdItem = typeof item.content === 'string' ? JSON.parse(item.content) : item.content;
+      } catch (e) {
+        console.error(e);
+      }
+      return renderActivityItem({
+        extCls: 'comment-activity-item',
+        icon: <i class='icon-monitor icon-a-useryonghu' />,
+        title: (
+          <div class='title-row'>
+            <span>{item.activity_type === IssueActiveNodeTypeEnum.TAPD_LINK ? t('关联已有单据') : t('创建单据')}</span>
+            {renderActivityItemTime(item, true)}
+          </div>
+        ),
+        content: (
+          <RelationTapdItem
+            style='margin: 0'
+            value={tapdItem}
+          />
         ),
         showLine,
       });
@@ -485,7 +573,7 @@ export default defineComponent({
               }}
             >
               {dispatchNode.alias}：
-              {item.to_value.split(',').map((user: string, index: number) => (
+              {(item.to_value || '').split(',').map((user: string, index: number) => (
                 <span key={user.trim()}>
                   {index > 0 && ', '}
                   <bk-user-display-name user-id={user.trim()} />
@@ -521,6 +609,30 @@ export default defineComponent({
               }}
             >
               {priorityNode.alias}：{ISSUES_PRIORITY_MAP[item.to_value]?.alias}
+            </span>
+            {renderActivityItemTime(item)}
+          </div>
+        ),
+        showLine,
+      });
+    };
+
+    /**
+     * 渲染名称变更（用户手动改名 / 系统按关联日志生成可读标题）
+     */
+    const renderNameChangeActivity = (item: IssueActivityItem, showLine = true) => {
+      const nameNode = activeNodeMap[IssueActiveNodeTypeEnum.NAME_CHANGE];
+      return renderActivityItem({
+        icon: <i class='icon-monitor icon-bianji' />,
+        title: (
+          <div class='title-row'>
+            <span
+              class='action'
+              v-overflow-tips={{
+                placement: 'top',
+              }}
+            >
+              {nameNode.alias}：{item.to_value}
             </span>
             {renderActivityItemTime(item)}
           </div>
@@ -572,36 +684,27 @@ export default defineComponent({
           return renderDispatchActivity(item, showLine);
         case IssueActiveNodeTypeEnum.PRIORITY_CHANGE:
           return renderPriorityActivity(item, showLine);
+        case IssueActiveNodeTypeEnum.NAME_CHANGE:
+          return renderNameChangeActivity(item, showLine);
         case IssueActiveNodeTypeEnum.CREATE:
           return renderFirstActivity(item, showLine);
-        // // TODO: 合并和拆分是二期功能
-        // case IssueActiveNodeTypeEnum.SPLIT:
+        case IssueActiveNodeTypeEnum.TAPD_LINK:
+          return renderTapdActivity(item, showLine);
+        case IssueActiveNodeTypeEnum.CREATE_TAPD:
+          return renderTapdActivity(item, showLine);
+        // case IssueActiveNodeTypeEnum.SPLIT_FROM:
         //   return renderSplitActivity(item);
-        // case IssueActiveNodeTypeEnum.MERGE:
+        // case IssueActiveNodeTypeEnum.MERGED_INTO:
         //   return renderMergeActivity(item);
         default:
           return null;
       }
     };
 
-    const renderSkeleton = () => {
-      return (
-        <div class='skeleton-wrapper'>
-          {new Array(5).fill(0).map(() =>
-            renderActivityItem({
-              title: <div class='skeleton-element title-skeleton' />,
-              icon: <div class='skeleton-element icon-skeleton' />,
-            })
-          )}
-        </div>
-      );
-    };
-
     return {
       renderCommentInput,
       renderMarkdownDialog,
       renderActivityContent,
-      renderSkeleton,
     };
   },
   render() {
@@ -611,9 +714,10 @@ export default defineComponent({
         title={this.$t('活动')}
       >
         {this.renderCommentInput()}
+        <DetailLoadStatus loading={this.loading && this.loaded} error={this.error} onRetry={() => this.$emit('retry')} />
         <div class='activity-list'>
-          {this.loading
-            ? this.renderSkeleton()
+          {this.loading && !this.loaded
+            ? <IssuesLoading variant='activity' />
             : this.list.map((item, index) => this.renderActivityContent(item, index !== this.list.length - 1))}
         </div>
         {this.renderMarkdownDialog()}

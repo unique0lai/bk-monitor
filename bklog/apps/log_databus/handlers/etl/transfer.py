@@ -22,24 +22,102 @@ the project delivered to anyone in the future.
 import copy
 
 from django.conf import settings
+from django.db import transaction
 
 from apps.constants import UserOperationActionEnum, UserOperationTypeEnum
 from apps.decorators import user_operation_record
 from apps.log_clustering.models import ClusteringConfig
 from apps.log_clustering.tasks.flow import update_clustering_clean
+from apps.log_databus.constants import STORAGE_CLUSTER_TYPE
+from apps.log_databus.exceptions import CleanTemplateNotExistException
 from apps.log_databus.handlers.collector import CollectorHandler
 from apps.log_databus.handlers.collector_scenario import CollectorScenario
 from apps.log_databus.handlers.collector_scenario.custom_define import get_custom
 from apps.log_databus.handlers.collector_scenario.utils import build_es_option_type
-from apps.log_databus.handlers.etl import EtlHandler
+from apps.log_databus.handlers.etl.base import EtlHandler
 from apps.log_databus.handlers.etl_storage import EtlStorage
 from apps.log_databus.handlers.storage import StorageHandler
+from apps.log_databus.models import CleanTemplate, CollectorConfig
 from apps.log_search.constants import CollectorScenarioEnum
 from apps.log_search.models import LogIndexSet
 from apps.utils.local import get_request_username
 
 
+_CLEAN_TEMPLATE_ID_NOT_PROVIDED = object()
+
+
 class TransferEtlHandler(EtlHandler):
+    def _validate_clean_template(self, clean_template_id):
+        if clean_template_id is None:
+            return None
+
+        try:
+            return CleanTemplate.objects.get(
+                clean_template_id=clean_template_id,
+                bk_biz_id=self.data.bk_biz_id,
+            )
+        except CleanTemplate.DoesNotExist:
+            raise CleanTemplateNotExistException(
+                CleanTemplateNotExistException.MESSAGE.format(clean_template_id=clean_template_id)
+            )
+
+    def _prepare_clean_template_config(
+        self, clean_template_id, etl_config, etl_params, fields, use_provided_clean_config=False
+    ):
+        clean_template = self._validate_clean_template(clean_template_id)
+        if clean_template is None:
+            return clean_template, etl_config, etl_params, fields
+
+        if not use_provided_clean_config:
+            etl_config = clean_template.clean_type
+            etl_params = copy.deepcopy(clean_template.etl_params or {})
+            fields = clean_template.etl_fields
+
+        # 兼容历史模板字段整体不完整：统一补齐缺省键
+        etl_fields = copy.deepcopy(fields or [])
+        for field in etl_fields:
+            field.setdefault("is_delete", False)
+            field.setdefault("is_analyzed", False)
+            field.setdefault("is_time", False)
+            field.setdefault("is_built_in", False)
+            field.setdefault("field_type", "string")
+            field.setdefault("is_dimension", not field.get("is_analyzed", False))
+
+        return (
+            clean_template,
+            etl_config,
+            etl_params,
+            etl_fields,
+        )
+
+    def _update_clean_template(self, clean_template):
+        if clean_template is not None:
+            # 加事务和行锁，避免并发导致绑定到已经删除的模板
+            with transaction.atomic():
+                active_template = (
+                    CleanTemplate.objects.select_for_update()
+                    .filter(
+                        clean_template_id=clean_template.clean_template_id,
+                        is_deleted=False,
+                    )
+                    .first()
+                )
+                if active_template is None:
+                    raise CleanTemplateNotExistException(
+                        CleanTemplateNotExistException.MESSAGE.format(
+                            clean_template_id=clean_template.clean_template_id
+                        )
+                    )
+                self._save_clean_template_association(clean_template)
+            return
+        self._save_clean_template_association(clean_template)
+
+    def _save_clean_template_association(self, clean_template):
+        update_fields = {"clean_template_id": clean_template.clean_template_id if clean_template else None}
+        CollectorConfig.objects.filter(collector_config_id=self.collector_config_id).update(**update_fields)
+        for field, value in update_fields.items():
+            setattr(self.data, field, value)
+
     def update_or_create(
         self,
         etl_config,
@@ -56,17 +134,44 @@ class TransferEtlHandler(EtlHandler):
         target_fields=None,
         username="",
         total_shards_per_node=None,
+        storage_cluster_type=None,
+        labels=None,
         is_platform_index=None,
         platform_index_visibility=None,
         platform_index_filter=None,
+        clean_template_id=_CLEAN_TEMPLATE_ID_NOT_PROVIDED,
+        use_provided_clean_config=False,
         *args,
         **kwargs,
     ):
+        # 未显式传入模板 ID 时沿用采集项当前关联，避免请求中的清洗参数与模板关联产生偏差。
+        clean_template_id_provided = clean_template_id is not _CLEAN_TEMPLATE_ID_NOT_PROVIDED
+        if not clean_template_id_provided:
+            clean_template_id = self.data.clean_template_id
+        # 普通采集项保存以关联模板为配置来源；模板批量同步则使用发布时固定的调用参数。
+        clean_template, etl_config, etl_params, fields = self._prepare_clean_template_config(
+            clean_template_id,
+            etl_config,
+            etl_params,
+            fields,
+            use_provided_clean_config=use_provided_clean_config,
+        )
+
         etl_params = etl_params or {}
         user_fields = copy.deepcopy(fields)
 
         # 存储集群信息
         cluster_info = StorageHandler(storage_cluster_id).get_cluster_info_by_id()
+
+        if not storage_cluster_type:
+            storage_cluster_type = cluster_info.get("cluster_type") or STORAGE_CLUSTER_TYPE
+
+        # es 集群获取 es 版本, doris 集群将 es 版本设置为空
+        if not cluster_info["cluster_config"]["version"] or storage_cluster_type != STORAGE_CLUSTER_TYPE:
+            es_version = "7.x"
+        else:
+            es_version = cluster_info["cluster_config"]["version"]
+
         self.check_es_storage_capacity(cluster_info, storage_cluster_id)
         is_add = False if self.data.table_id else True
 
@@ -84,9 +189,7 @@ class TransferEtlHandler(EtlHandler):
                 # 旧版聚类链路，由于入库链路不是独立的，需要更新 transfer 的结果表配置；新版则无需更新
                 etl_params["etl_flat"] = True
                 etl_params["separator_node_action"] = ""
-                log_clustering_fields = CollectorScenario.log_clustering_fields(
-                    cluster_info["cluster_config"]["version"]
-                )
+                log_clustering_fields = CollectorScenario.log_clustering_fields(es_version)
                 fields = CollectorScenario.fields_insert_field_index(
                     source_fields=fields, dst_fields=log_clustering_fields
                 )
@@ -108,7 +211,7 @@ class TransferEtlHandler(EtlHandler):
                             "tag": "dimension",
                             "alias_name": "signature",
                             "description": "signature",
-                            "option": build_es_option_type("keyword", cluster_info["cluster_config"]["version"]),
+                            "option": build_es_option_type("keyword", es_version),
                             "is_built_in": True,
                             "is_time": False,
                             "is_analyzed": False,
@@ -125,10 +228,11 @@ class TransferEtlHandler(EtlHandler):
                     storage_cluster_id=storage_cluster_id,
                     allocation_min_days=allocation_min_days,
                     storage_replies=storage_replies,
-                    es_version=cluster_info["cluster_config"]["version"],
+                    es_version=es_version,
                     hot_warm_config=cluster_info["cluster_config"].get("custom_option", {}).get("hot_warm_config"),
                     es_shards=es_shards,
                     total_shards_per_node=total_shards_per_node,
+                    storage_cluster_type=storage_cluster_type,
                 )
 
         index_set_obj = LogIndexSet.objects.filter(index_set_id=self.data.index_set_id).first()
@@ -143,17 +247,19 @@ class TransferEtlHandler(EtlHandler):
             self.data,
             table_id=table_id,
             storage_cluster_id=storage_cluster_id,
+            storage_cluster_type=storage_cluster_type,
             retention=retention,
             allocation_min_days=allocation_min_days,
             storage_replies=storage_replies,
             fields=fields,
             etl_params=etl_params,
-            es_version=cluster_info["cluster_config"]["version"],
+            es_version=es_version,
             hot_warm_config=cluster_info["cluster_config"].get("custom_option", {}).get("hot_warm_config"),
             es_shards=es_shards,
             sort_fields=sort_fields,
             target_fields=target_fields,
             total_shards_per_node=total_shards_per_node,
+            labels=labels,
         )
 
         if not view_roles:
@@ -174,6 +280,12 @@ class TransferEtlHandler(EtlHandler):
 
         # 3. 更新完结果表之后, 如果存在fields的snapshot, 清理一次
         LogIndexSet.objects.filter(index_set_id=index_set["index_set_id"]).update(fields_snapshot={})
+
+        # 4. 保存存储集群类型
+        if self.collector_config_id:
+            CollectorConfig.objects.filter(collector_config_id=self.collector_config_id).update(
+                storage_cluster_type=storage_cluster_type
+            )
 
         # add user_operation_record
         operation_record = {
@@ -199,14 +311,24 @@ class TransferEtlHandler(EtlHandler):
             custom_config = get_custom(self.data.custom_type)
             custom_config.after_etl_hook(self.data)
 
+        clean_stash_template_id = clean_template.clean_template_id if clean_template else None
+        if not clean_template_id_provided:
+            clean_stash_template_id = (
+                CollectorConfig.objects.filter(collector_config_id=self.collector_config_id)
+                .values_list("clean_template_id", flat=True)
+                .first()
+            )
         CollectorHandler(collector_config_id=self.collector_config_id).create_clean_stash(
             {
+                "clean_template_id": clean_stash_template_id,
                 "clean_type": etl_config,
                 "etl_params": etl_params,
                 "etl_fields": user_fields,
                 "bk_biz_id": self.data.bk_biz_id,
             }
         )
+        if clean_template_id_provided:
+            self._update_clean_template(clean_template)
 
         return {
             "collector_config_id": self.data.collector_config_id,

@@ -41,8 +41,10 @@ import useStore from '@/hooks/use-store';
 import { InfoBox } from 'bk-magic-vue';
 
 import { useDrag } from '../../hooks/use-drag';
+import ClusterTypeTabs from './cluster-type-tabs.tsx';
 import EsSlider from './es-slider.tsx';
 import IntroPanel from './intro-panel.tsx';
+import { CLUSTER_TYPES, ClusterType, useClusterType } from './use-cluster-type';
 import http from '@/api';
 
 import './index.scss';
@@ -58,7 +60,9 @@ export default defineComponent({
     EsSlider,
     IntroPanel,
     EmptyStatus,
+    ClusterTypeTabs,
   },
+
   setup() {
     const store = useStore();
     const router = useRouter();
@@ -83,6 +87,7 @@ export default defineComponent({
     const isAllowedCreate = ref(null); // 是否有权限新建
     const showSlider = ref(false); // 显示编辑或新建ES源侧边栏
     const editClusterId = ref(null); // 编辑ES源ID
+    const editClusterData = ref(null); // 编辑的集群行数据
     const isOpenWindow = ref(false); // 是否打开窗口
     const emptyType = ref('empty'); // 空状态类型
     const filterParams = ref({}); // 过滤参数对象
@@ -123,8 +128,49 @@ export default defineComponent({
 
     const bkBizId = computed(() => store.getters.bkBizId); // 业务ID
     const spaceUid = computed(() => store.getters.spaceUid); // 空间ID
-    const globalsData = computed(() => store.getters.globalsData);
+    const globalsData = computed(() => store.getters['globals/globalsData']);
     const authorityMapComputed = computed(() => authorityMap); // 权限映射
+
+    // 从路由查询参数获取初始 tab 值
+    const getInitialTab = (): ClusterType => {
+      const tabQuery = router.currentRoute.query.tab;
+      if (tabQuery === 'doris') return CLUSTER_TYPES.DORIS;
+      return CLUSTER_TYPES.ES;
+    };
+
+    const { activeTab, isDorisEnabled, checkDorisAccess, handleTabClick } = useClusterType({
+      bkBizId,
+      spaceUid,
+      initialTab: getInitialTab(),
+      onAccessDenied: () => {
+        const { tab, ...restQuery } = router.currentRoute.query;
+        router.replace({
+          name: router.currentRoute.name,
+          params: router.currentRoute.params,
+          query: restQuery,
+        });
+      },
+      onTabChange: type => {
+        const currentQuery = { ...router.currentRoute.query };
+        currentQuery.tab = type === CLUSTER_TYPES.DORIS ? 'doris' : 'es';
+        router.replace({
+          name: router.currentRoute.name,
+          params: router.currentRoute.params,
+          query: currentQuery,
+        });
+
+        params.value.keyword = '';
+        filterParams.value = {};
+        isFilterSearch.value = false;
+        tableDataOrigin.value = [];
+        tableDataSearched.value = [];
+        tableDataPaged.value = [];
+        pagination.value.current = 1;
+        pagination.value.count = 0;
+
+        getTableData();
+      },
+    });
 
     // 来源过滤器
     const sourceFilters = computed(() => {
@@ -165,6 +211,7 @@ export default defineComponent({
         const tableRes = await http.request('/source/list', {
           query: {
             bk_biz_id: bkBizId.value,
+            cluster_type: activeTab.value,
           },
         });
         tableLoading.value = false;
@@ -269,9 +316,9 @@ export default defineComponent({
 
       // 先进行过滤处理
       if (isFilterSearch.value) {
-        filteredData = filteredData.filter(item => Object.keys(filterParams.value).
-          every(key => (filterIsNotCompared(filterParams.value[key])
-            ? true : compareFilter(item, filterParams.value[key], key)),
+        filteredData = filteredData.filter(item =>
+          Object.keys(filterParams.value).every(key =>
+            filterIsNotCompared(filterParams.value[key]) ? true : compareFilter(item, filterParams.value[key], key),
           ),
         );
       }
@@ -279,7 +326,7 @@ export default defineComponent({
       // 再进行搜索处理
       const keyword = params.value.keyword.trim();
       if (keyword) {
-        filteredData = filteredData.filter((item) => {
+        filteredData = filteredData.filter(item => {
           if (isIPv6(keyword)) {
             return completeIPv6Address(item.cluster_config.domain_name) === completeIPv6Address(keyword);
           }
@@ -292,10 +339,10 @@ export default defineComponent({
           const creator = (item.cluster_config.creator || '').toLowerCase();
 
           return (
-            clusterName.includes(keywordLower)
-            || displayName.includes(keywordLower)
-            || domainName.includes(keywordLower)
-            || creator.includes(keywordLower)
+            clusterName.includes(keywordLower) ||
+            displayName.includes(keywordLower) ||
+            domainName.includes(keywordLower) ||
+            creator.includes(keywordLower)
           );
         });
       }
@@ -337,8 +384,9 @@ export default defineComponent({
     // 新建ES源
     const addDataSource = async () => {
       if (isAllowedCreate.value) {
-        showSlider.value = true;
         editClusterId.value = null;
+        editClusterData.value = null;
+        showSlider.value = true;
       } else {
         try {
           tableLoading.value = true;
@@ -396,8 +444,9 @@ export default defineComponent({
         return;
       }
 
-      showSlider.value = true;
       editClusterId.value = id;
+      editClusterData.value = item;
+      showSlider.value = true;
     };
 
     // 删除ES源
@@ -488,7 +537,7 @@ export default defineComponent({
     };
 
     // 判断过滤值是否为空
-    const filterIsNotCompared = (val) => {
+    const filterIsNotCompared = val => {
       if (typeof val === 'string' && val === '') return true;
       if (typeof val === 'object' && JSON.stringify(val) === '{}') return true;
       if (Array.isArray(val) && !val.length) return true;
@@ -511,8 +560,8 @@ export default defineComponent({
     };
 
     // 过滤变化处理
-    const handleFilterChange = (data) => {
-      Object.keys(data).forEach((key) => {
+    const handleFilterChange = data => {
+      Object.keys(data).forEach(key => {
         filterParams.value[key] = Array.isArray(data[key]) ? data[key].join('') : data[key];
       });
       isFilterSearch.value = !!Object.values(filterParams.value).some(item => !filterIsNotCompared(item));
@@ -536,6 +585,7 @@ export default defineComponent({
     };
 
     onMounted(() => {
+      checkDorisAccess();
       checkCreateAuth();
       getTableData();
       const { selectedFields } = clusterSetting.value;
@@ -558,17 +608,25 @@ export default defineComponent({
           style={`width: calc(100% - ${introWidth.value}px);`}
           class='es-cluster-list-container'
         >
+          <ClusterTypeTabs
+            activeTab={activeTab.value}
+            isDorisEnabled={isDorisEnabled.value}
+            on-tab-click={handleTabClick}
+          />
           <div class='main-operator-container'>
-            <bk-button
-              style='width: 120px'
-              data-test-id='esAccessBox_button_addNewEsAccess'
-              disabled={isAllowedCreate.value === null || tableLoading.value}
-              theme='primary'
-              vCursor={{ active: isAllowedCreate.value === false }}
-              onClick={addDataSource}
-            >
-              {t('新建')}
-            </bk-button>
+            {activeTab.value !== CLUSTER_TYPES.DORIS && (
+              <bk-button
+                style='width: 120px'
+                data-test-id='esAccessBox_button_addNewEsAccess'
+                disabled={isAllowedCreate.value === null || tableLoading.value}
+                theme='primary'
+                vCursor={{ active: isAllowedCreate.value === false }}
+                onClick={addDataSource}
+              >
+                {t('新建')}
+              </bk-button>
+            )}
+
             <bk-input
               style='float: right; width: 360px'
               clearable={true}
@@ -683,7 +741,7 @@ export default defineComponent({
                 renderHeader={renderHeader}
               />
             )}
-            {checkcFields('enable_hot_warm') && (
+            {activeTab.value !== CLUSTER_TYPES.DORIS && checkcFields('enable_hot_warm') && (
               <bk-table-column
                 key='hot_warm'
                 label={t('冷热数据')}
@@ -730,7 +788,11 @@ export default defineComponent({
                 min-width='80'
                 prop='cluster_config.creator'
                 renderHeader={renderHeader}
-                scopedSlots={{ default: (props: any) => <bk-user-display-name user-id={props.row.cluster_config.creator}></bk-user-display-name> }}
+                scopedSlots={{
+                  default: (props: any) => (
+                    <bk-user-display-name user-id={props.row.cluster_config.creator}></bk-user-display-name>
+                  ),
+                }}
               />
             )}
             {checkcFields('create_time') && (
@@ -744,55 +806,79 @@ export default defineComponent({
                 sortable
               />
             )}
-            <bk-table-column
-              key='operate'
-              width='180'
-              scopedSlots={{
-                default: (props: any) => (
-                  <div class='collect-table-operate'>
-                    <log-button
-                      class='mr10'
-                      tips-conf={
-                        props.row.is_platform
-                          ? t('公共集群，禁止创建自定义索引集')
-                          : t('平台默认的集群不允许编辑和删除，请联系管理员。')
-                      }
-                      button-text={t('新建索引集')}
-                      disabled={!props.row.is_editable || props.row.is_platform}
-                      theme='primary'
-                      text
-                      on-on-click={() => createIndexSet(props.row)}
-                    />
-                    <log-button
-                      class='mr10'
-                      vCursor={{
-                        active: !props.row.permission?.[authorityMapComputed.value.MANAGE_ES_SOURCE_AUTH],
-                      }}
-                      button-text={t('编辑')}
-                      disabled={!props.row.is_editable}
-                      theme='primary'
-                      tips-conf={t('平台默认的集群不允许编辑和删除，请联系管理员。')}
-                      text
-                      on-on-click={() => editDataSource(props.row)}
-                    />
-                    <log-button
-                      class='mr10'
-                      vCursor={{
-                        active: !props.row.permission?.[authorityMapComputed.value.MANAGE_ES_SOURCE_AUTH],
-                      }}
-                      button-text={t('删除')}
-                      disabled={!props.row.is_editable}
-                      theme='primary'
-                      tips-conf={t('平台默认的集群不允许编辑和删除，请联系管理员。')}
-                      text
-                      on-on-click={() => deleteDataSource(props.row)}
-                    />
-                  </div>
-                ),
-              }}
-              label={t('操作')}
-              renderHeader={renderHeader}
-            />
+            {activeTab.value === CLUSTER_TYPES.DORIS ? (
+              <bk-table-column
+                key='operate'
+                width='100'
+                scopedSlots={{
+                  default: (props: any) => (
+                    <div class='collect-table-operate'>
+                      <log-button
+                        vCursor={{
+                          active: !props.row.permission?.[authorityMapComputed.value.MANAGE_ES_SOURCE_AUTH],
+                        }}
+                        button-text={t('编辑')}
+                        theme='primary'
+                        text
+                        on-on-click={() => editDataSource(props.row)}
+                      />
+                    </div>
+                  ),
+                }}
+                label={t('操作')}
+                renderHeader={renderHeader}
+              />
+            ) : (
+              <bk-table-column
+                key='operate'
+                width='180'
+                scopedSlots={{
+                  default: (props: any) => (
+                    <div class='collect-table-operate'>
+                      <log-button
+                        class='mr10'
+                        tips-conf={
+                          props.row.is_platform
+                            ? t('公共集群，禁止创建自定义索引集')
+                            : t('平台默认的集群不允许编辑和删除，请联系管理员。')
+                        }
+                        button-text={t('新建索引集')}
+                        disabled={!props.row.is_editable || props.row.is_platform}
+                        theme='primary'
+                        text
+                        on-on-click={() => createIndexSet(props.row)}
+                      />
+                      <log-button
+                        class='mr10'
+                        vCursor={{
+                          active: !props.row.permission?.[authorityMapComputed.value.MANAGE_ES_SOURCE_AUTH],
+                        }}
+                        button-text={t('编辑')}
+                        disabled={!props.row.is_editable}
+                        theme='primary'
+                        tips-conf={t('平台默认的集群不允许编辑和删除，请联系管理员。')}
+                        text
+                        on-on-click={() => editDataSource(props.row)}
+                      />
+                      <log-button
+                        class='mr10'
+                        vCursor={{
+                          active: !props.row.permission?.[authorityMapComputed.value.MANAGE_ES_SOURCE_AUTH],
+                        }}
+                        button-text={t('删除')}
+                        disabled={!props.row.is_editable}
+                        theme='primary'
+                        tips-conf={t('平台默认的集群不允许编辑和删除，请联系管理员。')}
+                        text
+                        on-on-click={() => deleteDataSource(props.row)}
+                      />
+                    </div>
+                  ),
+                }}
+                label={t('操作')}
+                renderHeader={renderHeader}
+              />
+            )}
             <bk-table-column
               key='setting'
               tippy-options={{ zIndex: 3000 }}
@@ -832,6 +918,8 @@ export default defineComponent({
         </div>
 
         <EsSlider
+          clusterData={editClusterData.value}
+          clusterType={activeTab.value}
           editClusterId={editClusterId.value}
           showSlider={showSlider.value}
           onHandleCancelSlider={handleSliderHidden}

@@ -50,6 +50,7 @@ interface IProps {
   show?: boolean;
   variables?: { name: string }[];
   width?: number;
+  multiple?: boolean;
   onAddVariableOpenChange?: (val: boolean) => void;
   onCreateVariable?: (val: string) => void;
   onIsChecked?: (v: boolean) => void;
@@ -86,6 +87,7 @@ export default class ValueOptions extends tsc<IProps> {
   /* 是否支持变量操作 */
   @Prop({ type: Boolean, default: false }) hasVariableOperate: boolean;
   @Prop({ type: Array, default: () => [] }) variables: { name: string }[];
+  @Prop({ type: Boolean, default: false }) multiple: boolean;
 
   localOptions: IValue[] = [];
   loading = false;
@@ -295,19 +297,15 @@ export default class ValueOptions extends tsc<IProps> {
         class='retrieval-filter__value-options-select-component'
       >
         {this.loading ? (
-          <div
-            class={['options-drop-down-wrap', { 'is-popover': this.isPopover, 'no-border': !this.localOptions.length }]}
-          >
-            {new Array(4).fill(null).map(index => {
-              return (
-                <div
-                  key={index}
-                  class='options-item skeleton-item'
-                >
-                  <div class='skeleton-element h-16' />
-                </div>
-              );
-            })}
+          <div class={['options-drop-down-wrap', { 'is-popover': this.isPopover }]}>
+            {new Array(4).fill(null).map((_, index) => (
+              <div
+                key={index}
+                class='options-item skeleton-item'
+              >
+                <div class='skeleton-element' />
+              </div>
+            ))}
           </div>
         ) : !this.renderOptions.length && !this.search ? (
           <div class={['options-drop-down-wrap', { 'is-popover': this.isPopover }]}>
@@ -362,7 +360,7 @@ export default class ValueOptions extends tsc<IProps> {
                   this.handleCheck({ id: this.search, name: this.search });
                 }}
               >
-                <i18n path='直接输入 "{0}"'>
+                <i18n path={this.multiple ? '直接输入 "{0}"' : '回车直接输入 "{0}"'}>
                   <span class='highlight'>{this.search}</span>
                 </i18n>
               </div>

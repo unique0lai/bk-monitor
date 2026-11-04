@@ -26,6 +26,7 @@
 
 import { bkMessage } from 'monitor-api/utils';
 import { copyText } from 'monitor-common/utils';
+import { resolveLegacyHostHash } from 'monitor-pc/common/legacy-host-url';
 import { transformLogUrlQuery } from 'monitor-pc/utils';
 
 import {
@@ -47,6 +48,7 @@ import {
 } from '../../../typings';
 import { BaseScenario } from './base-scenario';
 
+import type { AlarmCenterPanelTabType } from '../../../utils/constant';
 import type { IUsePopoverTools } from '../hooks/use-popover';
 import type { SlotReturnValue } from 'tdesign-vue-next';
 import type { TippyContent } from 'vue-tippy';
@@ -57,15 +59,15 @@ import type { TippyContent } from 'vue-tippy';
  * @extends BaseScenario
  */
 export class AlertScenario extends BaseScenario {
-  readonly name = ALERT_STORAGE_KEY;
-  readonly privateClassName = 'alert-table';
+  readonly name: string = ALERT_STORAGE_KEY;
+  readonly privateClassName: string = 'alert-table';
 
   constructor(
     private readonly context: {
       clickPopoverTools: IUsePopoverTools;
       handleAlertContentDetailShow: (e: MouseEvent, row: AlertTableItem, colKey: string) => void;
       handleAlertOperationClick: (actionType: AlertRowOperationAction, row: AlertTableItem) => void;
-      handleAlertSliderShowDetail: (row: AlertTableItem, defaultTab?: string) => void;
+      handleAlertSliderShowDetail: (row: AlertTableItem, defaultTab?: AlarmCenterPanelTabType) => void;
       hoverPopoverTools: IUsePopoverTools;
     }
   ) {
@@ -147,7 +149,10 @@ export class AlertScenario extends BaseScenario {
       /** 策略名称(strategy_name) 列 */
       strategy_name: {
         renderType: ExploreTableColumnTypeEnum.LINK,
-        getRenderValue: row => ({ url: this.getStrategyUrl(row.strategy_id, row.bk_biz_id), alias: row.strategy_name }),
+        getRenderValue: row => ({
+          url: this.canJumpToStrategy(row) ? this.getStrategyUrl(row.strategy_id, row.bk_biz_id) : undefined,
+          alias: row.strategy_name,
+        }),
       },
       /** 策略标签(labels) 列 */
       labels: {
@@ -240,7 +245,7 @@ export class AlertScenario extends BaseScenario {
    * @param {BaseTableColumn} column 触发列的列配置项
    * @returns {SlotReturnValue} 渲染dom
    */
-  private renderOperatePanel(row: AlertTableItem, column?: BaseTableColumn) {
+  protected renderOperatePanel(row: AlertTableItem, column?: BaseTableColumn) {
     const { status, is_ack: isAck, ack_operator: ackOperator, followerDisabled } = row;
     const colKey = column?.colKey;
     const moreMenuIsActive =
@@ -305,31 +310,35 @@ export class AlertScenario extends BaseScenario {
    * @param {MouseEvent} e 鼠标事件
    * @param {AlertTableItem} row 告警项
    */
-  private handleAlterNameHover(e: MouseEvent, row: AlertTableItem) {
+  protected handleAlterNameHover(e: MouseEvent, row: AlertTableItem) {
     const content = (
-      <div class='alert-name-popover-container'>
-        <div class='alert-name-item'>
-          <span class='alert-name-item-label'>{window.i18n.t('告警 ID')} : </span>
+      <div class='alarm-name-popover-container'>
+        <div class='alarm-name-popover-item'>
+          <span class='alarm-name-popover-item-label'>{window.i18n.t('告警 ID')} : </span>
           <div
-            class='alert-name-item-value'
+            class='alarm-name-popover-item-value'
             onClick={() => this.handleCopy(row?.id)}
           >
             <span class='item-text'>{row?.id || '--'}</span>
             <i class='icon-monitor icon-mc-copy' />
           </div>
         </div>
-        <div class='alert-name-item'>
-          <span class='alert-name-item-label'>{window.i18n.t('告警策略')} : </span>
-          <div class='alert-name-item-value'>
-            <a
-              style='color: inherit'
-              href={this.getStrategyUrl(row?.strategy_id, row?.bk_biz_id)}
-              rel='noreferrer'
-              target='_blank'
-            >
-              <span class='alert-name-item-value'>{row?.strategy_name || '--'}</span>
-              <i class='icon-monitor icon-mc-goto' />
-            </a>
+        <div class='alarm-name-popover-item'>
+          <span class='alarm-name-popover-item-label'>{window.i18n.t('告警策略')} : </span>
+          <div class='alarm-name-popover-item-value'>
+            {this.canJumpToStrategy(row) ? (
+              <a
+                style='color: inherit'
+                href={this.getStrategyUrl(row?.strategy_id, row?.bk_biz_id)}
+                rel='noopener noreferrer'
+                target='_blank'
+              >
+                <span class='alarm-name-popover-item-value'>{row.strategy_name}</span>
+                <i class='icon-monitor icon-mc-goto' />
+              </a>
+            ) : (
+              <span class='alarm-name-popover-item-value'>{row?.strategy_name || '--'}</span>
+            )}
           </div>
         </div>
       </div>
@@ -342,7 +351,7 @@ export class AlertScenario extends BaseScenario {
    * @param ellipsisList 溢出的指标列表
    * @returns {SlotReturnValue} 溢出指标展示渲染内容dom
    */
-  private handleMetricEllipsisTip(ellipsisList: string[]) {
+  protected handleMetricEllipsisTip(ellipsisList: string[]) {
     return (
       <div class='alert-metric-ellipsis-tip-container'>
         {ellipsisList.map((v, i) => (
@@ -451,7 +460,9 @@ export class AlertScenario extends BaseScenario {
           extendInfo.bk_host_id ??
           `${extendInfo.ip}-${extendInfo.bk_cloud_id === undefined ? 0 : extendInfo.bk_cloud_id}`;
         window.open(
-          `${origin}${location.pathname.toString().replace('fta/', '')}?bizId=${bizId}#/performance/detail/${detailId}`,
+          `${origin}${location.pathname.toString().replace('fta/', '')}?bizId=${bizId}${resolveLegacyHostHash({
+            id: String(detailId),
+          })}`,
           '_blank'
         );
         return;
@@ -516,6 +527,14 @@ export class AlertScenario extends BaseScenario {
   }
 
   /**
+   * @description 是否可跳转策略详情：告警来源为监控策略且存在策略名称
+   * @param {AlertTableItem} row 告警项
+   */
+  private canJumpToStrategy(row: AlertTableItem) {
+    return row?.plugin_id === 'bkmonitor' && !!row?.strategy_name;
+  }
+
+  /**
    * @description 拼接 策略详情 页面url
    * @param {string} strategy_id 策略ID
    * @param {string} bk_biz_id 业务ID
@@ -533,7 +552,7 @@ export class AlertScenario extends BaseScenario {
    * @param {boolean} followerDisabled 是否关注人
    * @return {string} 告警确认提示文案
    */
-  private askTipMsg(isAak, status, ackOperator, followerDisabled) {
+  protected askTipMsg(isAak, status, ackOperator, followerDisabled) {
     const statusNames = {
       RECOVERED: window.i18n.t('告警已恢复'),
       CLOSED: window.i18n.t('告警已关闭'),
@@ -552,7 +571,7 @@ export class AlertScenario extends BaseScenario {
    * @param {AlertTableItem} row 告警项
    * @returns {Element} 更多操作下拉菜单 dom
    */
-  private getMoreMenuDom(row: AlertTableItem) {
+  protected getMoreMenuDom(row: AlertTableItem) {
     return (
       <div class='alert-table-more-operation-menu'>
         <div
@@ -599,7 +618,7 @@ export class AlertScenario extends BaseScenario {
    * @param {AlertTableItem} row 告警项
    * @param {string} colKey 列key
    */
-  private handleMoreOperationClick(e: MouseEvent, row: AlertTableItem, colKey: string) {
+  protected handleMoreOperationClick(e: MouseEvent, row: AlertTableItem, colKey: string) {
     const dom = this.getMoreMenuDom(row);
     this.context.clickPopoverTools.showPopover(e, dom, `${row.id}-${colKey}-more`, { arrow: false });
   }

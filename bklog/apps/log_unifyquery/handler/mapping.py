@@ -29,6 +29,8 @@ from apps.api import BkDataStorekitApi, TransferApi, UnifyQueryApi
 from apps.feature_toggle.handlers.toggle import FeatureToggleObject
 from apps.log_clustering.handlers.dataflow.constants import PATTERN_SEARCH_FIELDS
 from apps.log_clustering.models import ClusteringConfig
+from apps.log_databus.constants import DORIS_CLUSTER_TYPE
+from apps.log_databus.models import CollectorConfig
 from apps.log_search.constants import (
     BKDATA_ASYNC_CONTAINER_FIELDS,
     BKDATA_ASYNC_FIELDS,
@@ -43,7 +45,9 @@ from apps.log_search.constants import (
     SearchScopeEnum,
     DorisFieldTypeEnum,
 )
+from apps.log_search.exceptions import GetAllFieldsException
 from apps.log_search.models import (
+    TAG_TYPE_INNER,
     IndexSetFieldsConfig,
     LogIndexSet,
     LogIndexSetData,
@@ -58,7 +62,9 @@ from apps.utils.local import (
     get_request_external_username,
     get_request_username,
 )
+from apps.utils.log import logger
 from apps.utils.thread import MultiExecuteFunc
+from bkm_space.utils import space_uid_to_bk_biz_id
 
 INNER_COMMIT_FIELDS = ["dteventtime", "report_time"]
 INNER_PRODUCE_FIELDS = [
@@ -196,6 +202,7 @@ class UnifyQueryMappingHandler:
 
         fields_list: list = []
         for field in fields_result:
+            field_type = self.normalize_dt_event_timestamp_field_type(field["field_name"], field["field_type"])
             tokenize_on_chars = field.get("tokenize_on_chars", [])
             if isinstance(tokenize_on_chars, list | tuple):
                 tokenize_on_chars = "".join(tokenize_on_chars)
@@ -204,7 +211,7 @@ class UnifyQueryMappingHandler:
 
             fields_list.append(
                 {
-                    "field_type": field["field_type"],
+                    "field_type": field_type,
                     "field_name": field["field_name"],
                     "field_alias": field.get("field_alias", ""),
                     "query_alias": field.get("alias_name", ""),
@@ -214,18 +221,30 @@ class UnifyQueryMappingHandler:
                     "origin_field": field.get("origin_field", ""),
                     "es_doc_values": field.get("is_agg", False),
                     "is_analyzed": field.get("is_analyzed", False),
-                    "field_operator": OPERATORS.get(field["field_type"], []),
+                    "field_operator": OPERATORS.get(field_type, []),
                     "is_case_sensitive": field.get("is_case_sensitive", False),
                     "tokenize_on_chars": tokenize_on_chars,
                 }
             )
         # doris需要映射字段类型，根据新的类型获取操作列表
-        is_doris = str(IndexSetTag.get_tag_id("Doris")) in list(self.index_set.tag_ids)
+        indices_list = self.indices.split(",")
+
+        is_doris = str(IndexSetTag.get_tag_id("Doris", tag_type=TAG_TYPE_INNER)) in list(
+            self.index_set.tag_ids
+        ) or DORIS_CLUSTER_TYPE in {
+            storage_cluster_type
+            for storage_cluster_type in CollectorConfig.get_storage_cluster_type_map_by_table_ids(indices_list).values()
+        }
         if is_doris:
             for field in fields_list:
                 field["field_type"] = DorisFieldTypeEnum.get_es_field_type(field)
                 field["field_operator"] = OPERATORS.get(field["field_type"], [])
-                field["es_doc_values"] = field["field_type"] not in ["text", "object"]
+                field["es_doc_values"] = field["field_type"] not in ["text", "object"] and field["field_name"] not in [
+                    "dtEventTime",
+                    "localTime",
+                    "thedate",
+                    "__shard_key__",
+                ]
 
         for field in fields_list:
             # @TODO tag：兼容前端代码，后面需要删除
@@ -249,6 +268,12 @@ class UnifyQueryMappingHandler:
             field["is_built_in"] = field_name in built_in_fields or field_name.startswith("__ext.")
 
         return fields_list
+
+    @staticmethod
+    def normalize_dt_event_timestamp_field_type(field_name, field_type):
+        if field_name == "dtEventTimeStamp" and field_type != "date_nanos":
+            return "date"
+        return field_type
 
     def get_all_fields_by_index_id(self, scope=SearchScopeEnum.DEFAULT.value, is_union_search=False):
         """
@@ -455,6 +480,62 @@ class UnifyQueryMappingHandler:
         }
         result = UnifyQueryApi.query_field_map(params)
         return result.get("data", [])
+
+    @staticmethod
+    def get_fields_by_table_id(bk_biz_id: int, table_id: str):
+        """通过 UQ metadata 路由查询单个 RT 的 mapping。"""
+        params = {
+            "bk_biz_id": bk_biz_id,
+            "data_source": settings.UNIFY_QUERY_DATA_SOURCE,
+            "table_id": table_id,
+        }
+        result = UnifyQueryApi.query_field_map(params)
+        return result.get("data", [])
+
+    @classmethod
+    def get_fields_by_result_tables(cls, index_set: LogIndexSet) -> dict:
+        """按 RT 查询 UQ mapping，返回与 ES mapping 的非合并结果一致的结构。"""
+        from apps.log_search.handlers.index_set import BaseIndexSetHandler
+
+        indexes = index_set.get_indexes(has_applied=True)
+        if not indexes:
+            return {}
+
+        default_bk_biz_id = space_uid_to_bk_biz_id(index_set.space_uid)
+        multi_execute_func = MultiExecuteFunc()
+
+        for index in indexes:
+            result_table_id = index["result_table_id"]
+            multi_execute_func.append(
+                result_key=result_table_id,
+                func=cls.get_fields_by_table_id,
+                params={
+                    "bk_biz_id": index.get("bk_biz_id") or default_bk_biz_id,
+                    "table_id": BaseIndexSetHandler.get_rt_id(index_set.index_set_id, result_table_id),
+                },
+                multi_func_params=True,
+            )
+
+        multi_result = multi_execute_func.run(return_exception=True)
+        successful_result = {}
+        first_exception = None
+        for result_table_id, field_result in multi_result.items():
+            if isinstance(field_result, Exception):
+                first_exception = first_exception or field_result
+                logger.warning(
+                    "get fields from unifyquery for result table(%s) of index set(%s) failed: %s",
+                    result_table_id,
+                    index_set.index_set_id,
+                    field_result,
+                )
+                continue
+            successful_result[result_table_id] = (field_result, [])
+
+        if not successful_result and first_exception:
+            raise GetAllFieldsException(
+                GetAllFieldsException.MESSAGE.format(index_set_id=index_set.index_set_id, e=first_exception)
+            )
+        return successful_result
 
     def _combine_description_field(self, fields_list=None, scope=None):
         if fields_list is None:

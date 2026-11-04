@@ -43,6 +43,7 @@ from alarm_backends.service.converge.shield.shielder.saas_config import HostShie
 from alarm_backends.service.fta_action.collect.processor import (
     ActionProcessor as CollectActionProcessor,
 )
+from alarm_backends.service.fta_action import BaseActionProcessor
 from alarm_backends.service.fta_action.double_check import DoubleCheckHandler
 from alarm_backends.service.fta_action.job.processor import (
     ActionProcessor as JobActionProcessor,
@@ -102,9 +103,10 @@ from constants.action import (
     NoticeWay,
     NotifyStep,
     UserGroupType,
+    VoiceNoticeMode,
 )
 from constants.aiops import DIMENSION_DRILL
-from constants.alert import EventSeverity, EventStatus
+from constants.alert import EventStatus
 from constants.data_source import KubernetesResultTableLabel
 from core.errors.alarm_backends import EmptyAssigneeError
 from packages.fta_web.action.resources import AlertDocument
@@ -430,7 +432,7 @@ def register_builtin_plugins():
                     "outputs": [
                         {"key": "sn", "value": "response.sn", "format": "jmespath"},
                         {"key": "id", "value": "response.id", "format": "jmespath"},
-                        {"key": "url", "value": "{{itsm_site_url}}#/ticket/detail?id={{id}}", "format": "jinja2"},
+                        {"key": "url", "value": "{{itsm_site_url}}/#/ticket/detail?id={{id}}", "format": "jinja2"},
                     ],
                     "need_insert_log": True,
                     "log_template": "流程服务套餐【{{action_name}}】已成功创建工单[{{sn}}]，点击$查看工单详情$",
@@ -1105,6 +1107,64 @@ class TestActionProcessor(TransactionTestCase):
         p_action.create_sub_actions()
 
         self.assertEqual(ActionInstance.objects.filter(is_parent_action=False).count(), 9)
+
+    def test_voice_serial_order_follows_user_groups(self):
+        """串行电话：跨用户组拨打顺序应严格按 user_groups 配置列表顺序，不受 UserGroup 默认排序(-update_time) 影响"""
+        # 两个不轮值用户组，成员通过 DutyArrange 保存；仅保留电话(voice)一种通知方式，聚焦顺序断言
+        base = copy.deepcopy(self.user_group_data)
+        base["need_duty"] = False
+        base["duty_rules"] = []
+        base["mention_list"] = []
+        base["alert_notice"] = [
+            {"time_range": "00:00:00--23:59:59", "notify_config": [{"level": 1, "type": ["voice"]}]}
+        ]
+
+        data_a = copy.deepcopy(base)
+        data_a["name"] = "voice-order-A"
+        data_b = copy.deepcopy(base)
+        data_b["name"] = "voice-order-B"
+        group_a = UserGroup.objects.create(**data_a)
+        group_b = UserGroup.objects.create(**data_b)
+
+        DutyArrange.objects.create(
+            user_group_id=group_a.id,
+            order=1,
+            users=[{"id": "a1", "type": "user"}, {"id": "a2", "type": "user"}],
+        )
+        DutyArrange.objects.create(
+            user_group_id=group_b.id,
+            order=1,
+            users=[{"id": "b1", "type": "user"}, {"id": "b2", "type": "user"}],
+        )
+
+        # 构造 update_time 与配置顺序相反：B 更新更晚，使默认排序 -update_time 会把 B 排到 A 前面
+        now = datetime.now(tz=pytz.timezone("Asia/Shanghai"))
+        UserGroup.objects.filter(id=group_a.id).update(update_time=now - timedelta(hours=1))
+        UserGroup.objects.filter(id=group_b.id).update(update_time=now)
+
+        event = EventDocument(**{"bk_biz_id": 2, "ip": "127.0.0.1", "bk_cloud_id": 0})
+        alert = AlertDocument(**{"event": event, "severity": 1})
+
+        # user_groups 配置顺序为 [A, B]，voice 为“列表的列表”，应按配置顺序：A 在前、B 在后
+        notice_info = AlertAssignee(alert, [group_a.id, group_b.id]).get_notice_receivers()
+        self.assertEqual(notice_info["voice"], [["a1", "a2"], ["b1", "b2"]])
+
+        # 串行模式拍平后，拨打顺序应为 a1,a2,b1,b2（而非受 update_time 影响的 b1,b2,a1,a2）
+        p_action = ActionInstance.objects.create(
+            inputs={"notify_info": notice_info, "voice_notice_mode": VoiceNoticeMode.SERIAL},
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            is_parent_action=True,
+        )
+        p_action.create_sub_actions()
+
+        voice_subs = [
+            a
+            for a in ActionInstance.objects.filter(is_parent_action=False)
+            if a.inputs["notice_way"] == NoticeWay.VOICE
+        ]
+        self.assertEqual(len(voice_subs), 1)
+        self.assertEqual(voice_subs[0].inputs["notice_receiver"], ["a1", "a2", "b1", "b2"])
 
     def test_notify_with_appointee(self):
         duty_plans = copy.deepcopy(self.duty_plans)
@@ -4179,53 +4239,175 @@ class TestActionProcessor(TransactionTestCase):
             cp.converge_alarm()
             print(f"${instance.id} converge status ", cp.status)
 
-    def test_timeout_action(self):
+    def test_action_eta_uses_snapshot_timeout(self):
+        current_action_config = {
+            "is_enabled": True,
+            "execute_config": {"timeout": 7200},
+        }
+        action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.RECEIVED,
+            bk_biz_id=2,
+            action_config={"execute_config": {"timeout": 600}},
+            action_config_id=1,
+            action_plugin={"plugin_type": ActionPluginType.JOB},
+        )
+
+        with (
+            patch(
+                "alarm_backends.service.fta_action.ActionConfigCacheManager.get_action_config_by_id",
+                return_value=current_action_config,
+            ),
+            patch("alarm_backends.service.fta_action.i18n.set_biz"),
+            patch("alarm_backends.service.fta_action.bk_biz_id_to_bk_tenant_id", return_value="default"),
+            patch.object(BaseActionProcessor, "get_context", return_value={}),
+        ):
+            processor = BaseActionProcessor(action.id)
+
+        processor.notify = MagicMock(return_value=None)
+        processor.wait_callback = MagicMock()
+        processor.update_action_status = MagicMock()
+        processor.get_target_info_from_ctx = MagicMock(return_value={})
+        processor.set_start_to_execute()
+
+        processor.wait_callback.assert_called_once_with(callback_func="timeout_callback", delta_seconds=600)
+
+    def test_action_eta_falls_back_to_current_config_for_legacy_snapshot(self):
+        current_action_config = {
+            "is_enabled": True,
+            "execute_config": {"timeout": 7200},
+        }
+        action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.RECEIVED,
+            bk_biz_id=2,
+            action_config={"execute_config": {}},
+            action_config_id=1,
+            action_plugin={"plugin_type": ActionPluginType.JOB},
+        )
+
+        with (
+            patch(
+                "alarm_backends.service.fta_action.ActionConfigCacheManager.get_action_config_by_id",
+                return_value=current_action_config,
+            ),
+            patch("alarm_backends.service.fta_action.i18n.set_biz"),
+            patch("alarm_backends.service.fta_action.bk_biz_id_to_bk_tenant_id", return_value="default"),
+            patch.object(BaseActionProcessor, "get_context", return_value={}),
+        ):
+            processor = BaseActionProcessor(action.id)
+
+        self.assertEqual(processor.timeout_setting, 7200)
+
+    def test_timeout_action_uses_snapshot_timeout(self):
         before_twenty_minutes = datetime.now(tz=timezone.utc) - timedelta(minutes=20)
-        action_config = {"execute_config": {"timeout": 0 * 10 * 60}}
-        for i in range(0, 5):
-            action_config = {"execute_config": {"timeout": i * 10 * 60}}
-            ActionInstance.objects.create(
-                signal=ActionSignal.ABNORMAL,
-                strategy_id=0,
-                alerts=[],
-                alert_level=EventSeverity.REMIND,
-                status=ActionStatus.RUNNING,
-                bk_biz_id=2,
-                inputs={"converge_id": 0},
-                action_config=action_config,
-                action_config_id=action_config.get("id", 0),
-                action_plugin={
-                    "plugin_type": ActionPluginType.NOTICE,
-                    "name": "测试超时",
-                    "plugin_key": ActionPluginType.NOTICE,
-                },
-            )
-        ActionInstance.objects.all().update(create_time=before_twenty_minutes)
-        print("before_twenty_minutes is ", before_twenty_minutes.timestamp())
-        time.sleep(2)
+        expired_action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.RUNNING,
+            bk_biz_id=2,
+            action_config={"execute_config": {"timeout": 5 * 60}},
+        )
+        running_action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.RUNNING,
+            bk_biz_id=2,
+            action_config={"execute_config": {"timeout": 30 * 60}},
+        )
+        ActionInstance.objects.filter(id__in=[expired_action.id, running_action.id]).update(
+            create_time=before_twenty_minutes
+        )
 
-        action_config_patch = patch(
+        with patch(
             "alarm_backends.core.cache.action_config.ActionConfigCacheManager.get_action_config_by_id",
-            MagicMock(return_value=action_config),
+            return_value={"execute_config": {"timeout": 60}},
+        ) as get_current_config:
+            check_timeout_actions()
+
+        expired_action.refresh_from_db()
+        running_action.refresh_from_db()
+        self.assertEqual(expired_action.status, ActionStatus.FAILURE)
+        self.assertEqual(expired_action.failure_type, FailureType.TIMEOUT)
+        self.assertEqual(running_action.status, ActionStatus.RUNNING)
+        get_current_config.assert_not_called()
+
+    def test_timeout_action_falls_back_to_current_config_for_legacy_snapshot(self):
+        action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.RUNNING,
+            bk_biz_id=2,
+            action_config={"execute_config": {}},
+            action_config_id=1,
         )
-        action_config_patch.start()
-        check_timeout_actions()
-        action_config_patch.stop()
+        ActionInstance.objects.filter(id=action.id).update(
+            create_time=datetime.now(tz=timezone.utc) - timedelta(minutes=20)
+        )
 
-        self.assertEqual(ActionInstance.objects.filter(status=ActionStatus.RUNNING).count(), 5)
-
-        action_config = {"execute_config": {"timeout": 10 * 60}}
-        action_config_patch = patch(
+        with patch(
             "alarm_backends.core.cache.action_config.ActionConfigCacheManager.get_action_config_by_id",
-            MagicMock(return_value=action_config),
-        )
-        action_config_patch.start()
-        check_timeout_actions()
-        action_config_patch.stop()
+            return_value={"execute_config": {"timeout": 5 * 60}},
+        ) as get_current_config:
+            check_timeout_actions()
 
-        self.assertEqual(
-            ActionInstance.objects.filter(status=ActionStatus.FAILURE, failure_type=FailureType.TIMEOUT).count(), 5
+        action.refresh_from_db()
+        self.assertEqual(action.status, ActionStatus.FAILURE)
+        self.assertEqual(action.failure_type, FailureType.TIMEOUT)
+        get_current_config.assert_called_once_with(action.action_config_id)
+
+    def test_waiting_action_keeps_fixed_timeout(self):
+        waiting_action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.WAITING,
+            bk_biz_id=2,
+            action_config={"execute_config": {"timeout": 60}},
         )
+        ActionInstance.objects.filter(id=waiting_action.id).update(
+            create_time=datetime.now(tz=timezone.utc) - timedelta(minutes=20)
+        )
+
+        check_timeout_actions()
+
+        waiting_action.refresh_from_db()
+        self.assertEqual(waiting_action.status, ActionStatus.WAITING)
+
+    def test_timeout_action_does_not_overwrite_terminal_status(self):
+        timeout_snapshot = {"execute_config": {"timeout": 5 * 60}}
+        completed_action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.RUNNING,
+            bk_biz_id=2,
+            action_config=timeout_snapshot,
+        )
+        expired_action = ActionInstance.objects.create(
+            signal=ActionSignal.ABNORMAL,
+            strategy_id=0,
+            status=ActionStatus.RUNNING,
+            bk_biz_id=2,
+            action_config=timeout_snapshot,
+        )
+        ActionInstance.objects.filter(id__in=[completed_action.id, expired_action.id]).update(
+            create_time=datetime.now(tz=timezone.utc) - timedelta(minutes=20)
+        )
+        original_filter = ActionInstance.objects.filter
+
+        def finish_action_before_timeout_update(*args, **kwargs):
+            if "id__in" in kwargs:
+                original_filter(id=completed_action.id).update(status=ActionStatus.SUCCESS)
+            return original_filter(*args, **kwargs)
+
+        with patch.object(ActionInstance.objects, "filter", side_effect=finish_action_before_timeout_update):
+            check_timeout_actions()
+
+        completed_action.refresh_from_db()
+        expired_action.refresh_from_db()
+        self.assertEqual(completed_action.status, ActionStatus.SUCCESS)
+        self.assertEqual(expired_action.status, ActionStatus.FAILURE)
 
     def test_webhook_render(self):
         content = json.dumps(

@@ -13,21 +13,22 @@ import json
 import logging
 from collections import defaultdict
 from datetime import UTC, datetime
+from typing import Any
 
 import pytz
 from django.conf import settings
-from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 
+from apm_web.handlers.query import get_query
 from bkmonitor.utils.time_tools import time_interval_align
 from constants.apm import TelemetryDataType
-from constants.common import DEFAULT_TENANT_ID
 from constants.data_source import (
     DATA_LINK_V4_VERSION_NAME,
     DataSourceLabel,
     DataTypeLabel,
 )
+from constants.otel_query import FieldTypeEnum
 from core.drf_resource import api, resource
 
 logger = logging.getLogger("apm")
@@ -143,6 +144,50 @@ class TelemetryBackendHandler:
             templates.append(template)
         return templates
 
+    @classmethod
+    def format_v4_metrics_msgs_stat(cls, resp, grain="1m"):
+        if not resp:
+            return []
+
+        if isinstance(resp, dict):
+            series = resp.get("result") or resp.get("series") or resp.get("data") or resp.get("results") or []
+        else:
+            series = resp
+
+        interval = cls.GRAIN_MAPPING.get(grain, 0)
+        timestamp_to_count = defaultdict(int)
+        for serie in series:
+            if not isinstance(serie, dict):
+                continue
+            datapoints = serie.get("values") or serie.get("datapoints") or serie.get("series") or []
+            if datapoints:
+                for datapoint in datapoints:
+                    if isinstance(datapoint, dict):
+                        timestamp = datapoint.get("time") or datapoint.get("timestamp")
+                        count = datapoint.get("output_count") or datapoint.get("value") or datapoint.get("count") or 0
+                    else:
+                        if len(datapoint) < 2:
+                            continue
+                        timestamp, count = datapoint[0], datapoint[1]
+                    if timestamp is None:
+                        continue
+                    timestamp_to_count[int(timestamp) - interval] += int(float(count or 0))
+                continue
+
+            timestamp = serie.get("time") or serie.get("timestamp")
+            count = serie.get("output_count") or serie.get("value") or serie.get("count") or 0
+            if timestamp is not None:
+                timestamp_to_count[int(timestamp) - interval] += int(float(count or 0))
+
+        return [
+            {
+                "series": [
+                    {"output_count": count, "time": timestamp}
+                    for timestamp, count in sorted(timestamp_to_count.items())
+                ]
+            }
+        ]
+
 
 """
 观测数据后端适配器注册表
@@ -171,22 +216,23 @@ class TraceBackendHandler(TelemetryBackendHandler):
                 datasource_config = {**datasource_config, "es_shards": shards_count}
         return datasource_config
 
-    def storage_field_info(self):
-        # 获取字段信息
-        field_data = api.apm_api.query_fields({"bk_biz_id": self.app.bk_biz_id, "app_name": self.app.app_name})
-        # 获取字段描述信息
-        table_data = api.metadata.get_result_table({"table_id": self.app.trace_result_table_id}).get("field_list", [])
-        field_desc_data = {field_info["field_name"]: field_info["description"] for field_info in table_data}
-        # 构造响应信息
+    def storage_field_info(self) -> list[dict[str, Any]]:
+        """通过 unify-query 获取可搜索的 Span 字段信息。"""
+
+        fields_info = get_query(self.app.build_data_sources()).query_fields(None, None)
+        searchable_fields: list[tuple[str, dict[str, Any]]] = [
+            (field_name, field_info) for field_name, field_info in fields_info.items() if field_info["is_searchable"]
+        ]
+
         return [
             {
-                "field_name": key,
-                "ch_field_name": field_desc_data.get(key, ""),
-                "analysis_field": value == "text",
-                "field_type": value,
-                "time_field": value == "date",
+                "field_name": field_name,
+                "ch_field_name": field_info["field_alias"],
+                "analysis_field": field_info["field_type"] == FieldTypeEnum.TEXT.value,
+                "field_type": field_info["field_type"],
+                "time_field": field_info["field_type"] == FieldTypeEnum.DATE.value,
             }
-            for key, value in field_data.items()
+            for field_name, field_info in searchable_fields
         ]
 
     @property
@@ -385,7 +431,6 @@ class MetricBackendHandler(TelemetryBackendHandler):
         if vm_record:
             ret["data_id"] = vm_record.bk_base_data_id
             ret["vm_result_table_id"] = vm_record.vm_result_table_id
-            ret["vm_cluster_id"] = vm_record.vm_cluster_id
         return ret
 
     @cached_property
@@ -408,33 +453,27 @@ class MetricBackendHandler(TelemetryBackendHandler):
     def bk_vm_result_table_id(self):
         return self.bk_base_data_info.get("vm_result_table_id")
 
+    @cached_property
+    def v4_data_id_name(self):
+        from metadata import models
+
+        bkbase_result_table = models.BkBaseResultTable.objects.filter(monitor_table_id=self.result_table_id).first()
+        if not bkbase_result_table or not bkbase_result_table.data_link_name:
+            return ""
+
+        databus_configs = models.DataBusConfig.objects.filter(data_link_name=bkbase_result_table.data_link_name)
+        databus_config = databus_configs.filter(bk_tenant_id=bkbase_result_table.bk_tenant_id).first()
+        if not databus_config:
+            databus_config = databus_configs.first()
+
+        return databus_config.data_id_name if databus_config and databus_config.data_id_name else ""
+
     def storage_info(self):
-        vm_cluster_id = self.bk_base_data_info.get("vm_cluster_id")
-        if settings.ENABLE_MULTI_TENANT_MODE and vm_cluster_id:
-            from metadata import models
+        if self.datalink_version == DATA_LINK_V4_VERSION_NAME:
+            return self._v4_storage_info()
+        return self._v3_storage_info()
 
-            cluster_name = ""
-            cluster_obj = models.ClusterInfo.objects.filter(cluster_id=vm_cluster_id).first()
-            if cluster_obj:
-                cluster_name = cluster_obj.cluster_name
-            return [
-                {
-                    "raw_data_id": self.bk_base_data_id,
-                    "bk_biz_id": self.app.bk_biz_id,
-                    "result_table_id": self.bk_vm_result_table_id,
-                    "storage_type": "vm",
-                    "storage_type_alias": "",
-                    "storage_cluster": vm_cluster_id,
-                    "storage_cluster_alias": cluster_name,
-                    "expire_time": "30d",
-                    "expire_time_alias": _("30天"),
-                    "status": "running",
-                    "status_display": _("运行中"),
-                    "created_at": "system",
-                    "created_by": "system",
-                }
-            ]
-
+    def _v3_storage_info(self):
         storage_info = []
         result_table = api.bkdata.get_result_table(result_table_id=self.bk_vm_result_table_id)
         storage = result_table.get("storages", {}).get("vm")
@@ -462,6 +501,53 @@ class MetricBackendHandler(TelemetryBackendHandler):
             }
             storage_info.append(ret_storage)
         return storage_info
+
+    def _v4_storage_info(self):
+        from metadata import models
+        from metadata.models.data_link.constants import DataLinkKind, DataLinkResourceStatus
+
+        vm_binding = (
+            models.VMStorageBindingConfig.objects.filter(
+                bk_tenant_id=self.app.bk_tenant_id, table_id=self.result_table_id
+            )
+            .exclude(status=DataLinkResourceStatus.TERMINATED.value)
+            .first()
+        )
+        if not vm_binding:
+            return []
+
+        vm_storage_binding = api.bkdata.get_data_link(
+            bk_tenant_id=self.app.bk_tenant_id,
+            kind=DataLinkKind.get_choice_value(DataLinkKind.VMSTORAGEBINDING.value),
+            namespace=vm_binding.namespace,
+            name=vm_binding.name,
+        )
+        phase = vm_storage_binding.get("status", {}).get("phase", "")
+        if phase == DataLinkResourceStatus.OK.value:
+            status, status_display = "running", _("运行中")
+        elif phase == DataLinkResourceStatus.FAILED.value:
+            status, status_display = "failed", _("异常")
+        else:
+            status, status_display = "stopped", phase
+
+        storage = vm_storage_binding.get("spec", {}).get("storage", {})
+        return [
+            {
+                "raw_data_id": self.bk_base_data_id,
+                "bk_biz_id": self.app.bk_biz_id,
+                "result_table_id": self.bk_vm_result_table_id,
+                "storage_type": "vm",
+                "storage_type_alias": "",
+                "storage_cluster": storage.get("name"),
+                "storage_cluster_alias": storage.get("name"),
+                "expire_time": "180d",
+                "expire_time_alias": _("180天"),
+                "status": status,
+                "status_display": status_display,
+                "created_at": vm_binding.create_time,
+                "created_by": self.app.create_user,
+            }
+        ]
 
     @property
     def storage_status(self):
@@ -519,57 +605,35 @@ class MetricBackendHandler(TelemetryBackendHandler):
 
     def _get_data_view(self, start_time: int, end_time: int, **kwargs):
         if self.datalink_version == DATA_LINK_V4_VERSION_NAME:
-            namespace = self.data_status_config.get("namespace", "bkmonitor-vm")
-            metric_biz_id = self.data_status_config.get("metric_biz_id")
-            if not metric_biz_id:
+            data_id_name = self.v4_data_id_name
+            if not data_id_name:
                 return []
-
-            if not self.bk_vm_result_table_id:
-                return []
-
-            # 多租户适配
-            tenant_prefix = "" if self.app.bk_tenant_id == DEFAULT_TENANT_ID else f"{self.app.bk_tenant_id}-"
-
-            # v3迁移到v4链路的规则
-            component_id_prefix = f"{namespace}_{self.bk_vm_result_table_id}-"
-
-            # 监控自建v4链路规则
-            databus_name = "_".join(self.bk_vm_result_table_id.split("_")[1:])
-            v4_component_id_prefix = f"bkmonitor-{databus_name}-"
 
             grain = kwargs.get("time_grain", "1m")
+            interval = self.GRAIN_MAPPING.get(grain)
+            if interval:
+                start_time = time_interval_align(timestamp=start_time, interval=interval)
+                end_time = time_interval_align(timestamp=end_time, interval=interval)
+            resource_info = {"kind": "DataId", "namespace": "bkmonitor", "name": data_id_name}
+            if settings.ENABLE_MULTI_TENANT_MODE:
+                resource_info["tenant"] = self.app.bk_tenant_id
 
-            # 时间对齐
-            start_time = time_interval_align(timestamp=start_time, interval=self.GRAIN_MAPPING[grain])
-            end_time = time_interval_align(timestamp=end_time, interval=self.GRAIN_MAPPING[grain])
-
-            request_params = dict(
-                # 数据存储在运营租户下
-                bk_tenant_id=DEFAULT_TENANT_ID,
-                promql=f'sum(increase(bkmonitor:record_count{{component_id=~"^{tenant_prefix}({component_id_prefix}|{v4_component_id_prefix})"}}[{grain}]))',
-                start=start_time,
-                end=end_time,
-                step=grain,
-                bk_biz_ids=[metric_biz_id],
-                timezone=timezone.get_current_timezone_name(),
-            )
-
-            series = api.unify_query.query_data_by_promql(**request_params)["series"]
-
-            # 讲同一个timestamp的count相加
-            timestamp_to_count = defaultdict(int)
-            for serie in series:
-                for datapoint in serie["values"]:
-                    timestamp_to_count[datapoint[0]] += datapoint[1]
-
-            resp = [
-                {
-                    "series": [
-                        {"output_count": count, "time": int(timestamp / 1000)}
-                        for timestamp, count in timestamp_to_count.items()
-                    ]
-                }
-            ]
+            try:
+                resp = api.bkdata.get_v4_metrics_msgs_stat(
+                    resource=resource_info,
+                    start=start_time,
+                    end=end_time,
+                    step=grain,
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    "get metric v4 metrics msgs stat failed, app_name=%s, data_id_name=%s, error=%s",
+                    self.app.app_name,
+                    data_id_name,
+                    e,
+                )
+                return []
+            return self.format_v4_metrics_msgs_stat(resp, grain=grain)
         else:
             storages = self.storage_info()
             storage_result_table_id = None
@@ -588,7 +652,7 @@ class MetricBackendHandler(TelemetryBackendHandler):
                 if storage_result_table_id
                 else []
             )
-        return resp
+            return resp
 
     def get_data_count(self, start_time: int, end_time: int, **kwargs):
         resp = self._get_data_view(start_time, end_time, **kwargs)
@@ -653,21 +717,109 @@ class ProfilingBackendHandler(TelemetryBackendHandler):
     性能分析后端适配器
     """
 
+    @cached_property
+    def _profiling_config(self):
+        datasource_config = api.apm_api.detail_application(
+            {
+                "bk_biz_id": self.app.bk_biz_id,
+                "app_name": self.app.app_name,
+            }
+        )
+        return datasource_config.get("profiling_config", {})
+
+    @cached_property
+    def profiling_bkdata_datalink_config(self):
+        return self._profiling_config.get("bkdata_datalink_config") or {}
+
     def storage_info(self):
-        return api.bkdata.get_raw_data_storages_info(raw_data_id=self.bk_data_id) if self.bk_data_id else []
+        if self._is_v4_datalink():
+            return self._v4_storage_info()
+        return self._v3_storage_info()
+
+    def _v3_storage_info(self):
+        result_table_id = self._profiling_config.get("result_table_id")
+        if not result_table_id:
+            return []
+
+        result_table = api.bkdata.get_result_table(result_table_id=result_table_id)
+        storage = result_table.get("storages", {}).get("doris")
+        if not storage:
+            return []
+
+        expire_time = storage.get("expires", "")
+        return [
+            {
+                "raw_data_id": self._profiling_config.get("bk_data_id"),
+                "bk_biz_id": self.app.bk_biz_id,
+                "result_table_id": result_table_id,
+                "storage_type": "doris",
+                "storage_type_alias": "Doris",
+                "storage_cluster": storage.get("storage_cluster", {}).get("storage_cluster_config_id"),
+                "storage_cluster_alias": storage.get("storage_cluster", {}).get("cluster_name"),
+                "expire_time": expire_time,
+                "expire_time_alias": _("{}天").format(expire_time.rstrip("d")) if expire_time else "",
+                "status": "running",
+                "status_display": _("运行中"),
+                "created_by": self.app.create_user,
+                "created_at": self._profiling_config.get("created"),
+            }
+        ]
+
+    def _v4_storage_info(self):
+        from metadata.models.data_link.constants import DataLinkKind, DataLinkResourceStatus
+
+        v4_resource_names = self.profiling_bkdata_datalink_config.get("v4_resource_names") or {}
+        doris_binding_name = v4_resource_names.get("doris_binding_name")
+        if not doris_binding_name:
+            return []
+
+        doris_binding = api.bkdata.get_data_link(
+            bk_tenant_id=self.app.bk_tenant_id,
+            kind=DataLinkKind.get_choice_value(DataLinkKind.DORISBINDING.value),
+            namespace=self.profiling_bkdata_datalink_config.get("namespace", "bklog"),
+            name=doris_binding_name,
+        )
+        phase = doris_binding.get("status", {}).get("phase", "")
+        if phase == DataLinkResourceStatus.OK.value:
+            status, status_display = "running", _("运行中")
+        elif phase == DataLinkResourceStatus.FAILED.value:
+            status, status_display = "failed", _("异常")
+        else:
+            status, status_display = "stopped", phase
+
+        spec = doris_binding.get("spec", {})
+        storage = spec.get("storage", {})
+        storage_kind = storage.get("kind", "")
+        expire_time = spec.get("storage_config", {}).get("expires", "")
+        return [
+            {
+                "raw_data_id": self._profiling_config.get("bk_data_id"),
+                "bk_biz_id": self.app.bk_biz_id,
+                "result_table_id": self._profiling_config.get("result_table_id"),
+                "storage_type": storage_kind.lower(),
+                "storage_type_alias": storage_kind,
+                "storage_cluster": storage.get("name"),
+                "storage_cluster_alias": storage.get("name"),
+                "expire_time": expire_time,
+                "expire_time_alias": _("{}天").format(expire_time.rstrip("d")) if expire_time else "",
+                "status": status,
+                "status_display": status_display,
+                "created_by": self.app.create_user,
+                "created_at": self._profiling_config.get("created"),
+            }
+        ]
 
     @property
     def storage_status(self):
         storages = self.storage_info() or [{}]
         return all([storage.get("status") == "running" for storage in storages])
 
-    def data_sampling(self, **kwargs):
+    def data_sampling(self, size: int = 10, **kwargs):
         resp_data = []
         if self.bk_data_id:
-            resp = api.bkdata.get_data_bus_sampling_data(data_id=self.bk_data_id)
+            resp = api.metadata.kafka_tail({"bk_data_id": self.bk_data_id, "size": size})
             for log in resp:
-                log_content = json.loads(log["value"])
-                resp_data.append({"raw_log": log_content, "sampling_time": ""})
+                resp_data.append({"raw_log": log, "sampling_time": ""})
         return resp_data
 
     def get_data_view_config(self, **kwargs):
@@ -698,7 +850,34 @@ class ProfilingBackendHandler(TelemetryBackendHandler):
             data_view_config.update(kwargs)
         return target
 
+    def _is_v4_datalink(self):
+        return (self.profiling_bkdata_datalink_config.get("version") or 3) == 4
+
     def _get_data_view(self, start_time: int, end_time: int, **kwargs):
+        if self._is_v4_datalink():
+            v4_resource_names = self.profiling_bkdata_datalink_config.get("v4_resource_names") or {}
+            data_id_name = v4_resource_names.get("data_id_name")
+            if not data_id_name:
+                return []
+
+            namespace = self.profiling_bkdata_datalink_config.get("namespace", "bkmonitor")
+            grain = kwargs.get("time_grain", "1m")
+            interval = self.GRAIN_MAPPING.get(grain)
+            if interval:
+                start_time = time_interval_align(timestamp=start_time, interval=interval)
+                end_time = time_interval_align(timestamp=end_time, interval=interval)
+            resource_info = {"kind": "DataId", "namespace": namespace, "name": data_id_name}
+            if settings.ENABLE_MULTI_TENANT_MODE:
+                resource_info["tenant"] = self.app.bk_tenant_id
+
+            resp = api.bkdata.get_v4_metrics_msgs_stat(
+                resource=resource_info,
+                start=start_time,
+                end=end_time,
+                step=grain,
+            )
+            return self.format_v4_metrics_msgs_stat(resp, grain=grain)
+
         storages = self.storage_info()
         storage_result_table_id = None
         for storage in storages:

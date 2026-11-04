@@ -42,6 +42,13 @@ class MetadataBaseSerializer(serializers.Serializer):
         return attrs
 
 
+class QueryResourceStorageResource(MetaDataAPIGWResource):
+    """批量查询业务场景资源的结果表和存储关联。"""
+
+    action = "/app/metadata/query_resource_storage/"
+    method = "POST"
+
+
 class GetLabelResource(MetaDataAPIGWResource):
     """
     获取分类标签（一二级标签）
@@ -80,6 +87,7 @@ class CreateDataIdResource(MetaDataAPIGWResource):
         space_uid = serializers.CharField(required=False)
         bk_biz_id = serializers.IntegerField(required=False)
         is_platform_data_id = serializers.BooleanField(required=False)
+        created_from = serializers.ChoiceField(required=False, choices=["bkgse", "bkdata"], default="bkgse")
 
 
 class CreateResultTableResource(MetaDataAPIGWResource):
@@ -208,6 +216,35 @@ class GetResultTableStorageResource(MetaDataAPIGWResource):
         storage_type = serializers.CharField(required=True)
 
 
+class GetResultTableStorageStatusResource(MetaDataAPIGWResource):
+    """批量查询结果表 ES/Doris 存储状态和历史分段。"""
+
+    action = "/app/metadata/get_result_table_storage_status/"
+    method = "GET"
+
+    class RequestSerializer(serializers.Serializer):
+        table_ids = serializers.ListField(
+            required=True,
+            min_length=1,
+            max_length=50,
+            child=serializers.CharField(label="结果表ID"),
+            label="结果表ID列表",
+        )
+        timeout = serializers.IntegerField(required=False, default=15, min_value=1, max_value=30, label="超时时间")
+        total_timeout = serializers.IntegerField(
+            required=False,
+            default=60,
+            min_value=1,
+            max_value=300,
+            label="批量查询总超时时间",
+        )
+
+        def validate_table_ids(self, value):
+            if len(value) != len(set(value)):
+                raise serializers.ValidationError("结果表ID不能重复")
+            return value
+
+
 class GetTsDataResource(MetaDataAPIGWResource):
     """
     数据查询
@@ -232,6 +269,9 @@ class GetEsDataResource(MetaDataAPIGWResource):
         table_id = serializers.CharField(required=True, label="结果表ID")
         query_body = serializers.DictField(required=True, label="查询内容")
         use_full_index_names = serializers.BooleanField(required=False, label="是否使用索引全名进行检索", default=False)
+        is_index_prefix = serializers.BooleanField(
+            required=False, label="table_id 是否为索引前缀（跨集群检索同前缀索引）", default=False
+        )
 
 
 class ModifyDataIdResource(MetaDataAPIGWResource):
@@ -268,6 +308,7 @@ class CreateResultTableMetricSplitResource(MetaDataAPIGWResource):
 class ListMonitorResultTableResource(Resource):
     # todo to being legacy
     class RequestSerializer(serializers.Serializer):
+        bk_tenant_id = TenantIdField(label="租户ID")
         bk_biz_id = serializers.IntegerField(required=False, label="业务ID")
         datasource_type = serializers.CharField(required=False, label="需要过滤的结果表类型，如 system")
         is_public_include = serializers.BooleanField(required=False, label="是否包含全业务结果表")
@@ -428,6 +469,7 @@ class ModifyTimeSeriesGroupResource(MetaDataAPIGWResource):
     method = "POST"
 
     class RequestSerializer(serializers.Serializer):
+        bk_tenant_id = TenantIdField(label="租户ID")
         operator = serializers.CharField(allow_blank=True, label="操作者")
         time_series_group_id = serializers.IntegerField(label="自定义时序分组ID")
         time_series_group_name = serializers.CharField(required=False, label="自定义时序分组名")
@@ -438,6 +480,7 @@ class ModifyTimeSeriesGroupResource(MetaDataAPIGWResource):
         metric_info_list = serializers.ListField(required=False, label="metric信息")
         data_label = serializers.CharField(required=False, label="数据标签")
         options = serializers.DictField(required=False, label="结果表选项内容")
+        metric_group_dimensions = serializers.JSONField(required=False, label="指标分组的维度key配置")
 
 
 class DeleteTimeSeriesGroupResource(MetaDataAPIGWResource):
@@ -744,6 +787,30 @@ class QueryClusterInfoResource(MetaDataAPIGWResource):
         registered_system = serializers.CharField(required=False, label="来源系统名称", default="")
 
 
+class GetClusterStatusResource(MetaDataAPIGWResource):
+    """批量查询存储集群运行状态。"""
+
+    action = "/app/metadata/get_cluster_status/"
+    method = "GET"
+
+    class RequestSerializer(serializers.Serializer):
+        cluster_ids = serializers.ListField(
+            label="存储集群ID列表",
+            child=serializers.IntegerField(min_value=1),
+            allow_empty=False,
+            min_length=1,
+            max_length=20,
+        )
+        timeout = serializers.IntegerField(
+            label="单次底层探测操作超时时间（秒）",
+            required=False,
+            default=5,
+            min_value=1,
+            max_value=30,
+        )
+        include_node_details = serializers.BooleanField(label="是否返回节点明细", required=False, default=False)
+
+
 class AccessBkDataByResultTable(MetaDataAPIGWResource):
     """
     创建降采样dataflow
@@ -1000,6 +1067,7 @@ class RegisterClusterResource(MetaDataAPIGWResource):
     method = "POST"
 
     class RequestSerializer(serializers.Serializer):
+        default_settings = serializers.JSONField(required=False, label="默认集群配置")
         cluster_name = serializers.CharField(label="集群名称")
         cluster_type = serializers.CharField(label="集群类型")
         domain = serializers.CharField(label="集群域名")
@@ -1022,14 +1090,14 @@ class UpdateRegisteredClusterResource(MetaDataAPIGWResource):
     class RequestSerializer(serializers.Serializer):
         cluster_id = serializers.IntegerField(label="集群 ID")
         operator = serializers.CharField(label="创建者")
-        description = serializers.CharField(label="描述", default="", allow_blank=True)
-        username = serializers.CharField(label="访问集群的用户名", default="", allow_blank=True)
-        password = serializers.CharField(label="访问集群的密码", default="", allow_blank=True)
-        version = serializers.CharField(label="集群版本", default="", allow_blank=True)
-        schema = serializers.CharField(label="访问协议", default="", allow_blank=True)
-        is_ssl_verify = serializers.BooleanField(label="是否 ssl 验证", default=False)
-        label = serializers.CharField(label="标签", default="", allow_blank=True)
-        default_settings = serializers.JSONField(required=False, label="默认集群配置", default={})
+        description = serializers.CharField(required=False, label="描述", allow_blank=True)
+        username = serializers.CharField(required=False, label="访问集群的用户名", allow_blank=True)
+        password = serializers.CharField(required=False, label="访问集群的密码", allow_blank=True)
+        version = serializers.CharField(required=False, label="集群版本", allow_blank=True)
+        schema = serializers.CharField(required=False, label="访问协议", allow_blank=True)
+        is_ssl_verify = serializers.BooleanField(label="是否 ssl 验证", required=False)
+        label = serializers.CharField(required=False, label="标签", allow_blank=True)
+        default_settings = serializers.JSONField(required=False, label="默认集群配置")
 
 
 class CustomTimeSeriesDetailResource(MetaDataAPIGWResource):

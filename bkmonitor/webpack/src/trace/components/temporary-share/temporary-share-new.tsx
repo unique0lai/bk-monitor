@@ -55,6 +55,10 @@ export default defineComponent({
       type: Function,
       default: (params: Record<string, any>) => params,
     },
+    icon: {
+      type: String,
+      default: 'icon-mc-share',
+    },
   },
   setup(props) {
     const { t } = useI18n();
@@ -84,7 +88,7 @@ export default defineComponent({
     const timeRange: Ref<TimeRangeType> = ref([]);
     // 分享链接
     const shareUrl = computed(
-      () => `${location.origin}${location.pathname}?bizId=${store.bizId}/#/share/${token.value || ''}`
+      () => `${location.origin}${location.pathname}?bizId=${store.bizId}#/share/${token.value || ''}`
     );
 
     async function handleShowDialog() {
@@ -291,7 +295,7 @@ export default defineComponent({
     return (
       <div class='temporary-share'>
         <span
-          class={['icon-monitor', this.onlyCopy ? 'icon-mc-target-link' : 'temporary-share-icon', 'icon-mc-share']}
+          class={['icon-monitor', this.onlyCopy ? 'icon-mc-target-link' : 'temporary-share-icon', this.icon]}
           v-bk-tooltips={tipsOpts}
           onClick={this.handleShowDialog}
         />

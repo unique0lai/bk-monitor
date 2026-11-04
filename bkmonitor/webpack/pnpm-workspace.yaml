@@ -1,5 +1,6 @@
 packages:
   - src/*
+  - apm-vue3-for-vue2
   - '!packages/*'
   - '!**/bk-iframe/**'
   - '!**/bk-weweb/**'
@@ -9,27 +10,28 @@ modulesDir: node_modules
 
 onlyBuiltDependencies:
   - '@biomejs/biome'
-  - 'simple-git-hooks'
+  - simple-git-hooks
 
 overrides:
+  '@prometheus-io/lezer-promql': 0.305.0
   bk-magic-vue: 2.5.10-beta.18
-  eslint: $eslint
+  browserslist: ^4.28.1
+  cross-spawn: ^7.0.6
+  eslint: ^9.35.0
   monaco-editor: 0.44.0
+  on-headers: ^1.1.0
   semver: ^7.7.2
   vue-class-component: ^7.2.6
   vue-property-decorator: ^9.1.2
   vue-tsx-support: ^3.2.0
   vuex-module-decorators: ^1.2.0
-  cross-spawn: ^7.0.6
-  on-headers: ^1.1.0
-  '@prometheus-io/lezer-promql': 0.305.0
-  browserslist: ^4.28.1
   'braces': '>=3.0.3'
   'dompurify': '>=2.5.4'
   'minimatch': '>=9.0.7'
   'serialize-javascript': '>=7.0.3'
   'path-to-regexp': '>=0.1.13'
   'lodash': '>=4.18.0'
+  'dayjs': '1.11.18'
 
 recursiveInstall: true
 
@@ -38,3 +40,18 @@ publicHoistPattern:
   - '!vue-template-compiler'
   - '!vue-i18n'
   - '!@vue/compiler-sfc'
+
+minimumReleaseAgeExclude:
+  - '@blueking/open-telemetry@0.0.14 || 0.0.33'
+  - '@blueking/monitor-apm-log@2.3.28 || 2.3.29 || 2.3.30 || 2.3.31 || 2.3.32 || 2.3.33 || 2.3.34 || 2.3.35'
+  - '@blueking/monitor-trace-log@2.0.27'
+
+allowBuilds:
+  '@biomejs/biome': true
+  '@parcel/watcher': true
+  core-js: false
+  esbuild: true
+  protobufjs: true
+  simple-git-hooks: true
+  vue-demi: true
+  vuex-module-decorators: false

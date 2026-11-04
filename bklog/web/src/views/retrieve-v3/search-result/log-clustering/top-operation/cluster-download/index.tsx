@@ -66,8 +66,8 @@ export default defineComponent({
       }
 
       // 如果没有数据，禁用按钮
-      const rawData = props.logTableRef.value.getRawData?.() || [];
-      return rawData.length === 0;
+      const rawDataCount = props.logTableRef.value.getRawDataCount?.() ?? 0;
+      return rawDataCount === 0;
     });
 
     // 获取当前索引集信息
@@ -102,10 +102,11 @@ export default defineComponent({
       let stringValue = String(value);
 
       // 检查是否包含需要转义的字符：逗号、双引号、换行符(\n)、回车符(\r)
-      const needsEscape =        stringValue.includes(',')
-        || stringValue.includes('"')
-        || stringValue.includes('\n')
-        || stringValue.includes('\r');
+      const needsEscape =
+        stringValue.includes(',') ||
+        stringValue.includes('"') ||
+        stringValue.includes('\n') ||
+        stringValue.includes('\r');
 
       if (needsEscape) {
         // 1. 先将字段内的双引号转义为两个双引号（CSV标准）
@@ -129,11 +130,11 @@ export default defineComponent({
       const headers = Object.keys(firstItem).filter(key => key !== 'id');
 
       // 处理数据行
-      const rows = data.map((item) => {
+      const rows = data.map(item => {
         const row = [];
 
         // 遍历所有键，处理对应的值
-        headers.forEach((key) => {
+        headers.forEach(key => {
           let value = item[key];
 
           // 特殊处理某些字段的值格式
@@ -179,7 +180,7 @@ export default defineComponent({
         isDownloading.value = true;
 
         // 从logTableRef获取原始数据
-        const rawData = props.logTableRef.value?.getRawData?.() || [];
+        const rawData = (await props.logTableRef.value?.getRawData?.()) || [];
         const displayMode = props.logTableRef.value?.getDisplayMode?.() || 'flatten';
 
         // 转换为CSV格式

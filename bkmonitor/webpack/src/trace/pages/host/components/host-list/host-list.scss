@@ -1,0 +1,32 @@
+.host-list {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+
+  &__filter-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 16px 0;
+  }
+
+  &__full-status {
+    flex-shrink: 0;
+    margin-top: 12px;
+  }
+
+  &__full-retry {
+    margin-left: 8px;
+  }
+}
+
+/** 真实内容容器 */
+.host-list-content {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}

@@ -1,0 +1,813 @@
+#! /usr/bin/env python
+"""merge_resources 的 operationId 唯一性校验测试。
+
+apigateway 要求 operationId 全局唯一，重复会在部署阶段被网关以 `40002 校验失败`
+拒绝，导致 migrate Job CrashLoopBackOff。这里在合并阶段就拦住该类回归。
+
+脚本不是包模块，按文件路径动态加载，便于在任意 python 环境下独立运行：
+    python support-files/apigw/scripts/test_merge_resources.py
+"""
+
+import ast
+import importlib.util
+from pathlib import Path
+
+import pytest
+import yaml
+
+_SCRIPT = Path(__file__).with_name("merge_resources.py")
+_spec = importlib.util.spec_from_file_location("merge_resources", _SCRIPT)
+merge_resources = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(merge_resources)
+
+check_unique_operation_ids = merge_resources.check_unique_operation_ids
+merge_resources_func = merge_resources.merge_resources
+
+_RESOURCES_DIR = _SCRIPT.parent.parent / "resources"
+_DOCS_DIR = _SCRIPT.parent.parent / "docs/zh"
+_INTERNAL_APM_FILE = _RESOURCES_DIR / "internal/app/apm.yaml"
+_EXTERNAL_APM_FILE = _RESOURCES_DIR / "external/app/apm.yaml"
+_METADATA_FILE = _RESOURCES_DIR / "internal/app/metadata.yaml"
+_ALARM_STRATEGY_FILE = _RESOURCES_DIR / "external/app/alarm_strategy.yaml"
+_ALERT_FILE = _RESOURCES_DIR / "external/app/alert.yaml"
+_ALERT_MCP_FILE = _RESOURCES_DIR / "internal/user/alert_mcp.yaml"
+_ALERT_HANDLING_MCP_FILE = _RESOURCES_DIR / "internal/user/alert_handling_mcp.yaml"
+_LOG_COLLECTION_MCP_FILE = _RESOURCES_DIR / "internal/user/log_collection_mcp.yaml"
+_LOG_COLLECTION_INDEX_SET_MCP_FILE = _RESOURCES_DIR / "internal/user/log_collection_index_set_mcp.yaml"
+_LOG_COLLECTION_SPECIAL_CREATE_MCP_FILE = _RESOURCES_DIR / "internal/user/log_collection_special_create_mcp.yaml"
+_LOG_COLLECTION_SPECIAL_UPDATE_MCP_FILE = _RESOURCES_DIR / "internal/user/log_collection_special_update_mcp.yaml"
+
+_ALERT_QUERY_OPERATION_IDS = {
+    "list_alerts",
+    "get_alert_top_n",
+    "get_strategy_snapshot",
+    "get_strategy_detail",
+    "get_alert_info",
+    "get_alert_events",
+    "get_alert_event_ts",
+    "get_alert_event_tag_detail",
+    "get_alert_k8s_target",
+    "get_alert_host_target",
+    "get_alert_traces",
+    "get_alert_log_relations",
+}
+_ALERT_HANDLING_OPERATION_IDS = {
+    "search_alarm_strategies",
+    "get_alarm_strategy",
+    "create_alarm_strategy",
+    "update_alarm_strategy",
+    "search_alarm_shields",
+    "get_alarm_shield",
+    "create_alarm_shield",
+    "update_alarm_shield",
+    "disable_alarm_shield",
+    "search_alarm_notice_groups",
+    "create_alarm_notice_group",
+    "update_alarm_notice_group",
+    "search_alarm_action_configs",
+    "get_alarm_action_config",
+    "update_alarm_action_config",
+    "search_alarm_assign_groups",
+    "save_alarm_assign_group",
+    "delete_alarm_assign_group",
+}
+
+
+def _load_paths(file: Path) -> dict[str, dict]:
+    return yaml.safe_load(file.read_text())["paths"]
+
+
+def _operation_ids(paths: dict[str, dict]) -> set[str]:
+    return {method_data["operationId"] for path_data in paths.values() for method_data in path_data.values()}
+
+
+def test_check_unique_operation_ids_passes_on_unique():
+    merged = {
+        "/app/apm/calculate_by_range/": {"post": {"operationId": "calculate_by_range"}},
+        "/mcp/calculate_by_range/": {"post": {"operationId": "apm_mcp_calculate_by_range"}},
+    }
+    # 不应抛出
+    check_unique_operation_ids(merged)
+
+
+def test_check_unique_operation_ids_raises_on_duplicate():
+    merged = {
+        "/app/apm/calculate_by_range/": {"post": {"operationId": "calculate_by_range"}},
+        "/mcp/calculate_by_range/": {"post": {"operationId": "calculate_by_range"}},
+    }
+    with pytest.raises(ValueError, match="duplicate operationId 'calculate_by_range'"):
+        check_unique_operation_ids(merged)
+
+
+def test_check_unique_operation_ids_ignores_missing_operation_id():
+    # 缺失 operationId 的方法不参与唯一性校验，不应误报
+    merged = {
+        "/a/": {"get": {}},
+        "/b/": {"get": {}},
+    }
+    check_unique_operation_ids(merged)
+
+
+def test_alert_mcp_resource_groups_are_disjoint():
+    """告警查询与处置 MCP 必须保持独立，查询资源固定为当前 12 个。"""
+    query_paths = _load_paths(_ALERT_MCP_FILE)
+    handling_paths = _load_paths(_ALERT_HANDLING_MCP_FILE)
+
+    assert len(query_paths) == 12
+    assert _operation_ids(query_paths) == _ALERT_QUERY_OPERATION_IDS
+    assert set(query_paths).isdisjoint(handling_paths)
+    assert _operation_ids(query_paths).isdisjoint(_operation_ids(handling_paths))
+
+
+def test_alert_handling_mcp_contract():
+    """告警处置 MCP 必须精确包含 18 个资源并使用独立标签。"""
+    paths = _load_paths(_ALERT_HANDLING_MCP_FILE)
+
+    assert len(paths) == 18
+    assert set(paths) == {f"/mcp/{operation_id}/" for operation_id in _ALERT_HANDLING_OPERATION_IDS}
+    assert _operation_ids(paths) == _ALERT_HANDLING_OPERATION_IDS
+    for path_data in paths.values():
+        for method_data in path_data.values():
+            assert method_data["tags"] == ["alert_handling_mcp"]
+
+
+def test_log_collection_clean_config_mcp_contract():
+    """清洗修改必须保持单一高风险 Tool、完整存储参数和无模板边界。"""
+    clean_config_mcp_file = _RESOURCES_DIR / "internal/user/log_collection_clean_config_mcp.yaml"
+    paths = _load_paths(clean_config_mcp_file)
+
+    assert set(paths) == {"/mcp/update_log_collector_clean_config/"}
+    method_data = paths["/mcp/update_log_collector_clean_config/"]["post"]
+    schema = method_data["requestBody"]["content"]["application/json"]["schema"]
+    assert method_data["operationId"] == "update_log_collector_clean_config"
+    assert method_data["tags"] == ["log_collection_mcp"]
+    assert method_data["x-bk-apigateway-resource"]["backend"] == {
+        "name": "default",
+        "method": "post",
+        "path": "/api/v4/log_collection_clean_config/update_clean_config/",
+        "matchSubpath": False,
+        "timeout": 30,
+    }
+    assert {
+        "storage_cluster_id",
+        "retention",
+        "allocation_min_days",
+        "storage_replies",
+        "es_shards",
+        "confirm",
+    }.issubset(schema["required"])
+    assert schema["properties"]["confirm"]["enum"] == [True]
+    assert schema["additionalProperties"] is False
+    assert "template_id" not in schema["properties"]
+    assert "template_name" not in schema["properties"]
+
+
+def test_log_collection_mcp_contract():
+    """日志采集 MCP 暴露列表、采集器详情和索引集详情查询。"""
+    paths = _load_paths(_LOG_COLLECTION_MCP_FILE)
+
+    assert set(paths) == {
+        "/mcp/list_log_collectors/",
+        "/mcp/get_log_collector/",
+        "/mcp/get_log_index_set/",
+    }
+    assert _operation_ids(paths) == {"list_log_collectors", "get_log_collector", "get_log_index_set"}
+    list_schema = paths["/mcp/list_log_collectors/"]["get"]["parameters"]
+    list_parameter_names = {parameter["name"] for parameter in list_schema}
+    assert {"conditions", "ordering"}.issubset(list_parameter_names)
+    assert {
+        "parent_index_set_id",
+        "exclude_parent_index_set_id",
+        "exclude_not_completed",
+        "exclude_not_data",
+        "include_related_spaces",
+    }.isdisjoint(list_parameter_names)
+    access_type_parameter = next(parameter for parameter in list_schema if parameter["name"] == "log_access_type")
+    assert "bkdata" in access_type_parameter["schema"]["items"]["enum"]
+    index_set_parameters = paths["/mcp/get_log_index_set/"]["get"]["parameters"]
+    assert {parameter["name"] for parameter in index_set_parameters} == {"bk_biz_id", "index_set_id"}
+    assert paths["/mcp/get_log_index_set/"]["get"]["x-bk-apigateway-resource"]["backend"]["path"] == (
+        "/api/v4/log_collection/get_index_set/"
+    )
+    for path_data in paths.values():
+        for method_data in path_data.values():
+            assert method_data["tags"] == ["log_collection_mcp"]
+            resource = method_data["x-bk-apigateway-resource"]
+            assert resource["backend"]["method"] == "get"
+            assert {k: v for k, v in resource["authConfig"].items() if k != "oauth2PersonalClientEnabled"} == {
+                "userVerifiedRequired": True,
+                "appVerifiedRequired": False,
+                "resourcePermissionRequired": True,
+            }
+
+
+def test_log_collection_mcp_exposes_index_groups_and_mixed_access_types():
+    index_set_paths = _load_paths(_LOG_COLLECTION_INDEX_SET_MCP_FILE)
+    assert set(index_set_paths) == {"/mcp/list_log_index_set_groups/"}
+    method_data = index_set_paths["/mcp/list_log_index_set_groups/"]["get"]
+    assert method_data["operationId"] == "list_log_index_set_groups"
+    assert method_data["tags"] == ["log_collection_mcp"]
+    assert method_data["x-bk-apigateway-resource"]["backend"]["path"] == (
+        "/api/v4/log_collection/list_index_set_groups/"
+    )
+    bk_biz_id_parameter = next(parameter for parameter in method_data["parameters"] if parameter["name"] == "bk_biz_id")
+    assert "minimum" not in bk_biz_id_parameter["schema"]
+
+    special_paths = _load_paths(_LOG_COLLECTION_SPECIAL_CREATE_MCP_FILE)
+    assert set(special_paths) == {
+        "/mcp/create_custom_report/",
+        "/mcp/create_third_party_es/",
+        "/mcp/create_bkdata_index_set/",
+    }
+    assert _operation_ids(special_paths) == {
+        "create_custom_report",
+        "create_third_party_es",
+        "create_bkdata_index_set",
+    }
+    for path_data in special_paths.values():
+        method_data = path_data["post"]
+        schema = method_data["requestBody"]["content"]["application/json"]["schema"]
+        parent_ids_schema = schema["properties"]["parent_index_set_ids"]
+        assert parent_ids_schema["type"] == "array"
+        assert parent_ids_schema["items"]["minimum"] == 1
+        assert "minimum" not in schema["properties"]["bk_biz_id"]
+        assert schema["properties"]["confirm"]["enum"] == [True]
+        assert method_data["tags"] == ["log_collection_mcp"]
+    third_party_index_schema = special_paths["/mcp/create_third_party_es/"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]["properties"]["indexes"]["items"]["properties"]
+    assert third_party_index_schema["result_table_id"]["maxLength"] == 255
+    assert "minimum" not in third_party_index_schema["bk_biz_id"]
+
+    special_update_paths = _load_paths(_LOG_COLLECTION_SPECIAL_UPDATE_MCP_FILE)
+    assert set(special_update_paths) == {
+        "/mcp/update_custom_report/",
+        "/mcp/update_third_party_es/",
+        "/mcp/update_bkdata_index_set/",
+    }
+    assert _operation_ids(special_update_paths) == {
+        "update_custom_report",
+        "update_third_party_es",
+        "update_bkdata_index_set",
+    }
+    for path_data in special_update_paths.values():
+        method_data = path_data["post"]
+        schema = method_data["requestBody"]["content"]["application/json"]["schema"]
+        parent_ids_schema = schema["properties"]["parent_index_set_ids"]
+        assert parent_ids_schema["type"] == "array"
+        assert parent_ids_schema["items"]["minimum"] == 1
+        assert "minimum" not in schema["properties"]["bk_biz_id"]
+        assert schema["properties"]["confirm"]["enum"] == [True]
+        assert method_data["tags"] == ["log_collection_mcp"]
+    third_party_update_index_schema = special_update_paths["/mcp/update_third_party_es/"]["post"]["requestBody"][
+        "content"
+    ]["application/json"]["schema"]["properties"]["indexes"]["items"]["properties"]
+    assert third_party_update_index_schema["result_table_id"]["maxLength"] == 255
+    assert "minimum" not in third_party_update_index_schema["bk_biz_id"]
+    required_full_update_fields = {
+        "time_field",
+        "time_field_type",
+        "time_field_unit",
+        "category_id",
+        "is_trace_log",
+        "target_fields",
+        "sort_fields",
+    }
+    for path in ("/mcp/update_third_party_es/", "/mcp/update_bkdata_index_set/"):
+        schema = special_update_paths[path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        assert required_full_update_fields.issubset(schema["required"])
+    bkdata_update_schema = special_update_paths["/mcp/update_bkdata_index_set/"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    assert bkdata_update_schema["properties"]["indexes"]["minItems"] == 1
+    assert bkdata_update_schema["properties"]["indexes"]["items"]["properties"]["result_table_id"]["maxLength"] == 255
+    assert "time_field" in bkdata_update_schema["required"]
+
+
+def test_log_collection_create_and_update_support_parent_index_set_ids():
+    create_schema = _load_paths(_RESOURCES_DIR / "internal/user/log_collection_create_mcp.yaml")[
+        "/mcp/fast_create_log_collector/"
+    ]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    update_schema = _load_paths(_RESOURCES_DIR / "internal/user/log_collection_update_mcp.yaml")[
+        "/mcp/fast_update_log_collector/"
+    ]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    for schema in (create_schema, update_schema):
+        parent_ids_schema = schema["properties"]["parent_index_set_ids"]
+        assert parent_ids_schema["type"] == "array"
+        assert parent_ids_schema["items"]["minimum"] == 1
+
+
+def test_log_collection_status_mcp_contract():
+    """采集状态 MCP 仅开放单采集项查询，并保持只读后端契约。"""
+    status_mcp_file = _RESOURCES_DIR / "internal/user/log_collection_status_mcp.yaml"
+    paths = _load_paths(status_mcp_file)
+
+    assert set(paths) == {"/mcp/get_log_collector_status/"}
+    method_data = paths["/mcp/get_log_collector_status/"]["post"]
+    assert method_data["operationId"] == "get_log_collector_status"
+    assert method_data["tags"] == ["log_collection_mcp"]
+    schema = method_data["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["collector_config_id"]["minimum"] == 1
+    task_ids_schema = schema["properties"]["task_ids"]
+    assert task_ids_schema["minItems"] == 1
+    assert task_ids_schema["maxItems"] == 100
+    assert task_ids_schema["items"]["oneOf"] == [
+        {"type": "string", "maxLength": 20, "pattern": "^[1-9][0-9]{0,19}$"},
+        {"type": "integer", "minimum": 1, "maximum": 99999999999999999999},
+    ]
+    resource = method_data["x-bk-apigateway-resource"]
+    assert resource["backend"] == {
+        "name": "default",
+        "method": "post",
+        "path": "/api/v4/log_collection_status/get_status/",
+        "matchSubpath": False,
+        "timeout": 30,
+    }
+    assert {k: v for k, v in resource["authConfig"].items() if k != "oauth2PersonalClientEnabled"} == {
+        "userVerifiedRequired": True,
+        "appVerifiedRequired": False,
+        "resourcePermissionRequired": True,
+    }
+
+
+def test_promql_query_config_apigw_contract():
+    """query_config 与 PromQL 互转接口必须保持外部应用态注册，并提供对应中文文档。"""
+    paths = _load_paths(_ALARM_STRATEGY_FILE)
+    expected = {
+        "/app/alarm_strategy/query_config_to_promql/": {
+            "operation_id": "query_config_to_promql",
+            "backend": "/api/v4/alarm_strategy_v3/query_config_to_promql/",
+        },
+        "/app/alarm_strategy/promql_to_query_config/": {
+            "operation_id": "promql_to_query_config",
+            "backend": "/api/v4/alarm_strategy_v3/promql_to_query_config/",
+        },
+    }
+
+    for path, expect in expected.items():
+        method_data = paths[path]["post"]
+        gateway_resource = method_data["x-bk-apigateway-resource"]
+        assert method_data["operationId"] == expect["operation_id"]
+        assert gateway_resource["isPublic"] is True
+        assert gateway_resource["backend"]["method"] == "post"
+        assert gateway_resource["backend"]["path"] == expect["backend"]
+        assert (_DOCS_DIR / f"{method_data['operationId']}.md").is_file()
+
+
+def test_search_alert_events_apigw_contract():
+    """旧告警关联异常事件查询必须按原语义迁移到公开应用态网关。"""
+    method_data = _load_paths(_ALERT_FILE)["/app/alert/search_alert_events/"]["post"]
+    gateway_resource = method_data["x-bk-apigateway-resource"]
+
+    assert method_data["operationId"] == "search_alert_events"
+    assert gateway_resource["isPublic"] is True
+    assert gateway_resource["backend"] == {
+        "name": "default",
+        "method": "post",
+        "path": "/api/v4/alert/search_alert_events/",
+        "matchSubpath": False,
+    }
+    assert {k: v for k, v in gateway_resource["authConfig"].items() if k != "oauth2PersonalClientEnabled"} == {
+        "appVerifiedRequired": True,
+        "userVerifiedRequired": False,
+        "resourcePermissionRequired": True,
+    }
+    assert (_DOCS_DIR / "search_alert_events.md").is_file()
+
+
+def test_log_collection_create_mcp_contract():
+    """采集创建 MCP 的可选存储参数应保留底层默认值与写操作权限约束。"""
+    create_mcp_file = _RESOURCES_DIR / "internal/user/log_collection_create_mcp.yaml"
+    paths = _load_paths(create_mcp_file)
+
+    assert set(paths) == {"/mcp/fast_create_log_collector/"}
+    method_data = paths["/mcp/fast_create_log_collector/"]["post"]
+    assert method_data["operationId"] == "fast_create_log_collector"
+    assert method_data["tags"] == ["log_collection_mcp"]
+    schema = method_data["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["environment"]["enum"] == ["linux", "windows", "container"]
+    assert schema["properties"]["confirm"]["enum"] == [True]
+    for name, minimum in {"storage_cluster_id": 1, "retention": 1, "es_shards": 1, "storage_replies": 0}.items():
+        field_schema = schema["properties"][name]
+        assert field_schema["type"] == "integer"
+        assert field_schema["minimum"] == minimum
+        assert name not in schema["required"]
+        assert "default" not in field_schema
+    assert "data_link_id" not in schema["properties"]
+    assert "bk_username" not in schema["properties"]
+    assert schema["properties"]["target_nodes"]["items"]["additionalProperties"] is False
+    assert schema["properties"]["params"]["additionalProperties"] is False
+    assert schema["properties"]["configs"]["items"]["additionalProperties"] is False
+    assert schema["properties"]["configs"]["items"]["properties"]["params"]["additionalProperties"] is False
+    resource = method_data["x-bk-apigateway-resource"]
+    assert resource["backend"] == {
+        "name": "default",
+        "method": "post",
+        "path": "/api/v4/log_collection_create/fast_create/",
+        "matchSubpath": False,
+        "timeout": 30,
+    }
+    assert {k: v for k, v in resource["authConfig"].items() if k != "oauth2PersonalClientEnabled"} == {
+        "userVerifiedRequired": True,
+        "appVerifiedRequired": False,
+        "resourcePermissionRequired": True,
+    }
+
+
+def test_negative_space_id_related_info_apigw_contract():
+    """负数空间换正数业务必须保持内部应用态注册，并转到已有内核接口。"""
+    method_data = _load_paths(_METADATA_FILE)["/app/metadata/get_negative_space_id_related_info/"]["get"]
+    gateway_resource = method_data["x-bk-apigateway-resource"]
+
+    assert method_data["operationId"] == "metadata_get_negative_space_id_related_info"
+    assert gateway_resource["isPublic"] is False
+    assert gateway_resource["backend"]["method"] == "get"
+    assert gateway_resource["backend"]["path"] == "/api/v3/meta/get_negative_space_id_related_info/"
+    assert (_DOCS_DIR / f"{method_data['operationId']}.md").is_file()
+
+
+def test_result_table_storage_status_apigw_contract():
+    """结果表存储状态接口必须保持内部应用态注册，并提供对应中文文档。"""
+    method_data = _load_paths(_METADATA_FILE)["/app/metadata/get_result_table_storage_status/"]["get"]
+    gateway_resource = method_data["x-bk-apigateway-resource"]
+
+    assert method_data["operationId"] == "metadata_get_result_table_storage_status"
+    assert gateway_resource["isPublic"] is False
+    assert gateway_resource["backend"]["method"] == "get"
+    assert gateway_resource["backend"]["path"] == "/api/v3/meta/get_result_table_storage_status/"
+    assert (_DOCS_DIR / f"{method_data['operationId']}.md").is_file()
+
+
+def test_log_collection_update_mcp_contract():
+    """采集更新 MCP 只提供 Fast Update，并使用写请求后端。"""
+    update_mcp_file = _RESOURCES_DIR / "internal/user/log_collection_update_mcp.yaml"
+    paths = _load_paths(update_mcp_file)
+
+    assert set(paths) == {"/mcp/fast_update_log_collector/"}
+    method_data = paths["/mcp/fast_update_log_collector/"]["post"]
+    assert method_data["operationId"] == "fast_update_log_collector"
+    assert method_data["tags"] == ["log_collection_mcp"]
+    schema = method_data["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["collector_config_id"]["minimum"] == 1
+    assert "environment" not in schema["properties"]
+    assert "etl_config" not in schema["properties"]
+    assert schema["properties"]["target_nodes"]["items"]["additionalProperties"] is False
+    assert schema["properties"]["params"]["additionalProperties"] is False
+    assert schema["properties"]["configs"]["items"]["additionalProperties"] is False
+    assert schema["properties"]["configs"]["items"]["properties"]["params"]["additionalProperties"] is False
+    assert schema["properties"]["extra_labels"]["items"]["additionalProperties"] is False
+    resource = method_data["x-bk-apigateway-resource"]
+    assert resource["backend"] == {
+        "name": "default",
+        "method": "post",
+        "path": "/api/v4/log_collection_update/fast_update/",
+        "matchSubpath": False,
+        "timeout": 30,
+    }
+    assert {k: v for k, v in resource["authConfig"].items() if k != "oauth2PersonalClientEnabled"} == {
+        "userVerifiedRequired": True,
+        "appVerifiedRequired": False,
+        "resourcePermissionRequired": True,
+    }
+
+
+def test_apm_platform_integration_apigw_contract() -> None:
+    """平台对接依赖的服务列表与指标计算接口必须使用约定的网关配置。"""
+    internal_paths = _load_paths(_INTERNAL_APM_FILE)
+    external_paths = _load_paths(_EXTERNAL_APM_FILE)
+    expected_resources: dict[str, tuple[str, str]] = {
+        "/app/apm/service/service_list/": ("apm_service_list", "/api/v4/service_web/service_list/"),
+        "/app/apm/calculate_by_range/": ("calculate_by_range", "/api/v4/apm_metric_web/calculate_by_range/"),
+    }
+
+    for path, (operation_id, backend_path) in expected_resources.items():
+        assert path not in internal_paths
+
+        method_data = external_paths[path]["post"]
+        gateway_resource = method_data["x-bk-apigateway-resource"]
+        assert method_data["operationId"] == operation_id
+        assert gateway_resource["isPublic"] is True
+        assert gateway_resource["backend"] == {
+            "name": "default",
+            "method": "post",
+            "path": backend_path,
+            "matchSubpath": False,
+        }
+        assert (_DOCS_DIR / f"{operation_id}.md").is_file()
+
+
+def test_apm_return_code_configuration_apigw_contract(tmp_path) -> None:
+    """返回码配置经合并后仍使用受授权的应用态路由，并指向已注册的 Resource。"""
+    import shutil
+
+    backend_root: Path = _RESOURCES_DIR.parents[2]
+    service_tree: ast.Module = ast.parse((backend_root / "packages/apm_web/service/views.py").read_text())
+    routes: dict[str, tuple[str, str]] = {
+        ast.literal_eval(node.args[2]): (ast.literal_eval(node.args[0]), node.args[1].id)
+        for node in ast.walk(service_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ResourceRoute"
+        and len(node.args) >= 3
+    }
+    expected_resources: dict[str, str] = {
+        "list_code_redefined_rule": "ListCodeRedefinedRuleResource",
+        "set_code_redefined_rule": "SetCodeRedefinedRuleResource",
+        "get_code_remarks": "GetCodeRemarksResource",
+        "set_code_remark": "SetCodeRemarkResource",
+    }
+    shutil.copytree(_RESOURCES_DIR, tmp_path / "resources")
+    merge_resources_func(tmp_path / "resources")
+    merged_paths: dict = _load_paths(tmp_path / "resources.yaml")
+
+    for endpoint, resource_class in expected_resources.items():
+        path: str = f"/app/apm/service/{endpoint}/"
+        assert routes[endpoint] == ("POST", resource_class)
+        assert path not in _load_paths(_EXTERNAL_APM_FILE)
+        operation: dict = merged_paths[path]["post"]
+        assert operation["operationId"] == f"apm_{endpoint}"
+        assert operation["tags"] == ["apm"]
+        resource: dict = operation["x-bk-apigateway-resource"]
+        assert resource["isPublic"] is False
+        assert resource["matchSubpath"] is False
+        assert resource["backend"] == {
+            "name": "default",
+            "method": "post",
+            "path": f"/api/v4/service_web/{endpoint}/",
+            "matchSubpath": False,
+        }
+        assert resource["authConfig"] == {
+            "appVerifiedRequired": True,
+            "userVerifiedRequired": False,
+            "resourcePermissionRequired": True,
+        }
+        assert (_DOCS_DIR / f"apm_{endpoint}.md").is_file()
+
+
+def test_llm_observability_apigw_contract() -> None:
+    """旧 APM Trace API 保持不变，新增 LLM API 转发到 V4 Resource。"""
+    paths = _load_paths(_INTERNAL_APM_FILE)
+    expected_legacy_resources = {
+        "/app/apm/list_spans/": {
+            "post": {
+                "operationId": "list_spans",
+                "description": "查询 span",
+                "x-bk-apigateway-resource": {
+                    "isPublic": False,
+                    "allowApplyPermission": True,
+                    "matchSubpath": False,
+                    "backend": {
+                        "name": "default",
+                        "method": "post",
+                        "path": "/api/v4/trace_query_web/list_spans/",
+                        "matchSubpath": False,
+                    },
+                    "authConfig": {
+                        "appVerifiedRequired": True,
+                        "userVerifiedRequired": False,
+                        "resourcePermissionRequired": True,
+                    },
+                    "descriptionEn": "query span list",
+                },
+            }
+        },
+        "/app/apm/list_traces/": {
+            "post": {
+                "operationId": "list_traces",
+                "description": "查询 span",
+                "x-bk-apigateway-resource": {
+                    "isPublic": False,
+                    "allowApplyPermission": True,
+                    "matchSubpath": False,
+                    "backend": {
+                        "name": "default",
+                        "method": "post",
+                        "path": "/api/v4/trace_query_web/list_traces/",
+                        "matchSubpath": False,
+                    },
+                    "authConfig": {
+                        "appVerifiedRequired": True,
+                        "userVerifiedRequired": False,
+                        "resourcePermissionRequired": True,
+                    },
+                    "descriptionEn": "query span list",
+                },
+            }
+        },
+    }
+    for path, expected_resource in expected_legacy_resources.items():
+        assert paths[path] == expected_resource
+
+    expected_resources: dict[str, tuple[str, str]] = {
+        "/app/apm/list_llm_spans/": ("list_llm_spans", "/api/v4/apm_llm_web/list_spans/"),
+        "/app/apm/list_llm_flows/": ("list_llm_flows", "/api/v4/apm_llm_web/list_flows/"),
+        "/app/apm/llm_token_statistics/": (
+            "llm_token_statistics",
+            "/api/v4/apm_llm_web/token_statistics/",
+        ),
+        "/app/apm/list_llm_traces/": ("list_llm_traces", "/api/v4/apm_llm_web/list_traces/"),
+        "/app/apm/llm_time_series/": ("llm_time_series", "/api/v4/apm_llm_web/time_series/"),
+        "/app/apm/llm_calculate_by_range/": (
+            "llm_calculate_by_range",
+            "/api/v4/apm_llm_web/calculate_by_range/",
+        ),
+    }
+
+    for path, (operation_id, backend_path) in expected_resources.items():
+        method_data = paths[path]["post"]
+        gateway_resource = method_data["x-bk-apigateway-resource"]
+        assert method_data["operationId"] == operation_id
+        assert gateway_resource["backend"] == {
+            "name": "default",
+            "method": "post",
+            "path": backend_path,
+            "matchSubpath": False,
+        }
+        assert (_DOCS_DIR / f"{operation_id}.md").is_file()
+
+
+def test_repository_resources_have_unique_operation_ids():
+    """仓库内现有 apigw 资源定义必须无重复 operationId（回归基线）。"""
+    public_dirs = ["internal", "external"]
+    verify_dirs = ["app", "user"]
+    merged: dict[str, dict] = {}
+    for public_dir in public_dirs:
+        for verify_dir in verify_dirs:
+            for file in _RESOURCES_DIR.glob(f"{public_dir}/{verify_dir}/*.yaml"):
+                for path, path_data in _load_paths(file).items():
+                    # 带上来源文件，避免同一路径被 dict.update 覆盖后漏检 operationId 冲突。
+                    merged[f"{file.relative_to(_RESOURCES_DIR)}::{path}"] = path_data
+    check_unique_operation_ids(merged)
+
+
+def test_log_collection_etl_preview_mcp_contract():
+    """清洗预览 MCP 仅暴露无确认参数的只读预览 Tool。"""
+    etl_preview_mcp_file = _RESOURCES_DIR / "internal/user/log_collection_etl_preview_mcp.yaml"
+    paths = _load_paths(etl_preview_mcp_file)
+
+    assert set(paths) == {"/mcp/preview_log_etl/"}
+    method_data = paths["/mcp/preview_log_etl/"]["post"]
+    assert method_data["operationId"] == "preview_log_etl"
+    assert method_data["tags"] == ["log_collection_mcp"]
+    schema = method_data["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["properties"]["etl_config"]["enum"] == [
+        "bk_log_text",
+        "bk_log_json",
+        "bk_log_regexp",
+        "bk_log_delimiter",
+    ]
+    assert schema["properties"]["data"]["maxLength"] == 10_000
+    assert schema["properties"]["etl_params"]["additionalProperties"] is False
+    assert "confirm" not in schema["properties"]
+
+    gateway_resource = method_data["x-bk-apigateway-resource"]
+    assert gateway_resource["backend"] == {
+        "name": "default",
+        "method": "post",
+        "path": "/api/v4/log_collection_etl_preview/preview/",
+        "matchSubpath": False,
+        "timeout": 30,
+    }
+    assert {k: v for k, v in gateway_resource["authConfig"].items() if k != "oauth2PersonalClientEnabled"} == {
+        "userVerifiedRequired": True,
+        "appVerifiedRequired": False,
+        "resourcePermissionRequired": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("operation", "resource_class"),
+    [
+        ("find_relations", "QueryMultiResourceRelationResource"),
+        ("find_relations_range", "QueryMultiResourceRelationRangeResource"),
+    ],
+)
+def test_relation_gateway_backend_matches_registered_resource(operation, resource_class):
+    """Compare independent gateway and server route declarations without loading services."""
+    backend_root = _RESOURCES_DIR.parents[2]
+    view = ast.parse((backend_root / "kernel_api/views/v4/relation.py").read_text())
+    routes = {}
+    for node in ast.walk(view):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "ResourceRoute":
+            continue
+        endpoint = next(keyword.value for keyword in node.keywords if keyword.arg == "endpoint")
+        routes[node.args[1].id] = (ast.literal_eval(node.args[0]), ast.literal_eval(endpoint))
+    method, endpoint = routes[resource_class]
+    operation_data = _load_paths(_RESOURCES_DIR / "internal/user/relation_mcp.yaml")[f"/mcp/{operation}/"]["post"]
+    backend = operation_data["x-bk-apigateway-resource"]["backend"]
+    assert backend["method"].upper() == method
+    assert backend["path"] == f"/api/v4/relation/{endpoint}/"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_personal_tokens_are_opted_in_and_survive_merge(tmp_path):
+    """Personal authentication must remain user-scoped and never opt in mutations implicitly."""
+    import shutil
+
+    registry_path = _SCRIPT.parents[3] / "kernel_api/unified_mcp/registry.py"
+    tree = ast.parse(registry_path.read_text())
+    capabilities = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "CAPABILITIES" for t in node.targets)
+    )
+    aliases = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "PUBLIC_TOOL_NAMES" for t in node.targets)
+    )
+    shutil.copytree(_RESOURCES_DIR, tmp_path / "resources")
+    merge_resources_func(tmp_path / "resources")
+    merged = yaml.safe_load((tmp_path / "resources.yaml").read_text())["paths"]
+    enabled = set()
+    for path, methods in merged.items():
+        for operation in methods.values():
+            config = operation["x-bk-apigateway-resource"]["authConfig"]
+            if not config.get("oauth2PersonalClientEnabled"):
+                continue
+            name = operation["operationId"]
+            assert config["userVerifiedRequired"] is True
+            assert config["appVerifiedRequired"] is False
+            assert not {"mutation", "task", "export"}.intersection(capabilities.get(aliases.get(name, name), ()))
+            enabled.add(name)
+    assert {
+        "search_logs",
+        "get_trace_detail",
+        "execute_range_query",
+        "lookup_tool",
+        "lookup_tool_schema",
+        "lookup_permissions",
+        "lookup_metadata",
+    } <= enabled
+    assert "execute_tool" not in enabled
+
+
+def test_shared_read_backends_move_only_mcp_resources(tmp_path):
+    """Check the generated gateway deployment input; original app paths stay intact."""
+    import shutil
+
+    expected = {
+        "get_alert_info": ("get", "/app/alert/detail/", "/api/v4/alert/alert/detail/"),
+        "list_time_series_metrics": (
+            "get",
+            "/app/metadata/get_time_series_metrics/",
+            "/api/v3/meta/get_time_series_metrics/",
+        ),
+        "search_spaces": ("get", "/app/metadata/list_spaces/", "/api/v3/meta/list_spaces/"),
+        "get_dashboard_tree_list": (
+            "get",
+            "/app/dashboard/get_dashboard_directory_tree/",
+            "/api/v4/grafana/get_directory_tree/",
+        ),
+        "get_dashboard_detail_by_uid": (
+            "get",
+            "/app/dashboard/get_dashboard_detail/",
+            "/api/v4/grafana/get_dashboard_detail/",
+        ),
+        "list_apm_services": ("post", "/app/apm/service/service_list/", "/api/v4/service_web/service_list/"),
+        "calculate_by_range": ("post", "/app/apm/calculate_by_range/", "/api/v4/apm_metric_web/calculate_by_range/"),
+    }
+    shutil.copytree(_RESOURCES_DIR, tmp_path / "resources")
+    merge_resources_func(tmp_path / "resources")
+    paths = yaml.safe_load((tmp_path / "resources.yaml").read_text())["paths"]
+    app_backends, mcp_backends = set(), {}
+    for frontend, methods in paths.items():
+        for operation in methods.values():
+            resource = operation["x-bk-apigateway-resource"]
+            backend = resource["backend"]
+            pair = (backend["method"].lower(), backend["path"])
+            if frontend.startswith("/app/"):
+                app_backends.add(pair)
+            elif frontend.startswith("/mcp/"):
+                mcp_backends[frontend] = pair
+    for name, (method, app_frontend, original) in expected.items():
+        app = paths[app_frontend][method]["x-bk-apigateway-resource"]
+        user_operation = paths["/mcp/" + name + "/"][method]
+        user = user_operation["x-bk-apigateway-resource"]
+        assert app["backend"]["path"] == original
+        assert app["authConfig"]["appVerifiedRequired"] is True
+        assert app["authConfig"]["userVerifiedRequired"] is False
+        assert app["authConfig"]["resourcePermissionRequired"] is True
+        assert user["backend"]["path"] == "/api/v4/mcp/" + name + "/"
+        assert user["authConfig"]["userVerifiedRequired"] is True
+        assert user["authConfig"]["oauth2PersonalClientEnabled"] is True
+        assert user["authConfig"]["resourcePermissionRequired"] is True
+        assert user["matchSubpath"] is False and user["backend"]["matchSubpath"] is False
+        assert user_operation["operationId"] == ("apm_mcp_calculate_by_range" if name == "calculate_by_range" else name)
+    # The two ops MCP overlaps are intentionally unchanged and remain user-only.
+    assert app_backends & set(mcp_backends.values()) == {
+        ("get", "/api/v3/meta/query_data_link_metadata/"),
+        ("get", "/api/v3/meta/get_data_link_metadata/"),
+    }
+    for name in ("query_datalink_metadata", "get_data_link_metadata"):
+        auth = paths["/mcp/" + name + "/"]["get"]["x-bk-apigateway-resource"]["authConfig"]
+        assert auth["userVerifiedRequired"] is True
+        assert not auth.get("oauth2PersonalClientEnabled", False)

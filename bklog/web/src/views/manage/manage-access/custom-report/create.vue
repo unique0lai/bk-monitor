@@ -27,9 +27,9 @@
 <template>
   <div
     ref="addNewCustomBoxRef"
+    v-bkloading="{ isLoading: containerLoading }"
     :style="`padding-right: ${introWidth + 20}px;`"
     class="custom-create-container"
-    v-bkloading="{ isLoading: containerLoading }"
     data-test-id="custom_div_addNewCustomBox"
   >
     <bk-form
@@ -47,8 +47,8 @@
           required
         >
           <bk-input
-            class="form-input"
             v-model="formData.bk_data_id"
+            class="form-input"
             disabled
           >
           </bk-input>
@@ -65,8 +65,8 @@
           required
         >
           <bk-input
-            class="form-input"
             v-model="formData.collector_config_name"
+            class="form-input"
             data-test-id="addNewCustomBox_input_dataName"
             maxlength="50"
             show-word-limit
@@ -82,10 +82,10 @@
             <div class="bk-button-group">
               <bk-button
                 v-for="(item, index) of globalsData.databus_custom"
+                :key="index"
                 :class="`${formData.custom_type === item.id ? 'is-selected' : ''}`"
                 :data-test-id="`addNewCustomBox_button_typeTo${item.id}`"
                 :disabled="isEdit"
-                :key="index"
                 size="small"
                 @click="handleChangeType(item.id)"
               >
@@ -93,8 +93,8 @@
               </bk-button>
             </div>
             <p
-              class="group-tip"
               slot="tip"
+              class="group-tip"
             >
               {{
                 $t(
@@ -115,8 +115,8 @@
           <div class="en-name-box">
             <div>
               <bk-input
-                class="form-input"
                 v-model="formData.collector_config_name_en"
+                class="form-input"
                 :disabled="submitLoading || isEdit"
                 :placeholder="$t('支持数字、字母、下划线，长短5～50字符')"
                 data-test-id="addNewCustomBox_input_englishName"
@@ -147,8 +147,8 @@
           required
         >
           <bk-select
-            style="width: 500px"
             v-model="formData.category_id"
+            style="width: 500px"
             :disabled="submitLoading"
             data-test-id="addNewCustomBox_select_selectDataCategory"
           >
@@ -173,8 +173,8 @@
         </bk-form-item>
         <bk-form-item :label="$t('说明')">
           <bk-input
-            class="form-input"
             v-model="formData.description"
+            class="form-input"
             :disabled="submitLoading"
             :maxlength="100"
             :placeholder="$t('未输入')"
@@ -192,16 +192,26 @@
           :property="'data_link_id'"
           required
         >
+          <ClusterTypeTabs
+            v-if="isDorisEnabled"
+            :active-tab="clusterType"
+            :is-doris-enabled="isDorisEnabled"
+            @tab-click="handleClusterTypeChange"
+          />
           <cluster-table
+            :external-doris-mode="isDorisMode"
             :is-change-select="true"
             :storage-cluster-id.sync="formData.storage_cluster_id"
             :table-list="clusterList"
+            :table-loading="clusterLoading"
           />
           <cluster-table
             style="margin-top: 20px"
+            :external-doris-mode="isDorisMode"
             :is-change-select="true"
             :storage-cluster-id.sync="formData.storage_cluster_id"
             :table-list="exclusiveList"
+            :table-loading="clusterLoading"
             table-type="exclusive"
           />
         </bk-form-item>
@@ -214,8 +224,8 @@
           required
         >
           <bk-select
-            style="width: 500px"
             v-model="formData.data_link_id"
+            style="width: 500px"
             :clearable="false"
             :disabled="submitLoading || isEdit"
             data-test-id="addNewCustomBox_select_selectDataLink"
@@ -237,8 +247,8 @@
           :rules="storageRules.table_id"
         >
           <bk-input
-            style="width: 500px"
             v-model="formData.collector_config_name_en"
+            style="width: 500px"
             :placeholder="$t('英文或者数字，5～50长度')"
             data-test-id="addNewCustomBox_input_configName"
             maxlength="50"
@@ -253,8 +263,8 @@
         <!-- 过期时间 -->
         <bk-form-item :label="$t('过期时间')">
           <bk-select
-            style="width: 500px"
             v-model="formData.retention"
+            style="width: 500px"
             :clearable="false"
             :disabled="submitLoading"
             data-test-id="addNewCustomBox_select_expireDate"
@@ -287,10 +297,13 @@
           </bk-select>
         </bk-form-item>
         <!-- 副本数 -->
-        <bk-form-item :label="$t('副本数')">
+        <bk-form-item
+          v-if="!isDorisMode"
+          :label="$t('副本数')"
+        >
           <bk-input
-            class="copy-number-input"
             v-model="formData.storage_replies"
+            class="copy-number-input"
             :clearable="false"
             :disabled="submitLoading"
             :max="replicasMax"
@@ -303,10 +316,13 @@
           ></bk-input>
         </bk-form-item>
         <!-- 分片数 -->
-        <bk-form-item :label="$t('分片数')">
+        <bk-form-item
+          v-if="!isDorisMode"
+          :label="$t('分片数')"
+        >
           <bk-input
-            class="copy-number-input"
             v-model="formData.es_shards"
+            class="copy-number-input"
             :clearable="false"
             :disabled="submitLoading"
             :max="shardsMax"
@@ -319,13 +335,13 @@
         </bk-form-item>
         <!-- 热数据\冷热集群存储期限 -->
         <bk-form-item
-          v-if="selectedStorageCluster.enable_hot_warm"
+          v-if="selectedStorageCluster.enable_hot_warm && !isDorisMode"
           class="hot-data-form-item"
           :label="$t('热数据天数')"
         >
           <bk-select
-            style="width: 320px"
             v-model="formData.allocation_min_days"
+            style="width: 320px"
             :clearable="false"
             :disabled="!selectedStorageCluster.enable_hot_warm"
             data-test-id="addNewCustomBox_select_selectHotData"
@@ -412,6 +428,8 @@
 
 <script>
   import clusterTable from '@/components/collection-access/components/cluster-table';
+  import ClusterTypeTabs from '@/views/manage-v2/es-cluster/cluster-manage/cluster-type-tabs';
+  import { isFeatureToggleOn } from '@/hooks/use-feature-toggle';
   import dragMixin from '@/mixins/drag-mixin';
   import storageMixin from '@/mixins/storage-mixin';
   import { mapGetters } from 'vuex';
@@ -424,12 +442,16 @@
     components: {
       IntroPanel,
       clusterTable,
+      ClusterTypeTabs,
       FieldSetting,
     },
     mixins: [storageMixin, dragMixin],
     data() {
       return {
-        isItsm: window.FEATURE_TOGGLE.collect_itsm === 'on',
+        isItsm: isFeatureToggleOn('collect_itsm', [
+          String(this.$store.state.bkBizId),
+          String(this.$store.state.spaceUid),
+        ]),
         customRetentionDay: '', // 过期时间天数
         customHotDataDay: 0, // 热数据天数
         retentionDaysList: [], // 过期时间列表
@@ -539,6 +561,10 @@
         exclusiveList: [], // 独享集群
         editStorageClusterID: null,
         isTextValid: true,
+        isDorisMode: false, // 是否为doris集群模式
+        clusterType: 'elasticsearch', // 当前集群类型
+        clusterLoading: false, // 切换集群类型时的加载状态
+        isDorisEnabled: false, // 是否启用doris集群
         fieldSettingData: {
           indexSetId: 0,
           targetFields: [],
@@ -549,12 +575,13 @@
     computed: {
       ...mapGetters({
         bkBizId: 'bkBizId',
+        spaceUid: 'spaceUid',
         globalsData: 'globals/globalsData',
       }),
       defaultRetention() {
-        const { storage_duration_time } = this.globalsData;
+        const { storage_duration_time: storageDurationTime } = this.globalsData;
 
-        return storage_duration_time?.filter(item => item.default === true)[0].id;
+        return storageDurationTime?.filter(item => item.default === true)[0].id;
       },
       isCloseDataLink() {
         // 没有可上报的链路时，编辑采集配置链路ID为0或null时，隐藏链路配置框，并且不做空值校验。
@@ -592,18 +619,65 @@
     },
     mounted() {
       this.containerLoading = true;
-      Promise.all([this.getLinkData(), this.getStorage()])
-        .then(async () => {
-          await this.initFormData();
-        })
-        .finally(() => {
-          this.containerLoading = false;
-        });
+      this.checkDorisAccess();
+      if (this.isEdit) {
+        // 编辑模式：先获取详情确定集群类型，再获取对应集群列表，最后回填表单
+        this.initEditFlow();
+      } else {
+        // 新建模式：原有逻辑不变
+        Promise.all([this.getLinkData(), this.getStorage()])
+          .then(async () => {
+            await this.initFormData();
+          })
+          .finally(() => {
+            this.containerLoading = false;
+          });
+      }
       this.$nextTick(() => {
         this.maxIntroWidth = this.$refs.addNewCustomBoxRef.clientWidth - 380;
       });
     },
     methods: {
+      checkDorisAccess() {
+        const hasAccess = isFeatureToggleOn('doris_storage_cluster', [String(this.bkBizId), String(this.spaceUid)]);
+        this.isDorisEnabled = hasAccess;
+        if (hasAccess) {
+          const tabQuery = this.$route.query.cluster_type;
+          if (tabQuery === 'doris') {
+            this.clusterType = 'doris';
+            this.isDorisMode = true;
+          }
+        } else if (this.clusterType === 'doris') {
+          this.clusterType = 'elasticsearch';
+          this.isDorisMode = false;
+          this.updateRouteClusterType('elasticsearch');
+        }
+      },
+      updateRouteClusterType(type) {
+        const currentQuery = { ...this.$route.query };
+        currentQuery.cluster_type = type;
+        this.$router.replace({
+          name: this.$route.name,
+          params: this.$route.params,
+          query: currentQuery,
+        });
+      },
+      async handleClusterTypeChange(type) {
+        if (this.clusterType === type) return;
+        this.clusterType = type;
+        this.isDorisMode = type === 'doris';
+        this.updateRouteClusterType(type);
+        this.formData.storage_cluster_id = '';
+        this.selectedStorageCluster = {};
+        this.clusterList = [];
+        this.exclusiveList = [];
+        this.clusterLoading = true;
+        try {
+          await this.getStorage();
+        } finally {
+          this.clusterLoading = false;
+        }
+      },
       handleChangeType(id) {
         this.formData.custom_type = id;
       },
@@ -619,20 +693,28 @@
           () => {
             this.submitLoading = true;
             if (this.isCloseDataLink) delete this.formData.data_link_id;
+            const submitData = {
+              ...this.formData,
+              storage_replies: Number(this.formData.storage_replies),
+              allocation_min_days: Number(this.formData.allocation_min_days),
+              es_shards: Number(this.formData.es_shards),
+              bk_biz_id: Number(this.bkBizId),
+              sort_fields: this.fieldSettingData.sortFields || [],
+              target_fields: this.fieldSettingData.targetFields || [],
+            };
+
+            if (this.isDorisMode) {
+              delete submitData.es_shards;
+              delete submitData.storage_replies;
+              delete submitData.allocation_min_days;
+            }
+
             this.$http
               .request(`custom/${this.isEdit ? 'setCustom' : 'createCustom'}`, {
                 params: {
                   collector_config_id: this.collectorId,
                 },
-                data: {
-                  ...this.formData,
-                  storage_replies: Number(this.formData.storage_replies),
-                  allocation_min_days: Number(this.formData.allocation_min_days),
-                  es_shards: Number(this.formData.es_shards),
-                  bk_biz_id: Number(this.bkBizId),
-                  sort_fields: this.fieldSettingData.sortFields || [],
-                  target_fields: this.fieldSettingData.targetFields || [],
-                },
+                data: submitData,
               })
               .then(res => {
                 res.result && this.messageSuccess(this.$t('保存成功'));
@@ -663,57 +745,85 @@
         }
       },
       async initFormData() {
-        if (this.isEdit) {
-          const res = await this.$http.request('collect/details', {
+        // 仅用于新建模式
+        const { retention } = this.formData;
+        Object.assign(this.formData, {
+          retention: retention ? `${retention}` : this.defaultRetention,
+        });
+      },
+      async initEditFlow() {
+        try {
+          // 第一步：先获取详情，拿到 storage_cluster_type 确定集群类型
+          const detailRes = await this.$http.request('collect/details', {
             params: {
               collector_config_id: this.collectorId,
             },
           });
-          const {
-            index_set_id,
-            collector_config_name,
-            collector_config_name_en,
-            custom_type,
-            data_link_id,
-            storage_cluster_id,
-            retention,
-            allocation_min_days,
-            storage_replies,
-            category_id,
-            description,
-            bk_data_id,
-            target_fields,
-            sort_fields,
-            storage_shards_nums: storageShardsNums,
-          } = res?.data;
-          Object.assign(this.formData, {
-            collector_config_name,
-            collector_config_name_en,
-            custom_type,
-            data_link_id,
-            storage_cluster_id,
-            retention: retention ? `${retention}` : this.defaultRetention,
-            allocation_min_days,
-            storage_replies,
-            category_id,
-            description,
-            bk_data_id,
-            es_shards: storageShardsNums,
-          });
-          // 缓存编辑时的集群ID
+          const detailData = detailRes?.data;
 
-          this.editStorageClusterID = storage_cluster_id;
-          this.fieldSettingData = {
-            indexSetId: index_set_id || 0,
-            targetFields: target_fields || [],
-            sortFields: sort_fields || [],
-          };
-        } else {
-          const { retention } = this.formData;
-          Object.assign(this.formData, {
-            retention: retention ? `${retention}` : this.defaultRetention,
-          });
+          // 第二步：根据详情中的 storage_cluster_type 设置集群类型
+          if (this.isDorisEnabled && detailData?.storage_cluster_type === 'doris') {
+            this.clusterType = 'doris';
+            this.isDorisMode = true;
+          } else {
+            this.clusterType = 'elasticsearch';
+            this.isDorisMode = false;
+          }
+          this.updateRouteClusterType(this.clusterType);
+
+          // 第三步：用正确的集群类型获取集群列表和数据链路
+          this.clusterList = [];
+          this.exclusiveList = [];
+          await Promise.all([this.getLinkData(), this.getStorage()]);
+
+          // 第四步：集群列表已就绪，回填表单数据
+          this.fillEditFormData(detailData);
+        } catch (e) {
+          console.warn(e);
+        } finally {
+          this.containerLoading = false;
         }
+      },
+      fillEditFormData(detailData) {
+        const {
+          index_set_id: indexSetId,
+          collector_config_name,
+          collector_config_name_en,
+          custom_type,
+          data_link_id,
+          storage_cluster_id: storageClusterId,
+          retention,
+          allocation_min_days,
+          storage_replies,
+          category_id,
+          description,
+          bk_data_id,
+          target_fields: targetFields,
+          sort_fields: sortFields,
+          storage_shards_nums: storageShardsNums,
+        } = detailData;
+
+        Object.assign(this.formData, {
+          collector_config_name,
+          collector_config_name_en,
+          custom_type,
+          data_link_id,
+          storage_cluster_id: storageClusterId,
+          retention: retention ? `${retention}` : this.defaultRetention,
+          allocation_min_days,
+          storage_replies,
+          category_id,
+          description,
+          bk_data_id,
+          es_shards: storageShardsNums,
+        });
+        // 缓存编辑时的集群ID
+        this.editStorageClusterID = storageClusterId;
+        this.fieldSettingData = {
+          indexSetId: indexSetId || 0,
+          targetFields: targetFields || [],
+          sortFields: sortFields || [],
+        };
       },
       cancel() {
         let routeName;

@@ -30,6 +30,7 @@ export default {
   // 规范: 去掉了请
 
   // 规范：输入xxx  Enter xxx
+  '搜索 会话 ID、Trace ID、用户 ID、消息关键字': 'Search by session ID, Trace ID, user ID, or message keywords',
   填写规则名: 'Enter rule name',
   填写英文名: 'Enter English name',
   输入指标id: 'Enter metric ID',
@@ -371,12 +372,31 @@ export default {
   '搜索 分组名': 'Search Groups Name',
   '搜索 收藏名称': 'Search Favorite Name',
   '请输入 关键字': 'Please enter keywords',
+  '搜索 关键字': 'Search Keyword',
   '搜索 字段名称': 'Search Field Name',
   '搜索 名称、别名': 'Search Name, Alias',
   '搜索 指标名、别名': 'Search Metric Name, Alias',
   输入告警ID进行变量渲染: 'Enter Alarm ID to render variables',
   '搜索 告警关键词': 'Search Alarm Keywords',
+
+  // RUM
+  '搜索 应用名称、应用别名、应用状态': 'Search Application Name, Application Alias, Application Status',
   '我要评论...': 'I want to comment...',
   请选择负责人: 'Please select the person in charge',
   请选择聚合维度: 'Please select aggregation dimension',
+  不选则按策略整体聚合: 'Aggregate by strategy as a whole if left empty',
+
+  '自定义拆分依据，例如：同一蓝盾发布后集中出现':
+    'Custom split criteria, e.g. Same BlueShift release after a consolidated appearance',
+  '自定义新增合并依据，例如：同一蓝盾发布后集中出现':
+    'Custom add merge criteria, e.g. Same BlueShift release after a consolidated appearance',
+  '{n} 列': '{n} columns',
+  '搜索 项目': 'Search Project',
+  '搜索 指标名称': 'Search Metric Name',
+  '搜索 指标分组': 'Search Metric Group',
+  请输入分组名称: 'Please enter group name',
+  '搜索 IP / 主机名 / 节点名称': 'Search IP / Hostname / Node Name',
+  '输入 进程名': 'Enter Process Name',
+  '搜索 名称、模型、Span ID': 'Search Name, Model, Span ID',
+  '搜索 Span': 'Search Span',
 };

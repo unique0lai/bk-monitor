@@ -30,8 +30,7 @@ import { formatFileSize } from '@/common/util';
 import EmptyStatus from '@/components/empty-status/index.vue';
 
 import { t } from '@/hooks/use-locale';
-import useStore from '@/hooks/use-store';
-import { useTableSetting } from '../hooks/use-table-setting';
+import { useTableSetting } from '@/views/manage-v2/hooks/use-table-setting';
 import { useSearchTask } from '../hooks/use-search-task';
 import { useDownloadFile } from '../hooks/use-download-file';
 import { FileUploadStatus, UserReportItem } from './types';
@@ -78,8 +77,6 @@ export default defineComponent({
   },
   emits: ['page-change', 'page-limit-change', 'search', 'sort-change', 'upload', 'selection-change'],
   setup(props, { emit }) {
-    const store = useStore();
-
     const reportTableRef = ref(null);
 
     // 分页配置
@@ -438,7 +435,7 @@ export default defineComponent({
     // 监听 total 变化，更新分页配置
     watch(
       () => props.total,
-      (newTotal) => {
+      newTotal => {
         pagination.value.count = newTotal;
       },
     );

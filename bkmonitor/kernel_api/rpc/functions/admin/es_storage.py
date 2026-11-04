@@ -17,21 +17,36 @@ from django.db.models import Q
 from core.drf_resource.exceptions import CustomException
 from kernel_api.rpc import KernelRPCRegistry
 from kernel_api.rpc.functions.admin.common import (
+    PAGE_LIST_TENANT_SCHEMA,
     build_response,
     count_by_field,
+    count_by_tenant_and_field,
+    filter_by_bk_tenant_id,
+    filter_by_tenant_resource_pairs,
     get_bk_tenant_id,
+    get_page_list_bk_tenant_id,
+    get_scoped_map_value,
+    instance_tenant_resource_key,
     normalize_include,
+    normalize_int_list_filter,
     normalize_optional_bool,
     normalize_ordering,
     normalize_pagination,
     normalize_positive_int,
+    normalize_string_list_filter,
     paginate_queryset,
     SAFETY_LEVEL_WRITE,
     serialize_model,
     serialize_option,
     serialize_value,
 )
+from kernel_api.rpc.functions.admin.storage_cluster_history import (
+    build_storage_cluster_records,
+    clone_storage_with_runtime_cluster,
+    resolve_runtime_storage_cluster,
+)
 from metadata import models
+from metadata.service.es_storage import query_es_storage_runtime
 
 FUNC_ES_STORAGE_LIST = "admin.es_storage.list"
 FUNC_ES_STORAGE_DETAIL = "admin.es_storage.detail"
@@ -87,17 +102,6 @@ RESULT_TABLE_SUMMARY_FIELDS = [
     "is_deleted",
 ]
 CLUSTER_SUMMARY_FIELDS = ["cluster_id", "cluster_name", "display_name", "cluster_type"]
-STORAGE_CLUSTER_RECORD_FIELDS = [
-    "table_id",
-    "cluster_id",
-    "is_current",
-    "is_deleted",
-    "enable_time",
-    "disable_time",
-    "delete_time",
-    "creator",
-    "create_time",
-]
 RESULT_TABLE_OPTION_NAMES = {
     models.ResultTableOption.OPTION_ES_DOCUMENT_ID,
     models.ResultTableOption.OPTION_CUSTOM_REPORT_DIMENSION_VALUES,
@@ -167,16 +171,23 @@ def _serialize_es_storage_list_item(
 ) -> dict[str, Any]:
     item = serialize_model(es_storage, ES_STORAGE_LIST_FIELDS)
     item["table_kind"] = _table_kind(es_storage)
-    item["result_table"] = _serialize_result_table_summary(result_table_map.get(es_storage.table_id))
-    item["storage_cluster"] = _serialize_cluster_summary(cluster_map.get(es_storage.storage_cluster_id))
+    item["result_table"] = _serialize_result_table_summary(
+        get_scoped_map_value(result_table_map, es_storage.bk_tenant_id, es_storage.table_id)
+    )
+    item["storage_cluster"] = _serialize_cluster_summary(
+        get_scoped_map_value(cluster_map, es_storage.bk_tenant_id, es_storage.storage_cluster_id)
+    )
     item["physical_table"] = None
     if item["table_kind"] == TABLE_KIND_VIRTUAL:
         item["physical_table"] = {
             "table_id": es_storage.origin_table_id,
-            "exists": es_storage.origin_table_id in physical_table_exists,
+            "exists": es_storage.origin_table_id in physical_table_exists
+            or (es_storage.bk_tenant_id, es_storage.origin_table_id) in physical_table_exists,
         }
     item["virtual_table_count"] = (
-        virtual_table_count_map.get(es_storage.table_id, 0) if item["table_kind"] == TABLE_KIND_PHYSICAL else 0
+        get_scoped_map_value(virtual_table_count_map, es_storage.bk_tenant_id, es_storage.table_id) or 0
+        if item["table_kind"] == TABLE_KIND_PHYSICAL
+        else 0
     )
     return item
 
@@ -193,8 +204,8 @@ def _serialize_cluster_summary(cluster: Any | None) -> dict[str, Any] | None:
     return serialize_model(cluster, CLUSTER_SUMMARY_FIELDS)
 
 
-def _build_es_storage_queryset(params: dict[str, Any], bk_tenant_id: str):
-    queryset = models.ESStorage.objects.filter(bk_tenant_id=bk_tenant_id)
+def _build_es_storage_queryset(params: dict[str, Any], bk_tenant_id: str | None):
+    queryset = filter_by_bk_tenant_id(models.ESStorage.objects.all(), bk_tenant_id)
 
     if params.get("table_id"):
         table_id = str(params["table_id"]).strip()
@@ -207,11 +218,33 @@ def _build_es_storage_queryset(params: dict[str, Any], bk_tenant_id: str):
             | Q(origin_table_id__contains=table_id)
         )
 
-    if params.get("data_label") not in (None, ""):
-        table_ids = models.ResultTable.objects.filter(
-            bk_tenant_id=bk_tenant_id, data_label=str(params["data_label"]).strip()
-        ).values_list("table_id", flat=True)
-        queryset = queryset.filter(table_id__in=table_ids)
+    data_labels = normalize_string_list_filter(params, "data_label", "data_labels")
+    if data_labels:
+        result_tables = filter_by_bk_tenant_id(
+            models.ResultTable.objects.filter(data_label__in=data_labels), bk_tenant_id
+        ).only("bk_tenant_id", "table_id")
+        if bk_tenant_id is None:
+            queryset = filter_by_tenant_resource_pairs(
+                queryset,
+                "table_id",
+                ((result_table.bk_tenant_id, result_table.table_id) for result_table in result_tables),
+            )
+        else:
+            queryset = queryset.filter(table_id__in=[result_table.table_id for result_table in result_tables])
+
+    bk_data_ids = normalize_int_list_filter(params, "bk_data_id", "bk_data_ids", positive=True)
+    if bk_data_ids:
+        relations = filter_by_bk_tenant_id(
+            models.DataSourceResultTable.objects.filter(bk_data_id__in=bk_data_ids), bk_tenant_id
+        ).only("bk_tenant_id", "table_id")
+        if bk_tenant_id is None:
+            queryset = filter_by_tenant_resource_pairs(
+                queryset,
+                "table_id",
+                ((relation.bk_tenant_id, relation.table_id) for relation in relations),
+            )
+        else:
+            queryset = queryset.filter(table_id__in=[relation.table_id for relation in relations])
 
     table_kind = str(params.get("table_kind") or "").strip()
     if table_kind == TABLE_KIND_PHYSICAL:
@@ -221,12 +254,9 @@ def _build_es_storage_queryset(params: dict[str, Any], bk_tenant_id: str):
     elif table_kind:
         raise CustomException(message="table_kind 仅支持 physical 或 virtual")
 
-    if params.get("storage_cluster_id") not in (None, ""):
-        try:
-            storage_cluster_id = int(params["storage_cluster_id"])
-        except (TypeError, ValueError) as error:
-            raise CustomException(message="storage_cluster_id 必须是整数") from error
-        queryset = queryset.filter(storage_cluster_id=storage_cluster_id)
+    storage_cluster_ids = normalize_int_list_filter(params, "storage_cluster_id", "storage_cluster_ids", positive=True)
+    if storage_cluster_ids:
+        queryset = queryset.filter(storage_cluster_id__in=storage_cluster_ids)
 
     if params.get("source_type") not in (None, ""):
         queryset = queryset.filter(source_type=str(params["source_type"]).strip())
@@ -238,23 +268,23 @@ def _build_es_storage_queryset(params: dict[str, Any], bk_tenant_id: str):
     return queryset
 
 
-def _load_result_table_map(bk_tenant_id: str, table_ids: list[str]) -> dict[str, Any]:
+def _load_result_table_map(bk_tenant_id: str | None, table_ids: list[str]) -> dict[Any, Any]:
     if not table_ids:
         return {}
-    return {
-        result_table.table_id: result_table
-        for result_table in models.ResultTable.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=table_ids)
-    }
+    queryset = filter_by_bk_tenant_id(models.ResultTable.objects.filter(table_id__in=table_ids), bk_tenant_id)
+    if bk_tenant_id is None:
+        return {instance_tenant_resource_key(result_table, "table_id"): result_table for result_table in queryset}
+    return {result_table.table_id: result_table for result_table in queryset}
 
 
-def _load_cluster_map(bk_tenant_id: str, cluster_ids: list[int]) -> dict[int, Any]:
+def _load_cluster_map(bk_tenant_id: str | None, cluster_ids: list[int]) -> dict[Any, Any]:
     normalized_ids = [cluster_id for cluster_id in cluster_ids if cluster_id not in (None, "")]
     if not normalized_ids:
         return {}
-    return {
-        cluster.cluster_id: cluster
-        for cluster in models.ClusterInfo.objects.filter(bk_tenant_id=bk_tenant_id, cluster_id__in=normalized_ids)
-    }
+    queryset = filter_by_bk_tenant_id(models.ClusterInfo.objects.filter(cluster_id__in=normalized_ids), bk_tenant_id)
+    if bk_tenant_id is None:
+        return {instance_tenant_resource_key(cluster, "cluster_id"): cluster for cluster in queryset}
+    return {cluster.cluster_id: cluster for cluster in queryset}
 
 
 def _get_es_storage_or_raise(bk_tenant_id: str, table_id: str):
@@ -262,23 +292,6 @@ def _get_es_storage_or_raise(bk_tenant_id: str, table_id: str):
         return models.ESStorage.objects.get(bk_tenant_id=bk_tenant_id, table_id=table_id)
     except models.ESStorage.DoesNotExist as error:
         raise CustomException(message=f"未找到 ESStorage: table_id={table_id}") from error
-
-
-def _serialize_storage_cluster_record(record: Any, cluster_map: dict[int, Any]) -> dict[str, Any]:
-    item = serialize_model(record, STORAGE_CLUSTER_RECORD_FIELDS)
-    item["cluster"] = _serialize_cluster_summary(cluster_map.get(record.cluster_id))
-    return item
-
-
-def _build_storage_cluster_records(es_storage: Any, bk_tenant_id: str) -> list[dict[str, Any]]:
-    record_table_id = es_storage.origin_table_id if _is_virtual_es_storage(es_storage) else es_storage.table_id
-    records = list(
-        models.StorageClusterRecord.objects.filter(bk_tenant_id=bk_tenant_id, table_id=record_table_id).order_by(
-            "-create_time"
-        )
-    )
-    cluster_map = _load_cluster_map(bk_tenant_id, [record.cluster_id for record in records])
-    return [_serialize_storage_cluster_record(record, cluster_map) for record in records]
 
 
 def _build_physical_table(es_storage: Any, bk_tenant_id: str) -> dict[str, Any] | None:
@@ -366,18 +379,6 @@ def _mark_inspect_response(response: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
-def _serialize_runtime_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _serialize_runtime_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_serialize_runtime_value(item) for item in value]
-    return serialize_value(value)
-
-
-def _runtime_index_expression(es_storage: Any, index: str | None = None) -> str:
-    return index or es_storage.search_format_v2()
-
-
 def _append_runtime_warning(
     warnings: list[dict[str, Any]], code: str, message: str, error: Exception | None = None
 ) -> None:
@@ -385,86 +386,6 @@ def _append_runtime_warning(
     if error is not None:
         warning["details"] = {"error": str(error)}
     warnings.append(warning)
-
-
-def _run_runtime_query(
-    *,
-    name: str,
-    es_storage: Any,
-    bk_tenant_id: str,
-    table_id: str,
-    query,
-    warnings: list[dict[str, Any]],
-) -> Any:
-    try:
-        return query(es_storage)
-    except Exception as error:  # pylint: disable=broad-except
-        if _is_virtual_es_storage(es_storage):
-            physical_storage = models.ESStorage.objects.filter(
-                bk_tenant_id=bk_tenant_id, table_id=es_storage.origin_table_id
-            ).first()
-            if physical_storage is not None:
-                try:
-                    result = query(physical_storage)
-                    _append_runtime_warning(
-                        warnings,
-                        "RUNTIME_QUERY_FALLBACK_TO_PHYSICAL",
-                        f"{name} 查询虚拟表失败，已回退实体表: table_id={table_id}, origin_table_id={es_storage.origin_table_id}",
-                        error,
-                    )
-                    return result
-                except Exception as fallback_error:  # pylint: disable=broad-except
-                    _append_runtime_warning(
-                        warnings,
-                        "RUNTIME_QUERY_FAILED",
-                        f"{name} 查询失败，虚拟表和实体表回退均不可用: table_id={table_id}",
-                        fallback_error,
-                    )
-                    return None
-        _append_runtime_warning(warnings, "RUNTIME_QUERY_FAILED", f"{name} 查询失败: table_id={table_id}", error)
-        return None
-
-
-def _build_indices_overview(es_storage: Any, warnings: list[dict[str, Any]]) -> dict[str, Any]:
-    index_exist: bool | None = None
-    current_index_info: dict[str, Any] | None = None
-    index_names = es_storage.get_index_names()
-    stats_map, stats_version = es_storage.get_index_stats()
-
-    try:
-        index_exist = es_storage.index_exist()
-    except Exception as error:  # pylint: disable=broad-except
-        _append_runtime_warning(warnings, "INDEX_EXIST_UNAVAILABLE", "ES 索引存在性查询失败", error)
-
-    try:
-        current_index_info = es_storage.current_index_info()
-    except Exception as error:  # pylint: disable=broad-except
-        _append_runtime_warning(warnings, "CURRENT_INDEX_INFO_UNAVAILABLE", "ES 当前索引信息查询失败", error)
-
-    return {
-        "index_names": index_names,
-        "index_stats": stats_map,
-        "index_version": stats_version,
-        "index_exist": index_exist,
-        "current_index_info": _serialize_runtime_value(current_index_info),
-        "items": [
-            {
-                "index": index_name,
-                "stats": stats_map.get(index_name, {}),
-            }
-            for index_name in index_names
-        ],
-    }
-
-
-def _build_aliases_overview(es_storage: Any, index: str | None = None) -> Any:
-    client = es_storage.get_client()
-    return client.indices.get_alias(index=_runtime_index_expression(es_storage, index))
-
-
-def _build_mapping_overview(es_storage: Any, index: str | None = None) -> Any:
-    client = es_storage.get_client()
-    return client.indices.get_mapping(index=_runtime_index_expression(es_storage, index))
 
 
 def _contains_index_wildcard(index: str) -> bool:
@@ -493,21 +414,32 @@ def _is_index_allowed(es_storage: Any, index: str, warnings: list[dict[str, Any]
     summary="Admin 查询 ESStorage 列表",
     description="只读查询 ESStorage，支持实体/虚拟表、ResultTable.data_label、集群和受控 table_id 匹配。",
     params_schema={
-        "bk_tenant_id": "可选，租户 ID",
+        "bk_tenant_id": PAGE_LIST_TENANT_SCHEMA,
         "table_id": "可选，同时匹配 ESStorage.table_id 和 origin_table_id，支持精确、前缀或受控包含匹配",
         "data_label": "可选，精确匹配 ResultTable.data_label 后按 table_id 查询 ESStorage",
+        "data_labels": "可选，ResultTable.data_label 数组，最多 100 项；与 data_label 合并去重",
+        "bk_data_id": "可选，通过 DataSourceResultTable 关联过滤",
+        "bk_data_ids": "可选，DataSource ID 正整数数组，最多 100 项；与 bk_data_id 合并去重",
         "table_kind": "可选，physical / virtual",
         "storage_cluster_id": "可选，ES 集群 ID",
+        "storage_cluster_ids": "可选，ES 集群 ID 正整数数组，最多 100 项；与 storage_cluster_id 合并去重",
         "source_type": "可选，数据源类型",
         "need_create_index": "可选，是否需要创建物理索引",
         "page": "可选，默认 1",
         "page_size": "可选，默认 20，最大 100",
         "ordering": f"可选，白名单字段: {', '.join(sorted(ES_STORAGE_ORDERING_FIELDS))}",
     },
-    example_params={"bk_tenant_id": "system", "table_kind": "virtual", "page": 1, "page_size": 20},
+    example_params={
+        "bk_tenant_id": "system",
+        "table_kind": "virtual",
+        "bk_data_ids": [50010, 50011],
+        "storage_cluster_ids": [3, 4],
+        "page": 1,
+        "page_size": 20,
+    },
 )
 def list_es_storages(params: dict[str, Any]) -> dict[str, Any]:
-    bk_tenant_id = get_bk_tenant_id(params)
+    bk_tenant_id = get_page_list_bk_tenant_id(params)
     page, page_size = normalize_pagination(params)
     ordering = normalize_ordering(params.get("ordering"), ES_STORAGE_ORDERING_FIELDS, default="table_id")
 
@@ -521,14 +453,22 @@ def list_es_storages(params: dict[str, Any]) -> dict[str, Any]:
 
     result_table_map = _load_result_table_map(bk_tenant_id, table_ids)
     cluster_map = _load_cluster_map(bk_tenant_id, cluster_ids)
-    physical_table_exists = set(
-        models.ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=origin_table_ids).values_list(
-            "table_id", flat=True
+    physical_storage_queryset = filter_by_bk_tenant_id(
+        models.ESStorage.objects.filter(table_id__in=origin_table_ids), bk_tenant_id
+    )
+    physical_table_exists = (
+        {instance_tenant_resource_key(storage, "table_id") for storage in physical_storage_queryset}
+        if bk_tenant_id is None
+        else set(physical_storage_queryset.values_list("table_id", flat=True))
+    )
+    if bk_tenant_id is None:
+        virtual_table_count_map = count_by_tenant_and_field(
+            models.ESStorage, group_field="origin_table_id", values=physical_table_ids
         )
-    )
-    virtual_table_count_map = count_by_field(
-        models.ESStorage, group_field="origin_table_id", values=physical_table_ids, bk_tenant_id=bk_tenant_id
-    )
+    else:
+        virtual_table_count_map = count_by_field(
+            models.ESStorage, group_field="origin_table_id", values=physical_table_ids, bk_tenant_id=bk_tenant_id
+        )
 
     items = [
         _serialize_es_storage_list_item(
@@ -578,7 +518,7 @@ def get_es_storage_detail(params: dict[str, Any]) -> dict[str, Any]:
         "storage_cluster": _serialize_cluster_summary(cluster),
         "physical_table": _build_physical_table(es_storage, bk_tenant_id),
         "virtual_tables": _build_virtual_tables(es_storage, bk_tenant_id),
-        "storage_cluster_records": _build_storage_cluster_records(es_storage, bk_tenant_id),
+        "storage_cluster_records": build_storage_cluster_records(es_storage, bk_tenant_id),
         "result_table_options": _build_result_table_options(table_id, bk_tenant_id),
         "field_aliases": _build_field_aliases(table_id, bk_tenant_id, warnings),
     }
@@ -600,7 +540,8 @@ def get_es_storage_detail(params: dict[str, Any]) -> dict[str, Any]:
         "bk_tenant_id": "可选，租户 ID",
         "table_id": "必填，ESStorage.table_id",
         "include": f"可选，展开范围: {', '.join(sorted(RUNTIME_INCLUDE_VALUES))}",
-        "index": "可选，指定索引；不传时使用 ESStorage 现有 search_format_v2 规则",
+        "index": "可选，指定索引；不传时受管索引使用 v2/v1 日期规则，外部索引直接使用 index_set",
+        "storage_cluster_id": "可选，当前集群或同一实体表迁移历史中的 ES 集群 ID，默认当前集群",
     },
     example_params={"bk_tenant_id": "system", "table_id": "system.cpu", "include": ["indices", "mapping"]},
 )
@@ -610,48 +551,22 @@ def get_es_storage_runtime_overview(params: dict[str, Any]) -> dict[str, Any]:
     includes = normalize_include(params.get("include"), RUNTIME_INCLUDE_VALUES, default=DEFAULT_RUNTIME_INCLUDE)
     index = str(params["index"]).strip() if params.get("index") not in (None, "") else None
     es_storage = _get_es_storage_or_raise(bk_tenant_id, table_id)
-
-    warnings: list[dict[str, Any]] = []
-    data: dict[str, Any] = {
-        "table_id": table_id,
-        "origin_table_id": es_storage.origin_table_id,
-        "table_kind": _table_kind(es_storage),
-        "index_set": es_storage.index_set,
-        "index_pattern": {
-            "v2": es_storage.search_format_v2(),
-            "v1": es_storage.search_format_v1(),
-            "effective": _runtime_index_expression(es_storage, index),
-        },
-        "inspect": True,
-    }
-
-    if "indices" in includes:
-        data["indices"] = _run_runtime_query(
-            name="indices",
-            es_storage=es_storage,
-            bk_tenant_id=bk_tenant_id,
-            table_id=table_id,
-            query=lambda storage: _build_indices_overview(storage, warnings),
-            warnings=warnings,
-        )
-    if "aliases" in includes:
-        data["aliases"] = _run_runtime_query(
-            name="aliases",
-            es_storage=es_storage,
-            bk_tenant_id=bk_tenant_id,
-            table_id=table_id,
-            query=lambda storage: _build_aliases_overview(storage, index),
-            warnings=warnings,
-        )
+    runtime_cluster = resolve_runtime_storage_cluster(
+        es_storage,
+        bk_tenant_id,
+        params.get("storage_cluster_id"),
+        models.ClusterInfo.TYPE_ES,
+    )
+    data, warnings = query_es_storage_runtime(
+        es_storage=es_storage,
+        bk_tenant_id=bk_tenant_id,
+        runtime_cluster=runtime_cluster,
+        includes=includes,
+        index=index,
+    )
+    data["inspect"] = True
+    data["storage_cluster"] = _serialize_cluster_summary(runtime_cluster)
     if "mapping" in includes:
-        data["mapping"] = _run_runtime_query(
-            name="mapping",
-            es_storage=es_storage,
-            bk_tenant_id=bk_tenant_id,
-            table_id=table_id,
-            query=lambda storage: _build_mapping_overview(storage, index),
-            warnings=warnings,
-        )
         data["field_aliases"] = _build_field_aliases(table_id, bk_tenant_id, warnings)
 
     response = build_response(
@@ -673,6 +588,7 @@ def get_es_storage_runtime_overview(params: dict[str, Any]) -> dict[str, Any]:
         "table_id": "必填，ESStorage.table_id",
         "index": "必填，指定查询索引，不允许通配符，必须属于当前 ESStorage 索引集合或规则",
         "time_field": "可选，默认 dtEventTimeStamp",
+        "storage_cluster_id": "可选，当前集群或同一实体表迁移历史中的 ES 集群 ID，默认当前集群",
     },
     example_params={"bk_tenant_id": "system", "table_id": "system.cpu", "index": "v2_system_cpu_20260425_0"},
 )
@@ -684,6 +600,13 @@ def get_es_storage_sample(params: dict[str, Any]) -> dict[str, Any]:
         raise CustomException(message="index 为必填项")
     time_field = str(params.get("time_field") or "dtEventTimeStamp").strip() or "dtEventTimeStamp"
     es_storage = _get_es_storage_or_raise(bk_tenant_id, table_id)
+    runtime_cluster = resolve_runtime_storage_cluster(
+        es_storage,
+        bk_tenant_id,
+        params.get("storage_cluster_id"),
+        models.ClusterInfo.TYPE_ES,
+    )
+    es_storage = clone_storage_with_runtime_cluster(es_storage, runtime_cluster)
 
     warnings: list[dict[str, Any]] = []
     sample_storage = es_storage
@@ -692,6 +615,8 @@ def get_es_storage_sample(params: dict[str, Any]) -> dict[str, Any]:
         physical_storage = models.ESStorage.objects.filter(
             bk_tenant_id=bk_tenant_id, table_id=es_storage.origin_table_id
         ).first()
+        if physical_storage is not None:
+            physical_storage = clone_storage_with_runtime_cluster(physical_storage, runtime_cluster)
         if physical_storage is not None and _is_index_allowed(physical_storage, index, warnings):
             sample_storage = physical_storage
             is_allowed = True
@@ -720,6 +645,7 @@ def get_es_storage_sample(params: dict[str, Any]) -> dict[str, Any]:
         "hit": hits[0] if hits else None,
         "raw": raw_data,
         "inspect": True,
+        "storage_cluster": _serialize_cluster_summary(runtime_cluster),
     }
     response = build_response(
         operation="es_storage.sample",

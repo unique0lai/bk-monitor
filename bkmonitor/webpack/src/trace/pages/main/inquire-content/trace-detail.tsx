@@ -28,26 +28,27 @@ import {
   defineAsyncComponent,
   defineComponent,
   inject,
-  provide,
   nextTick,
   onBeforeUnmount,
   onMounted,
+  provide,
   reactive,
   ref,
   toRefs,
   watch,
 } from 'vue';
 
-import { Checkbox, Loading, Message, Popover, ResizeLayout, Switcher, Tab, Button } from 'bkui-vue';
+import { Button, Checkbox, Loading, Message, Popover, ResizeLayout, Switcher, Tab } from 'bkui-vue';
+import dayjs from 'dayjs';
 import { CancelToken } from 'monitor-api/cancel';
 import { traceDetail } from 'monitor-api/modules/apm_trace';
 import { formatWithTimezone } from 'monitor-common/utils/timezone';
 import { typeTools } from 'monitor-common/utils/utils';
 import { useI18n } from 'vue-i18n';
 import { useRoute } from 'vue-router';
-import dayjs from 'dayjs';
 
 import CompareSelect from '../../../components/compare-select/compare-select';
+import EmptyStatus from '../../../components/empty-status/empty-status';
 import MonitorTab from '../../../components/monitor-tab/monitor-tab';
 import StatisticsTable, { type IFilterItem } from '../../../components/statistics-table/statistics-table';
 import TraceView from '../../../components/trace-view';
@@ -58,6 +59,11 @@ import FlameGraphV2 from '../../../plugins/charts/flame-graph-v2/flame-graph';
 import TopoSpanList from '../../../plugins/charts/span-list/topo-span-list';
 import { useSpanDetailQueryStore } from '../../../store/modules/span-detail-query';
 import { toUnixMilliseconds } from '../../../utils/date';
+import TraceLlmObservation from './llm-observation';
+import { useLlmObservation } from './llm-observation/hooks/use-llm-observation';
+import { useTracePanelPreference } from './llm-observation/hooks/use-trace-panel-preference';
+
+import type { LlmSpanRowView } from './llm-observation/utils/typings';
 const MonitorTraceLog = defineAsyncComponent(
   () =>
     import(/* webpackChunkName: "monitor-trace-log" */ '../../../plugins/charts/monitor-trace-log/monitor-trace-log')
@@ -91,7 +97,6 @@ import './trace-detail.scss';
  * 宿主 webpack 对 mermaid 的 bundling 方式与 trace 主站一致，不会出现 getBBox 问题
  */
 const SequenceGraph = defineAsyncComponent(() => import('../../../plugins/charts/sequence-graph/sequence-graph'));
-
 const { TabPanel } = Tab;
 
 const TraceDetailProps = {
@@ -101,7 +106,12 @@ const TraceDetailProps = {
   },
   appName: {
     type: String,
-    default: true,
+    default: '',
+  },
+  /** 跨业务打开时的目标业务 ID，缺省则使用当前 window 业务 */
+  bizId: {
+    type: [Number, String],
+    default: undefined,
   },
   traceID: {
     type: String,
@@ -109,7 +119,7 @@ const TraceDetailProps = {
   },
 };
 
-type IPanelEnum = 'flame' | 'sequence' | 'statistics' | 'timeline' | 'topo' | 'log';
+type IPanelEnum = 'flame' | 'llm' | 'log' | 'sequence' | 'statistics' | 'timeline' | 'topo';
 
 interface IState {
   activePanel: IPanelEnum;
@@ -145,6 +155,15 @@ export default defineComponent({
     let searchCancelFn = () => {};
     const { t } = useI18n();
     const store = useTraceStore();
+    /** 跨业务场景优先使用 props.bizId，供 SpanDetails 等子树 inject */
+    const resolvedBizId = computed(() => {
+      if (props.bizId != null && props.bizId !== '' && !Number.isNaN(+props.bizId)) {
+        return +props.bizId;
+      }
+      return +(window.bk_biz_id || window.cc_biz_id);
+    });
+    const resolveBizId = () => resolvedBizId.value;
+    provide('bizId', resolvedBizId);
     const spanDetailQueryStore = useSpanDetailQueryStore();
     /** 缓存不同tab下的过滤选项 */
     const cacheFilterToolsValues = {
@@ -166,6 +185,7 @@ export default defineComponent({
       traceMainStyle: '',
       /** tab panel 配置 */
       tabPanels: [
+        { id: 'llm', name: t('LLM 观测'), icon: 'LLM' },
         { id: 'timeline', name: t('瀑布列表'), icon: 'Waterfall' },
         { id: 'topo', name: t('节点拓扑'), icon: 'Component' },
         { id: 'statistics', name: t('表格统计'), icon: 'table' },
@@ -239,13 +259,11 @@ export default defineComponent({
     );
     // 层级数
 
-    const spanDepth = computed<number>(
-      () =>
-        Math.max.apply(
-          Math,
-          traceTree.value.spans.map(item => item.depth)
-        ) + 1
-    );
+    const spanDepth = computed<number>(() => {
+      let maxDepth = -1;
+      for (const span of traceTree.value.spans) maxDepth = Math.max(maxDepth, span.depth);
+      return maxDepth + 1;
+    });
     /** 工具栏过滤选项 */
     const filterToolList = computed(() =>
       TRACE_INFO_TOOL_FILTERS.filter(item => item.show && item.effect.includes(state.activePanel))
@@ -256,12 +274,41 @@ export default defineComponent({
     // 快捷跳转文案
     const exploreButtonName = computed(() => {
       if (state.activePanel === 'log') {
-        return t('日志检索');
+        return t('更多日志');
       }
       return '';
     });
-    /* 当前应用名称 */
-    const appName = computed(() => store.traceData.appName);
+    /* 当前应用名称：优先 props.appName（关联 trace 侧滑场景） */
+    const appName = computed(() => props.appName || store.traceData.appName);
+    const llmObservation = useLlmObservation({ appName, bizId: resolvedBizId, traceId: currentTraceId });
+    const visibleTabPanels = computed(() =>
+      state.tabPanels.filter(item => item.id !== 'llm' || llmObservation.hasTraces.value)
+    );
+    const panelPreference = useTracePanelPreference({
+      appName,
+      bizId: resolvedBizId,
+      traceId: currentTraceId,
+      hasLlmTraces: llmObservation.hasTraces,
+      llmLoading: llmObservation.loading,
+      traceLoading: computed(() => isLoading.value || store.loading || !traceTree.value.spans.length),
+    });
+    const traceInfoReady = computed(() => !isLoading.value && !store.loading && traceTree.value.spans.length > 0);
+    const isEmpty = computed(
+      () =>
+        !isLoading.value &&
+        !store.loading &&
+        !llmObservation.loading.value &&
+        !llmObservation.ioLoading.value &&
+        !llmObservation.hasTraces.value &&
+        !traceTree.value.spans.length
+    );
+    const pageLoading = computed(() =>
+      state.activePanel === 'llm' && llmObservation.hasTraces.value
+        ? false
+        : isLoading.value ||
+          store.loading ||
+          (!traceTree.value.spans.length && (llmObservation.loading.value || llmObservation.ioLoading.value))
+    );
     provide('traceId', currentTraceId);
     provide('appName', appName);
     /**
@@ -430,7 +477,7 @@ export default defineComponent({
         }
       });
       store.updateTraceViewFilterTab(v);
-      (traceDetailElem.value as any).scrollTop = 0;
+      if (traceDetailElem.value) (traceDetailElem.value as any).scrollTop = 0;
       handleResize();
       cancelFilter();
 
@@ -517,7 +564,7 @@ export default defineComponent({
     };
     // 根据窗口大小变化自适应视图高度
     const handleResize = () => {
-      if (traceMainElem.value && !isLoading.value) {
+      if (traceMainElem.value && (!isLoading.value || state.activePanel === 'llm')) {
         let containerHeight = document.querySelector('.trace-detail-wrapper')?.clientHeight as number; // 详情容器高度
         const { offsetTop, clientWidth } = traceMainElem.value as any; // 视图容器举例详情容器顶部高度
         const baseMessageRect = baseMessage.value?.getBoundingClientRect();
@@ -527,15 +574,18 @@ export default defineComponent({
         }
         const toolRowHeight = TOOLS_ROW_HEIGHT;
         // 视图容器的最小高度
-        const viewHeight = containerHeight - offsetTop - toolRowHeight - 12; // 12为padding大小
+        let viewHeight = containerHeight - offsetTop - toolRowHeight - 12; // 12为padding大小
+        if (state.activePanel === 'llm') {
+          viewHeight += 50;
+        }
         const viewWidth =
           showSpanList.value && !contentLoading.value && ['topo', 'sequence', 'flame'].includes(state.activePanel)
             ? `${clientWidth - spanListWidth.value}px`
             : '100%';
-        const isHaveHeight = ['topo', 'statistics', 'flame', 'sequence'].includes(state.activePanel);
+        const isHaveHeight = ['topo', 'statistics', 'flame', 'sequence', 'llm'].includes(state.activePanel);
         state.traceMainStyle = `width:${viewWidth};min-height: ${viewHeight}px${
           isHaveHeight ? `; height: ${viewHeight}px` : '; height: 100%'
-        };padding-right:${showSpanList.value ? '0' : '16px'}`;
+        };padding-right:${showSpanList.value ? '0' : '40px'}`;
         if (baseMessageRect && baseMessageRect.height > 18) {
           // 基本信息是否换行 样式处理
           isbaseMessageWrap.value = true;
@@ -584,9 +634,10 @@ export default defineComponent({
         contentLoading.value = true;
         if (state.activePanel === 'topo') handleResize();
         const params = {
-          bk_biz_id: window.bk_biz_id,
+          bk_biz_id: resolveBizId(),
           app_name: props.appName,
           trace_id: traceId,
+          reduce_span_details: true,
           displays,
           enabled_time_alignment: enabledTimeAlignment.value,
         };
@@ -637,10 +688,22 @@ export default defineComponent({
     /** 侧栏查看 span 详情 */
     const handleShowSpanDetails = (span: Span | string) => {
       if (typeTools.isString(span)) {
-        // 如果 span 为 string 类型 说明span为span_id 需要通过spanlist匹配
-        spanDetails.value = (traceTree.value.spans.find(item => item.span_id === span) || {}) as Span;
+        const found = traceTree.value.spans.find(item => item.span_id === span);
+        // 当前 Trace 瀑布图能命中则直接复用；关联 Trace 的 span 不在这棵树上，只传 stub 交给 SpanDetails 按 span_id 拉取
+        const stub: Partial<Span> = { span_id: span as string };
+        spanDetails.value = (found || stub) as Span;
       } else spanDetails.value = span as Span;
       showSpanDetails.value = true;
+    };
+    const handleShowLlmSpanDetails = (row: LlmSpanRowView) => {
+      const span: Partial<Span> = {
+        span_id: row.spanId,
+        spanID: row.spanId,
+        traceID: row.traceId,
+        app_name: appName.value,
+        bk_biz_id: resolvedBizId.value,
+      };
+      handleShowSpanDetails(span as Span);
     };
     /** 计算 span list 赋值的定位 */
     const setSpanListPosition = () => {
@@ -698,8 +761,7 @@ export default defineComponent({
         clearCompareParams();
         nextTick(() => handleResize());
         compareSelect.value?.handleCancelCompare();
-      },
-      { deep: true }
+      }
     );
 
     watch(
@@ -842,9 +904,10 @@ export default defineComponent({
       const { trace_id: traceId } = traceData.value;
       enabledTimeAlignment.value = v;
       const params = {
-        bk_biz_id: window.bk_biz_id,
+        bk_biz_id: resolveBizId(),
         app_name: props.appName,
         trace_id: traceId,
+        reduce_span_details: true,
         enabled_time_alignment: enabledTimeAlignment.value,
       };
       const data = await traceDetail(params, {
@@ -857,19 +920,39 @@ export default defineComponent({
     // 日志检索快捷跳转
     const handleLogQuickJump = () => {
       if (!spanDetailQueryStore.queryData?.indexId && !spanDetailQueryStore.queryData?.unionList) return;
-      const { indexId, unionList, start_time, end_time, addition } = spanDetailQueryStore.queryData;
+      const { indexId, unionList, start_time, end_time, addition, search_mode, keyword } =
+        spanDetailQueryStore.queryData;
       const startMs = toUnixMilliseconds(start_time);
       const endMs = toUnixMilliseconds(end_time);
       let url = '';
       if (unionList) {
-        url = `${window.bk_log_search_url}#/retrieve?bizId=${window.bk_biz_id}&search_mode=ui&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}&unionList=${unionList}`;
+        url = `${window.bk_log_search_url}#/retrieve?bizId=${resolveBizId()}&search_mode=${search_mode}&keyword=${keyword}&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}&unionList=${unionList}`;
       } else {
-        url = `${window.bk_log_search_url}#/retrieve/${indexId}?bizId=${window.bk_biz_id}&search_mode=ui&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}`;
+        url = `${window.bk_log_search_url}#/retrieve/${indexId}?bizId=${resolveBizId()}&search_mode=${search_mode}&keyword=${keyword}&start_time=${startMs}&end_time=${endMs}&addition=${addition || ''}`;
       }
       window.open(url, '_blank');
     };
+
+    // 跳转应用配置
+    const handleConfigQuickJump = () => {
+      const url = location.href.replace(location.hash, `#/apm/application/config/${props.appName}`);
+      window.open(url, '_blank');
+    };
+    watch(panelPreference.panel, panel => {
+      nextTick(() => {
+        if (panelPreference.panel.value === panel) handleTabChange(panel as IPanelEnum);
+      });
+    });
+    if (panelPreference.panel.value !== state.activePanel)
+      state.activePanel = panelPreference.panel.value as IPanelEnum;
     return {
       ...toRefs(state),
+      llmObservation,
+      visibleTabPanels,
+      pageLoading,
+      traceInfoReady,
+      isEmpty,
+      handleShowLlmSpanDetails,
       isLoading,
       contentLoading,
       traceView,
@@ -881,7 +964,7 @@ export default defineComponent({
       searchBarElem,
       exploreButtonName,
       handleSelectFilters,
-      handleTabChange,
+      handleTabChange: panelPreference.selectPanel,
       trackFilter,
       clearSearch,
       nextResult,
@@ -925,6 +1008,7 @@ export default defineComponent({
       handleChangeEnableTimeALignment,
       disabledSpanKindById,
       handleLogQuickJump,
+      handleConfigQuickJump,
       t,
     };
   },
@@ -932,12 +1016,29 @@ export default defineComponent({
   render() {
     const { trace_id: traceId, trace_info: traceInfo, span_classify: spanClassify } = this.traceData;
     const isStatisticsPanel = this.activePanel === 'statistics';
+    if (this.isEmpty) {
+      return (
+        <div class='trace-detail-wrapper'>
+          {!this.isInTable && (
+            <TraceDetailHeader
+              appName={this.appName}
+              hasFullscreen={false}
+              traceId={this.traceID || traceId}
+            />
+          )}
+          <EmptyStatus
+            showOperation={false}
+            type='search-empty'
+          />
+        </div>
+      );
+    }
 
     return (
       <Loading
         ref='traceDetailElem'
         class={`trace-detail-wrapper is-fix ${this.isInTable ? 'is-table-detail' : ''} ${this.isSticky ? 'is-sticky' : ''}`}
-        loading={this.isLoading}
+        loading={this.pageLoading}
         zIndex={99999}
       >
         {/* {this.isInTable && (
@@ -963,11 +1064,11 @@ export default defineComponent({
         >
           <div class='message-item'>
             <span>{this.t('产生时间')}</span>
-            <span>{formatWithTimezone(traceInfo?.product_time / 1e3) as string}</span>
+            <span>{this.traceInfoReady ? (formatWithTimezone(traceInfo?.product_time) as string) : '--'}</span>
           </div>
           <div class='message-item'>
             <span>{this.t('总耗时')}</span>
-            <span>{formatDuration(traceInfo?.trace_duration)}</span>
+            <span>{this.traceInfoReady ? formatDuration(traceInfo?.trace_duration) : '--'}</span>
             {traceInfo?.time_error && [
               this.enabledTimeAlignment ? (
                 <span
@@ -1001,7 +1102,11 @@ export default defineComponent({
           </div>
           <div class='message-item'>
             <span>{this.t('耗时分布')}</span>
-            <span>{`${formatDuration(traceInfo?.min_duration)} - ${formatDuration(traceInfo?.max_duration)}`}</span>
+            <span>
+              {this.traceInfoReady
+                ? `${formatDuration(traceInfo?.min_duration)} - ${formatDuration(traceInfo?.max_duration)}`
+                : '--'}
+            </span>
           </div>
           <div class='message-item'>
             <span>{this.t('服务数')}</span>
@@ -1124,16 +1229,32 @@ export default defineComponent({
                 }
                 if (this.exploreButtonName) {
                   return (
-                    <Button
-                      class='quick-jump'
-                      size='small'
-                      theme='primary'
-                      outline
-                      onClick={this.handleLogQuickJump}
-                    >
-                      {this.exploreButtonName}
-                      <i class='icon-monitor icon-fenxiang' />
-                    </Button>
+                    <div class='quick-jump-container'>
+                      {this.activePanel === 'log' && (
+                        <Button
+                          class='quick-jump'
+                          size='small'
+                          theme='primary'
+                          outline
+                          text
+                          onClick={this.handleConfigQuickJump}
+                        >
+                          {this.t('关联配置')}
+                          <i class='icon-monitor icon-fenxiang' />
+                        </Button>
+                      )}
+                      <Button
+                        class='quick-jump'
+                        size='small'
+                        theme='primary'
+                        outline
+                        text
+                        onClick={this.handleLogQuickJump}
+                      >
+                        {this.exploreButtonName}
+                        <i class='icon-monitor icon-fenxiang' />
+                      </Button>
+                    </div>
                   );
                 }
                 return '';
@@ -1142,7 +1263,7 @@ export default defineComponent({
             active={this.activePanel}
             onTabChange={this.handleTabChange}
           >
-            {this.tabPanels.map(item => (
+            {this.visibleTabPanels.map(item => (
               <TabPanel
                 key={item.id}
                 v-slots={{
@@ -1159,7 +1280,7 @@ export default defineComponent({
             ))}
           </MonitorTab>
           {/* 工具栏 */}
-          {this.activePanel !== 'log' && (
+          {!['log', 'llm'].includes(this.activePanel) && (
             <div
               ref='viewTool'
               class='view-tools'
@@ -1235,7 +1356,7 @@ export default defineComponent({
               class='tab-panel-content'
             >
               <Loading
-                loading={this.contentLoading}
+                loading={this.activePanel !== 'llm' && this.contentLoading}
                 zIndex={9999999}
               >
                 {/* 瀑布图 */}
@@ -1300,6 +1421,13 @@ export default defineComponent({
                 )}
                 {/* 日志视图 */}
                 {this.activePanel === 'log' && <MonitorTraceLog />}
+                {/* LLM 观测 */}
+                {this.activePanel === 'llm' && (
+                  <TraceLlmObservation
+                    observation={this.llmObservation}
+                    onShowSpanDetail={this.handleShowLlmSpanDetails}
+                  />
+                )}
               </Loading>
               <ResizeLayout
                 key={this.activePanel}
@@ -1341,6 +1469,8 @@ export default defineComponent({
           </div>
         )}
         <SpanDetails
+          appName={this.appName}
+          bizId={this.bizId}
           isFullscreen={this.isFullscreen}
           show={this.showSpanDetails}
           spanDetails={this.spanDetails as Span}

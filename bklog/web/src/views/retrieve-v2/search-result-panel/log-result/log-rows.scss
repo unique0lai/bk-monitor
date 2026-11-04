@@ -46,6 +46,9 @@
     min-height: 32px;
     background-color: #fff;
     border-bottom: 1px solid #dfe0e5;
+    // 跳过视口外日志行的布局和绘制；浏览器会保留已测量高度，避免滚动条跳动。
+    content-visibility: auto;
+    contain-intrinsic-size: auto 32px;
 
     .bklog-row-observe {
       display: inline-flex;
@@ -54,7 +57,6 @@
 
       min-width: 100%;
       height: 100%;
-      will-change: contents;
 
       &.is-pending {
         position: relative;
@@ -80,6 +82,8 @@
 
         mark {
           background-color: rgb(250, 238, 177);
+          border-radius: 2px;
+          padding: 1px 0px;
         }
 
         .bklog-v3-column-placeholder {
@@ -119,40 +123,6 @@
           }
         }
 
-        &.right {
-          position: sticky;
-          right: 0;
-          z-index: 2;
-          display: flex;
-          align-items: stretch;
-          padding: 0px 12px;
-          background-color: #fff;
-
-          .handle-content {
-            position: relative;
-            display: flex;
-            justify-content: space-around;
-            padding: 4px 0;
-
-            .handle-card {
-              margin-left: 0;
-            }
-          }
-
-          &::before {
-            position: absolute;
-            top: 0;
-            right: 100%;
-            bottom: 0px;
-            left: -8px;
-            z-index: 2;
-            min-width: 8px;
-            pointer-events: none;
-            content: '';
-            background-image: linear-gradient(270deg, #0000000f 0%, #00000000 100%);
-          }
-        }
-
         &.header-cell {
           position: relative;
           display: inline-flex;
@@ -168,15 +138,6 @@
           vertical-align: middle;
           cursor: pointer;
           background-color: #fafbfd;
-
-          &.right {
-            position: sticky;
-            right: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 12px;
-          }
 
           .bklog-header-cell {
             display: flex;
@@ -245,7 +206,8 @@
             position: absolute;
             top: 12px;
             right: 12px;
-            display: none;
+            display: inline-block;
+            visibility: hidden;
             color: #c4c6cc;
             cursor: pointer;
 
@@ -271,7 +233,7 @@
             background-color: #f0f1f5;
 
             .toggle-display {
-              display: inline-block;
+              visibility: visible;
             }
           }
         }
@@ -322,7 +284,8 @@
     &.row-header {
       position: sticky;
       top: 0;
-      z-index: 2;
+      z-index: 5;
+      pointer-events: none;
       box-sizing: content-box;
       display: none;
       width: fit-content;
@@ -338,6 +301,7 @@
         z-index: 1;
         width: 100%;
         padding: 0;
+        pointer-events: auto;
       }
 
       &::before {
@@ -354,8 +318,9 @@
       position: relative;
 
       &:hover,
-      &.ai-active {
-        background-color: #fafbfd;
+      &.ai-active,
+      &.is-hover-operator-active {
+        background-color: #F5F7FA;
 
         .bklog-row-ai {
           img {
@@ -525,6 +490,27 @@
     }
   }
 
+  > .bklog-row-hover-operator {
+    position: fixed;
+    z-index: 200;
+    width: max-content;
+    min-width: 0;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateX(12px);
+    transition: opacity 0.16s ease-out, transform 0.16s ease-out;
+
+    &.is-show {
+      pointer-events: auto;
+      opacity: 1;
+      transform: translate(0, -32px);
+    }
+
+    .handle-content {
+      overflow: visible;
+    }
+  }
+
   &.show-header {
     .bklog-row-container {
       &.row-header {
@@ -550,4 +536,9 @@
       }
     }
   }
+}
+
+.bklog-row-hover-operator-content {
+  display: inline-flex;
+  align-items: center;
 }

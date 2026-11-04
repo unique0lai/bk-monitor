@@ -10,8 +10,11 @@ specific language governing permissions and limitations under the License.
 
 import copy
 import logging
+from datetime import datetime
 
 import arrow
+from django.conf import settings
+from django.utils import timezone
 from django.utils.translation import gettext as _
 
 from alarm_backends.core.cache.cmdb.dynamic_group import DynamicGroupManager
@@ -19,6 +22,11 @@ from alarm_backends.core.cache.key import NOTICE_SHIELD_KEY_LOCK
 from alarm_backends.core.context.utils import get_business_roles
 from alarm_backends.core.control.strategy import Strategy
 from alarm_backends.service.converge.shield.display_manager import DisplayManager
+from alarm_backends.service.converge.shield.window import business_timezone, matching_window
+from alarm_backends.service.converge.shield_conditions import (
+    DIMENSION_CONDITION_CLASSES,
+    PROMQL_EXPRESSION_DIMENSION,
+)
 from bkmonitor.documents.alert import AlertDocument
 from bkmonitor.utils import time_tools
 from bkmonitor.utils.range import (
@@ -26,14 +34,26 @@ from bkmonitor.utils.range import (
     TIME_MATCH_CLASS_MAP,
     load_field_instance,
 )
-from bkmonitor.utils.range.conditions import AndCondition, EqualCondition, OrCondition
-from bkmonitor.utils.range.period import TimeMatch, TimeMatchBySingle
+from bkmonitor.utils.range.conditions import AndCondition, Condition, EqualCondition, OrCondition
+from bkmonitor.utils.range.period import TimeMatch, TimeMatchByMonth, TimeMatchBySingle, TimeMatchByWeek
 from bkmonitor.utils.send import Sender
+from bkmonitor.utils.sms import format_sms_time, get_sms_template_mode
 from bkmonitor.utils.tenant import bk_biz_id_to_bk_tenant_id
 from constants.shield import ScopeType, ShieldCategory
 from core.errors.alarm_backends import StrategyNotFound
 
 logger = logging.getLogger("fta_action")
+
+
+class _NeverMatchCondition(Condition):
+    """永不命中的占位条件。
+
+    用于 dimension_condition 解析失败时兜底（fail-close）：所在 AND 组整体不命中，
+    确保解析失败不会让屏蔽范围被动扩大（过度屏蔽导致漏告警，比屏蔽不生效更危险）。
+    """
+
+    def is_match(self, data):
+        return False
 
 
 class ShieldObj:
@@ -81,12 +101,32 @@ class ShieldObj:
         or_condition = OrCondition()
         and_condition = AndCondition()
         for condition in dimension_conditions:
-            field = load_field_instance(condition["key"], condition["value"])
-            condition_class = CONDITION_CLASS_MAP.get(condition.get("method"), EqualCondition)
+            if not isinstance(condition, dict):
+                logger.error(
+                    "shield(%s) invalid dimension_condition(%s), treat as never-match",
+                    self.id,
+                    condition,
+                )
+                and_condition.add(_NeverMatchCondition())
+                continue
+            # 分组边界仅由 condition 声明的 and/or 关系决定，与解析成败无关，保证解析失败时分组结构不漂移
             if condition.get("condition") == "or" and and_condition.conditions:
                 or_condition.add(and_condition)
                 and_condition = AndCondition()
-            and_condition.add(condition_class(field))
+            try:
+                field = load_field_instance(condition["key"], condition["value"])
+                condition_class = CONDITION_CLASS_MAP.get(condition.get("method"), EqualCondition)
+                and_condition.add(condition_class(field))
+            except Exception as e:
+                # 解析失败的条件替换为永不命中的占位条件（fail-close）：
+                # 所在 AND 组整体不命中，避免条件被静默丢弃后屏蔽范围被动扩大（过度屏蔽导致漏告警）
+                logger.error(
+                    "shield(%s) parse dimension_condition(%s) failed: %s, treat as never-match",
+                    self.id,
+                    condition,
+                    e,
+                )
+                and_condition.add(_NeverMatchCondition())
         if and_condition.conditions:
             or_condition.add(and_condition)
         if or_condition.conditions:
@@ -115,6 +155,22 @@ class ShieldObj:
                 if not (len(bk_topo_node) == 1 and bk_topo_node[0]["bk_obj_id"] == ScopeType.BIZ):
                     clean_dimension["bk_topo_node"] = bk_topo_node
 
+        if self.config["category"] == ShieldCategory.SCOPE:
+            # 范围屏蔽支持维度过滤条件（如 regex/nregex），进一步筛选目标范围内的匹配维度
+            self._parse_dimension_conditions(clean_dimension)
+
+        if self.config["category"] == ShieldCategory.ALERT:
+            # 告警屏蔽（含移动端 EVENT 类型映射）支持维度过滤条件
+            has_dimension_conditions = bool(clean_dimension.get("dimension_conditions"))
+            self._parse_dimension_conditions(clean_dimension)
+            # 存量快捷告警屏蔽曾把全量原始维度与 dimension_conditions 一并写入。
+            # 匹配时这些等值 key 会 AND 掉 conditions 的范围；部署后按 conditions 归一化。
+            # PC 批量快捷屏蔽无 conditions，不会进入此分支。
+            if self.config.get("is_quick") and has_dimension_conditions:
+                for key in list(clean_dimension.keys()):
+                    if key not in {"strategy_id", "level"}:
+                        clean_dimension.pop(key)
+
         # 解析动态分组配置
         if self.config["scope_type"] == ScopeType.DYNAMIC_GROUP:
             dynamic_group_ids = set()
@@ -139,7 +195,8 @@ class ShieldObj:
 
         for k, v in list(clean_dimension.items()):
             field = load_field_instance(k, v)
-            self.dimension_check.add(EqualCondition(field))
+            condition_class = DIMENSION_CONDITION_CLASSES.get(k, EqualCondition)
+            self.dimension_check.add(condition_class(field))
 
     def _clean_dimension(self):
         """
@@ -241,6 +298,7 @@ class ShieldObj:
         begin_time = self.get_now_datetime()
         end_time = begin_time.replace(minutes=notice_time)
         is_time_match = self.time_check.is_match(end_time)
+        self._sms_start_notice_probe = end_time
 
         if not is_time_match:
             # 未到发送时间，忽略
@@ -267,6 +325,7 @@ class ShieldObj:
         begin_time = self.get_now_datetime()
         end_time = begin_time.replace(minutes=notice_time + 1)
         is_time_match = not self.time_check.is_match(end_time)
+        self._sms_end_notice_probe = end_time.replace(minutes=-1)
 
         if not is_time_match:
             # 未到发送时间，忽略
@@ -312,7 +371,9 @@ class ShieldObj:
             return {}
 
         # 获取通知模板上下文
-        context = self.get_notice_context(notice_type)
+        notice_ways = self.config["notice_config"]["notice_way"]
+        sms_template_mode = get_sms_template_mode() if "sms" in notice_ways else "legacy"
+        context = self.get_notice_context(notice_type, include_standard_sms=sms_template_mode == "standard")
 
         all_notice_result = {}
 
@@ -322,6 +383,7 @@ class ShieldObj:
                 title_template_path=f"notice/shield/{notice_way}_title.jinja",
                 content_template_path=f"notice/shield/{notice_way}_content.jinja",
                 context=context,
+                sms_template_mode=sms_template_mode,
             )
             logger.debug(
                 "[屏蔽通知] shield({}) 通知方式：{}, 内容：{}".format(self.config["id"], notice_way, sender.content)
@@ -353,7 +415,7 @@ class ShieldObj:
 
         return actual_receivers
 
-    def get_notice_context(self, notice_type):
+    def get_notice_context(self, notice_type, include_standard_sms=False):
         """
         获取屏蔽通知上下文
         :param notice_type:
@@ -376,11 +438,59 @@ class ShieldObj:
             "shield_content": self.display_manager.get_shield_content(self.config),
             "description": self.config["description"],
         }
+        if include_standard_sms:
+            try:
+                context["sms_event_time_formatted"] = format_sms_time(
+                    self._get_sms_notice_boundary(notice_type),
+                    tz=business_timezone(self.config["bk_biz_id"]),
+                    language=settings.DEFAULT_LOCALE,
+                )
+            except Exception:
+                logger.warning("failed to resolve shield SMS event time", exc_info=True)
+                context["sms_event_time_formatted"] = format_sms_time(None, language=settings.DEFAULT_LOCALE)
 
         return context
 
+    def _get_sms_notice_boundary(self, notice_type):
+        """Resolve the window from the probe used by the existing notice decision."""
+        probe = getattr(self, f"_sms_{notice_type}_notice_probe", None)
+        if probe is None or not self.time_check.is_match(probe):
+            return None
+
+        if self.config.get("end_policy") != "close" and isinstance(
+            self.time_check, (TimeMatchByWeek, TimeMatchByMonth)
+        ):
+            system_offset = datetime.fromtimestamp(probe.timestamp).astimezone().utcoffset()
+            current_offset = timezone.localtime(probe.datetime).utcoffset()
+            if system_offset != current_offset:
+                # The matcher combines the system calendar with Django's current wall clock.
+                return None
+
+        window = matching_window(self.time_check, probe)
+        if window is None:
+            return None
+        return window[0 if notice_type == "start" else 1]
+
 
 class AlertShieldObj(ShieldObj):
+    def __init__(self, config, business_timezone_name=None):
+        self.business_timezone_name = business_timezone_name
+        super().__init__(config)
+
+    def _parse_cycle_config(self):
+        if self.config.get("end_policy") != "close":
+            return super()._parse_cycle_config()
+        from django.utils import timezone
+
+        from alarm_backends.service.converge.shield.window import business_timezone, close_time_matcher
+
+        if not getattr(self, "business_timezone_name", None):
+            self.business_timezone_name = business_timezone(self.config.get("bk_biz_id"))
+        with timezone.override(self.business_timezone_name):
+            self.time_check = close_time_matcher(
+                self.config["cycle_config"], self.config["begin_time"], self.config["end_time"]
+            )
+
     # 类级别的缓存，用于存储告警维度信息
     _alert_dimension_cache = {}
 
@@ -437,6 +547,7 @@ class AlertShieldObj(ShieldObj):
         dimension["bk_host_id"] = dimension.get("bk_host_id") or alert.event_document.bk_host_id
         dimension["bk_biz_id"] = alert.event_document.bk_biz_id
         metric_ids = []
+        promql_expressions = []
 
         if alert.strategy_id:
             # 需要判断当前的alert是否有策略ID
@@ -448,7 +559,15 @@ class AlertShieldObj(ShieldObj):
             for query_config in strategy.config["items"][0]["query_configs"]:
                 metric_ids.append(query_config["metric_id"])
 
+                # PromQL 策略的 metric_id 受 QueryConfig.metric_id 字段长度（128）限制，超长时被
+                # 截断成 promql[:125] + "..."，指标名可能整个落在截断之外。未截断的表达式存在
+                # config JSONField 中，无长度限制，单独放一个维度键供按指标屏蔽匹配使用。
+                promql = query_config.get("promql")
+                if promql:
+                    promql_expressions.append(promql)
+
         dimension["metric_id"] = metric_ids
+        dimension[PROMQL_EXPRESSION_DIMENSION] = promql_expressions
 
         if "tags.bk_target_ip" in dimension and "ip" not in dimension:
             dimension["ip"] = dimension["tags.bk_target_ip"]
@@ -491,6 +610,19 @@ class AlertShieldObj(ShieldObj):
         """
         return self._get_cached_alert_dimension(alert)
 
-    def is_match(self, alert: AlertDocument):
-        source_time = arrow.now()
-        return self.time_check.is_match(source_time) and self.dimension_check.is_match(self.get_dimension(alert))
+    def is_match(self, alert: AlertDocument, source_time=None):
+        source_time = source_time or arrow.now()
+        if self.config.get("end_policy") == "close":
+            from django.utils import timezone
+
+            from alarm_backends.service.converge.shield.window import business_timezone, matching_window
+
+            with timezone.override(
+                getattr(self, "business_timezone_name", None) or business_timezone(self.config.get("bk_biz_id"))
+            ):
+                window = matching_window(self.time_check, source_time)
+            if not window or not window[0] <= alert.begin_time <= window[1]:
+                return False
+        elif not self.time_check.is_match(source_time):
+            return False
+        return self.dimension_check.is_match(self.get_dimension(alert))

@@ -138,7 +138,7 @@ export default defineComponent({
     },
     config: {
       type: Object,
-      default: () => { },
+      default: () => {},
     },
     collectorConfigId: {
       type: Number,
@@ -478,6 +478,10 @@ export default defineComponent({
       () => props.isShow,
       (val: boolean) => {
         if (val) {
+          // 加载新采集项前清空遗留的任务数据，
+          // 避免 HostDetail 使用旧的 task_id 请求任务详情。
+          tableListAll.value = [];
+          calcTabNum();
           curTaskIdList.value = [...new Set([...(props.config?.task_id_list ?? [])])];
           if (props.isContainer) {
             // 容器环境：使用容器状态逻辑
@@ -662,13 +666,14 @@ export default defineComponent({
               </span>
             ))}
           </span>
-          <bk-button on-click={() => containerRetry()}>
-            {t('失败批量重试')}
-          </bk-button>
+          <bk-button on-click={() => containerRetry()}>{t('失败批量重试')}</bk-button>
         </div>
         <div class='container-table-section'>
           {containerRenderList.value.map((renderItem, renderIndex) => (
-            <div class='container-table-item' key={renderIndex}>
+            <div
+              class='container-table-item'
+              key={renderIndex}
+            >
               <div
                 class={`container-table-title ${renderItem.isShowTable ? '' : 'close-table'}`}
                 on-click={() => {
@@ -714,7 +719,7 @@ export default defineComponent({
                   <bk-table-column
                     width={80}
                     scopedSlots={{
-                      default: ({ row }: { row: IContainerConfigItem }) => (
+                      default: ({ row }: { row: IContainerConfigItem }) =>
                         row.status === 'failed' ? (
                           <a
                             class='container-retry-link'
@@ -726,8 +731,7 @@ export default defineComponent({
                           >
                             {t('重试')}
                           </a>
-                        ) : null
-                      ),
+                        ) : null,
                     }}
                   />
                 </bk-table>

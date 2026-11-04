@@ -9,6 +9,7 @@ specific language governing permissions and limitations under the License.
 """
 
 import copy
+import logging
 import time
 from collections import Counter, defaultdict
 from typing import Any
@@ -19,7 +20,9 @@ from django.utils import timezone
 from django.utils.translation import gettext as _
 
 from bkmonitor.aiops.alert.utils import AIOPSManager
+from bkmonitor.aiops.incident.graph_snapshot import edge_identity, graph_analysis, target_analysis
 from bkmonitor.aiops.incident.models import (
+    IncidentGraphEdge,
     IncidentGraphEdgeType,
     IncidentGraphEntity,
     IncidentSnapshot,
@@ -35,6 +38,7 @@ from bkmonitor.documents.incident import (
 )
 from bkmonitor.utils.request import get_request_username
 from bkmonitor.views import serializers
+from bkm_space.scope import MONITOR_SCOPE_QUERY_SENTINELS, bk_biz_id_to_scope_id, scope_id_to_bk_biz_id
 from constants.alert import EVENT_STATUS_DICT, EventStatus
 from constants.incident import (
     IncidentAlertAggregateDimension,
@@ -54,12 +58,81 @@ from fta_web.models.alert import SearchHistory, SearchType
 from monitor_web.incident.events.resources import IncidentEventsDetailResource, IncidentEventsSearchResource  # noqa
 from monitor_web.incident.metrics.resources import IncidentMetricsSearchResource  # noqa
 from monitor_web.incident.serializers import IncidentSearchSerializer
+from .utils import bk_data_robot_link_list_search
+
+logger = logging.getLogger(__name__)
 
 
 class IncidentBaseResource(Resource):
     """
     故障相关资源基类
     """
+
+    BKFARA_NOTICE_SOURCE = "bkfara"
+    REMOTE_INCIDENT_UPDATE_FIELDS = {
+        "incident_id",
+        "bk_biz_id",
+        "incident_name",
+        "incident_reason",
+        "level",
+        "status",
+        "assignees",
+        "handlers",
+        "labels",
+        "feedback",
+        "end_time",
+    }
+
+    @classmethod
+    def get_incident_extra_info(cls, incident: IncidentDocument) -> dict:
+        extra_info = getattr(incident, "extra_info", None) or {}
+        return extra_info.to_dict() if hasattr(extra_info, "to_dict") else extra_info
+
+    @classmethod
+    def is_bkfara_incident(cls, incident: IncidentDocument) -> bool:
+        return cls.get_incident_extra_info(incident).get("notice_source") == cls.BKFARA_NOTICE_SOURCE
+
+    @classmethod
+    def get_remote_incident_api(cls, incident: IncidentDocument):
+        return api.bk_incident if cls.is_bkfara_incident(incident) else api.bkdata
+
+    @classmethod
+    def get_incident_document(cls, incident_doc_id: str) -> IncidentDocument:
+        return IncidentDocument.get(incident_doc_id, fetch_remote=False)
+
+    @classmethod
+    def get_remote_incident_detail(cls, incident: IncidentDocument) -> dict:
+        return cls.get_remote_incident_api(incident).get_incident_detail(incident_id=incident.incident_id)
+
+    @classmethod
+    def get_remote_incident_update_params(cls, incident_info: dict, updates: dict = None) -> dict:
+        updates = updates or {}
+        params = {
+            field_name: incident_info[field_name]
+            for field_name in cls.REMOTE_INCIDENT_UPDATE_FIELDS
+            if field_name in incident_info
+        }
+        params.update(
+            {
+                field_name: updates[field_name]
+                for field_name in cls.REMOTE_INCIDENT_UPDATE_FIELDS
+                if field_name in updates
+            }
+        )
+        return params
+
+    @classmethod
+    def get_remote_analysis_results(cls, incident: IncidentDocument, bk_biz_id: int = None) -> dict:
+        incident_id = int(incident.incident_id)
+        if cls.is_bkfara_incident(incident):
+            return api.bk_incident.get_incident_diagnosis(incident_id=incident_id, bk_biz_id=bk_biz_id)
+        return api.bkdata.get_incident_analysis_results(incident_id=incident_id)
+
+    @classmethod
+    def normalize_incident_status(cls, status: str) -> str:
+        if isinstance(status, str) and status.lower() in IncidentStatus.get_enum_value_list():
+            return status.lower()
+        return status
 
     @classmethod
     def get_snapshot_alerts(cls, snapshot: IncidentSnapshot, **kwargs) -> list[dict]:
@@ -181,6 +254,7 @@ class IncidentBaseResource(Resource):
         alert_ids = snapshot.entity_alerts(entity.entity_id)
         return {
             "entity": {key: value for key, value in entity.to_src_dict().items() if key != "aggregated_entities"},
+            "graph_analysis": target_analysis(snapshot.incident_snapshot_content, entity_ref=entity.entity_id),
             "anomaly_count": self.get_anomaly_entity_count(entity),
             "bk_biz_id": bk_biz_id,
             "bk_biz_name": bk_biz_name,
@@ -227,6 +301,9 @@ class IncidentBaseResource(Resource):
         """
         incident_document = IncidentDocument.get(incident_info["id"], fetch_remote=False)
         for incident_key, incident_value in incident_info.items():
+            if incident_key == "status":
+                incident_value = self.normalize_incident_status(incident_value)
+                incident_info[incident_key] = incident_value
             if (
                 hasattr(incident_document, incident_key)
                 and (getattr(incident_document, incident_key) or incident_key in ("incident_reason", "assignees"))
@@ -288,8 +365,9 @@ class IncidentBaseResource(Resource):
         ]
         topology_data = {
             "nodes": nodes,
+            "graph_analysis": copy.deepcopy(graph_analysis(snapshot.incident_snapshot_content)),
             "edges": [
-                edge.to_src_dict()
+                self.generate_edge_info(snapshot, edge)
                 for edge in snapshot.incident_graph_edges.values()
                 if edge.source.entity_type not in ("BcsWorkload", "BcsService")
                 and edge.target.entity_type not in ("BcsWorkload", "BcsService")
@@ -306,6 +384,16 @@ class IncidentBaseResource(Resource):
             ],
         }
         return topology_data
+
+    def generate_edge_info(self, snapshot: IncidentSnapshot, edge: IncidentGraphEdge, container_id: str = None) -> dict:
+        result = edge.to_src_dict()
+        result["graph_analysis"] = target_analysis(snapshot.incident_snapshot_content, edge_ref=result["id"])
+        if container_id:
+            result["properties"] = {**result["properties"], "aggregated_by_id": container_id}
+        result["aggregated_edges"] = [
+            self.generate_edge_info(snapshot, item, container_id or result["id"]) for item in edge.aggregated_edges
+        ]
+        return result
 
     def filter_one_hop_snapshot(self, snapshot_content: dict) -> dict:
         """过滤故障根因拓扑图中超过一跳的节点.
@@ -362,12 +450,136 @@ class IncidentBaseResource(Resource):
 
 
 class IncidentListResource(IncidentBaseResource):
+    MAX_ENABLED_SPACE_PAGES = 10000
+
     """
     故障列表
     """
 
     def __init__(self):
         super().__init__()
+
+    @staticmethod
+    def get_enabled_space_bk_biz_id(config_item: dict):
+        """将 BKFara scope 配置转换回监控前端使用的 bk_biz_id 协议。"""
+        content = config_item.get("content") or {}
+        scope_identity = content.get("scope_identity") if isinstance(content, dict) else {}
+        scope_identity = scope_identity if isinstance(scope_identity, dict) else {}
+        space = scope_identity.get("space") or {}
+        space = space if isinstance(space, dict) else {}
+        bk_biz = scope_identity.get("bk_biz") or {}
+        bk_biz = bk_biz if isinstance(bk_biz, dict) else {}
+        space_type = str(space.get("space_type_id") or "").lower()
+
+        # BKCC identity 的 space.id 固定为空，业务 ID 保存在 space.space_id；不能只依赖
+        # list_configs 响应顶层的 scope_id，因为历史响应序列化可能不会返回该字段。
+        if space_type == "bkcc":
+            for bk_biz_id in (space.get("space_id"), bk_biz.get("bk_biz_id"), scope_identity.get("bk_biz_id")):
+                try:
+                    enabled_space = int(bk_biz_id)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if enabled_space:
+                    return enabled_space
+
+        space_id = space.get("id") if isinstance(space, dict) else None
+        if space_id not in (None, "") and space_type != "bkcc":
+            try:
+                enabled_space = -int(space_id)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if enabled_space:
+                    return enabled_space
+
+        for scope_id in (config_item.get("scope_id"), bk_biz.get("scope_id"), scope_identity.get("scope_id")):
+            enabled_space = scope_id_to_bk_biz_id(scope_id)
+            if enabled_space:
+                return enabled_space
+        return 0
+
+    @staticmethod
+    def get_authorized_query_biz_ids(bk_biz_ids):
+        """将查询范围收敛到当前用户有查看权限的空间。"""
+        authorized_biz_ids = resource.space.get_bk_biz_ids_by_user()
+        authorized_biz_ids = list(dict.fromkeys(authorized_biz_ids))
+        requested_biz_ids = [biz_id for biz_id in (bk_biz_ids or []) if biz_id not in (None, "")]
+        if not requested_biz_ids or set(requested_biz_ids) & MONITOR_SCOPE_QUERY_SENTINELS:
+            return authorized_biz_ids
+
+        authorized_biz_id_set = set(authorized_biz_ids)
+        return [biz_id for biz_id in requested_biz_ids if biz_id in authorized_biz_id_set]
+
+    @staticmethod
+    def build_general_config_search_params(bk_biz_ids):
+        """构造 list_configs / IncidentConfigSearchSerializer 所需参数。
+
+        BKFara 校验必填 scope_type、scope_value，批量查询再带 scope_id_list。
+        不能只传监控侧的 bk_biz_id / bk_biz_id_list。
+        """
+        scope_id_list = []
+        for biz_id in bk_biz_ids:
+            try:
+                scope_id = bk_biz_id_to_scope_id(biz_id)
+            except (TypeError, ValueError):
+                logger.warning("skip unresolved enabled-space scope")
+                continue
+            if scope_id and scope_id not in scope_id_list:
+                scope_id_list.append(scope_id)
+        if not scope_id_list:
+            raise ValueError("no valid scope_id for list_configs")
+        scope_type, scope_value = scope_id_list[0].split("_", 1)
+        return {
+            "config_type": "general_config",
+            "scope_type": scope_type,
+            "scope_value": scope_value,
+            "scope_id_list": scope_id_list,
+            "page": 1,
+            "page_size": 1000,
+        }
+
+    @classmethod
+    def fetch_enabled_spaces(cls, bk_biz_ids):
+        """分页查询当前用户授权范围内已开启故障分析的空间。"""
+        try:
+            query_biz_ids = cls.get_authorized_query_biz_ids(bk_biz_ids)
+            if not query_biz_ids:
+                return []
+
+            params = cls.build_general_config_search_params(query_biz_ids)
+            enabled_spaces = []
+            enabled_space_set = set()
+            while True:
+                general_config_data = GetConfigResource().request(**params)
+                if not isinstance(general_config_data, dict) or not isinstance(
+                    general_config_data.get("objects"), list
+                ):
+                    raise ValueError("list_configs response is not a paginated object")
+
+                for item in general_config_data["objects"]:
+                    if not isinstance(item, dict) or item.get("content", {}).get("enabled") is not True:
+                        continue
+                    enabled_space = cls.get_enabled_space_bk_biz_id(item)
+                    if not enabled_space or enabled_space in enabled_space_set:
+                        continue
+                    enabled_space_set.add(enabled_space)
+                    enabled_spaces.append(enabled_space)
+
+                if not general_config_data.get("has_next"):
+                    return enabled_spaces
+
+                current_page = general_config_data.get("current_page")
+                if not isinstance(current_page, int) or current_page < params["page"]:
+                    raise ValueError("list_configs response has invalid current_page")
+                total_pages = general_config_data.get("total_pages")
+                if isinstance(total_pages, int) and current_page >= total_pages:
+                    raise ValueError("list_configs response has inconsistent pagination")
+                if current_page >= cls.MAX_ENABLED_SPACE_PAGES:
+                    raise ValueError("list_configs pagination exceeds safety limit")
+                params["page"] = current_page + 1
+        except Exception:
+            logger.exception("fetch enabled incident spaces failed")
+            return []
 
     class RequestSerializer(IncidentSearchSerializer):
         level = serializers.ListField(required=False, label="故障级别", default=[])
@@ -389,12 +601,8 @@ class IncidentListResource(IncidentBaseResource):
         ):
             result = handler.search(show_overview=False, show_aggs=True)
 
-        result["greyed_spaces"] = settings.AIOPS_INCIDENT_BIZ_WHITE_LIST
-        result["wx_cs_link"] = ""
-        for item in settings.BK_DATA_ROBOT_LINK_LIST:
-            if item["icon_name"] == "icon-kefu":
-                result["wx_cs_link"] = item["link"]
-
+        result["enabled_spaces"] = self.fetch_enabled_spaces(validated_request_data.get("bk_biz_ids"))
+        result["wx_cs_link"] = bk_data_robot_link_list_search(settings.BK_DATA_ROBOT_LINK_LIST, "icon-kefu")
         return result
 
 
@@ -483,6 +691,10 @@ class IncidentDetailResource(IncidentBaseResource):
             incident["alert_count"] = len(incident["snapshot"]["alerts"])
             incident["incident_root"] = self.get_incident_root_info(snapshot)
 
+        incident["wx_cs_link"] = ""
+        for item in settings.BK_DATA_ROBOT_LINK_LIST:
+            if item["icon_name"] == "icon-kefu":
+                incident["wx_cs_link"] = item["link"]
         return incident
 
     def get_incident_snapshots(self, incident: IncidentDocument) -> dict:
@@ -562,6 +774,16 @@ class IncidentTopologyResource(IncidentBaseResource):
             if all([snapshot.fpp_snapshot_id != "fpp:None", not snapshot.fpp_snapshot_id.endswith(":llm_summary")])
         ]
 
+        if not incident_snapshots:
+            # A selected window may contain only summaries or no retained graph snapshots.
+            return {
+                "latest": {"nodes": [], "edges": [], "combos": [], "sub_combos": []},
+                "diff" if validated_request_data["only_diff"] else "full": [],
+                "complete": {"nodes": [], "edges": [], "sub_combos": [], "combos": []},
+                "status": "NO_DATA",
+                "message": _("所选时间范围内暂无可用图谱快照"),
+            }
+
         # 根据实体加入的时间生成实体ID到时间的映射
         entities_orders = self.generate_entities_orders(incident_snapshots)
 
@@ -584,18 +806,13 @@ class IncidentTopologyResource(IncidentBaseResource):
         )
         last_snapshot_content = None
         topologies_data = []
-        complete_topologies = {"nodes": {}, "edges": {}, "sub_combos": {}}
+        complete_topologies = {"nodes": {}, "edges": {}, "sub_combos": {}, "combos": {}}
         for incident_snapshot in incident_snapshots:
             snapshot = snapshots[incident_snapshot.id]
-            if validated_request_data["only_diff"]:
-                last_snapshot_content, topo_data = self.generate_topology_diff_from_snapshot(
-                    incident,
-                    snapshot,
-                    last_snapshot_content,
-                    complete_topologies,
-                )
-            else:
-                topo_data = self.generate_topology_data_from_snapshot(incident, snapshot)
+            last_snapshot_content, diff_data = self.generate_topology_diff_from_snapshot(
+                incident, snapshot, last_snapshot_content, complete_topologies
+            )
+            topo_data = diff_data if validated_request_data["only_diff"] else last_snapshot_content
             topologies_data.append(
                 {
                     "incident_id": incident_snapshot.incident_id,
@@ -612,6 +829,7 @@ class IncidentTopologyResource(IncidentBaseResource):
                 "nodes": list(complete_topologies["nodes"].values()),
                 "edges": list(complete_topologies["edges"].values()),
                 "sub_combos": list(complete_topologies["sub_combos"].values()),
+                "combos": list(complete_topologies["combos"].values()),
             },
         }
 
@@ -633,11 +851,13 @@ class IncidentTopologyResource(IncidentBaseResource):
         complete_topologies: dict,
     ) -> dict:
         current = self.generate_topology_data_from_snapshot(incident, snapshot)
+        # Layout includes historical nodes even when their category disappears in the latest frame.
+        complete_topologies.setdefault("combos", {}).update(
+            {combo["id"]: copy.deepcopy(combo) for combo in current.get("combos", [])}
+        )
 
         last_nodes = self.generate_sub_content(last_snapshot_content, "nodes", lambda obj: obj["id"])
-        last_edges = self.generate_sub_content(
-            last_snapshot_content, "edges", lambda obj: (obj["source"], obj["target"], obj["edge_type"])
-        )
+        last_edges = self.generate_sub_content(last_snapshot_content, "edges", edge_identity)
         last_sub_combos = self.generate_sub_content(last_snapshot_content, "sub_combos", lambda obj: obj["id"])
 
         # 找出所有在上一帧没有出现过的节点(边)或者出现过但是已经修改的节点(边)
@@ -649,7 +869,7 @@ class IncidentTopologyResource(IncidentBaseResource):
             "edges",
             last_edges,
             complete_topologies,
-            lambda obj: (obj["source"], obj["target"], obj["edge_type"]),
+            edge_identity,
             self.check_edge_diff,
         )
         new_sub_combos = self.generate_new_objs(
@@ -658,9 +878,7 @@ class IncidentTopologyResource(IncidentBaseResource):
 
         # 找出所有在之前帧出现过，且未删除，但是在当前帧没有的节点(边)节点(边)
         current_nodes = self.generate_sub_content(current, "nodes", lambda obj: obj["id"])
-        current_edges = self.generate_sub_content(
-            current, "edges", lambda obj: (obj["source"], obj["target"], obj["edge_type"])
-        )
+        current_edges = self.generate_sub_content(current, "edges", edge_identity)
         current_sub_combos = self.generate_sub_content(current, "sub_combos", lambda obj: obj["id"])
 
         # 增加删除标记位
@@ -668,7 +886,12 @@ class IncidentTopologyResource(IncidentBaseResource):
         self.generate_delete_tag("edges", current_edges, complete_topologies, new_edges)
         self.generate_delete_tag("sub_combos", current_sub_combos, complete_topologies, new_sub_combos)
 
-        return current, {"nodes": new_nodes, "edges": new_edges, "sub_combos": new_sub_combos}
+        return current, {
+            "nodes": new_nodes,
+            "edges": new_edges,
+            "sub_combos": new_sub_combos,
+            "combos": current.get("combos", []),
+        }
 
     def generate_sub_content(self, snapshot_content: dict, content_key: str, id_func: callable) -> dict:
         return (
@@ -689,12 +912,12 @@ class IncidentTopologyResource(IncidentBaseResource):
             obj_id = id_func(current_obj)
             if obj_id not in last_objs:
                 new_objs.append(current_obj)
-                complete_content[content_key][obj_id] = current_obj
+                complete_content[content_key][obj_id] = copy.deepcopy(current_obj)
             elif diff_func(current_obj, last_objs[obj_id]):
                 new_objs.append(current_obj)
-                complete_content[content_key][obj_id] = current_obj
+                complete_content[content_key][obj_id] = copy.deepcopy(current_obj)
             elif obj_id not in complete_content[content_key]:
-                complete_content[content_key][obj_id] = current_obj
+                complete_content[content_key][obj_id] = copy.deepcopy(current_obj)
 
         return new_objs
 
@@ -706,8 +929,10 @@ class IncidentTopologyResource(IncidentBaseResource):
                 continue
 
             if complete_obj_id not in current_objs:
-                complete_obj["is_deleted"] = True
-                new_objs.append(complete_obj)
+                # Deletion belongs to this frame; never retroactively mutate an earlier snapshot.
+                deleted_obj = {**copy.deepcopy(complete_obj), "is_deleted": True}
+                complete_content[content_key][complete_obj_id] = deleted_obj
+                new_objs.append(deleted_obj)
 
     def check_node_diff(self, current_node: dict, last_node: dict):
         """判断节点是否发生变化."""
@@ -718,11 +943,12 @@ class IncidentTopologyResource(IncidentBaseResource):
             "alert_ids",
             "aggregated_nodes",
             "alert_all_recorved",
+            "graph_analysis",
         ]:
             if node_key not in current_node and node_key not in last_node:
                 continue
 
-            if current_node[node_key] != last_node[node_key]:
+            if current_node.get(node_key) != last_node.get(node_key):
                 return True
 
         return False
@@ -736,10 +962,11 @@ class IncidentTopologyResource(IncidentBaseResource):
             "is_anomaly",
             "source_is_anomaly",
             "target_is_anomaly",
+            "graph_analysis",
             "source_is_on_alert",
             "target_is_on_alert",
         ]:
-            if current_edge[edge_key] != last_edge[edge_key]:
+            if current_edge.get(edge_key) != last_edge.get(edge_key):
                 return True
 
         return False
@@ -888,22 +1115,27 @@ class IncidentTopologyUpstreamResource(IncidentBaseResource):
             validated_request_data["entity_id"],
             incident.snapshot.fpp_snapshot_id,
         )
+        if sub_snapshot is None:
+            return {
+                "ranks": [],
+                "edges": [],
+                "status": "NOT_SUPPORTED",
+                "message": _("该分析快照未提供资源展开数据"),
+            }
         sub_snapshot.aggregate_graph(incident)
         ranks = sub_snapshot.group_by_rank()
 
         for rank_info in ranks:
             rank_info["nodes"] = self.generate_nodes_by_entites(incident, sub_snapshot, rank_info["entities"])
-            for index, entity_info in enumerate(rank_info["entities"]):
-                rank_info["nodes"][index]["aggregated_nodes"] = self.generate_nodes_by_entites(
-                    incident, sub_snapshot, entity_info.aggregated_entities
-                )
             rank_info.pop("entities")
 
         return {
             "ranks": sorted(
                 [rank_info for rank_info in ranks if len(rank_info["nodes"]) > 0], key=lambda x: x["rank_id"]
             ),
-            "edges": [edge.to_src_dict() for edge in sub_snapshot.incident_graph_edges.values()],
+            "edges": [
+                self.generate_edge_info(sub_snapshot, edge) for edge in sub_snapshot.incident_graph_edges.values()
+            ],
         }
 
 
@@ -1267,9 +1499,14 @@ class EditIncidentResource(IncidentBaseResource):
     def perform_request(self, validated_request_data: dict) -> dict:
         incident_id = validated_request_data["incident_id"]
 
-        incident_info = api.bkdata.get_incident_detail(incident_id=incident_id)
-        incident_info.update(validated_request_data)
-        updated_incident = api.bkdata.update_incident_detail(**incident_info)
+        incident = self.get_incident_document(str(validated_request_data["id"]))
+        incident_api = self.get_remote_incident_api(incident)
+        incident_info = incident_api.get_incident_detail(incident_id=incident_id)
+        remote_incident_info = self.get_remote_incident_update_params(incident_info, validated_request_data)
+        updated_incident = incident_api.update_incident_detail(**remote_incident_info)
+
+        incident_info.update(remote_incident_info)
+        incident_info["id"] = validated_request_data["id"]
 
         self.update_incident_document(
             incident_info,
@@ -1297,14 +1534,19 @@ class FeedbackIncidentRootResource(IncidentBaseResource):
         incident_id = validated_request_data["incident_id"]
         is_cancel = validated_request_data["is_cancel"]
 
-        incident_info = api.bkdata.get_incident_detail(incident_id=incident_id)
+        incident = self.get_incident_document(str(validated_request_data["id"]))
+        incident_api = self.get_remote_incident_api(incident)
+        incident_info = incident_api.get_incident_detail(incident_id=incident_id)
         incident_info["id"] = validated_request_data["id"]
 
+        feedback = incident_info.get("feedback") if isinstance(incident_info.get("feedback"), dict) else {}
         if not is_cancel:
-            incident_info["feedback"].update(validated_request_data["feedback"])
+            feedback.update(validated_request_data["feedback"])
         else:
-            incident_info["feedback"] = {}
-        updated_incident = api.bkdata.update_incident_detail(**incident_info)
+            feedback = {}
+        incident_info["feedback"] = feedback
+        remote_incident_info = self.get_remote_incident_update_params(incident_info)
+        updated_incident = incident_api.update_incident_detail(**remote_incident_info)
         update_time = arrow.get(updated_incident["updated_at"]).replace(tzinfo=timezone.get_current_timezone().zone)
         self.update_incident_document(incident_info, update_time)
         if is_cancel:
@@ -1417,8 +1659,12 @@ class IncidentAlertViewResource(IncidentBaseResource):
             )
             alert["is_current_primary"] = incident_version_id is not None and alert_version_id == incident_version_id
             alert_doc = AlertDocument(**alert)
+            if not alert_doc.event.bk_biz_id:
+                alert_doc.event.bk_biz_id = incident.bk_biz_id
             # 检索得到的alert详情不包含event信息，只有event_id，这里默认当前告警时间的extra_info跟event相同
             alert_doc.event.extra_info = alert_doc.extra_info
+            anomaly_ids = alert.get("extra_info", {}).get("origin_alarm", {}).get("trigger", {}).get("anomaly_ids", [])
+            alert["anomaly_timestamps"] = sorted(int(anomaly_id.split(".", 2)[1]) for anomaly_id in anomaly_ids)
             for category in incident_alerts:
                 if alert["category"] in category["sub_categories"]:
                     alert["graph_panel"] = AIOPSManager.get_graph_panel(
@@ -1521,16 +1767,21 @@ class IncidentResultsResource(IncidentBaseResource):
             "status": None,
         }
 
-        # 去除前面的时间戳
-        incident_id = str(validated_request_data["id"])[10:]
-        raw_results = api.bkdata.get_incident_analysis_results(incident_id=int(incident_id))
+        incident = self.get_incident_document(str(validated_request_data["id"]))
+        raw_results = self.get_remote_analysis_results(incident, bk_biz_id=validated_request_data["bk_biz_id"])
 
         if "incident_diagnosis" in raw_results and isinstance(raw_results["incident_diagnosis"], dict):
-            diagnosis_result = {"status": None, "enabled": None, "sub_panels": {}}
+            diagnosis_result = {
+                "status": None,
+                "enabled": None,
+                "sub_panels": {},
+                "extracted_info": raw_results["incident_diagnosis"].get("extracted_info", {}),
+            }
             for sub_panel_name, sub_panel in raw_results["incident_diagnosis"].get("sub_panels", {}).items():
                 diagnosis_result["sub_panels"][sub_panel_name] = {
                     "status": sub_panel["status"],
                     "message": sub_panel["message"] if sub_panel.get("message") else "",
+                    "extracted_info": sub_panel.get("extracted_info", {}),
                     "enabled": True
                     if sub_panel.get("status") == "running"
                     or (sub_panel.get("is_show", True) and self._content_valid(sub_panel.get("content")))
@@ -1583,10 +1834,11 @@ class IncidentDiagnosisResource(IncidentBaseResource):
     def perform_request(self, validated_request_data: dict) -> dict:
         panel = validated_request_data.get("panel", "incident_diagnosis")
         sub_panel = validated_request_data.get("sub_panel")
-        incident_id = str(validated_request_data["id"])[10:]
+        incident = self.get_incident_document(str(validated_request_data["id"]))
         bk_biz_ids = validated_request_data["bk_biz_ids"]
-        raw_results = api.bkdata.get_incident_analysis_results(incident_id=int(incident_id))
-        raw_content = raw_results.get(panel, {}).get("sub_panels", {}).get(sub_panel, {}).get("content")
+        raw_results = self.get_remote_analysis_results(incident, bk_biz_id=bk_biz_ids[0] if bk_biz_ids else None)
+        raw_sub_panel = raw_results.get(panel, {}).get("sub_panels", {}).get(sub_panel, {})
+        raw_content = raw_sub_panel.get("content")
         # 设置默认返回
         display_panel = sub_panel
         content = []
@@ -1626,19 +1878,44 @@ class IncidentDiagnosisResource(IncidentBaseResource):
                     "strategy_alerts_mapping": strategy_alerts_mapping,
                     "dimension_values": {k: [v] for k, v in drill_result.get("dimensions", {}).items()},
                 }
+                if drill_result.get("interaction"):
+                    # 异常维度仍由监控补充告警详情，但跳转协议必须保持 BKFara 生成的原始语义。
+                    content_item["interaction"] = drill_result["interaction"]
                 content.append(content_item)
         else:
             content = raw_content
         diagnosis_result = {"sub_panel": display_panel, "contents": content}
-        display_content = raw_results.get(panel, {}).get("sub_panels", {}).get(sub_panel, {}).get("display")
-        individual_summary_content = (
-            raw_results.get(panel, {}).get("sub_panels", {}).get(sub_panel, {}).get("individual_summary")
-        )
+        extracted_info = raw_sub_panel.get("extracted_info") or raw_results.get(panel, {}).get("extracted_info")
+        display_content = raw_sub_panel.get("display")
+        individual_summary_content = raw_sub_panel.get("individual_summary")
+        if extracted_info:
+            diagnosis_result.update({"extracted_info": extracted_info})
         if display_content:
             diagnosis_result.update({"display": display_content})
         if individual_summary_content:
             diagnosis_result.update({"individual_summary": individual_summary_content})
         return diagnosis_result
+
+
+class IncidentPanelDetailResource(IncidentBaseResource):
+    """代理 BKFara 故障诊断侧滑详情，保持组件原生 payload 不变。"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
+        incident_id = serializers.IntegerField(required=True, label="故障ID")
+        incident_task_id = serializers.IntegerField(required=False, allow_null=True, label="故障分析任务ID")
+        drawer_type = serializers.ChoiceField(required=True, choices=("event", "log", "trace"), label="侧滑类型")
+        detail_ref = serializers.DictField(required=True, label="详情引用")
+        page = serializers.IntegerField(required=False, default=1, min_value=1, label="页码")
+        page_size = serializers.IntegerField(required=False, default=30, min_value=1, max_value=1000, label="每页数量")
+        sort_list = serializers.ListField(
+            required=False,
+            max_length=10,
+            child=serializers.ListField(child=serializers.CharField(), min_length=2, max_length=2),
+        )
+
+    def perform_request(self, validated_request_data: dict) -> dict:
+        return api.bk_incident.get_panel_detail(**validated_request_data)
 
 
 class IncidentDateHistogramResource(Resource):
@@ -1707,6 +1984,7 @@ class IncidentDateHistogramResultResource(Resource):
             return data
         return datas[0]
 
+
 class GetConfigResource(Resource):
     def perform_request(self, validated_request_data):
         return api.bk_incident.get_config(validated_request_data)
@@ -1715,3 +1993,36 @@ class GetConfigResource(Resource):
 class FetchGlobalVariablesResource(Resource):
     def perform_request(self, validated_request_data):
         return api.bk_incident.fetch_global_variables(validated_request_data)
+
+
+class CreateListConfigResource(Resource):
+    def perform_request(self, validated_request_data):
+        return api.bk_incident.create_list_config(validated_request_data)
+
+
+class GetIncidentDocIdResource(Resource):
+    class RequestSerializer(serializers.Serializer):
+        incident_id = serializers.CharField(required=True, label="故障ID")
+
+    def perform_request(self, validated_request_data):
+        incident_id = str(validated_request_data["incident_id"]).strip()
+        if not incident_id:
+            return {}
+
+        search = (
+            IncidentDocument.search(all_indices=True)
+            .filter("term", incident_id=incident_id)
+            .source(["id", "incident_id", "create_time"])
+            .sort("-create_time")
+            .params(size=1)
+        )
+
+        hits = search.execute().hits
+        if not hits:
+            return {}
+
+        incident = hits[0].to_dict()
+        return {
+            "id": incident.get("id"),
+            "incident_id": incident.get("incident_id"),
+        }

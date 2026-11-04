@@ -32,12 +32,12 @@ from django.db.models import Q
 from django.utils.translation import gettext as _
 
 from apps.api import BkLogApi, TransferApi
-from apps.constants import UserOperationActionEnum, UserOperationTypeEnum
+from apps.constants import SpacePropertyEnum, UserOperationActionEnum, UserOperationTypeEnum
 from apps.decorators import user_operation_record
 from apps.exceptions import CreateOrUpdateLogRouterException
 from apps.feature_toggle.handlers.toggle import feature_switch
 from apps.iam import Permission, ResourceEnum
-from apps.log_databus.constants import STORAGE_CLUSTER_TYPE
+from apps.log_databus.handlers.doris_cluster import DorisClusterHandler
 from apps.log_databus.handlers.storage import StorageHandler
 from apps.log_databus.models import CollectorConfig
 from apps.log_desensitize.constants import (
@@ -63,6 +63,12 @@ from apps.log_search.constants import (
     TimeFieldTypeEnum,
     TimeFieldUnitEnum,
     IndexSetDataType,
+    METADATA_ROUTER_SPACE_TYPES,
+    PLATFORM_INDEX_OWNER_SPACE_UID_FIELD,
+    QUERY_ROUTER_CONFIG_OPTION_NAME,
+    ROUTER_SPACE_TYPE_ALL,
+    PlatformIndexFilterValueRef,
+    PlatformIndexVisibleType,
 )
 from apps.log_search.exceptions import (
     DesensitizeConfigCreateOrUpdateException,
@@ -86,10 +92,14 @@ from apps.log_search.exceptions import (
     DataIDNotExistException,
     IndexSetAliasSettingsException,
     ParentIndexSetNotExistException,
+    PlatformIndexRouterSyncException,
 )
 from apps.log_search.handlers.search.mapping_handlers import MappingHandlers
-from apps.log_search.handlers.search.search_handlers_esquery import SearchHandler
+from apps.log_unifyquery.handler.mapping import UnifyQueryMappingHandler
 from apps.log_search.models import (
+    TAG_TYPE_INNER,
+    TAG_TYPE_SCENE,
+    TAG_TYPE_USER,
     IndexSetCustomConfig,
     IndexSetFieldsConfig,
     IndexSetTag,
@@ -105,7 +115,7 @@ from apps.log_search.models import (
 )
 from apps.log_search.tasks.mapping import sync_single_index_set_mapping_snapshot
 from apps.log_search.tasks.sync_index_set_archive import sync_index_set_archive
-from apps.log_search.utils import fetch_request_username
+from apps.log_search.utils import display_index_set_name, fetch_request_username
 from apps.log_trace.handlers.proto.proto import Proto
 from apps.models import model_to_dict
 from apps.utils import APIModel
@@ -197,7 +207,7 @@ class IndexSetHandler(APIModel):
     @classmethod
     def get_user_index_set(cls, space_uid, is_group=False, scenarios=None):
         space_uids = cls.get_all_related_space_uids(space_uid)
-        index_sets = LogIndexSet.get_index_set(scenarios=scenarios, space_uids=space_uids)
+        index_sets = LogIndexSet.get_index_set(scenarios=scenarios, space_uids=space_uids, current_space_uid=space_uid)
         # 补充采集场景
         collector_config_ids = [
             index_set["collector_config_id"] for index_set in index_sets if index_set["collector_config_id"]
@@ -209,8 +219,19 @@ class IndexSetHandler(APIModel):
             key="collector_config_id",
             value="collector_scenario_id",
         )
+        index_set_ids = [index_set["index_set_id"] for index_set in index_sets]
+        is_id_to_is_native_doris_map = LogIndexSet.batch_get_is_native_doris(index_set_ids)
         for index_set in index_sets:
+            index_set["index_set_name"] = display_index_set_name(
+                index_set["index_set_name"], index_set["collector_config_id"]
+            )
             index_set["collector_scenario_id"] = collector_scenario_map.get(index_set["collector_config_id"])
+            is_support_sql_and_grep = False
+            if index_set["support_doris"] and index_set["doris_table_id"]:
+                is_support_sql_and_grep = True
+            if is_id_to_is_native_doris_map.get(index_set["index_set_id"], False):
+                is_support_sql_and_grep = True
+            index_set["support_doris"] = is_support_sql_and_grep
         # 不分组，直接返回
         if not is_group:
             return index_sets
@@ -227,11 +248,16 @@ class IndexSetHandler(APIModel):
         # 先构建一个字典，建立 result_table_id 到 other_index_sets 的映射关系
         rt_id_to_index_mapping = {}
         for index in other_index_sets:
+            # 跨空间分发进来的索引集会和本业务的索引集共用同一张 RT，按 RT 猜归属会把两边错误地并成一组
+            if index.get(PLATFORM_INDEX_OWNER_SPACE_UID_FIELD) or index.get("is_platform_index"):
+                continue
             if index["collector_config_id"] and index["scenario_id"] == Scenario.LOG:
                 rt_id = index["indices"][0]["result_table_id"]
                 rt_id_to_index_mapping.setdefault(rt_id, []).append(index)
 
         for log_index_set in log_index_sets:
+            if log_index_set.get(PLATFORM_INDEX_OWNER_SPACE_UID_FIELD) or log_index_set.get("is_platform_index"):
+                continue
             result_table_id_list = [idx["result_table_id"] for idx in log_index_set["indices"]]
             for rt_id in result_table_id_list:
                 if rt_id in rt_id_to_index_mapping:
@@ -253,7 +279,12 @@ class IndexSetHandler(APIModel):
                 if index_set_id not in index_id_to_index_mapping:
                     continue
                 child_index_set = index_id_to_index_mapping[index_set_id]
-                remove_ids.add(index_set_id)
+                # 跨空间分发进来的平台索引集不能被本业务其它索引组按 ID 吃掉
+                if child_index_set.get(PLATFORM_INDEX_OWNER_SPACE_UID_FIELD) and not log_index_set.get(
+                    PLATFORM_INDEX_OWNER_SPACE_UID_FIELD
+                ):
+                    continue
+                remove_ids.add(child_index_set["index_set_id"])
                 log_index_set["children"].append(child_index_set)
                 log_index_set["indices"].extend(child_index_set["indices"])
 
@@ -339,8 +370,8 @@ class IndexSetHandler(APIModel):
                 _index["time_field"] = time_field
         result = multi_execute_func.run()
 
-        # 获取标签信息
-        index_set_tag_objs = IndexSetTag.objects.filter(tag_id__in=tag_ids_all)
+        # 获取标签信息（排除场景化检索路由标签，仅后端使用，不暴露给前端）
+        index_set_tag_objs = IndexSetTag.objects.filter(tag_id__in=tag_ids_all).exclude(tag_type=TAG_TYPE_SCENE)
         index_set_tag_mapping = {
             obj.tag_id: {
                 "name": InnerTag.get_choice_label(obj.name),
@@ -432,6 +463,7 @@ class IndexSetHandler(APIModel):
         sort_fields=None,
         bcs_cluster_id=None,
         parent_index_set_ids=None,
+        parent_index_set_names=None,
         is_platform_index=None,
         platform_index_visibility=None,
         platform_index_filter=None,
@@ -461,6 +493,7 @@ class IndexSetHandler(APIModel):
             sort_fields=sort_fields,
             bcs_cluster_id=bcs_cluster_id,
             parent_index_set_ids=parent_index_set_ids,
+            parent_index_set_names=parent_index_set_names,
             is_platform_index=is_platform_index,
             platform_index_visibility=platform_index_visibility,
             platform_index_filter=platform_index_filter,
@@ -497,6 +530,7 @@ class IndexSetHandler(APIModel):
 
         return index_set
 
+    @transaction.atomic()
     def update(
         self,
         index_set_name,
@@ -514,6 +548,7 @@ class IndexSetHandler(APIModel):
         sort_fields=None,
         bcs_cluster_id=None,
         parent_index_set_ids=None,
+        parent_index_set_names=None,
         is_platform_index=None,
         platform_index_visibility=None,
         platform_index_filter=None,
@@ -537,6 +572,7 @@ class IndexSetHandler(APIModel):
             sort_fields=sort_fields,
             bcs_cluster_id=bcs_cluster_id,
             parent_index_set_ids=parent_index_set_ids,
+            parent_index_set_names=parent_index_set_names,
             is_platform_index=is_platform_index,
             platform_index_visibility=platform_index_visibility,
             platform_index_filter=platform_index_filter,
@@ -695,6 +731,13 @@ class IndexSetHandler(APIModel):
         scenario_id = index_set_obj.scenario_id
         storage_cluster_id = index_set_obj.storage_cluster_id
         index_list: list = [x.get("result_table_id") for x in index_set_data]
+        if scenario_id == Scenario.LOG:
+            indices_for_index = {
+                table_id: indices
+                for table_id, indices in StorageHandler.get_result_tables_indices(index_list).items()
+                if indices
+            }
+            return self._indices_result(indices_for_index, index_list)
         if scenario_id == Scenario.ES:
             multi_execute_func = MultiExecuteFunc()
             for index in index_list:
@@ -810,7 +853,7 @@ class IndexSetHandler(APIModel):
                             "docs.count": self._get_sum("docs.count", indices_info),
                             "docs.deleted": self._get_sum("docs.deleted", indices_info),
                             "store.size": self._get_sum("store.size", indices_info),
-                            "pri.store.size": self._get_sum("store.size", indices_info),
+                            "pri.store.size": self._get_sum("pri.store.size", indices_info),
                         },
                         "details": indices_info,
                     }
@@ -1031,15 +1074,16 @@ class IndexSetHandler(APIModel):
         """
         索引集添加标签
         """
-        # 校验标签是否存在
-        if not IndexSetTag.objects.filter(tag_id=tag_id).exists():
-            raise IndexSetTagNotExistException(IndexSetTagNotExistException.MESSAGE.format(tag_id=tag_id))
-
-        # 校验是否为内置标签
-        if tag_id in self._get_inner_tag_ids():
+        if tag_id in self._get_protected_tag_ids():
             raise IndexSetInnerTagOperatorException()
 
         index_set_obj = self._get_data()
+        if not IndexSetTag.objects.filter(
+            tag_id=tag_id,
+            tag_type=TAG_TYPE_USER,
+            space_uid__in=["", index_set_obj.space_uid],
+        ).exists():
+            raise IndexSetTagNotExistException(IndexSetTagNotExistException.MESSAGE.format(tag_id=tag_id))
 
         tag_ids = list(index_set_obj.tag_ids)
 
@@ -1056,8 +1100,7 @@ class IndexSetHandler(APIModel):
         """
         索引集删除标签
         """
-        # 校验是否为内置标签
-        if tag_id in self._get_inner_tag_ids():
+        if tag_id in self._get_protected_tag_ids():
             raise IndexSetInnerTagOperatorException()
 
         index_set_obj = self._get_data()
@@ -1076,46 +1119,48 @@ class IndexSetHandler(APIModel):
         """
         创建标签
         """
-        # 名称校验
+        space_uid = params.get("space_uid", "")
         if (
             params["name"] in list(InnerTag.get_dict_choices().values())
-            or IndexSetTag.objects.filter(name=params["name"]).exists()
+            or IndexSetTag.objects.filter(
+                space_uid__in=["", space_uid], name=params["name"], tag_type=TAG_TYPE_USER
+            ).exists()
         ):
             raise IndexSetTagNameExistException(IndexSetTagNameExistException.MESSAGE.format(name=params["name"]))
 
-        obj = IndexSetTag.objects.create(name=params["name"], color=params["color"])
+        obj = IndexSetTag.objects.create(
+            space_uid=space_uid, name=params["name"], color=params["color"], tag_type=TAG_TYPE_USER
+        )
 
         return model_to_dict(obj)
 
     @staticmethod
-    def tag_list():
+    def tag_list(space_uid: str):
         """
-        标签列表
+        标签列表 — 仅返回用户自定义标签和系统内置标签，不包含场景维度标签
         """
-        objs = IndexSetTag.objects.all()
+        objs = IndexSetTag.objects.filter(
+            Q(tag_type=TAG_TYPE_USER, space_uid__in=["", space_uid]) | Q(tag_type=TAG_TYPE_INNER)
+        )
 
         ret = list()
 
-        inner_tag_names = list(InnerTag.get_dict_choices().keys())
         for obj in objs:
             _data = model_to_dict(obj)
-            if _data["name"] in inner_tag_names:
-                _data["is_built_in"] = True
-            else:
-                _data["is_built_in"] = False
+            _data["is_built_in"] = obj.tag_type == "inner"
             _data["name"] = InnerTag.get_choice_label(obj.name)
             ret.append(_data)
 
         return ret
 
     @staticmethod
-    def _get_inner_tag_ids():
+    def _get_protected_tag_ids():
         """
-        获取内置标签ID列表
+        获取受保护（不可由用户操作）的标签 ID 列表，包括系统内置标签和场景维度标签
         """
-        inner_tag_names = list(InnerTag.get_dict_choices().keys())
-        inner_tag_ids = list(IndexSetTag.objects.filter(name__in=inner_tag_names).values_list("tag_id", flat=True))
-        return inner_tag_ids
+        return list(
+            IndexSetTag.objects.filter(tag_type__in=[TAG_TYPE_INNER, TAG_TYPE_SCENE]).values_list("tag_id", flat=True)
+        )
 
     @staticmethod
     def get_desensitize_config_state(index_set_ids: list):
@@ -1140,17 +1185,31 @@ class IndexSetHandler(APIModel):
 
     @staticmethod
     def _get_health(src: list):
-        has_red_health_list = [item.get("health", "") == EsHealthStatus.RED.value for item in src]
-        has_yellow_health_list = [item.get("health", "") == EsHealthStatus.YELLOW.value for item in src]
-        if any(has_red_health_list):
+        health_values = [item.get("health") for item in src]
+        if EsHealthStatus.RED.value in health_values:
             return EsHealthStatus.RED.value
-        if any(has_yellow_health_list):
+        if EsHealthStatus.YELLOW.value in health_values:
             return EsHealthStatus.YELLOW.value
-        return EsHealthStatus.GREEN.value
+        if health_values and all(health == EsHealthStatus.GREEN.value for health in health_values):
+            return EsHealthStatus.GREEN.value
+        return "--"
 
     @staticmethod
-    def _get_sum(key: str, src: list) -> int:
-        return sum([int(item.get(key, 0)) for item in src])
+    def _get_sum(key: str, src: list):
+        # Doris 物理存储行对无等价指标返回 "--"，这类占位值不参与求和；
+        # 整列都无可聚合值时继续返回 "--"，避免把「没有该指标」展示成 0
+        values = []
+        for item in src:
+            value = item.get(key)
+            if value in (None, "", "--"):
+                continue
+            try:
+                values.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        if not values:
+            return "--"
+        return sum(values)
 
     def _get_data(self):
         try:
@@ -1214,8 +1273,14 @@ class IndexSetHandler(APIModel):
 
         # 调用接口查询结果表集群信息
         table_str = ",".join(table_list)
+        table_str_map = CollectorConfig.get_table_str_map_by_storage_cluster_type(table_str)
+
+        if len(table_str_map) != 1:
+            return None
+
+        storage_cluster_type, group_table_str = next(iter(table_str_map.items()))
         storage_info = TransferApi.get_result_table_storage(
-            {"result_table_list": table_str, "storage_type": STORAGE_CLUSTER_TYPE}
+            {"result_table_list": group_table_str, "storage_type": storage_cluster_type}
         )
 
         # 校验所有结果表查询出的集群是否一致
@@ -1375,27 +1440,27 @@ class IndexSetHandler(APIModel):
                 is_deleted=False, search_type="default", created_at__range=[start_time, end_time], created_by=username
             ).order_by("-created_at")
         history_data = list(history_obj.values("index_set_id", "created_at", "params", "duration"))
-        index_set_ids = list(history_obj.values_list("index_set_id", flat=True))
-        detail_data = list(
-            LogIndexSet.objects.filter(index_set_id__in=index_set_ids, is_active=True).values(
+        index_set_ids = [history["index_set_id"] for history in history_data]
+        detail_by_index_set_id = {
+            detail["index_set_id"]: detail
+            for detail in LogIndexSet.objects.filter(index_set_id__in=index_set_ids, is_active=True).values(
                 "index_set_id", "index_set_name", "space_uid"
             )
-        )
+        }
         return_data = []
         for history in history_data:
-            for detail in detail_data:
-                if detail["index_set_id"] == history["index_set_id"]:
-                    if space_uid and space_uid != detail["space_uid"]:
-                        continue
-                    search_data = {
-                        "index_set_id": history["index_set_id"],
-                        "created_at": history["created_at"],
-                        "params": history["params"],
-                        "duration": history["duration"],
-                        "index_set_name": detail["index_set_name"],
-                        "space_uid": detail["space_uid"],
-                    }
-                    return_data.append(search_data)
+            detail = detail_by_index_set_id.get(history["index_set_id"])
+            if not detail or (space_uid and space_uid != detail["space_uid"]):
+                continue
+            search_data = {
+                "index_set_id": history["index_set_id"],
+                "created_at": history["created_at"],
+                "params": history["params"],
+                "duration": history["duration"],
+                "index_set_name": detail["index_set_name"],
+                "space_uid": detail["space_uid"],
+            }
+            return_data.append(search_data)
         return_data = return_data[: int(limit)]
         return return_data
 
@@ -1457,15 +1522,15 @@ class IndexSetHandler(APIModel):
         }
 
     @staticmethod
-    def get_rt_alias_settings(index_set_id, alias_settings):
-        """
-        获取每个RT对应的别名配置列表
-        """
-        search_handler_esquery = SearchHandler(index_set_id, {})
-        multi_result = search_handler_esquery.get_all_fields_by_index_id(need_merge=False)
+    def _build_rt_alias_settings(multi_result, alias_settings):
+        """根据按 RT 拆分的字段结果生成别名配置。"""
         result_table_mappings = defaultdict(list)
         field_name_mappings = {}
+        query_alias_mappings = defaultdict(list)
         for result_table_id, (field_result, display_fields) in multi_result.items():
+            # 仅字段查询有结果时才认为该 RT 已成功解析；空结果可能表示 mapping 不可用。
+            if field_result:
+                query_alias_mappings[result_table_id] = []
             field_name_list = []
             for i in field_result:
                 _filed_name = i["field_name"]
@@ -1475,7 +1540,6 @@ class IndexSetHandler(APIModel):
 
         # 存储别名对应的字段及其所属rt列表
         alias_field_map = defaultdict(list)
-        query_alias_mappings = defaultdict(list)
 
         for alias_setting in alias_settings:
             field_name = alias_setting["field_name"]
@@ -1492,11 +1556,21 @@ class IndexSetHandler(APIModel):
 
         return query_alias_mappings, alias_field_map
 
+    @classmethod
+    def get_rt_alias_settings(cls, index_set_id, alias_settings):
+        """获取每个 RT 对应的别名配置列表。"""
+        index_set = LogIndexSet.objects.filter(index_set_id=index_set_id).first()
+        # 手工接入 Doris 的别名不按 RT 过滤，字段 mapping 无需在此解析。
+        if index_set and str(IndexSetTag.get_tag_id("Doris", tag_type=TAG_TYPE_INNER)) in list(index_set.tag_ids):
+            return defaultdict(list), defaultdict(list)
+        multi_result = UnifyQueryMappingHandler.get_fields_by_result_tables(index_set)
+        return cls._build_rt_alias_settings(multi_result, alias_settings)
+
     @transaction.atomic()
     def update_alias_settings(self, alias_settings):
         # 纳秒字段别名不支持用户修改
         alias_settings = [alias for alias in alias_settings if alias.get("field_name") != "dtEventTimeStampNanos"]
-        is_doris = str(IndexSetTag.get_tag_id("Doris")) in list(self.data.tag_ids)
+        is_doris = str(IndexSetTag.get_tag_id("Doris", tag_type=TAG_TYPE_INNER)) in list(self.data.tag_ids)
         multi_execute_func = MultiExecuteFunc()
         if not is_doris:
             query_alias_mappings, alias_field_map = self.get_rt_alias_settings(self.index_set_id, alias_settings)
@@ -1563,6 +1637,17 @@ class IndexSetHandler(APIModel):
                     "table_id": f"bklog_index_set_{self.index_set_id}_{doris_result_table}.__analysis__",
                     "need_create_index": False,
                 }
+                # 首次创建路由时不带 cluster_id 会落到默认 Doris 集群；
+                # 集群解析不出来时仍要下发别名配置，此时 metadata 会沿用路由上已有的集群
+                cluster_id = DorisClusterHandler.get_cluster_id(bkbase_table_id=doris_result_table)
+                if cluster_id:
+                    analysis_params["cluster_id"] = cluster_id
+                else:
+                    logger.warning(
+                        "update doris router of index set(%s) without cluster id: storage cluster of %s is unknown",
+                        self.index_set_id,
+                        doris_result_table,
+                    )
                 # Doris图表分析路由接入
                 multi_execute_func.append(
                     result_key=self.data.index_set_id,
@@ -1589,6 +1674,17 @@ class IndexSetHandler(APIModel):
                         reason=f"create or update index set({self.index_set_id}) es router failed：{ret}"
                     )
                 )
+
+        # 聚类结果表是独立的一条路由，不会随源表路由一起刷新。
+        # 不在这里同步，用户改完别名要等到下一次聚类 flow 变更才生效。
+        # 必须传当前入口索引集 ID：聚类路由按入口 ID 注册，归一到原始索引集会污染另一条路由。
+        # 别名显式传下去：带 Doris 标签的索引集走不到上面的 save，回读数据库只能拿到旧值。
+        from apps.log_clustering.handlers.dataflow.dataflow_handler import DataFlowHandler
+
+        DataFlowHandler.sync_clustered_route(
+            index_set_id=self.index_set_id,
+            query_alias_settings=alias_settings,
+        )
         return {"index_set_id": self.index_set_id}
 
     def add_to_parent_index_sets(self, parent_index_set_ids: list[int]):
@@ -1597,7 +1693,16 @@ class IndexSetHandler(APIModel):
         """
 
         # 检查所有父索引集是否存在
-        parent_index_sets = LogIndexSet.objects.filter(index_set_id__in=parent_index_set_ids, is_group=True)
+        child_space_uid = self.data.space_uid
+        parents = list(LogIndexSet.objects.filter(index_set_id__in=parent_index_set_ids, is_group=True))
+        # 同空间父组直接放行，跨空间父组需把子索引集空间作为关联空间（与索引组列表的可见范围一致）；
+        # 其余按不存在处理，避免泄露其他空间索引组的存在。仅在存在跨空间父组时查询关联空间。
+        allowed_space_uids = {child_space_uid} | {
+            space_uid
+            for space_uid in {parent.space_uid for parent in parents} - {child_space_uid}
+            if child_space_uid in self.get_all_related_space_uids(space_uid)
+        }
+        parent_index_sets = [parent for parent in parents if parent.space_uid in allowed_space_uids]
         existing_parent_ids = {index_set.index_set_id for index_set in parent_index_sets}
         missing_parents = set(parent_index_set_ids) - existing_parent_ids
         if missing_parents:
@@ -1638,7 +1743,7 @@ class IndexSetHandler(APIModel):
             parent_index_sets = LogIndexSet.objects.filter(index_set_id__in=parent_index_set_ids, is_group=True)
             BaseIndexSetHandler.sync_router(list(parent_index_sets))
 
-    def update_parent_index_sets(self, new_parent_index_set_ids: list):
+    def update_parent_index_sets(self, new_parent_index_set_ids: list | None):
         """
         更新归属索引集
         """
@@ -1682,6 +1787,7 @@ class BaseIndexSetHandler:
         sort_fields=None,
         bcs_cluster_id=None,
         parent_index_set_ids=None,
+        parent_index_set_names=None,
         is_platform_index=None,
         platform_index_visibility=None,
         platform_index_filter=None,
@@ -1708,6 +1814,7 @@ class BaseIndexSetHandler:
         self.is_editable = is_editable
         self.bcs_cluster_id = bcs_cluster_id
         self.parent_index_set_ids = parent_index_set_ids
+        self.parent_index_set_names = parent_index_set_names
 
         # time_field
         self.time_field, self.time_field_type, self.time_field_unit = self.init_time_field(
@@ -1802,7 +1909,7 @@ class BaseIndexSetHandler:
         tag_ids = []
         if self.bcs_cluster_id:
             # 为k8s容器添加默认标签
-            tag_id = IndexSetTag.get_tag_id(name=self.bcs_cluster_id)
+            tag_id = IndexSetTag.get_tag_id(name=self.bcs_cluster_id, space_uid=self.space_uid)
             tag_ids.append(str(tag_id))
 
         # 创建索引集
@@ -1847,6 +1954,12 @@ class BaseIndexSetHandler:
                 time_field_unit=index.get("time_field_unit") or self.time_field_unit,
             )
 
+        from apps.log_databus.handlers.collector.base import CollectorHandler
+
+        self.parent_index_set_ids = CollectorHandler.obtain_parent_index_set_ids(
+            self.parent_index_set_ids, self.parent_index_set_names, space_uid=self.space_uid, is_update=False
+        )
+
         # 将索引集添加到归属索引集(索引组)中
         if self.parent_index_set_ids:
             IndexSetHandler(index_set_id=self.index_set_obj.index_set_id).add_to_parent_index_sets(
@@ -1889,6 +2002,54 @@ class BaseIndexSetHandler:
             if isinstance(item, dict):
                 item["is_enable"] = True
 
+    @staticmethod
+    def resolve_router_space_type(index_set: LogIndexSet) -> str:
+        """
+        把可见范围里的空间类型翻译成 metadata 认识的 query_router_config.space_type。
+
+        可见范围里的空间类型是多值列表，而 query_router_config 只收单值，因此只有恰好一个
+        且 metadata 支持时才下推；多值、bcs、未按空间类型配置的一律回落 all。回落只会让
+        metadata 多算几个空间的路由，不会放宽数据面：可见性由 is_platform_index_visible 把关，
+        且注入的 filter 是各空间自己的取值，未授权空间查出来是空集。
+        """
+        visibility = index_set.platform_index_visibility or {}
+        if visibility.get("type") != PlatformIndexVisibleType.BIZ_ATTR.value:
+            return ROUTER_SPACE_TYPE_ALL
+        label_values = (visibility.get("bk_biz_labels") or {}).get(SpacePropertyEnum.SPACE_TYPE.value) or []
+        if len(label_values) != 1 or label_values[0] not in METADATA_ROUTER_SPACE_TYPES:
+            return ROUTER_SPACE_TYPE_ALL
+        return label_values[0]
+
+    @classmethod
+    def build_query_router_config_option(cls, index_set: LogIndexSet) -> dict | None:
+        """
+        平台级索引集下发跨空间路由过滤条件，metadata 据此按查询空间往路由里注入 filters。
+        """
+        if not index_set.is_platform_index:
+            return None
+        platform_index_filter = index_set.platform_index_filter or {}
+        filter_key = platform_index_filter.get("field")
+        filter_value = platform_index_filter.get("value_ref")
+        if not filter_key or filter_value not in PlatformIndexFilterValueRef.get_dict_choices():
+            # metadata 对非法配置只记 warning 并跳过，不写比写坏更安全：filter_key 为空会被回落成 bk_biz_id
+            logger.warning(
+                "skip query_router_config of index set(%s): invalid platform_index_filter %s",
+                index_set.index_set_id,
+                platform_index_filter,
+            )
+            return None
+        return {
+            "name": QUERY_ROUTER_CONFIG_OPTION_NAME,
+            "value_type": "dict",
+            "value": json.dumps(
+                {
+                    "space_type": cls.resolve_router_space_type(index_set),
+                    "filter_key": filter_key,
+                    "filter_value": filter_value,
+                }
+            ),
+        }
+
     @classmethod
     def get_index_set_table_info_list(
         cls,
@@ -1900,30 +2061,50 @@ class BaseIndexSetHandler:
         table_info_list = []
         # 索引组场景下使用索引组ID生成table_id，否则使用当前索引集ID
         effective_index_set_id = parent_index_set.index_set_id if parent_index_set else index_set.index_set_id
+        # 路由过滤条件必须取和 table_id 同一个主体：索引组场景下表是挂在组上的，
+        # 读子索引集会让组的表被子索引集的配置左右
+        query_router_config_option = cls.build_query_router_config_option(parent_index_set or index_set)
         # 索引组场景下使用索引组别名配置
         effective_alias_settings = (
             parent_index_set.query_alias_settings if parent_index_set else index_set.query_alias_settings
         )
         # Doris路由或图表分析路由
-        is_doris = str(IndexSetTag.get_tag_id("Doris")) in list(index_set.tag_ids)
-        doris_table_id = index_set.doris_table_id
+        is_doris = str(IndexSetTag.get_tag_id("Doris", tag_type=TAG_TYPE_INNER)) in list(index_set.tag_ids)
         if is_doris or is_analysis:
-            if not doris_table_id:
+            db_doris_table_id = index_set.doris_table_id
+            is_manual_connect_doris = True if index_set.support_doris and db_doris_table_id else False
+            if not is_manual_connect_doris:
                 return table_info_list
-            for doris_table_id in doris_table_id.split(","):
+            for doris_table_id in db_doris_table_id.split(","):
+                bkbase_table_id = doris_table_id.rsplit(".", maxsplit=1)[0]
                 doris_table_info = {
                     "storage_type": "doris",
-                    "bkbase_table_id": doris_table_id.rsplit(".", maxsplit=1)[0],
-                    "table_id": f"bklog_index_set_{effective_index_set_id}_{doris_table_id.rsplit('.', maxsplit=1)[0]}.__doris__",
+                    "bkbase_table_id": bkbase_table_id,
+                    "table_id": f"bklog_index_set_{effective_index_set_id}_{bkbase_table_id}.__doris__",
                     "source_type": "bkdata",
                     "need_create_index": False,
+                    "query_alias_settings": [],
                 }
+                # 首次创建路由时不带 cluster_id 会落到默认 Doris 集群，查询会打到错误的集群；
+                # 集群解析不出来时也不能把这张表从下发列表里摘掉，否则 metadata 会清空它的 data_label，
+                # 已建好的路由反而失效，此时交给 metadata 沿用路由上已有的集群
+                cluster_id = DorisClusterHandler.get_cluster_id(bkbase_table_id=bkbase_table_id)
+                if cluster_id:
+                    doris_table_info["cluster_id"] = cluster_id
+                else:
+                    logger.warning(
+                        "create doris router of index set(%s) without cluster id: storage cluster of %s is unknown",
+                        index_set.index_set_id,
+                        bkbase_table_id,
+                    )
                 if is_analysis:
                     doris_table_info["table_id"] = (
-                        f"bklog_index_set_{effective_index_set_id}_{doris_table_id.rsplit('.', maxsplit=1)[0]}.__analysis__"
+                        f"bklog_index_set_{effective_index_set_id}_{bkbase_table_id}.__analysis__"
                     )
                 if effective_alias_settings:
                     doris_table_info["query_alias_settings"] = copy.deepcopy(effective_alias_settings)
+                if query_router_config_option:
+                    doris_table_info["options"] = [copy.deepcopy(query_router_config_option)]
                 table_info_list.append(doris_table_info)
             return table_info_list
         # ES路由
@@ -1958,17 +2139,26 @@ class BaseIndexSetHandler:
                 ],
             }
 
+            if query_router_config_option:
+                table_info["options"].append(copy.deepcopy(query_router_config_option))
+
+            if obj.storage_cluster_id:
+                cluster_info = StorageHandler(cluster_id=obj.storage_cluster_id).get_cluster_info_by_id()
+                table_info["storage_type"] = cluster_info["cluster_type"]
+
+            # 只有确认拿到该 RT 的字段信息后，才显式下发别名配置；
+            # 查询失败的 RT 省略该字段，避免 metadata 清理已有别名。
+            alias_settings_resolved = rt_alias_mappings is None or obj.result_table_id in rt_alias_mappings
             if rt_alias_mappings is None:
-                if effective_alias_settings:
-                    table_info["query_alias_settings"] = copy.deepcopy(effective_alias_settings)
-            elif rt_alias_list := rt_alias_mappings.get(obj.result_table_id, []):
-                table_info["query_alias_settings"] = copy.deepcopy(rt_alias_list)
+                table_info["query_alias_settings"] = copy.deepcopy(effective_alias_settings or [])
+            elif alias_settings_resolved:
+                table_info["query_alias_settings"] = copy.deepcopy(rt_alias_mappings[obj.result_table_id])
 
             if table_info["source_type"] == Scenario.LOG:
                 table_info["origin_table_id"] = obj.result_table_id
                 collector_config = CollectorConfig.objects.filter(table_id=obj.result_table_id).first()
                 # 为纳秒字段新增别名
-                if collector_config.is_nanos:
+                if collector_config and collector_config.is_nanos and alias_settings_resolved:
                     table_info.setdefault("query_alias_settings", []).append(
                         {"field_name": "dtEventTimeStampNanos", "query_alias": "dtEventTimeStamp"}
                     )
@@ -1996,10 +2186,18 @@ class BaseIndexSetHandler:
 
     @classmethod
     def sync_router(cls, index_sets: LogIndexSet | list[LogIndexSet]):
-        """创建结果表路由信息"""
+        """创建结果表路由信息。
+
+        平台级索引集的跨空间数据隔离完全靠这里下发的 query_router_config 生效，静默失败会让
+        可见范围和 IAM 入口先开放、过滤却没落地，形成越权窗口，所以这类索引集失败即抛出，
+        由调用方连同配置一起回滚。普通索引集维持原有「记日志并继续」的行为。
+        """
         if not isinstance(index_sets, list):
             index_sets = [index_sets]
 
+        # data_label -> index_set，用于把并发写入的失败归因回具体索引集
+        routed_index_sets = {}
+        failed_platform_index_set_ids = set()
         multi_execute_func = MultiExecuteFunc()
         for index_set in index_sets:
             try:
@@ -2016,9 +2214,12 @@ class BaseIndexSetHandler:
                             index_set.index_set_id, index_set.query_alias_settings
                         )
                     except Exception as e:
+                        # 已配置别名但解析失败时，不要把 None 当作全量解析成功。
+                        # 空映射会让所有 RT 省略 query_alias_settings，避免覆盖已有别名。
+                        rt_alias_mappings = {}
                         logger.warning(
                             "get rt alias settings for index set(%s) failed: %s, "
-                            "fallback to apply full alias settings to all result tables",
+                            "skip alias settings for all result tables",
                             index_set.index_set_id,
                             e,
                         )
@@ -2057,9 +2258,27 @@ class BaseIndexSetHandler:
                             func=TransferApi.bulk_create_or_update_log_router,
                             params=request_params,
                         )
+                        routed_index_sets[data_label] = index_set
             except Exception as e:
                 logger.exception("create or update index set(%s) router failed：%s", index_set.index_set_id, e)
-        multi_execute_func.run()
+                if index_set.is_platform_index:
+                    failed_platform_index_set_ids.add(index_set.index_set_id)
+
+        # MultiExecuteFunc 默认会把 worker 异常直接吞掉，必须显式取回才能判断路由是否真的落库
+        for data_label, result in multi_execute_func.run(return_exception=True).items():
+            if not isinstance(result, Exception):
+                continue
+            logger.error("create or update log router(%s) failed：%s", data_label, result)
+            failed_index_set = routed_index_sets.get(data_label)
+            if failed_index_set is not None and failed_index_set.is_platform_index:
+                failed_platform_index_set_ids.add(failed_index_set.index_set_id)
+
+        if failed_platform_index_set_ids:
+            raise PlatformIndexRouterSyncException(
+                PlatformIndexRouterSyncException.MESSAGE.format(
+                    index_set_ids=",".join(str(index_set_id) for index_set_id in sorted(failed_platform_index_set_ids))
+                )
+            )
 
     def pre_update(self):
         if self.is_trace_log:
@@ -2096,7 +2315,7 @@ class BaseIndexSetHandler:
 
         # 标签
         if self.bcs_cluster_id:
-            tag_id = IndexSetTag.get_tag_id(name=self.bcs_cluster_id)
+            tag_id = IndexSetTag.get_tag_id(name=self.bcs_cluster_id, space_uid=self.space_uid)
             tag_ids = list(self.index_set_obj.tag_ids)
             if str(tag_id) not in tag_ids:
                 tag_ids.append(str(tag_id))
@@ -2174,6 +2393,12 @@ class BaseIndexSetHandler:
                 time_field_type=index.get("time_field_type") or self.time_field_type,
                 time_field_unit=index.get("time_field_unit") or self.time_field_unit,
             )
+
+        from apps.log_databus.handlers.collector.base import CollectorHandler
+
+        self.parent_index_set_ids = CollectorHandler.obtain_parent_index_set_ids(
+            self.parent_index_set_ids, self.parent_index_set_names, space_uid=self.space_uid, is_update=True
+        )
 
         # 更新归属索引集
         IndexSetHandler(index_set_id=self.index_set_obj.index_set_id).update_parent_index_sets(

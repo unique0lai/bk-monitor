@@ -197,6 +197,33 @@ class UsingCache:
         # 执行真实函数
         return task_definition(*args, **kwargs)
 
+    def get_cached(self, task_definition, args, kwargs):
+        """
+        【仅探测模式】
+        只查缓存、不执行函数：命中返回缓存值，未命中（或 development 关闭缓存）返回 None。
+        与 _cached 的读路径使用相同的 key 与开关语义。
+        """
+        if settings.ENVIRONMENT == "development":
+            return None
+        cache_key = self._cache_key(task_definition, args, kwargs)
+        if not cache_key:
+            return None
+        return self.get_value(cache_key, default=None)
+
+    def set_cached(self, task_definition, args, kwargs, value):
+        """
+        【仅回写模式】
+        把外部计算好的结果按与 _refresh 相同的 key、写入条件与超时回写缓存，不执行函数。
+        供「探缓存未命中后批量计算」的调用方回填单 key 缓存使用。
+        """
+        if settings.ENVIRONMENT == "development":
+            return
+        cache_key = self._cache_key(task_definition, args, kwargs)
+        if not cache_key:
+            return
+        if self.is_cache_func(value):
+            self.set_value(cache_key, value, self.using_cache_type.timeout)
+
     def __call__(self, task_definition):
         @functools.wraps(task_definition)
         def cached_wrapper(*args, **kwargs):
@@ -268,6 +295,7 @@ class CacheType:
     BCS = CacheTypeItem(key="bcs", timeout=60 * 5, user_related=False)
     METADATA = CacheTypeItem(key="metadata", timeout=60 * 10, user_related=False)
     APM = CacheTypeItem(key="apm", timeout=60 * 10, user_related=False)
+    RUM = CacheTypeItem(key="rum", timeout=60 * 10, user_related=False)
     APM_EBPF = CacheTypeItem(key="apm_ebpf", timeout=60 * 10, user_related=False)
     APM_ENDPOINTS = CacheTypeItem(key="apm_endpoints", timeout=60 * 10, user_related=False)
     CC_BACKEND = CacheTypeItem(key="cc_backend", timeout=60 * 10, user_related=False)
@@ -279,6 +307,8 @@ class CacheType:
     CC_CACHE_ALWAYS = CacheTypeItem(key="cc_cache_always", timeout=60 * 60, user_related=False)
     HOME = CacheTypeItem(key="home", timeout=settings.CACHE_HOME_TIMEOUT, label="自愈统计数据相关", user_related=False)
     DEVOPS = CacheTypeItem(key="devops", timeout=60 * 5, label="蓝盾接口相关", user_related=False)
+    # AIDEV 资源按当前用户登录态过滤，缓存必须按用户隔离
+    AIDEV = CacheTypeItem(key="aidev", timeout=60 * 5, label="AIDEV 接口相关", user_related=True)
     GRAFANA = CacheTypeItem(key="grafana", timeout=60 * 5, label="仪表盘相关", user_related=False)
     SCENE_VIEW = CacheTypeItem(key="scene_view", timeout=60 * 1, label="观测场景相关", user_related=False)
     DB_CACHE = CacheTypeItem(key="db_cache", timeout=60 * 3, label="db缓存", user_related=False)

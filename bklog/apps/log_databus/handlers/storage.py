@@ -19,6 +19,7 @@ We undertake not to change the open source license (MIT license) applicable to t
 the project delivered to anyone in the future.
 """
 
+import copy
 import functools
 import ipaddress
 import operator
@@ -27,6 +28,7 @@ from collections import defaultdict
 
 import arrow
 from django.conf import settings
+from django.core.cache import cache
 from django.db.models import Q, Sum
 from django.utils.translation import gettext as _
 
@@ -37,17 +39,21 @@ from apps.constants import (
     UserOperationTypeEnum,
 )
 from apps.decorators import user_operation_record
+from apps.feature_toggle.handlers.toggle import FeatureToggleObject
 from apps.iam import Permission, ResourceEnum
 from apps.log_databus.constants import (
     BKLOG_RESULT_TABLE_PATTERN,
+    ClusterTypeEnum,
     DEFAULT_ES_SCHEMA,
     DEFAULT_ES_TAGS,
     DEFAULT_ES_TRANSPORT,
+    DORIS_STORAGE_CLUSTER,
     NODE_ATTR_PREFIX_BLACKLIST,
     REGISTERED_SYSTEM_DEFAULT,
     STORAGE_CLUSTER_TYPE,
     EsSourceType,
     VisibleEnum,
+    DORIS_CLUSTER_TYPE,
 )
 from apps.log_databus.exceptions import (
     BKBaseStorageSyncFailed,
@@ -58,7 +64,7 @@ from apps.log_databus.exceptions import (
     StorageNotPermissionException,
     StorageUnKnowEsVersionException,
 )
-from apps.log_databus.models import StorageCapacity, StorageUsed
+from apps.log_databus.models import CollectorConfig, StorageCapacity, StorageUsed
 from apps.log_databus.utils.es_config import get_es_config
 from apps.log_esquery.utils.es_client import (
     es_client_ping,
@@ -66,8 +72,7 @@ from apps.log_esquery.utils.es_client import (
     get_es_client,
 )
 from apps.log_esquery.utils.es_route import EsRoute
-from apps.log_search.models import BizProperty, Scenario
-from apps.utils.cache import cache_five_minute
+from apps.log_search.models import BizProperty, Scenario, Space
 from apps.utils.local import get_local_param, get_request_username
 from apps.utils.log import logger
 from apps.utils.thread import MultiExecuteFunc
@@ -78,6 +83,11 @@ from bkm_space.utils import bk_biz_id_to_space_uid, parse_space_uid
 import builtins
 
 CACHE_EXPIRE_TIME = 300
+METADATA_CLUSTER_STATUS_BATCH_SIZE = 20
+METADATA_CLUSTER_STATUS_MAX_WORKERS = 5
+METADATA_RESULT_TABLE_STATUS_BATCH_SIZE = 50
+# Doris 无等价指标的物理存储行字段，沿用前端既有占位样式，不能落成 0
+DORIS_STORAGE_ROW_PLACEHOLDER = "--"
 
 
 class StorageHandler:
@@ -148,15 +158,49 @@ class StorageHandler:
             return BizProperty.objects.filter(q_filter).exists()
         return False
 
-    def get_cluster_groups(self, bk_biz_id, is_default=True, enable_archive=False):
+    def get_cluster_groups(
+        self,
+        bk_biz_id,
+        cluster_query_type=ClusterTypeEnum.ES.value,
+        is_default=True,
+        enable_archive=False,
+        cluster_id=None,
+    ):
         """
         获取集群列表
-        :param bk_biz_id:
-        :param is_default:
+        :param bk_biz_id: bk_biz_id
+        :param cluster_query_type: 集群类型
+        :param is_default: 是否查询公共集群
+        :param enable_archive: 是否只查询可归档集群
+        :param cluster_id: 可选集群ID
         :return:
         """
+        multi_execute_func = MultiExecuteFunc()
+
+        cluster_infos = []
+        cluster_types = []
+
+        if cluster_query_type == ClusterTypeEnum.ALL.value or cluster_query_type == ClusterTypeEnum.ES.value:
+            cluster_types.append(STORAGE_CLUSTER_TYPE)
+
+        if (
+            cluster_query_type == ClusterTypeEnum.ALL.value or cluster_query_type == ClusterTypeEnum.DORIS.value
+        ) and FeatureToggleObject.switch(DORIS_STORAGE_CLUSTER, bk_biz_id):
+            cluster_types.append(DORIS_CLUSTER_TYPE)
+
+        for cluster_type in cluster_types:
+            params = {"cluster_type": cluster_type}
+            if cluster_id:
+                params["cluster_id"] = cluster_id
+            multi_execute_func.append(cluster_type, TransferApi.get_cluster_info, params)
+
+        result = multi_execute_func.run()
+
+        for cluster_type, cluster_info_list in result.items():
+            cluster_infos.extend(cluster_info_list)
+
         cluster_groups = self.filter_cluster_groups(
-            TransferApi.get_cluster_info({"cluster_type": STORAGE_CLUSTER_TYPE}),
+            cluster_infos,
             bk_biz_id,
             is_default=is_default,
             enable_archive=enable_archive,
@@ -181,9 +225,10 @@ class StorageHandler:
                 "biz_count": i["biz_count"],
                 "storage_cluster_id": i["cluster_config"].get("cluster_id"),
                 "storage_cluster_name": i["cluster_config"].get("cluster_name"),
-                "storage_display_name": i["cluster_config"].get("display_name") or i["cluster_config"].get("cluster_name"),
+                "storage_display_name": i["cluster_config"].get("display_name")
+                or i["cluster_config"].get("cluster_name"),
                 "storage_version": i["cluster_config"].get("version"),
-                "storage_type": STORAGE_CLUSTER_TYPE,
+                "storage_type": i["cluster_type"],
                 "priority": i["priority"],
                 "registered_system": i["cluster_config"].get("registered_system"),
                 "bk_biz_id": i["cluster_config"]["custom_option"]["bk_biz_id"],
@@ -199,20 +244,30 @@ class StorageHandler:
                 "is_platform": self.is_platform_cluster(
                     i["cluster_config"]["custom_option"]["visible_config"]["visible_type"]
                 ),
+                "visible_editable": i.get("visible_editable", False),
             }
             for i in cluster_groups
             if i
         ]
 
-    def get_cluster_groups_filter(self, bk_biz_id, is_default=True, enable_archive=False):
+    def get_cluster_groups_filter(
+        self,
+        bk_biz_id,
+        cluster_query_type=ClusterTypeEnum.ES.value,
+        is_default=True,
+        enable_archive=False,
+    ):
         """
         获取集群列表并过滤
-        :param bk_biz_id:
-        :param is_default:
-        :param data_link_id: 链路ID
+        :param bk_biz_id: bk_biz_id
+        :param cluster_query_type: 集群查询类型
+        :param is_default: 是否查询公共集群
+        :param enable_archive: 是否只查询可归档集群
         :return:
         """
-        cluster_groups = self.get_cluster_groups(bk_biz_id, is_default=is_default, enable_archive=enable_archive)
+        cluster_groups = self.get_cluster_groups(
+            bk_biz_id, cluster_query_type=cluster_query_type, is_default=is_default, enable_archive=enable_archive
+        )
 
         # 排序：第三方集群 > 默认集群
         cluster_groups.sort(key=lambda c: c["priority"])
@@ -246,13 +301,14 @@ class StorageHandler:
     ):
         """
         筛选集群，并判断集群是否可编辑
-        :param cluster_groups:
-        :param bk_biz_id:
-        :param is_default:
+        :param cluster_groups: 集群信息列表
+        :param bk_biz_id: bk_biz_id
+        :param is_default: 是否查询公共集群
+        :param enable_archive: 是否只查询可归档的集群
         :return:
         """
-        cluster_data = list()
         # 筛选集群 & 判断是否可编辑
+        cluster_data = list()
         es_config = get_es_config(bk_biz_id)
 
         def get_storage_info(cluster_id):
@@ -268,186 +324,359 @@ class StorageHandler:
                 "biz_count": used.biz_count,
             }
 
+        for cluster_obj in cluster_groups:
+            cluster_type = cluster_obj.get("cluster_type")
+
+            is_append = False
+            after_filter_cluster_obj = None
+
+            if cluster_type == STORAGE_CLUSTER_TYPE:
+                is_append, after_filter_cluster_obj = cls.filter_es_cluster(
+                    bk_biz_id, is_default, post_visible, cluster_obj, es_config
+                )
+            elif cluster_type == DORIS_CLUSTER_TYPE:
+                is_append, after_filter_cluster_obj = cls.filter_doris_cluster(
+                    bk_biz_id, is_default, post_visible, cluster_obj
+                )
+
+            if not is_append or not after_filter_cluster_obj:
+                continue
+
+            after_filter_cluster_obj.update(
+                get_storage_info(after_filter_cluster_obj["cluster_config"].get("cluster_id"))
+            )
+
+            cluster_data.append(after_filter_cluster_obj)
+
+        return [
+            cluster
+            for cluster in cluster_data
+            if (not enable_archive)
+            or (enable_archive and cluster["cluster_config"]["custom_option"].get("enable_archive", False))
+        ]
+
+    @classmethod
+    def filter_es_cluster(cls, bk_biz_id, is_default, post_visible, cluster_obj, es_config):
         from apps.log_search.handlers.index_set import IndexSetHandler
 
-        for cluster_obj in cluster_groups:
-            custom_option = cluster_obj["cluster_config"]["custom_option"]
-            # 判断是否有setup_config配置
-            if not custom_option.get("setup_config", {}):
-                custom_option["setup_config"] = {
-                    "retention_days_max": es_config["ES_PUBLIC_STORAGE_DURATION"],
-                    "retention_days_default": es_config["ES_PUBLIC_STORAGE_DURATION"],
-                    "number_of_replicas_max": es_config["ES_REPLICAS"],
-                    "number_of_replicas_default": es_config["ES_REPLICAS"],
-                    "es_shards_default": es_config["ES_SHARDS"],
-                    "es_shards_max": es_config["ES_SHARDS_MAX"],
-                }
-            # 判断setup_config配置里是否有es_shards配置
-            if not custom_option["setup_config"].get("es_shards_default"):
-                custom_option["setup_config"]["es_shards_default"] = es_config["ES_SHARDS"]
-                custom_option["setup_config"]["es_shards_max"] = es_config["ES_SHARDS_MAX"]
-            cluster_obj.update(get_storage_info(cluster_obj["cluster_config"].get("cluster_id")))
-            cluster_obj["cluster_config"]["create_time"] = StorageHandler.convert_standard_time(
-                cluster_obj["cluster_config"]["create_time"]
-            )
-            cluster_obj["cluster_config"]["last_modify_time"] = StorageHandler.convert_standard_time(
-                cluster_obj["cluster_config"]["last_modify_time"]
-            )
-            cluster_obj["cluster_config"]["schema"] = cluster_obj["cluster_config"].get("schema") or DEFAULT_ES_SCHEMA
-            enable_hot_warm = (
-                cluster_obj["cluster_config"]["custom_option"].get("hot_warm_config", {}).get("is_enabled", False)
-            )
-            cluster_obj["cluster_config"]["enable_hot_warm"] = enable_hot_warm
+        custom_option = cluster_obj["cluster_config"]["custom_option"]
 
-            # 公共集群：凭据信息和域名置空处理，并添加不允许编辑标签
-            if cluster_obj["cluster_config"].get("registered_system") == REGISTERED_SYSTEM_DEFAULT:
-                if not is_default:
-                    continue
-                if not cls.storage_visible(bk_biz_id, settings.BLUEKING_BK_BIZ_ID, post_visible=post_visible):
-                    continue
-                cluster_obj["is_editable"] = True
-                cluster_obj["auth_info"]["password"] = ""
-                cluster_obj["cluster_config"]["max_retention"] = es_config["ES_PUBLIC_STORAGE_DURATION"]
-                # 默认集群权重：推荐集群 > 其他
-                cluster_obj["priority"] = 1 if cluster_obj["cluster_config"].get("is_default_cluster") else 2
-                if not cluster_obj["cluster_config"].get("custom_option", {}).get("visible_config"):
-                    custom_option = {
-                        "visible_config": {"visible_type": VisibleEnum.ALL_BIZ.value},
-                        "admin": [cluster_obj["cluster_config"]["creator"]],
-                        "setup_config": {
-                            "retention_days_max": es_config["ES_PUBLIC_STORAGE_DURATION"],
-                            "retention_days_default": es_config["ES_PUBLIC_STORAGE_DURATION"],
-                            "number_of_replicas_max": es_config["ES_REPLICAS"],
-                            "number_of_replicas_default": es_config["ES_REPLICAS"],
-                            "es_shards_default": settings.ES_SHARDS,
-                            "es_shards_max": settings.ES_SHARDS_MAX,
-                        },
-                        "description": "",
-                        "enable_archive": False,
-                        "enable_assessment": False,
-                        "source_type": EsSourceType.OTHER.value,
-                        "source_name": EsSourceType.get_choice_label(EsSourceType.OTHER.value),
-                    }
-                    custom_option.update(cluster_obj["cluster_config"]["custom_option"])
-                    cluster_obj["cluster_config"]["custom_option"] = custom_option
-                index_sets = IndexSetHandler.get_index_set_for_storage(cluster_obj["cluster_config"]["cluster_id"])
-                if (
-                    cluster_obj["cluster_config"]
-                    .get("custom_option", {})
-                    .get("visible_config", {})
-                    .get("visible_type", "")
-                    == VisibleEnum.MULTI_BIZ.value
-                ):
-                    cluster_obj["cluster_config"]["custom_option"]["visible_config"]["visible_bk_biz"] = [
-                        {
-                            "bk_biz_id": bk_biz_id,
-                            "is_use": index_sets.filter(
-                                space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True
-                            ).exists(),
-                        }
-                        for bk_biz_id in cluster_obj["cluster_config"]["custom_option"]["visible_config"][
-                            "visible_bk_biz"
-                        ]
-                    ]
-                cluster_obj["cluster_config"]["custom_option"]["bk_biz_id"] = settings.BLUEKING_BK_BIZ_ID
-                cluster_obj["source_type"] = cluster_obj["cluster_config"]["custom_option"]["source_type"]
-                cluster_obj["source_name"] = EsSourceType.get_choice_label(cluster_obj["source_type"])
-                cluster_data.append(cluster_obj)
-                continue
-
-            # 非公共集群， 筛选bk_biz_id，密码置空处理，并添加可编辑标签
-            new_custom_option = {
-                "admin": [cluster_obj["cluster_config"]["creator"]],
-                "setup_config": {
-                    "retention_days_max": es_config["ES_PUBLIC_STORAGE_DURATION"],
-                    "retention_days_default": es_config["ES_PUBLIC_STORAGE_DURATION"],
-                    "number_of_replicas_max": es_config["ES_REPLICAS"],
-                    "number_of_replicas_default": es_config["ES_REPLICAS"],
-                    "es_shards_default": settings.ES_SHARDS,
-                    "es_shards_max": settings.ES_SHARDS_MAX,
-                },
-                "description": "",
-                "enable_archive": False,
-                "enable_assessment": False,
-                "source_type": cluster_obj["cluster_config"]["custom_option"].get(
-                    "source_type", EsSourceType.OTHER.value
-                ),
-                "source_name": EsSourceType.get_choice_label(
-                    custom_option.get("source_type", EsSourceType.OTHER.value)
-                ),
+        # 判断是否有setup_config配置
+        if not custom_option.get("setup_config", {}):
+            custom_option["setup_config"] = {
+                "retention_days_max": es_config["ES_PUBLIC_STORAGE_DURATION"],
+                "retention_days_default": es_config["ES_PUBLIC_STORAGE_DURATION"],
+                "number_of_replicas_max": es_config["ES_REPLICAS"],
+                "number_of_replicas_default": es_config["ES_REPLICAS"],
+                "es_shards_default": es_config["ES_SHARDS"],
+                "es_shards_max": es_config["ES_SHARDS_MAX"],
             }
-            custom_biz_id = cluster_obj["cluster_config"]["custom_option"].get("bk_biz_id")
-            custom_visible_bk_biz = cluster_obj["cluster_config"]["custom_option"].get("visible_bk_biz", [])
+        # 判断setup_config配置里是否有es_shards配置
+        if not custom_option["setup_config"].get("es_shards_default"):
+            custom_option["setup_config"]["es_shards_default"] = es_config["ES_SHARDS"]
+            custom_option["setup_config"]["es_shards_max"] = es_config["ES_SHARDS_MAX"]
+        cluster_obj["cluster_config"]["create_time"] = StorageHandler.convert_standard_time(
+            cluster_obj["cluster_config"]["create_time"]
+        )
+        cluster_obj["cluster_config"]["last_modify_time"] = StorageHandler.convert_standard_time(
+            cluster_obj["cluster_config"]["last_modify_time"]
+        )
+        cluster_obj["cluster_config"]["schema"] = cluster_obj["cluster_config"].get("schema") or DEFAULT_ES_SCHEMA
+        enable_hot_warm = (
+            cluster_obj["cluster_config"]["custom_option"].get("hot_warm_config", {}).get("is_enabled", False)
+        )
+        cluster_obj["cluster_config"]["enable_hot_warm"] = enable_hot_warm
 
-            if not cls.storage_visible(bk_biz_id, custom_biz_id, post_visible=post_visible):
-                continue
-
+        # 公共集群：凭据信息和域名置空处理，并添加不允许编辑标签
+        if cluster_obj["cluster_config"].get("registered_system") == REGISTERED_SYSTEM_DEFAULT:
+            if not is_default:
+                return False, cluster_obj
+            if not cls.storage_visible(bk_biz_id, settings.BLUEKING_BK_BIZ_ID, post_visible=post_visible):
+                return False, cluster_obj
             cluster_obj["is_editable"] = True
             cluster_obj["auth_info"]["password"] = ""
-            # 第三方es权重最高
-            cluster_obj["priority"] = 0
-            cluster_obj["bk_biz_id"] = custom_biz_id
-            cluster_obj["source_type"] = cluster_obj["cluster_config"]["custom_option"].get(
-                "source_type", EsSourceType.OTHER.value
-            )
-            cluster_obj["source_name"] = EsSourceType.get_choice_label(cluster_obj["source_type"])
-
+            cluster_obj["cluster_config"]["max_retention"] = es_config["ES_PUBLIC_STORAGE_DURATION"]
+            # 默认集群权重：推荐集群 > 其他
+            cluster_obj["priority"] = 1 if cluster_obj["cluster_config"].get("is_default_cluster") else 2
+            if not cluster_obj["cluster_config"].get("custom_option", {}).get("visible_config"):
+                custom_option = {
+                    "visible_config": {"visible_type": VisibleEnum.ALL_BIZ.value},
+                    "admin": [cluster_obj["cluster_config"]["creator"]],
+                    "setup_config": {
+                        "retention_days_max": es_config["ES_PUBLIC_STORAGE_DURATION"],
+                        "retention_days_default": es_config["ES_PUBLIC_STORAGE_DURATION"],
+                        "number_of_replicas_max": es_config["ES_REPLICAS"],
+                        "number_of_replicas_default": es_config["ES_REPLICAS"],
+                        "es_shards_default": settings.ES_SHARDS,
+                        "es_shards_max": settings.ES_SHARDS_MAX,
+                    },
+                    "description": "",
+                    "enable_archive": False,
+                    "enable_assessment": False,
+                    "source_type": EsSourceType.OTHER.value,
+                    "source_name": EsSourceType.get_choice_label(EsSourceType.OTHER.value),
+                }
+                custom_option.update(cluster_obj["cluster_config"]["custom_option"])
+                cluster_obj["cluster_config"]["custom_option"] = custom_option
             index_sets = IndexSetHandler.get_index_set_for_storage(cluster_obj["cluster_config"]["cluster_id"])
-
-            cluster_obj["visible_bk_biz"] = [
-                {
-                    "bk_biz_id": bk_biz_id,
-                    "is_use": index_sets.filter(space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True).exists(),
-                }
-                for bk_biz_id in custom_visible_bk_biz
-            ]
-
-            # 如果这个存在说明是老的可见范围配置
-            if custom_visible_bk_biz:
-                new_custom_option["visible_config"] = {
-                    "visible_type": VisibleEnum.MULTI_BIZ.value,
-                    "visible_bk_biz": [
-                        {
-                            "bk_biz_id": bk_biz_id,
-                            "is_use": index_sets.filter(
-                                space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True
-                            ).exists(),
-                        }
-                        for bk_biz_id in custom_visible_bk_biz
-                    ],
-                }
-                new_custom_option.update(cluster_obj["cluster_config"]["custom_option"])
-                cluster_obj["cluster_config"]["custom_option"] = new_custom_option
-                cluster_data.append(cluster_obj)
-                continue
-
-            # 如果可见范围配置不存在，则直接为当前业务可见
-            if not custom_option.get("visible_config"):
-                new_custom_option["visible_config"] = {
-                    "visible_type": VisibleEnum.CURRENT_BIZ.value,
-                }
-                new_custom_option.update(cluster_obj["cluster_config"]["custom_option"])
-                cluster_obj["cluster_config"]["custom_option"] = new_custom_option
-                cluster_data.append(cluster_obj)
-                continue
-
-            if custom_option["visible_config"]["visible_type"] == VisibleEnum.MULTI_BIZ.value:
-                custom_option["visible_config"]["visible_bk_biz"] = [
+            if (
+                cluster_obj["cluster_config"].get("custom_option", {}).get("visible_config", {}).get("visible_type", "")
+                == VisibleEnum.MULTI_BIZ.value
+            ):
+                cluster_obj["cluster_config"]["custom_option"]["visible_config"]["visible_bk_biz"] = [
                     {
                         "bk_biz_id": bk_biz_id,
                         "is_use": index_sets.filter(
                             space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True
                         ).exists(),
                     }
-                    for bk_biz_id in custom_option["visible_config"]["visible_bk_biz"]
+                    for bk_biz_id in cluster_obj["cluster_config"]["custom_option"]["visible_config"]["visible_bk_biz"]
+                ]
+            cluster_obj["cluster_config"]["custom_option"]["bk_biz_id"] = settings.BLUEKING_BK_BIZ_ID
+            cluster_obj["source_type"] = cluster_obj["cluster_config"]["custom_option"]["source_type"]
+            cluster_obj["source_name"] = EsSourceType.get_choice_label(cluster_obj["source_type"])
+            return True, cluster_obj
+
+        # 非公共集群， 筛选bk_biz_id，密码置空处理，并添加可编辑标签
+        new_custom_option = {
+            "admin": [cluster_obj["cluster_config"]["creator"]],
+            "setup_config": {
+                "retention_days_max": es_config["ES_PUBLIC_STORAGE_DURATION"],
+                "retention_days_default": es_config["ES_PUBLIC_STORAGE_DURATION"],
+                "number_of_replicas_max": es_config["ES_REPLICAS"],
+                "number_of_replicas_default": es_config["ES_REPLICAS"],
+                "es_shards_default": settings.ES_SHARDS,
+                "es_shards_max": settings.ES_SHARDS_MAX,
+            },
+            "description": "",
+            "enable_archive": False,
+            "enable_assessment": False,
+            "source_type": cluster_obj["cluster_config"]["custom_option"].get("source_type", EsSourceType.OTHER.value),
+            "source_name": EsSourceType.get_choice_label(custom_option.get("source_type", EsSourceType.OTHER.value)),
+        }
+        custom_biz_id = cluster_obj["cluster_config"]["custom_option"].get("bk_biz_id")
+        custom_visible_bk_biz = cluster_obj["cluster_config"]["custom_option"].get("visible_bk_biz", [])
+
+        if not cls.storage_visible(bk_biz_id, custom_biz_id, post_visible=post_visible):
+            return False, cluster_obj
+
+        cluster_obj["is_editable"] = True
+        cluster_obj["auth_info"]["password"] = ""
+        # 第三方es权重最高
+        cluster_obj["priority"] = 0
+        cluster_obj["bk_biz_id"] = custom_biz_id
+        cluster_obj["source_type"] = cluster_obj["cluster_config"]["custom_option"].get(
+            "source_type", EsSourceType.OTHER.value
+        )
+        cluster_obj["source_name"] = EsSourceType.get_choice_label(cluster_obj["source_type"])
+
+        index_sets = IndexSetHandler.get_index_set_for_storage(cluster_obj["cluster_config"]["cluster_id"])
+
+        cluster_obj["visible_bk_biz"] = [
+            {
+                "bk_biz_id": bk_biz_id,
+                "is_use": index_sets.filter(space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True).exists(),
+            }
+            for bk_biz_id in custom_visible_bk_biz
+        ]
+
+        # 如果这个存在说明是老的可见范围配置
+        if custom_visible_bk_biz:
+            new_custom_option["visible_config"] = {
+                "visible_type": VisibleEnum.MULTI_BIZ.value,
+                "visible_bk_biz": [
+                    {
+                        "bk_biz_id": bk_biz_id,
+                        "is_use": index_sets.filter(
+                            space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True
+                        ).exists(),
+                    }
+                    for bk_biz_id in custom_visible_bk_biz
+                ],
+            }
+            new_custom_option.update(cluster_obj["cluster_config"]["custom_option"])
+            cluster_obj["cluster_config"]["custom_option"] = new_custom_option
+            return True, cluster_obj
+
+        # 如果可见范围配置不存在，则直接为当前业务可见
+        if not custom_option.get("visible_config"):
+            new_custom_option["visible_config"] = {
+                "visible_type": VisibleEnum.CURRENT_BIZ.value,
+            }
+            new_custom_option.update(cluster_obj["cluster_config"]["custom_option"])
+            cluster_obj["cluster_config"]["custom_option"] = new_custom_option
+            return True, cluster_obj
+
+        if custom_option["visible_config"]["visible_type"] == VisibleEnum.MULTI_BIZ.value:
+            custom_option["visible_config"]["visible_bk_biz"] = [
+                {
+                    "bk_biz_id": bk_biz_id,
+                    "is_use": index_sets.filter(space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True).exists(),
+                }
+                for bk_biz_id in custom_option["visible_config"]["visible_bk_biz"]
+            ]
+
+        return True, cluster_obj
+
+    @staticmethod
+    def _fill_doris_setup_config(custom_option: dict, es_config: dict) -> None:
+        """
+        doris 集群管理员未配置存储上限时回落到公共集群缺省时长。
+        前端取不到 retention_days_max 时会回退到写死的 7 天，因此该字段必须有值。
+        doris 无副本/分片概念，故不填充 number_of_replicas_* / es_shards_*。
+        """
+        setup_config = custom_option.get("setup_config") or {}
+        setup_config.setdefault("retention_days_max", es_config["ES_PUBLIC_STORAGE_DURATION"])
+        setup_config.setdefault("retention_days_default", es_config["ES_PUBLIC_STORAGE_DURATION"])
+        custom_option["setup_config"] = setup_config
+
+    @classmethod
+    def filter_doris_cluster(cls, bk_biz_id, is_default, post_visible, cluster_obj):
+        from apps.log_search.handlers.index_set import IndexSetHandler
+
+        es_config = get_es_config(bk_biz_id)
+
+        default_custom_option = {
+            "admin": [cluster_obj["cluster_config"]["creator"]],
+            "setup_config": {},
+            "description": "",
+            "enable_archive": False,
+            "enable_assessment": False,
+            "source_type": EsSourceType.OTHER.value,
+        }
+
+        cluster_obj["cluster_config"]["schema"] = cluster_obj["cluster_config"].get("schema") or DEFAULT_ES_SCHEMA
+
+        cluster_obj["cluster_config"]["create_time"] = StorageHandler.convert_standard_time(
+            cluster_obj["cluster_config"]["create_time"]
+        )
+        cluster_obj["cluster_config"]["last_modify_time"] = StorageHandler.convert_standard_time(
+            cluster_obj["cluster_config"]["last_modify_time"]
+        )
+
+        if not cluster_obj["cluster_config"].get("custom_option"):
+            cluster_obj["cluster_config"]["custom_option"] = {}
+
+        # 公共集群: 密码空置处理, 添加不可编辑标签
+        if cluster_obj["cluster_config"].get("registered_system") == REGISTERED_SYSTEM_DEFAULT:
+            if not is_default:
+                return False, cluster_obj
+
+            if not cls.storage_visible(bk_biz_id, settings.BLUEKING_BK_BIZ_ID, post_visible=post_visible):
+                return False, cluster_obj
+
+            # doris 集群不可编辑（连接信息），但允许蓝鲸业务编辑可见范围
+            cluster_obj["is_editable"] = False
+            cluster_obj["visible_editable"] = int(bk_biz_id) == int(settings.BLUEKING_BK_BIZ_ID)
+            cluster_obj["auth_info"]["password"] = ""
+            cluster_obj["cluster_config"]["max_retention"] = es_config["ES_PUBLIC_STORAGE_DURATION"]
+            # 默认集群权重: 推荐集群 > 其他
+            cluster_obj["priority"] = 1 if cluster_obj["cluster_config"].get("is_default_cluster") else 2
+
+            # 兼容 visible_config 上线前注册的历史公共集群
+            if not cluster_obj["cluster_config"]["custom_option"].get("visible_config"):
+                cluster_obj["cluster_config"]["custom_option"]["visible_config"] = {
+                    "visible_type": VisibleEnum.ALL_BIZ.value
+                }
+
+            if (
+                cluster_obj["cluster_config"]["custom_option"].get("visible_config", {}).get("visible_type", "")
+                == VisibleEnum.MULTI_BIZ.value
+            ):
+                index_sets = IndexSetHandler.get_index_set_for_storage(cluster_obj["cluster_config"]["cluster_id"])
+                cluster_obj["cluster_config"]["custom_option"]["visible_config"]["visible_bk_biz"] = [
+                    {
+                        "bk_biz_id": bk_biz_id,
+                        "is_use": index_sets.filter(
+                            space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True
+                        ).exists(),
+                    }
+                    for bk_biz_id in cluster_obj["cluster_config"]["custom_option"]["visible_config"].get(
+                        "visible_bk_biz", []
+                    )
                 ]
 
-            cluster_data.append(cluster_obj)
-        return [
-            cluster
-            for cluster in cluster_data
-            if (not enable_archive) or (enable_archive and cluster["cluster_config"]["custom_option"]["enable_archive"])
+            default_custom_option.update(cluster_obj["cluster_config"]["custom_option"])
+            # 必须在 update 之后填充：metadata 侧存的 setup_config 会整体覆盖该键，若其为空字典则缺省值被冲掉
+            cls._fill_doris_setup_config(default_custom_option, es_config)
+            default_custom_option["source_name"] = EsSourceType.get_choice_label(default_custom_option["source_type"])
+            cluster_obj["cluster_config"]["custom_option"] = default_custom_option
+
+            cluster_obj["cluster_config"]["custom_option"]["bk_biz_id"] = settings.BLUEKING_BK_BIZ_ID
+            cluster_obj["source_type"] = cluster_obj["cluster_config"]["custom_option"]["source_type"]
+            cluster_obj["source_name"] = cluster_obj["cluster_config"]["custom_option"]["source_name"]
+
+            return True, cluster_obj
+
+        # 非公共集群: 筛选bk_biz_id, 密码空置处理, 添加不可编辑标签
+        custom_biz_id = cluster_obj["cluster_config"]["custom_option"].get("bk_biz_id")
+        custom_visible_bk_biz = cluster_obj["cluster_config"]["custom_option"].get("visible_bk_biz", [])
+
+        if not cls.storage_visible(bk_biz_id, custom_biz_id, post_visible=post_visible):
+            return False, cluster_obj
+
+        index_sets = IndexSetHandler.get_index_set_for_storage(cluster_obj["cluster_config"]["cluster_id"])
+
+        # doris 集群不可编辑（连接信息），但允许归属业务编辑可见范围
+        cluster_obj["is_editable"] = False
+        cluster_obj["visible_editable"] = str(custom_biz_id) == str(bk_biz_id)
+        cluster_obj["auth_info"]["password"] = ""
+        # 第三方es权重最高
+        cluster_obj["priority"] = 0
+
+        cluster_obj["visible_bk_biz"] = [
+            {
+                "bk_biz_id": bk_biz_id,
+                "is_use": index_sets.filter(space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True).exists(),
+            }
+            for bk_biz_id in custom_visible_bk_biz
         ]
+
+        # 如果这个存在说明是老的可见范围配置
+        if custom_visible_bk_biz:
+            cluster_obj["cluster_config"]["custom_option"]["visible_config"] = {
+                "visible_type": VisibleEnum.MULTI_BIZ.value,
+                "visible_bk_biz": [
+                    {
+                        "bk_biz_id": bk_biz_id,
+                        "is_use": index_sets.filter(
+                            space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True
+                        ).exists(),
+                    }
+                    for bk_biz_id in custom_visible_bk_biz
+                ],
+            }
+        # 如果可见范围配置不存在, 则直接为当前业务可见
+        elif not cluster_obj["cluster_config"]["custom_option"].get("visible_config"):
+            cluster_obj["cluster_config"]["custom_option"]["visible_config"] = {
+                "visible_type": VisibleEnum.CURRENT_BIZ.value,
+            }
+        # 如果可见范围是多业务可见，则补充业务使用情况
+        elif (
+            cluster_obj["cluster_config"]["custom_option"]["visible_config"].get("visible_type", "")
+            == VisibleEnum.MULTI_BIZ.value
+        ):
+            cluster_obj["cluster_config"]["custom_option"]["visible_config"]["visible_bk_biz"] = [
+                {
+                    "bk_biz_id": bk_biz_id,
+                    "is_use": index_sets.filter(space_uid=bk_biz_id_to_space_uid(bk_biz_id), is_active=True).exists(),
+                }
+                for bk_biz_id in cluster_obj["cluster_config"]["custom_option"]["visible_config"].get(
+                    "visible_bk_biz", []
+                )
+            ]
+
+        default_custom_option.update(cluster_obj["cluster_config"]["custom_option"])
+        # 必须在 update 之后填充：metadata 侧存的 setup_config 会整体覆盖该键，若其为空字典则缺省值被冲掉
+        cls._fill_doris_setup_config(default_custom_option, es_config)
+        default_custom_option["source_name"] = EsSourceType.get_choice_label(default_custom_option["source_type"])
+        cluster_obj["cluster_config"]["custom_option"] = default_custom_option
+
+        cluster_obj["bk_biz_id"] = custom_biz_id
+        cluster_obj["source_type"] = cluster_obj["cluster_config"]["custom_option"]["source_type"]
+        cluster_obj["source_name"] = cluster_obj["cluster_config"]["custom_option"]["source_name"]
+
+        return True, cluster_obj
 
     @staticmethod
     def storage_visible(bk_biz_id, custom_bk_biz_id, post_visible=False) -> bool:
@@ -472,27 +701,57 @@ class StorageHandler:
     def is_platform_cluster(visible_type):
         return visible_type in [VisibleEnum.ALL_BIZ.value, VisibleEnum.BIZ_ATTR.value, VisibleEnum.MULTI_BIZ.value]
 
-    def list(self, bk_biz_id, cluster_id=None, is_default=True, enable_archive=False):
+    def list(
+        self,
+        bk_biz_id,
+        cluster_query_type=ClusterTypeEnum.ES.value,
+        cluster_id=None,
+        is_default=True,
+        enable_archive=False,
+    ):
         """
         存储集群列表
         :return:
         """
-        params = {"cluster_type": STORAGE_CLUSTER_TYPE}
+        multi_execute_func = MultiExecuteFunc()
+
+        cluster_infos = []
+        cluster_types = []
+
+        if cluster_query_type == ClusterTypeEnum.ALL.value or cluster_query_type == ClusterTypeEnum.ES.value:
+            cluster_types.append(STORAGE_CLUSTER_TYPE)
+
+        if (
+            cluster_query_type == ClusterTypeEnum.ALL.value or cluster_query_type == ClusterTypeEnum.DORIS.value
+        ) and FeatureToggleObject.switch(DORIS_STORAGE_CLUSTER, bk_biz_id):
+            cluster_types.append(DORIS_CLUSTER_TYPE)
+
+        for cluster_type in cluster_types:
+            params = {"cluster_type": cluster_type}
+            if cluster_id:
+                params["cluster_id"] = cluster_id
+            multi_execute_func.append(cluster_type, TransferApi.get_cluster_info, params)
+
+        result = multi_execute_func.run()
+
+        for cluster_type, cluster_info_list in result.items():
+            cluster_infos.extend(cluster_info_list)
+
         if cluster_id:
-            params["cluster_id"] = cluster_id
-        cluster_info = TransferApi.get_cluster_info(params)
-        if cluster_id:
-            cluster_info = self._get_cluster_nodes(cluster_info)
-            cluster_info = self._get_cluster_detail_info(cluster_info)
-        cluster_groups = self.filter_cluster_groups(cluster_info, bk_biz_id, is_default, enable_archive)
+            cluster_infos = self._get_cluster_nodes(cluster_infos)
+            cluster_infos = self._get_cluster_detail_info(cluster_infos, bk_biz_id=bk_biz_id)
+        cluster_groups = self.filter_cluster_groups(cluster_infos, bk_biz_id, is_default, enable_archive)
         for cluster_info in cluster_groups:
             cluster_info["is_platform"] = self.is_platform_cluster(
                 cluster_info["cluster_config"]["custom_option"]["visible_config"]["visible_type"]
             )
+            cluster_info.setdefault("visible_editable", False)
         return cluster_groups
 
     def _get_cluster_nodes(self, cluster_info: builtins.list[dict]):
         for cluster in cluster_info:
+            if cluster.get("cluster_type", STORAGE_CLUSTER_TYPE) == DORIS_CLUSTER_TYPE:
+                continue
             cluster_id = cluster.get("cluster_config").get("cluster_id")
             nodes_stats = EsRoute(
                 scenario_id=Scenario.ES, storage_cluster_id=cluster_id, raise_exception=False
@@ -515,22 +774,23 @@ class StorageHandler:
             ]
         return cluster_info
 
-    def _get_cluster_detail_info(self, cluster_info: builtins.list[dict]):
-        multi_execute_func = MultiExecuteFunc()
-
-        def get_cluster_stats(cluster_id: int):
-            return EsRoute(
-                scenario_id=Scenario.ES, storage_cluster_id=cluster_id, raise_exception=False
-            ).cluster_stats()
-
+    def _get_cluster_detail_info(self, cluster_info: builtins.list[dict], bk_biz_id=None):
+        cluster_ids = [
+            cluster.get("cluster_config", {}).get("cluster_id")
+            for cluster in cluster_info
+            if cluster.get("cluster_config", {}).get("cluster_id") is not None
+        ]
+        try:
+            bk_tenant_id = Space.get_tenant_id(bk_biz_id=int(bk_biz_id))
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("[storage] get tenant failed, bk_biz_id=%s", bk_biz_id)
+            statuses = {}
+        else:
+            statuses = self._get_cluster_statuses(cluster_ids, bk_biz_id, bk_tenant_id)
         for cluster in cluster_info:
-            cluster_id = cluster.get("cluster_config").get("cluster_id")
-            multi_execute_func.append(cluster_id, get_cluster_stats, cluster_id)
-        result = multi_execute_func.run()
-        for cluster in cluster_info:
-            cluster_id = cluster.get("cluster_config").get("cluster_id")
-            cluster_stats = result.get(cluster_id)
-            cluster["cluster_stats"] = cluster_stats
+            cluster_id = cluster.get("cluster_config", {}).get("cluster_id")
+            status = statuses.get(cluster_id)
+            cluster["cluster_stats"] = self._build_cluster_status(status)["cluster_stats"] if status else None
         return cluster_info
 
     @staticmethod
@@ -767,6 +1027,68 @@ class StorageHandler:
 
         return cluster_obj
 
+    def update_visible_config(self, params):
+        """
+        仅更新 Doris 集群可见范围配置
+        Doris 集群由外部（bkbase/metadata）注册，bklog 侧不创建、无域名/账号/连通性概念，
+        因此此处只允许更新 custom_option.visible_config，其余字段保持原值。
+        :param params: {"cluster_id", "bk_biz_id", "visible_config"}
+        :return:
+        """
+        bk_biz_id = int(params["bk_biz_id"])
+
+        cluster_objs = TransferApi.get_cluster_info(
+            {"cluster_type": DORIS_CLUSTER_TYPE, "cluster_id": int(self.cluster_id)}
+        )
+        if not cluster_objs:
+            raise StorageNotExistException()
+
+        cluster_config = cluster_objs[0]["cluster_config"]
+        registered_system = cluster_config.get("registered_system")
+        raw_custom_option = cluster_config.get("custom_option") or {}
+
+        # 权限校验：公共集群仅蓝鲸业务可改；非公共集群仅归属业务可改
+        if registered_system == REGISTERED_SYSTEM_DEFAULT:
+            if bk_biz_id != settings.BLUEKING_BK_BIZ_ID:
+                raise StorageNotPermissionException()
+        else:
+            if raw_custom_option.get("bk_biz_id") != bk_biz_id:
+                raise StorageNotPermissionException()
+
+        # 只覆盖 visible_config，保留其余 custom_option 字段
+        new_custom_option = copy.deepcopy(raw_custom_option)
+        new_custom_option["visible_config"] = params["visible_config"]
+
+        # 存储设置为可选项，仅在传入时按键合并，避免未传时清掉管理员已配置的上限
+        if params.get("setup_config"):
+            setup_config = new_custom_option.get("setup_config") or {}
+            setup_config.update(params["setup_config"])
+            new_custom_option["setup_config"] = setup_config
+
+        # 不传 auth_info：metadata ModifyClusterInfoResource（#11701）在 auth_info 缺省时保留原凭据；
+        # 传空账号会把 bkbase 同步的真实 Doris 凭据永久覆盖为空。
+        # Doris 查找权限：metadata 已放宽为 registered_system∈{调用方,_default} OR cluster_type=doris，
+        # 无需再传 registered_system。create_cluster_info_before 会去掉 ESB 注入的 auth_info，避免误清凭据。
+        modify_params = {
+            "cluster_id": int(self.cluster_id),
+            "cluster_type": DORIS_CLUSTER_TYPE,
+            "custom_option": new_custom_option,
+        }
+        cluster_obj = TransferApi.modify_cluster_info(modify_params)
+
+        # add user_operation_record
+        operation_record = {
+            "username": get_request_username(),
+            "biz_id": bk_biz_id,
+            "record_type": UserOperationTypeEnum.STORAGE,
+            "record_object_id": self.cluster_id,
+            "action": UserOperationActionEnum.UPDATE,
+            "params": modify_params,
+        }
+        user_operation_record.delay(operation_record)
+
+        return cluster_obj
+
     def destroy(self):
         from apps.log_search.handlers.index_set import IndexSetHandler
 
@@ -938,55 +1260,416 @@ class StorageHandler:
     def batch_connectivity_detect(cls, cluster_list, bk_biz_id):
         """
         :param cluster_list:
+        :param bk_biz_id:
         :return:
         """
-        multi_execute_func = MultiExecuteFunc()
-        for _cluster_id in cluster_list:
-            multi_execute_func.append(
-                _cluster_id, cls._get_cluster_status_and_stats, {"cluster_id": _cluster_id, "bk_biz_id": bk_biz_id}
+        cluster_list = list(dict.fromkeys(cluster_list))
+        result = {cluster_id: {"status": False, "cluster_stats": None} for cluster_id in cluster_list}
+        bk_biz_id = int(bk_biz_id)
+        try:
+            bk_tenant_id = Space.get_tenant_id(bk_biz_id=bk_biz_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("[storage] get tenant failed, bk_biz_id=%s", bk_biz_id)
+            return result
+
+        visible_cluster_ids = cls._get_visible_cluster_ids(cluster_list, bk_biz_id, bk_tenant_id)
+        statuses = cls._get_cluster_statuses(visible_cluster_ids, bk_biz_id, bk_tenant_id)
+        result.update({cluster_id: cls._build_cluster_status(status) for cluster_id, status in statuses.items()})
+        return result
+
+    @classmethod
+    def _get_visible_cluster_ids(cls, cluster_list, bk_biz_id, bk_tenant_id):
+        requested_cluster_ids = set(cluster_list)
+        try:
+            cluster_infos = TransferApi.get_cluster_info({}, bk_tenant_id=bk_tenant_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "[storage] get cluster infos for visibility failed, bk_biz_id=%s, bk_tenant_id=%s",
+                bk_biz_id,
+                bk_tenant_id,
             )
-        return multi_execute_func.run()
+            return []
 
-    @staticmethod
-    def _get_cluster_status_and_stats(params):
-        @cache_five_minute("connect_info_{cluster_id}")
-        def _cache_status_and_stats(*, cluster_id, bk_biz_id):
-            cluster_stats_info = None
-            _status = False
+        visible_cluster_ids = []
+        handler = cls()
+        for cluster_info in cluster_infos:
+            cluster_config = cluster_info.get("cluster_config") or {}
+            cluster_id = cluster_config.get("cluster_id")
+            if cluster_id not in requested_cluster_ids:
+                continue
             try:
-                _status = BkLogApi.connectivity_detect(
-                    params={"bk_biz_id": bk_biz_id, "cluster_id": cluster_id, "default_auth": True},
+                if handler.can_visible(
+                    bk_biz_id,
+                    cluster_config.get("custom_option") or {},
+                    cluster_config.get("registered_system"),
+                ):
+                    visible_cluster_ids.append(cluster_id)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "[storage] check cluster visibility failed, bk_biz_id=%s, cluster_id=%s",
+                    bk_biz_id,
+                    cluster_id,
                 )
-                cluster_stats = EsRoute(
-                    scenario_id=Scenario.ES, storage_cluster_id=cluster_id, raise_exception=False
-                ).cluster_stats()
-                if cluster_stats:
-                    cluster_stats_info = StorageHandler._build_cluster_stats(cluster_stats)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error(f"[storage] get cluster status failed => [{e}]")
-            # connectivity_detect连通性正常返回的事[True, Version], 失败的时候返回的是False
-            if isinstance(_status, list):
-                _status = _status[0]
-            return {"status": _status, "cluster_stats": cluster_stats_info}
+        return visible_cluster_ids
 
-        cluster_id = params.get("cluster_id")
-        bk_biz_id = params.get("bk_biz_id")
-        return _cache_status_and_stats(cluster_id=cluster_id, bk_biz_id=bk_biz_id)
+    @classmethod
+    def _get_cluster_statuses(cls, cluster_list, bk_biz_id, bk_tenant_id):
+        cluster_list = list(dict.fromkeys(cluster_list))
+        if not cluster_list:
+            return {}
+
+        cache_keys = {
+            cluster_id: cls._get_cluster_status_cache_key(bk_tenant_id, bk_biz_id, cluster_id)
+            for cluster_id in cluster_list
+        }
+        try:
+            cached_statuses = cache.get_many(cache_keys.values())
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("[storage] get cluster status cache failed")
+            cached_statuses = {}
+
+        result = {
+            cluster_id: cached_statuses[cache_key]
+            for cluster_id, cache_key in cache_keys.items()
+            if cache_key in cached_statuses and isinstance(cached_statuses[cache_key], dict)
+        }
+        missing_cluster_ids = [cluster_id for cluster_id in cluster_list if cluster_id not in result]
+        if not missing_cluster_ids:
+            return result
+
+        multi_execute_func = MultiExecuteFunc(max_workers=METADATA_CLUSTER_STATUS_MAX_WORKERS)
+        for start in range(0, len(missing_cluster_ids), METADATA_CLUSTER_STATUS_BATCH_SIZE):
+            cluster_ids = missing_cluster_ids[start : start + METADATA_CLUSTER_STATUS_BATCH_SIZE]
+            multi_execute_func.append(
+                start,
+                cls._get_cluster_status_batch,
+                {
+                    "cluster_ids": cluster_ids,
+                    "bk_biz_id": bk_biz_id,
+                    "bk_tenant_id": bk_tenant_id,
+                },
+            )
+
+        fetched_statuses = {}
+        for batch_result in multi_execute_func.run(return_exception=True).values():
+            if isinstance(batch_result, Exception):
+                logger.error("[storage] get cluster status batch failed: %s", batch_result)
+                continue
+            fetched_statuses.update(batch_result)
+
+        for cluster_id in missing_cluster_ids:
+            fetched_statuses.setdefault(cluster_id, cls._unavailable_cluster_status(cluster_id))
+        result.update(fetched_statuses)
+
+        try:
+            cache.set_many(
+                {cache_keys[cluster_id]: fetched_statuses[cluster_id] for cluster_id in missing_cluster_ids},
+                CACHE_EXPIRE_TIME,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("[storage] set cluster status cache failed")
+        return result
 
     @staticmethod
-    def _build_cluster_stats(cluster_stats):
-        nodes_count = cluster_stats["nodes"]["count"]
+    def _get_cluster_status_cache_key(bk_tenant_id, bk_biz_id, cluster_id):
+        return f"connect_info_{bk_tenant_id}_{bk_biz_id}_{cluster_id}"
+
+    @classmethod
+    def _get_cluster_status_batch(cls, params):
+        cluster_ids = params["cluster_ids"]
+        requested_cluster_ids = set(cluster_ids)
+        try:
+            statuses = TransferApi.get_cluster_status(
+                {"cluster_ids": cluster_ids, "bk_biz_id": params["bk_biz_id"]},
+                bk_tenant_id=params["bk_tenant_id"],
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("[storage] get cluster statuses failed, cluster_ids=%s", cluster_ids)
+            statuses = []
+
+        result = {}
+        for status in statuses:
+            cluster_id = status.get("cluster_id")
+            if cluster_id not in requested_cluster_ids:
+                continue
+            result[cluster_id] = status
+        for cluster_id in cluster_ids:
+            result.setdefault(cluster_id, cls._unavailable_cluster_status(cluster_id))
+        return result
+
+    @staticmethod
+    def _unavailable_cluster_status(cluster_id):
         return {
-            "node_count": cluster_stats["nodes"]["count"]["total"],
-            "shards_total": cluster_stats["indices"]["shards"].get("total", 0),
-            "shards_pri": cluster_stats["indices"]["shards"].get("primaries", 0),
-            "data_node_count": nodes_count.get("data_hot") or nodes_count.get("data_content") or nodes_count["data"],
-            "indices_count": cluster_stats["indices"]["count"],
-            "indices_docs_count": cluster_stats["indices"]["docs"]["count"],
-            "indices_store": cluster_stats["indices"]["store"]["size_in_bytes"],
-            "total_store": cluster_stats["nodes"]["fs"]["total_in_bytes"],
-            "status": cluster_stats["status"],
+            "cluster_id": cluster_id,
+            "cluster_type": None,
+            "is_available": False,
         }
+
+    @staticmethod
+    def _build_cluster_status(status):
+        details = status.get("details") or {}
+        nodes = status.get("nodes") or {}
+        capacity = status.get("capacity") or {}
+        if status.get("cluster_type") == DORIS_CLUSTER_TYPE:
+            is_available = bool(status.get("is_available"))
+            storage_status = status.get("status")
+            health_status = "yellow" if storage_status == "degraded" else ("green" if is_available else "red")
+            return {
+                "status": is_available,
+                "cluster_stats": {
+                    "node_count": nodes.get("total"),
+                    "available_node_count": nodes.get("available"),
+                    "shards_total": None,
+                    "shards_pri": None,
+                    "data_node_count": nodes.get("total"),
+                    "indices_count": None,
+                    "indices_docs_count": None,
+                    "indices_store": details.get("data_used_bytes"),
+                    "total_store": capacity.get("total_bytes"),
+                    "available_store": capacity.get("available_bytes"),
+                    "used_store": capacity.get("used_bytes"),
+                    "used_percent": capacity.get("used_percent"),
+                    "tablet_count": details.get("tablet_count"),
+                    "max_disk_used_percent": details.get("max_disk_used_percent"),
+                    "status": health_status,
+                    "storage_status": storage_status,
+                },
+            }
+        if status.get("cluster_type") != STORAGE_CLUSTER_TYPE:
+            return {"status": bool(status.get("is_available")), "cluster_stats": None}
+
+        shard_values = [
+            details.get("active_shards"),
+            details.get("initializing_shards"),
+            details.get("unassigned_shards"),
+        ]
+        shards_total = (
+            sum(value for value in shard_values if value is not None)
+            if any(value is not None for value in shard_values)
+            else None
+        )
+        return {
+            "status": bool(status.get("is_available")),
+            "cluster_stats": {
+                "node_count": details.get("number_of_nodes"),
+                "shards_total": shards_total,
+                "shards_pri": None,
+                "data_node_count": nodes.get("total"),
+                "indices_count": None,
+                "indices_docs_count": None,
+                "indices_store": details.get("indices_store_bytes"),
+                "total_store": capacity.get("total_bytes"),
+                "status": details.get("health_status"),
+            },
+        }
+
+    @classmethod
+    def get_result_table_indices(cls, table_id):
+        return cls.get_result_tables_indices([table_id]).get(table_id, [])
+
+    @classmethod
+    def get_result_tables_indices(cls, table_ids):
+        table_ids = list(dict.fromkeys(table_ids))
+        result = {table_id: [] for table_id in table_ids}
+        for start in range(0, len(table_ids), METADATA_RESULT_TABLE_STATUS_BATCH_SIZE):
+            batch_table_ids = table_ids[start : start + METADATA_RESULT_TABLE_STATUS_BATCH_SIZE]
+            try:
+                storage_status = TransferApi.get_result_table_storage_status({"table_ids": batch_table_ids})
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "[storage] get result table storage statuses failed, table_ids=%s",
+                    batch_table_ids,
+                )
+                continue
+            returned_table_ids = set()
+            for item in storage_status.get("items", []):
+                table_id = item.get("table_id")
+                if table_id not in result:
+                    continue
+                returned_table_ids.add(table_id)
+                result[table_id] = cls._get_result_table_indices_from_status(item)
+            missing_table_ids = [table_id for table_id in batch_table_ids if table_id not in returned_table_ids]
+            if missing_table_ids:
+                logger.error(
+                    "[storage] result table storage statuses missing items, table_ids=%s",
+                    missing_table_ids,
+                )
+        return result
+
+    @classmethod
+    def _get_result_table_indices_from_status(cls, item):
+        if not item or item.get("error"):
+            logger.error(
+                "[storage] get result table storage status failed, table_id=%s, item=%s",
+                item.get("table_id") if item else None,
+                item,
+            )
+            return []
+
+        data = item.get("data") or {}
+        storage_configs = data.get("storage_configs") or {}
+        default_storage = (data.get("result_table") or {}).get("default_storage")
+        configured_storage_types = {
+            storage_type for storage_type, storage_config in storage_configs.items() if storage_config
+        }
+        if default_storage is None:
+            # 只有「唯一配置存储」这一无歧义场景才回退推导，双存储并存时宁可返回空也不猜
+            if len(configured_storage_types) != 1:
+                logger.warning(
+                    "[storage] skip result table indices without unambiguous default storage, "
+                    "table_id=%s, configured_storage_types=%s",
+                    item.get("table_id"),
+                    sorted(configured_storage_types),
+                )
+                return []
+            default_storage = next(iter(configured_storage_types))
+        if default_storage not in (STORAGE_CLUSTER_TYPE, DORIS_CLUSTER_TYPE):
+            return []
+
+        storage_config = storage_configs.get(default_storage) or {}
+        cluster_id = storage_config.get("storage_cluster_id")
+        cluster_results = data.get("cluster_results") or {}
+        cluster_status = cluster_results.get(str(cluster_id)) or cluster_results.get(cluster_id) or {}
+
+        if default_storage == DORIS_CLUSTER_TYPE:
+            return cls._build_doris_storage_rows(cluster_status)
+        return cls._build_es_storage_rows(cluster_status)
+
+    @classmethod
+    def _build_es_storage_rows(cls, cluster_status):
+        runtime = cluster_status.get("runtime") or {}
+        indices = (runtime.get("indices") or {}).get("items") or []
+        health_unavailable = (
+            cluster_status.get("runtime_skipped")
+            or bool(cluster_status.get("errors"))
+            or any(
+                isinstance(warning, dict) and warning.get("code") == "INDEX_CAT_UNAVAILABLE"
+                for warning in cluster_status.get("warnings") or []
+            )
+        )
+        return cls.sort_indices(
+            [cls._build_result_table_index(index, health_unavailable=health_unavailable) for index in indices]
+        )
+
+    @staticmethod
+    def _build_result_table_index(index, health_unavailable=False):
+        health = index.get("health")
+        if not health or (health_unavailable and health not in {"red", "yellow"}):
+            health = "--"
+        return {
+            "index": index.get("index"),
+            "uuid": index.get("uuid"),
+            "health": health,
+            "status": index.get("status"),
+            "pri": str(index.get("primary_shards") or 0),
+            "rep": str(index.get("replica_factor") or 0),
+            "docs.count": str(index.get("docs_count") or 0),
+            "docs.deleted": str(index.get("docs_deleted") or 0),
+            "store.size": str(index.get("store_size_bytes") or 0),
+            "pri.store.size": str(index.get("primary_store_size_bytes") or 0),
+        }
+
+    @classmethod
+    def _build_doris_storage_rows(cls, cluster_status):
+        """把 Doris 物理表 / 分区适配成与 ES 物理索引一致的行结构，前端不感知存储类型"""
+        runtime = cluster_status.get("runtime") or {}
+        health, status = cls._get_doris_storage_health(cluster_status)
+        physical_table_name = cls._get_doris_physical_table_name(runtime)
+
+        partitions = runtime.get("partitions") or []
+        if partitions:
+            rows = [
+                (
+                    cls._doris_row_sort_key(partition),
+                    cls._build_doris_storage_row(
+                        name=partition.get("name"),
+                        physical_table_name=physical_table_name,
+                        rows_count=partition.get("rows"),
+                        data_length_bytes=partition.get("data_length_bytes"),
+                        index_length_bytes=partition.get("index_length_bytes"),
+                        health=health,
+                        status=status,
+                    ),
+                )
+                for partition in partitions
+            ]
+            return [row for _, row in sorted(rows, key=operator.itemgetter(0), reverse=True)]
+
+        # 无分区表不返回空列表，用物理表兜底一行，避免前端把「无分区」误判为「接口无数据」
+        table = runtime.get("table") or {}
+        if not table:
+            return []
+        return [
+            cls._build_doris_storage_row(
+                name=physical_table_name,
+                physical_table_name=physical_table_name,
+                rows_count=table.get("rows"),
+                data_length_bytes=table.get("data_length_bytes"),
+                index_length_bytes=table.get("index_length_bytes"),
+                health=health,
+                status=status,
+            )
+        ]
+
+    @staticmethod
+    def _build_doris_storage_row(
+        name, physical_table_name, rows_count, data_length_bytes, index_length_bytes, health, status
+    ):
+        store_size = StorageHandler._to_int(data_length_bytes) + StorageHandler._to_int(index_length_bytes)
+        return {
+            "index": name,
+            "uuid": f"doris:{physical_table_name}:{name}" if physical_table_name and name else None,
+            "health": health,
+            "status": status,
+            # Doris 没有分片概念，也不统计删除文档数，用现有占位值保持前端渲染不变
+            "pri": DORIS_STORAGE_ROW_PLACEHOLDER,
+            "rep": DORIS_STORAGE_ROW_PLACEHOLDER,
+            "docs.count": str(StorageHandler._to_int(rows_count)),
+            "docs.deleted": DORIS_STORAGE_ROW_PLACEHOLDER,
+            "store.size": str(store_size),
+            "pri.store.size": DORIS_STORAGE_ROW_PLACEHOLDER,
+        }
+
+    @staticmethod
+    def _doris_row_sort_key(partition):
+        update_time = partition.get("update_time")
+        # 缺少更新时间的分区统一排在有时间的分区之后
+        return bool(update_time), str(update_time or ""), str(partition.get("name") or "")
+
+    @staticmethod
+    def _get_doris_physical_table_name(runtime):
+        binding = runtime.get("binding") or {}
+        physical_table_name = binding.get("physical_table_name")
+        if physical_table_name:
+            return physical_table_name
+        table = runtime.get("table") or {}
+        schema, name = table.get("schema"), table.get("name")
+        if schema and name:
+            return f"{schema}.{name}"
+        return name or None
+
+    @staticmethod
+    def _get_doris_storage_health(cluster_status):
+        """Doris 健康状态由连通性与 runtime 告警推导，对外沿用 ES 的 green/yellow/red/-- 口径"""
+        if cluster_status.get("runtime_skipped"):
+            return "--", "unknown"
+        connectivity = cluster_status.get("connectivity")
+        if connectivity is not None and not connectivity.get("is_connected", False):
+            return "red", "unavailable"
+        if cluster_status.get("errors"):
+            return "red", "unavailable"
+        if connectivity is None:
+            return "--", "unknown"
+        if cluster_status.get("warnings"):
+            return "yellow", "open"
+        return "green", "open"
+
+    @staticmethod
+    def _to_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
     def _send_detective(
         self,
@@ -1044,8 +1727,9 @@ class StorageHandler:
         根据result_table_id查询集群信息
         :return:
         """
+        storage_cluster_type = CollectorConfig.get_storage_cluster_type_by_table_id(table_id)
         cluster_info = TransferApi.get_result_table_storage(
-            {"result_table_list": table_id, "storage_type": STORAGE_CLUSTER_TYPE}
+            {"result_table_list": table_id, "storage_type": storage_cluster_type}
         )
         if not cluster_info.get(table_id):
             raise StorageNotExistException()

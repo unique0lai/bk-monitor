@@ -12,6 +12,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import Any
 
 from celery import shared_task
 from django.conf import settings
@@ -21,6 +22,12 @@ from django.utils.functional import cached_property
 from django.utils.translation import gettext as _
 
 from apm_web.constants import ApmCacheKey
+from apm_web.handlers.log_handler import (
+    ServiceLogHandler,
+    deserialize_service_related_log_indexes,
+    get_biz_index_sets_with_cache,
+)
+from apm_web.handlers.task_handler import ServiceLogTaskHandler
 from apm_web.handlers.metric_group import MetricHelper
 from apm_web.handlers.service_handler import ServiceHandler
 from apm_web.models import Application
@@ -29,9 +36,9 @@ from apm_web.serializers import ApplicationCacheSerializer
 from apm_web.strategy.builtin.registry import BuiltinStrategyTemplateRegistry
 from apm_web.strategy.handler import StrategyTemplateHandler
 from monitor.models import GlobalConfig
-from bkmonitor.utils.common_utils import compress_and_serialize, get_local_ip, deserialize_and_decompress
+from bkmonitor.utils.common_utils import compress_and_serialize, deserialize_and_decompress, get_local_ip
 from bkmonitor.utils.custom_report_tools import custom_report_tool
-from bkmonitor.utils.tenant import set_local_tenant_id
+from bkmonitor.utils.tenant import get_local_tenant_id, set_local_tenant_id
 from bkmonitor.utils.time_tools import strftime_local
 from common.log import logger
 from constants.apm import TelemetryDataType
@@ -145,7 +152,7 @@ def refresh_application():
         try:
             # 刷新数据状态
             application.set_data_status()
-            # 刷新服务数量和数据状态
+            # 刷新服务数量
             application.set_service_count_and_data_status()
         except Exception as e:  # noqa
             logger.warning(
@@ -229,6 +236,143 @@ def application_create_check():
 
 
 @shared_task(ignore_result=True)
+def refresh_related_log_index_status() -> None:
+    """按租户和业务刷新关联日志索引状态，供页面只读消费。"""
+    if "redis" not in caches:
+        logger.info("[REFRESH_RELATED_LOG_INDEX_STATUS] no redis cache, task stopped")
+        return
+
+    targets: set[tuple[str, int]] = set()
+    original_tenant_id = get_local_tenant_id()
+    try:
+        applications = Application.objects.filter(is_enabled=True).exclude(app_name__startswith="bkapp_ai0us0")
+        for application in applications:
+            try:
+                set_local_tenant_id(application.bk_tenant_id)
+                related_biz_ids = {
+                    relation.related_bk_biz_id
+                    for relation in ServiceLogHandler.get_log_relations(
+                        application.bk_biz_id, application.app_name, None, include_global=True
+                    )
+                    if relation.related_bk_biz_id is not None and (relation.value_list or relation.value)
+                }
+                service_indexes = ServiceLogHandler.get_cached_k8s_related_indexes(
+                    application.bk_biz_id, application.app_name
+                )
+                related_biz_ids.update(
+                    index["bk_biz_id"]
+                    for indexes in service_indexes.values()
+                    for index in indexes
+                    if index.get("bk_biz_id") is not None
+                )
+                targets.update((application.bk_tenant_id, bk_biz_id) for bk_biz_id in related_biz_ids)
+            except Exception:  # noqa
+                logger.exception(
+                    f"[REFRESH_RELATED_LOG_INDEX_STATUS] relation read failed: "
+                    f"bk_tenant_id={application.bk_tenant_id} bk_biz_id={application.bk_biz_id} "
+                    f"app_name={application.app_name}"
+                )
+
+        for bk_tenant_id, bk_biz_id in sorted(targets):
+            try:
+                set_local_tenant_id(bk_tenant_id)
+                indexes = get_biz_index_sets_with_cache(bk_biz_id=bk_biz_id)
+                statuses = []
+                for index in indexes:
+                    # 日志平台返回本地化的标签展示名，兼容中文和英文的“无数据”标签。
+                    tags = index.get("tags") or []
+                    available = bool(tags) and not any(
+                        tag.get("tag_type", "inner") == "inner" and tag.get("name") in {"无数据", "No Data"}
+                        for tag in tags
+                    )
+                    statuses.append({"index_set_id": index["index_set_id"], "available": available})
+
+                cache_key = ApmCacheKey.APM_RELATED_LOG_INDEX_STATUS_KEY.format(
+                    bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id
+                )
+                caches["redis"].set(
+                    cache_key,
+                    {"checked_at": int(time.time()), "indexes": statuses},
+                    timeout=settings.APM_RELATED_LOG_INDEX_STATUS_CACHE_TTL,
+                )
+                logger.info(
+                    f"[REFRESH_RELATED_LOG_INDEX_STATUS] refreshed: bk_tenant_id={bk_tenant_id} "
+                    f"bk_biz_id={bk_biz_id} index_count={len(statuses)}"
+                )
+            except Exception:  # noqa
+                logger.exception(
+                    "[REFRESH_RELATED_LOG_INDEX_STATUS] refresh failed, old snapshot retained without renewal: "
+                    f"bk_tenant_id={bk_tenant_id} bk_biz_id={bk_biz_id}"
+                )
+    finally:
+        set_local_tenant_id(original_tenant_id)
+
+
+@shared_task(ignore_result=True)
+def cache_application_k8s_related_indexes() -> None:
+    """刷新启用 APM 应用的服务关联 K8S 日志索引缓存。"""
+    logger.info("[CACHE_APPLICATION_K8S_RELATED_INDEXES] task start")
+    if "redis" not in caches:
+        logger.info("[CACHE_APPLICATION_K8S_RELATED_INDEXES] no redis cache, task stopped")
+        return
+
+    cache_agent: Any = caches["redis"]
+    for application in Application.objects.filter(is_enabled=True).exclude(app_name__startswith="bkapp_ai0us0"):
+        try:
+            set_local_tenant_id(application.bk_tenant_id)
+            cache_key: str = ApmCacheKey.APP_SERVICE_K8S_RELATED_LOG_INDEXES_KEY.format(
+                bk_biz_id=application.bk_biz_id, app_name=application.app_name
+            )
+            related_indexes: dict[str, list[dict[str, Any]]] = ServiceLogTaskHandler.get_k8s_related_log_indexes(
+                application.bk_biz_id, application.app_name
+            )
+            cached_data: bytes | None = cache_agent.get(cache_key)
+            try:
+                merged_indexes: dict[str, list[dict[str, Any]]] = (
+                    deserialize_service_related_log_indexes(cached_data) if cached_data else {}
+                )
+            except Exception:  # noqa
+                logger.exception(
+                    f"[CACHE_APPLICATION_K8S_RELATED_INDEXES] invalid cache data replaced: "
+                    f"{application.bk_biz_id}-{application.app_name}"
+                )
+                merged_indexes = {}
+
+            updated_at: int = int(time.time())
+            for service_name, fresh_indexes in related_indexes.items():
+                index_map: dict[str, dict[str, Any]] = {
+                    str(index["index_set_id"]): index for index in merged_indexes.get(service_name, [])
+                }
+                index_map.update(
+                    {str(index["index_set_id"]): {**index, "updated_at": updated_at} for index in fresh_indexes}
+                )
+
+                merged_indexes[service_name] = list(index_map.values())
+
+            all_indexes: list[dict[str, Any]] = [
+                index for service_indexes in merged_indexes.values() for index in service_indexes
+            ]
+            index_set_count: int = len({str(index["index_set_id"]) for index in all_indexes})
+            refreshed_index_count: int = sum(index.get("updated_at") == updated_at for index in all_indexes)
+            if merged_indexes:
+                cache_agent.set(cache_key, compress_and_serialize(merged_indexes), timeout=24 * 60 * 60)
+
+            logger.info(
+                f"[CACHE_APPLICATION_K8S_RELATED_INDEXES] refresh data succeeded: "
+                f"bk_biz_id={application.bk_biz_id}, app_name={application.app_name}, "
+                f"service_count={len(merged_indexes)}, index_set_count={index_set_count}, "
+                f"refreshed_index_count={refreshed_index_count}"
+            )
+        except Exception:  # noqa
+            logger.exception(
+                f"[CACHE_APPLICATION_K8S_RELATED_INDEXES] refresh data failed: "
+                f"{application.bk_biz_id}-{application.app_name}"
+            )
+
+    logger.info("[CACHE_APPLICATION_K8S_RELATED_INDEXES] task finished")
+
+
+@shared_task(ignore_result=True)
 def cache_application_scope_name():
     """
     1. 和已有的缓存数据做一个整合
@@ -244,7 +388,9 @@ def cache_application_scope_name():
     # 获取按服务缓存的灰度应用列表
     service_cache_apps = settings.APM_SERVICE_CACHE_APPLICATIONS
 
-    for application in Application.objects.filter(is_enabled=True, is_enabled_metric=True):
+    for application in Application.objects.filter(is_enabled=True, is_enabled_metric=True).exclude(
+        app_name__startswith="bkapp_ai"
+    ):
         try:
             bk_biz_id = application.bk_biz_id
             application_id = application.application_id

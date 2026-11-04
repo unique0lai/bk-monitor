@@ -31,13 +31,14 @@ from apps.generic import ModelViewSet
 from apps.iam import ActionEnum, ResourceEnum
 from apps.iam.handlers.drf import (
     BusinessActionPermission,
+    IAMPermission,
     InstanceActionPermission,
     ViewBusinessPermission,
     insert_permission_field,
 )
 from apps.log_clustering.models import ClusteringConfig
 from apps.log_databus.constants import DEFAULT_CATEGORY_ID
-from apps.log_databus.serializers import PlatformIndexFieldsSerializer
+from apps.log_databus.serializers import ParentIndexSetFieldsSerializer, PlatformIndexFieldsSerializer
 from apps.log_search.constants import TimeFieldTypeEnum, TimeFieldUnitEnum
 from apps.log_search.exceptions import BkJwtVerifyException, IndexSetNotEmptyException
 from apps.log_search.handlers.index_set import BaseIndexSetHandler, IndexSetHandler
@@ -50,6 +51,7 @@ from apps.log_search.serializers import (
     ESRouterListSerializer,
     IndexSetAddTagSerializer,
     IndexSetDeleteTagSerializer,
+    IndexSetTagListSerializer,
     StorageUsageSerializer,
     UserFavoriteSerializer,
     UserSearchSerializer,
@@ -58,6 +60,43 @@ from apps.log_search.serializers import (
 from apps.log_search.tasks.bkdata import sync_auth_status
 from apps.utils.drf import detail_route, list_route
 from bkm_space.serializers import SpaceUIDField
+
+
+class DesensitizeConfigWritePermission(IAMPermission):
+    """
+    脱敏配置写操作鉴权。
+
+    脱敏规则以 index_set_id 为主键，但用户侧入口的权限资源并不统一：
+    有采集项的索引集走采集项「采集管理」（MANAGE_COLLECTION@collector_config_id），
+    无采集项的索引集（如第三方 ES）走索引集「索引集配置管理」（MANAGE_INDICES@index_set_id）。
+    因此按 LogIndexSet.collector_config_id 动态选择校验资源，避免仅有采集管理权限的
+    用户在保存脱敏规则时被误判为无权限。
+    """
+
+    def __init__(self):
+        super().__init__([])
+
+    def has_permission(self, request, view):
+        if settings.IGNORE_IAM_PERMISSION:
+            return True
+
+        index_set_id = view.kwargs[view.lookup_url_kwarg or view.lookup_field]
+        collector_config_id = (
+            LogIndexSet.objects.filter(index_set_id=index_set_id)
+            .values_list("collector_config_id", flat=True)
+            .first()
+        )
+
+        # collector_config_id=0 在语义上等同于「无采集项」（合法值从 1 开始），
+        # 因此用 truthy 判断而非 `is not None`，确保 collector_config_id=0 也走无采集项路径。
+        if collector_config_id:
+            self.actions = [ActionEnum.MANAGE_COLLECTION]
+            self.resources = [ResourceEnum.COLLECTION.create_instance(collector_config_id)]
+        else:
+            self.actions = [ActionEnum.MANAGE_INDICES]
+            self.resources = [ResourceEnum.INDICES.create_instance(index_set_id)]
+
+        return super().has_permission(request, view)
 
 
 class IndexSetViewSet(ModelViewSet):
@@ -78,10 +117,24 @@ class IndexSetViewSet(ModelViewSet):
     ]
 
     def get_permissions(self):
+        # 脱敏配置写操作不接受 ESQUERY 白名单豁免：会新增/修改/删除脱敏规则，
+        # 删除规则等同于明文暴露，必须先于白名单返回权限类做实例鉴权（fail-closed）。
+        # 与 CollectorViewSet.update_or_create_clean_config 的处理方式一致。
+        if self.action in [
+            "desensitize_config_create",
+            "desensitize_config_update",
+            "desensitize_config_delete",
+        ]:
+            return [DesensitizeConfigWritePermission()]
         try:
             auth_info = Permission.get_auth_info(self.request)
             # ESQUERY白名单不需要鉴权
-            if auth_info["bk_app_code"] in settings.ESQUERY_WHITE_LIST:
+            query_params = getattr(self.request, "query_params", {})
+            request_data = getattr(self.request, "data", {})
+            enforce_permission = str(
+                query_params.get("enforce_permission") or request_data.get("enforce_permission") or ""
+            ).lower() in {"1", "true", "yes"}
+            if auth_info["bk_app_code"] in settings.ESQUERY_WHITE_LIST and not enforce_permission:
                 return []
         except Exception:  # pylint: disable=broad-except
             pass
@@ -136,7 +189,7 @@ class IndexSetViewSet(ModelViewSet):
                     return value
                 raise IndexSetNotEmptyException
 
-        class CreateSerializer(CustomSerializer, PlatformIndexFieldsSerializer):
+        class CreateSerializer(CustomSerializer, PlatformIndexFieldsSerializer, ParentIndexSetFieldsSerializer):
             index_set_name = serializers.CharField(required=True)
             result_table_id = serializers.CharField(required=False)
             storage_cluster_id = serializers.IntegerField(required=False)
@@ -145,7 +198,6 @@ class IndexSetViewSet(ModelViewSet):
             space_uid = SpaceUIDField(label=_("空间唯一标识"), required=True)
             bkdata_auth_url = serializers.ReadOnlyField()
             is_editable = serializers.BooleanField(required=False, default=True)
-            parent_index_set_ids = serializers.ListField(label=_("归属索引集"), default=list)
 
             def validate(self, attrs):
                 attrs = super().validate(attrs)
@@ -155,14 +207,13 @@ class IndexSetViewSet(ModelViewSet):
                     raise ValidationError(_("集群ID不能为空"))
                 return attrs
 
-        class UpdateSerializer(CustomSerializer, PlatformIndexFieldsSerializer):
+        class UpdateSerializer(CustomSerializer, PlatformIndexFieldsSerializer, ParentIndexSetFieldsSerializer):
             index_set_name = serializers.CharField(required=True)
             storage_cluster_id = serializers.IntegerField(required=False, default=None)
             scenario_id = serializers.CharField(required=True)
             category_id = serializers.CharField(required=False, default=DEFAULT_CATEGORY_ID)
             space_uid = SpaceUIDField(label=_("空间唯一标识"), required=True)
             bkdata_auth_url = serializers.ReadOnlyField()
-            parent_index_set_ids = serializers.ListField(label=_("归属索引集"), default=list)
 
         class ShowMoreSerializer(CustomSerializer):
             source_name = serializers.CharField(read_only=True)
@@ -642,6 +693,7 @@ class IndexSetViewSet(ModelViewSet):
             target_fields=data.get("target_fields", []),
             sort_fields=data.get("sort_fields", []),
             parent_index_set_ids=data.get("parent_index_set_ids", []),
+            parent_index_set_names=data.get("parent_index_set_names", []),
             is_platform_index=data.get("is_platform_index"),
             platform_index_visibility=data.get("platform_index_visibility"),
             platform_index_filter=data.get("platform_index_filter"),
@@ -715,6 +767,7 @@ class IndexSetViewSet(ModelViewSet):
             target_fields=data.get("target_fields", []),
             sort_fields=data.get("sort_fields", []),
             parent_index_set_ids=data.get("parent_index_set_ids", []),
+            parent_index_set_names=data.get("parent_index_set_names", []),
             is_platform_index=data.get("is_platform_index"),
             platform_index_visibility=data.get("platform_index_visibility"),
             platform_index_filter=data.get("platform_index_filter"),
@@ -853,18 +906,20 @@ class IndexSetViewSet(ModelViewSet):
         @api {post} /index_set/$index_set_id/indices/ 索引集物理索引信息
         @apiName indices
         @apiGroup 05_AccessIndexSet
+        @apiDescription 行结构与存储类型无关：ES 返回物理索引，Doris 返回物理表分区，
+        调用方无需区分 storage_type。Doris 无等价指标的字段返回 --，整列均为 -- 时聚合值同样为 --。
         @apiSuccess {Int} total 索引集数量
         @apiSuccess {String} result_table_id rt_id
         @apiSuccess {Dict} item key为索引集名称
-        @apiSuccess {String} health 索引健康状态 red green yellow
-        @apiSuccess {String} status 索引状态
-        @apiSuccess {String} pri 主分片数量
-        @apiSuccess {String} rep 副本数量
-        @apiSuccess {String} index 索引名称
-        @apiSuccess {String} docs.count 文档数量
-        @apiSuccess {String} docs.deleted 删除文档数量
+        @apiSuccess {String} health 健康状态 red green yellow --
+        @apiSuccess {String} status 状态 open unavailable unknown
+        @apiSuccess {String} pri 主分片数量，Doris 无等价字段返回 --
+        @apiSuccess {String} rep 副本数量，Doris 无等价字段返回 --
+        @apiSuccess {String} index 物理存储单元名称，ES 为索引名，Doris 为分区名或物理表名
+        @apiSuccess {String} docs.count 文档数量，Doris 为分区行数
+        @apiSuccess {String} docs.deleted 删除文档数量，Doris 无等价字段返回 --
         @apiSuccess {String} store.size 储存大小 Byte
-        @apiSuccess {String} pri.store.size 主分片储存大小 Byte
+        @apiSuccess {String} pri.store.size 主分片储存大小 Byte，Doris 无等价字段返回 --
         @apiSuccessExample {json} 成功返回:
         {
             "result": true,
@@ -1268,7 +1323,8 @@ class IndexSetViewSet(ModelViewSet):
         @apiName list_tag
         @apiGroup 05_AccessIndexSet
         """
-        return Response(IndexSetHandler().tag_list())
+        data = self.params_valid(IndexSetTagListSerializer)
+        return Response(IndexSetHandler().tag_list(space_uid=data["space_uid"]))
 
     @list_route(methods=["POST"], url_path="user_search")
     def user_search(self, request):

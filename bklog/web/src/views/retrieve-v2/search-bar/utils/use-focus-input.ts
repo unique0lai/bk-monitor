@@ -30,7 +30,7 @@ import { getCharLength } from '@/common/util';
 import RetrieveHelper from '@/views/retrieve-helper';
 import { isElement } from 'lodash-es';
 
-import PopInstanceUtil from '@/global/pop-instance-util';
+import { createOverlayTippy } from '@/global/overlay';
 
 export default (
   props,
@@ -64,15 +64,20 @@ export default (
 
   let resizeObserver: ResizeObserver = null;
   const INPUT_MIN_WIDTH = 12;
-  const popInstanceUtil = new PopInstanceUtil({ refContent, onShowFn, onHiddenFn, arrow, newInstance, tippyOptions });
+  const overlayTippy = createOverlayTippy({
+    id: `retrieve-search-suggest-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    group: 'retrieve-search-suggest',
+    tippy: { refContent, onShowFn, onHiddenFn, arrow, newInstance, tippyOptions },
+  });
+  const popInstanceUtil = overlayTippy.instance;
 
-  const uninstallInstance = () => popInstanceUtil.uninstallInstance();
+  const uninstallInstance = () => overlayTippy.uninstall();
   const getTippyInstance = () => popInstanceUtil.getTippyInstance();
 
   /**
    * 处理多次点击触发多次请求的事件
    */
-  const delayShowInstance = (target) => {
+  const delayShowInstance = target => {
     popInstanceUtil?.cancelHide();
 
     if (popInstanceUtil?.isShown()) {
@@ -85,7 +90,7 @@ export default (
     isInputTextFocus.value = val;
   };
 
-  const setModelValue = (val) => {
+  const setModelValue = val => {
     if (Array.isArray(val)) {
       modelValue.value = (val ?? []).map(formatModelValueItem);
       return;
@@ -148,7 +153,7 @@ export default (
     }
   };
 
-  const handleFulltextInput = (e) => {
+  const handleFulltextInput = e => {
     const input = getTargetInput();
     if (input !== undefined && e.target === input) {
       const value = input.value;
@@ -175,13 +180,17 @@ export default (
     popInstanceUtil?.hide(180);
   };
 
-  const resizeHeightObserver = (target) => {
+  const hideTippyInstanceImmediate = () => {
+    overlayTippy.notifyAnchorLost();
+  };
+
+  const resizeHeightObserver = target => {
     if (!target) {
       return;
     }
 
     // 创建一个 ResizeObserver 实例
-    resizeObserver = new ResizeObserver((entries) => {
+    resizeObserver = new ResizeObserver(entries => {
       for (const entry of entries) {
         // 获取元素的新高度
         const newHeight = entry.contentRect.height;
@@ -206,11 +215,11 @@ export default (
     { deep: true, immediate: true },
   );
 
-  const handleWrapperClickCapture = (e) => {
+  const handleWrapperClickCapture = e => {
     isDocumentMousedown.value = handleWrapperClick?.(e, { getTippyInstance }) ?? true;
   };
 
-  const setIsDocumentMousedown = (val) => {
+  const setIsDocumentMousedown = val => {
     isDocumentMousedown.value = val;
   };
 
@@ -222,7 +231,7 @@ export default (
     return getRoot();
   };
 
-  const handleKeydown = (event) => {
+  const handleKeydown = event => {
     RetrieveHelper.beforeSlashKeyKeyDown(event, () => {
       // 检查按下的键是否是斜杠 "/"（需兼容不同键盘布局）
       const isSlashKey = event.key === '/' || event.keyCode === 191;
@@ -278,7 +287,7 @@ export default (
       document?.removeEventListener('input', handleFulltextInput);
     }
 
-    document.removeEventListener('mousedown', handleWrapperClickCapture);
+    document.removeEventListener('mousedown', handleWrapperClickCapture, { capture: true });
     document?.removeEventListener('keydown', handleKeydown);
     resizeObserver?.disconnect();
     resizeObserver = null;
@@ -292,6 +301,7 @@ export default (
     setIsDocumentMousedown,
     repositionTippyInstance,
     hideTippyInstance,
+    hideTippyInstanceImmediate,
     getTippyInstance,
     handleContainerClick,
     handleInputBlur,

@@ -18,10 +18,13 @@ from kubernetes import client
 from apm.core.handlers.apm_cache_handler import ApmCacheHandler
 from bkm_space.utils import bk_biz_id_to_space_uid, is_bk_saas_space
 from bkmonitor.utils.bcs import BcsKubeClient
-from bkmonitor.utils.common_utils import safe_int, count_md5
+from bkmonitor.utils.common_utils import count_md5, safe_int
+from bkmonitor.utils.new_env import is_biz_id_in_black_list
+from bkmonitor.utils.nodeman import host_queries
 from constants.bk_collector import BkCollectorComp
 from constants.common import DEFAULT_TENANT_ID
 from core.drf_resource import api
+from core.errors.iam import APIPermissionDeniedError
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ class BkCollectorConfig:
     @classmethod
     def get_target_host_ids_by_bk_tenant_id(cls, bk_tenant_id) -> list[int]:
         """
-        获取指定租户下所有的 Proxy 机器列表 (不包含直连区域)
+        获取指定租户下所有非黑名单业务的 Proxy 机器列表 (不包含直连区域)
         """
         bk_host_ids = []
         cloud_infos = api.cmdb.search_cloud_area(bk_tenant_id=bk_tenant_id)
@@ -59,11 +62,26 @@ class BkCollectorConfig:
             if int(bk_cloud_id) in [0, -1]:
                 continue
 
-            proxy_list = api.node_man.get_proxies(bk_cloud_id=bk_cloud_id)
+            try:
+                proxy_list = host_queries.proxies(bk_tenant_id=bk_tenant_id, bk_cloud_id=bk_cloud_id)
+            except APIPermissionDeniedError as error:
+                logger.warning(
+                    "get proxies permission denied, skip bk_tenant_id(%s), bk_cloud_id(%s), error: %s",
+                    bk_tenant_id,
+                    bk_cloud_id,
+                    error,
+                )
+                continue
             for p in proxy_list:
                 if p["status"] != "RUNNING":
                     logger.warning(
                         "proxy({}) can not be use with bk-collector, it's not running".format(p["bk_host_id"])
+                    )
+                elif is_biz_id_in_black_list(p["bk_biz_id"]):
+                    logger.warning(
+                        "proxy(%s) can not be use with bk-collector, business(%s) is in black list",
+                        p["bk_host_id"],
+                        p["bk_biz_id"],
                     )
                 else:
                     bk_host_ids.append(p["bk_host_id"])
@@ -71,7 +89,7 @@ class BkCollectorConfig:
         return bk_host_ids
 
     @classmethod
-    def get_target_host_ids_by_biz_id(cls, bk_tenant_id, bk_biz_id) -> list[int]:
+    def get_target_host_ids_by_biz_id(cls, bk_tenant_id, bk_biz_id, only_current_bk_biz_id: bool = False) -> list[int]:
         """
         获取指定租户指定业务下所有 Proxy 机器列表
         """
@@ -80,12 +98,18 @@ class BkCollectorConfig:
             return []
 
         try:
-            proxies = api.node_man.get_proxies_by_biz(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id)
+            proxies = host_queries.business_proxies(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id)
         except Exception as e:  # pylint: disable=broad-except
             proxies = []
             logger.info(f"get_proxies_by_biz({bk_biz_id}) error ({e})")
 
-        proxy_biz_ids = {proxy["bk_biz_id"] for proxy in proxies}
+        # 如果only_current_bk_biz_id为True，则只获取当前业务下的Proxy机器列表
+        proxy_biz_ids: set[int] = {proxy["bk_biz_id"] for proxy in proxies}
+        if only_current_bk_biz_id:
+            if bk_biz_id not in proxy_biz_ids:
+                return []
+            proxy_biz_ids = {bk_biz_id}
+
         proxy_hosts = []
         for proxy_biz_id in proxy_biz_ids:
             current_proxy_hosts = api.cmdb.get_host_by_ip(
@@ -107,21 +131,33 @@ class BkCollectorClusterConfig:
     GLOBAL_CONFIG_BK_BIZ_ID = 0
 
     @classmethod
-    def get_cluster_mapping(cls):
-        """获取由 apm_ebpf 模块发现的集群 id"""
+    def get_cluster_mapping(cls, bk_biz_ids=None):
+        """获取带 namespace 和公共目标标记的集群部署映射。"""
+        cluster_mapping = cls._get_default_cluster_mapping(bk_biz_ids)
+        cluster_mapping.update(cls.get_global_deploy_mapping())
+        return cluster_mapping
+
+    @classmethod
+    def _get_default_cluster_mapping(cls, bk_biz_ids=None):
+        """获取业务默认 collector 部署目标。"""
+        bk_biz_ids = set(bk_biz_ids or [])
+
+        cluster_mapping = {}
         cache = ApmCacheHandler().get_redis_client()
         cluster_to_bk_biz_ids = cache.smembers(BkCollectorComp.CACHE_KEY_CLUSTER_IDS)
-
-        res = {}
         for i in cluster_to_bk_biz_ids:
             value = ApmCacheHandler.decode_redis_value(i)
-            if value is not None:
-                cluster_id, related_bk_biz_ids = cls._split_value(value)
-                if cluster_id and related_bk_biz_ids:
-                    old_biz_ids = res.get(cluster_id, {})
-                    res[cluster_id] = set(old_biz_ids) | set(related_bk_biz_ids)
+            if value is None:
+                continue
 
-        return res
+            cluster_id, related_bk_biz_ids = cls._split_value(value)
+            if cluster_id and related_bk_biz_ids:
+                related_bk_biz_ids = set(related_bk_biz_ids)
+                if not bk_biz_ids or bk_biz_ids & related_bk_biz_ids:
+                    namespace = cls.bk_collector_namespace(cluster_id)
+                    cluster_mapping.setdefault((cluster_id, namespace, False), set()).update(related_bk_biz_ids)
+
+        return cluster_mapping
 
     @classmethod
     def bk_collector_namespace(cls, cluster_id):
@@ -129,49 +165,78 @@ class BkCollectorClusterConfig:
         return cluster_namespace.get(cluster_id, BkCollectorComp.NAMESPACE)
 
     @classmethod
-    def platform_config_tpl(cls, cluster_id):
+    def get_global_deploy_mapping(cls) -> dict[tuple[str, str, bool], set[int]]:
+        """获取公共 collector 部署目标；纯集群ID默认使用 blueking namespace。"""
+        configured_targets = settings.CUSTOM_REPORT_DEFAULT_DEPLOY_CLUSTER or []
+        cluster_mapping = {}
+        for target in configured_targets:
+            cluster_id, separator, namespace = target.partition("/")
+            if not separator:
+                namespace = BkCollectorComp.GLOBAL_NAMESPACE
+            if not cluster_id or not namespace:
+                logger.warning("invalid public collector target: %r, skip it", target)
+                continue
+            cluster_mapping[(cluster_id, namespace, True)] = {cls.GLOBAL_CONFIG_BK_BIZ_ID}
+        return cluster_mapping
+
+    @classmethod
+    def platform_config_tpl(cls, cluster_id: str, namespace: str):
         bcs_client = BcsKubeClient(cluster_id)
         config_maps = bcs_client.client_request(
             bcs_client.core_api.list_namespaced_config_map,
-            namespace=cls.bk_collector_namespace(cluster_id),
+            namespace=namespace,
             label_selector="component=bk-collector,template=true,type=platform",
         )
         if config_maps is None or len(config_maps.items) == 0:
             return None
 
         content = config_maps.items[0].data.get(BkCollectorComp.CONFIG_MAP_PLATFORM_TPL_NAME)
+        if not content:
+            logger.info(
+                f"[BkCollectorClusterConfig] platform config template not found: target({cluster_id}/{namespace}), "
+                f"template({BkCollectorComp.CONFIG_MAP_PLATFORM_TPL_NAME})"
+            )
+            return None
+
         try:
             return base64.b64decode(content).decode()
         except Exception as e:  # pylint: disable=broad-except
             logger.error(
-                f"[BkCollectorClusterConfig] parse platform_config_tpl failed: cluster({cluster_id}), error({e})"
+                f"[BkCollectorClusterConfig] parse platform_config_tpl failed: target({cluster_id}/{namespace}), error({e})"
             )
 
     @classmethod
-    def sub_config_tpl(cls, cluster_id: str, sub_config_tpl_name: str):
+    def sub_config_tpl(cls, cluster_id: str, namespace: str, sub_config_tpl_name: str):
         bcs_client = BcsKubeClient(cluster_id)
         config_maps = bcs_client.client_request(
             bcs_client.core_api.list_namespaced_config_map,
-            namespace=cls.bk_collector_namespace(cluster_id),
+            namespace=namespace,
             label_selector="component=bk-collector,template=true,type=subconfig",
         )
         if config_maps is None or len(config_maps.items) == 0:
             return None
 
-        content = b""
+        content = ""
         for item in config_maps.items:
             if not item.data:
                 continue
 
-            content = item.data.get(sub_config_tpl_name)
+            content = item.data.get(sub_config_tpl_name, "")
             if content:
                 break
+
+        if not content:
+            logger.info(
+                f"[BkCollectorClusterConfig] sub config template not found: target({cluster_id}/{namespace}), "
+                f"template({sub_config_tpl_name})"
+            )
+            return None
 
         try:
             return base64.b64decode(content).decode()
         except Exception as e:  # pylint: disable=broad-except
             logger.error(
-                f"[BkCollectorClusterConfig] parse {sub_config_tpl_name} failed: cluster({cluster_id}), error({e})"
+                f"[BkCollectorClusterConfig] parse {sub_config_tpl_name} failed: target({cluster_id}/{namespace}), error({e})"
             )
 
     @classmethod
@@ -201,13 +266,13 @@ class BkCollectorClusterConfig:
                 return _sec
 
     @classmethod
-    def deploy_to_k8s_with_hash(cls, cluster_id: str, config_map: dict, protocol: str, namespace: str | None = None):
+    def deploy_to_k8s_with_hash(cls, cluster_id: str, namespace: str, config_map: dict, protocol: str):
         """
         Args:
             cluster_id: 集群ID
+            namespace: 命名空间
             config_map: 配置映射，格式为 {config_id: config_content}
             protocol: 协议, json or prometheus
-            namespace: 命名空间
         """
         if not config_map:
             logger.info(f"deploy to cluster_id({cluster_id}), but config is empty, skip deployment")
@@ -254,8 +319,6 @@ class BkCollectorClusterConfig:
 
         # 批量处理每个secret
         bcs_client = BcsKubeClient(cluster_id)
-        if namespace is None:
-            namespace = BkCollectorClusterConfig.bk_collector_namespace(cluster_id)
         secret_label_selector = f"{BkCollectorComp.SECRET_COMMON_LABELS},{secret_config.get('secret_extra_label')}"
 
         # 一次性查询所有相关的secret
@@ -352,14 +415,15 @@ class BkCollectorClusterConfig:
                     logger.info(f"{cluster_id} {protocol} secret({secret_name}) has not been modified.")
 
         logger.info(
-            f"cluster({cluster_id}) batch deployment completed, processed {len(secret_groups)} secrets with total {len(config_map)} configs."
+            f"target({cluster_id}/{namespace}) batch deployment completed, "
+            f"processed {len(secret_groups)} secrets with total {len(config_map)} configs."
         )
 
         # 该逻辑会需要保留一段时间后清理  2025-09-24，半年后可删除该逻辑
-        cls.clean_dup_secrets(cluster_id, protocol)
+        cls.clean_dup_secrets(cluster_id, namespace, protocol)
 
     @classmethod
-    def clean_dup_secrets(cls, cluster_id: str, protocol: str):
+    def clean_dup_secrets(cls, cluster_id: str, namespace: str, protocol: str):
         """
         - 根据 protocol 查到集群内所有的 secrets
             - 转换为 子配置文件  -> secrets 的对应关系
@@ -375,7 +439,6 @@ class BkCollectorClusterConfig:
 
         # 查询集群内所有 secrets
         bcs_client = BcsKubeClient(cluster_id)
-        namespace = BkCollectorClusterConfig.bk_collector_namespace(cluster_id)
         secret_label_selector = f"{BkCollectorComp.SECRET_COMMON_LABELS},{secret_config.get('secret_extra_label')}"
 
         try:
@@ -447,3 +510,232 @@ class BkCollectorClusterConfig:
                     body=secret,
                 )
                 logger.info(f"[clean dup secrets] cluster_id {cluster_id} update secret {need_update_sec_file}")
+
+    @classmethod
+    def clean_dup_secrets_in_multi_protocol(
+        cls, cluster_id: str, namespace: str, protocols, config_id_to_protocol: dict
+    ):
+        """
+        按 config_id 当前所属协议，清理该 config_id 在其他协议 Secret 下的旧子配置。
+        注意：只清理 config_id_to_protocol 传入的 config_id，不会清理协议 Secret 下其他 config_id 的配置文件。
+        """
+        protocols = set(protocols or [])
+        config_id_to_protocol = dict(config_id_to_protocol or {})
+        if not protocols or not config_id_to_protocol:
+            return
+
+        bcs_client = BcsKubeClient(cluster_id)
+        for protocol in protocols:
+            secret_config = BkCollectorComp.get_secrets_config_map_by_protocol(cluster_id, protocol)
+            if not secret_config:
+                logger.info(
+                    f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) "
+                    f"protocol({protocol}) has no secret config, skip"
+                )
+                continue
+
+            removable_sub_config_files = {
+                secret_config["secret_data_key_tpl"].format(config_id)
+                for config_id, current_protocol in config_id_to_protocol.items()
+                if current_protocol != protocol
+            }
+            if not removable_sub_config_files:
+                logger.info(
+                    f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) "
+                    f"protocol({protocol}) has no configs need clean"
+                )
+                continue
+
+            secret_label_selector = f"{BkCollectorComp.SECRET_COMMON_LABELS},{secret_config.get('secret_extra_label')}"
+            try:
+                exists_secrets_obj = bcs_client.client_request(
+                    bcs_client.core_api.list_namespaced_secret,
+                    namespace=namespace,
+                    label_selector=secret_label_selector,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[clean dup secrets in multi protocol] failed to list secrets in namespace {namespace}: {e}"
+                )
+                continue
+
+            if not exists_secrets_obj or not exists_secrets_obj.items:
+                logger.info(
+                    f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) "
+                    f"protocol({protocol}) has no secrets"
+                )
+                continue
+
+            need_update_secrets = {}
+            for secret in exists_secrets_obj.items:
+                if not secret.data or not isinstance(secret.data, dict):
+                    continue
+
+                removed_sub_config_files = removable_sub_config_files & set(secret.data.keys())
+                if not removed_sub_config_files:
+                    continue
+
+                for sub_config_file in removed_sub_config_files:
+                    del secret.data[sub_config_file]
+                need_update_secrets[secret.metadata.name] = secret
+                logger.info(
+                    f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) "
+                    f"protocol({protocol}) secret({secret.metadata.name}) "
+                    f"remove {len(removed_sub_config_files)} dup configs"
+                )
+
+            logger.info(
+                f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) protocol({protocol}) "
+                f"update {len(need_update_secrets)} secrets"
+            )
+            if len(need_update_secrets) > 10:
+                logger.error(
+                    f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) "
+                    f"protocol({protocol}) update {len(need_update_secrets)} secrets more than 10. do nothing"
+                )
+                return
+
+            for secret_name, secret in need_update_secrets.items():
+                if not secret.data:
+                    logger.info(
+                        f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) "
+                        f"delete secret({secret_name}) start"
+                    )
+                    bcs_client.client_request(
+                        bcs_client.core_api.delete_namespaced_secret,
+                        name=secret.metadata.name,
+                        namespace=namespace,
+                        body=secret,
+                    )
+                    logger.info(
+                        f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) "
+                        f"delete secret({secret_name}) ok"
+                    )
+                else:
+                    bcs_client.client_request(
+                        bcs_client.core_api.replace_namespaced_secret,
+                        name=secret.metadata.name,
+                        namespace=namespace,
+                        body=secret,
+                    )
+                    logger.info(
+                        f"[clean dup secrets in multi protocol] cluster_id({cluster_id}) update secret({secret_name})"
+                    )
+
+    @classmethod
+    def clean_sub_configs(
+        cls,
+        cluster_id: str,
+        namespace: str,
+        protocol: str,
+        config_ids: list[int] | set[int],
+        dry_run=True,
+    ) -> list[dict]:
+        """
+        清理指定协议 Secret 中的子配置。
+
+        Args:
+            cluster_id: 集群 ID
+            namespace: 命名空间
+            protocol: 协议，json/prometheus/log
+            config_ids: 配置 ID 列表，一般为 bk_data_id
+            dry_run: 是否只预览，不实际删除
+
+        Returns:
+            清理计划列表
+        """
+        config_ids = {int(config_id) for config_id in config_ids if config_id is not None}
+        if not config_ids:
+            logger.info(f"[clean sub configs] cluster_id({cluster_id}) protocol({protocol}) config ids is empty, skip")
+            return []
+
+        secret_config = BkCollectorComp.get_secrets_config_map_by_protocol(cluster_id, protocol)
+        if not secret_config:
+            logger.info(
+                f"[clean sub configs] cluster_id({cluster_id}) protocol({protocol}) "
+                "has no secret config, please check if your config has been initialized"
+            )
+            return []
+
+        removable_sub_config_files = {
+            secret_config["secret_data_key_tpl"].format(config_id): config_id for config_id in config_ids
+        }
+        secret_label_selector = f"{BkCollectorComp.SECRET_COMMON_LABELS},{secret_config.get('secret_extra_label')}"
+
+        bcs_client = BcsKubeClient(cluster_id)
+        try:
+            exists_secrets_obj = bcs_client.client_request(
+                bcs_client.core_api.list_namespaced_secret,
+                namespace=namespace,
+                label_selector=secret_label_selector,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[clean sub configs] failed to list secrets: cluster_id({cluster_id}), namespace({namespace}), "
+                f"protocol({protocol}), error({e})"
+            )
+            return []
+
+        if not exists_secrets_obj or not exists_secrets_obj.items:
+            logger.info(f"[clean sub configs] cluster_id({cluster_id}) protocol({protocol}) has no secrets")
+            return []
+
+        clean_plans = []
+        for secret in exists_secrets_obj.items:
+            if not secret.data or not isinstance(secret.data, dict):
+                continue
+
+            removed_sub_config_files = set(removable_sub_config_files.keys()) & set(secret.data.keys())
+            if not removed_sub_config_files:
+                continue
+
+            clean_plans.append(
+                {
+                    "cluster_id": cluster_id,
+                    "namespace": namespace,
+                    "protocol": protocol,
+                    "secret_name": secret.metadata.name,
+                    "config_ids": sorted(removable_sub_config_files[file] for file in removed_sub_config_files),
+                    "sub_config_files": sorted(removed_sub_config_files),
+                    "delete_secret": len(secret.data) == len(removed_sub_config_files),
+                }
+            )
+
+            if dry_run:
+                logger.info(
+                    f"[clean sub configs][dry-run] cluster_id({cluster_id}) protocol({protocol}) "
+                    f"secret({secret.metadata.name}) will remove configs({sorted(removed_sub_config_files)})"
+                )
+                continue
+
+            for sub_config_file in removed_sub_config_files:
+                del secret.data[sub_config_file]
+
+            if not secret.data:
+                logger.info(
+                    f"[clean sub configs] cluster_id({cluster_id}) protocol({protocol}) "
+                    f"delete secret({secret.metadata.name}) start"
+                )
+                bcs_client.client_request(
+                    bcs_client.core_api.delete_namespaced_secret,
+                    name=secret.metadata.name,
+                    namespace=namespace,
+                    body=secret,
+                )
+                logger.info(
+                    f"[clean sub configs] cluster_id({cluster_id}) protocol({protocol}) "
+                    f"delete secret({secret.metadata.name}) ok"
+                )
+            else:
+                bcs_client.client_request(
+                    bcs_client.core_api.replace_namespaced_secret,
+                    name=secret.metadata.name,
+                    namespace=namespace,
+                    body=secret,
+                )
+                logger.info(
+                    f"[clean sub configs] cluster_id({cluster_id}) protocol({protocol}) "
+                    f"update secret({secret.metadata.name})"
+                )
+
+        return clean_plans

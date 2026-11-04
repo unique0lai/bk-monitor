@@ -12,11 +12,14 @@ specific language governing permissions and limitations under the License.
 
 import json
 
+from django.conf import settings
+
 from alarm_backends.constants import (
     LATEST_NO_DATA_CHECK_POINT,
     LATEST_POINT_WITH_ALL_KEY,
 )
 from alarm_backends.core.cache import key
+from alarm_backends.core.detect_result_retention import rank_trim_stop
 
 CONST_MAX_LEN_CHECK_RESULT = 30  # 检测结果缓存，默认只保留30条数据
 
@@ -59,14 +62,22 @@ class CheckResult(Result):
 
     @classmethod
     def pipeline(cls):
-        """
-        外部可直接使用pipeline对象，同时对象内部也使用相同的pipeline对象
-        >>>redis_pipeline = CheckResult.pipeline()
+        """返回当前检测结果批次的 pipeline，对象内部共享同一实例。
+
+        后台批次入口必须先调用 begin_pipeline_batch()，避免复用上一批未执行的命令。
+
+        >>>redis_pipeline = CheckResult.begin_pipeline_batch()
         >>>assert redis_pipeline is CheckResult(
         ...    strategy_id=1, item_id=2, dimensions_md5="md5_str", level="1").CHECK_RESULT
         """
         if cls._pipeline is None:
             cls._pipeline = key.CHECK_RESULT_CACHE_KEY.client.pipeline(transaction=False)
+        return cls._pipeline
+
+    @classmethod
+    def begin_pipeline_batch(cls):
+        """开启新的检测结果批次，清理上一批未执行的 pipeline 命令。"""
+        cls._pipeline = key.CHECK_RESULT_CACHE_KEY.client.pipeline(transaction=False)
         return cls._pipeline
 
     @property
@@ -112,10 +123,25 @@ class CheckResult(Result):
         return self.CHECK_RESULT.expire(self.check_result_cache_key, ttl)
 
     def remove_old_check_result_cache(self, point_remains=0):
-        point_remains = point_remains or 0
-        return self.CHECK_RESULT.zremrangebyrank(
-            self.check_result_cache_key, 0, -point_remains or -CONST_MAX_LEN_CHECK_RESULT
-        )
+        point_remains = point_remains or CONST_MAX_LEN_CHECK_RESULT
+        return self.CHECK_RESULT.zremrangebyrank(self.check_result_cache_key, 0, rank_trim_stop(point_remains))
+
+    @classmethod
+    def trim_check_result_caches(cls, cache_keys, point_remains):
+        """Trim each key once with bounded pipelines isolated from write batches."""
+        cache_keys = tuple(dict.fromkeys(cache_keys))
+        if not cache_keys:
+            return []
+
+        command_limit = settings.CHECK_RESULT_CLEAN_PIPELINE_COMMAND_LIMIT
+        stop = rank_trim_stop(point_remains)
+        results = []
+        for start in range(0, len(cache_keys), command_limit):
+            pipeline = key.CHECK_RESULT_CACHE_KEY.client.pipeline(transaction=False)
+            for cache_key in cache_keys[start : start + command_limit]:
+                pipeline.zremrangebyrank(cache_key, 0, stop)
+            results.extend(pipeline.execute())
+        return results
 
     def remove_expired_check_result_cache(self, expired_timestamp):
         return self.CHECK_RESULT.zremrangebyscore(self.check_result_cache_key, 0, expired_timestamp)

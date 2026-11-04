@@ -30,6 +30,7 @@ from bkmonitor.iam.permission import Permission
 from bkmonitor.models import Event, Shield
 from bkmonitor.utils.common_utils import logger
 from bkmonitor.utils.request import get_request, get_request_tenant_id, get_request_username
+from bkmonitor.utils.shield import format_dimension_conditions_display
 from bkmonitor.utils.time_tools import (
     DEFAULT_FORMAT,
     now,
@@ -39,7 +40,7 @@ from bkmonitor.utils.time_tools import (
 )
 from bkmonitor.utils.user import get_global_user
 from bkmonitor.views import serializers
-from constants.shield import ScopeType, ShieldCategory, ShieldStatus
+from constants.shield import ScopeType, ShieldCategory, ShieldEndPolicy, ShieldStatus
 from core.drf_resource import resource
 from core.drf_resource.base import Resource
 from core.errors.shield import DuplicateQuickShieldError, ShieldNotExist
@@ -162,6 +163,7 @@ class ShieldListResource(Resource):
                     "id": shield.id,
                     "bk_biz_id": shield.bk_biz_id,
                     "category": shield.category,
+                    "end_policy": shield.end_policy,
                     "status": shield.status,
                     "begin_time": strftime_local(shield.begin_time, DEFAULT_FORMAT),
                     "end_time": strftime_local(shield.end_time, DEFAULT_FORMAT),
@@ -194,7 +196,7 @@ class ShieldDetailResource(Resource):
 
     def perform_request(self, data):
         try:
-            shield = Shield.objects.get(id=data["id"])
+            shield = Shield.objects.get(id=data["id"], bk_biz_id=data["bk_biz_id"])
         except Shield.DoesNotExist:
             raise ShieldNotExist({"msg": data["id"]})
 
@@ -203,6 +205,7 @@ class ShieldDetailResource(Resource):
             "bk_biz_id": shield.bk_biz_id,
             "is_enabled": shield.is_enabled,
             "category": shield.category,
+            "end_policy": shield.end_policy,
             "status": shield.status,
             "scope_type": shield.scope_type,
             "description": shield.description,
@@ -271,6 +274,8 @@ class AddShieldResource(Resource, EventDimensionMixin):
             dimension_config = {scope_key_mapping.get(scope_type): target}
         if "metric_id" in data["dimension_config"]:
             dimension_config["metric_id"] = data["dimension_config"]["metric_id"]
+        if data["dimension_config"].get("dimension_conditions"):
+            dimension_config["dimension_conditions"] = data["dimension_config"]["dimension_conditions"]
         return dimension_config
 
     def handle_strategy(self, data):
@@ -307,23 +312,28 @@ class AddShieldResource(Resource, EventDimensionMixin):
         alert = AlertDocument.get(alert_id)
 
         dimension_keys = data.get("dimension_keys")
-        dimension_config = {}
-        shield_dimensions = []
-        for dimension in alert.dimensions:
-            dimension_data = dimension.to_dict()
-            # 若传递了dimension_keys，则只保留dimension_keys中指定的维度，用于前端动态删除维度信息
-            if dimension_keys is None or dimension_data["key"] in dimension_keys:
-                dimension_config[dimension_data["key"]] = dimension_data["value"]
-                shield_dimensions.append(dimension)
-        dimension_config.update(
-            {
-                "_alert_id": alert.id,
-                "strategy_id": alert.strategy_id,
-                "_severity": alert.severity,
-                "_alert_message": getattr(alert.event, "description", ""),
-                "_dimensions": AlertDimensionFormatter.get_dimensions_str(shield_dimensions),
-            }
-        )
+        dimension_conditions = data["dimension_config"].get("dimension_conditions") or []
+        dimension_config = {
+            "_alert_id": alert.id,
+            "strategy_id": alert.strategy_id,
+            "_severity": alert.severity,
+            "_alert_message": getattr(alert.event, "description", ""),
+        }
+
+        if dimension_conditions:
+            # 有 dimension_conditions 时匹配只认这些条件 + strategy_id，
+            # 不再把告警全量原始维度写成等值 key（否则会 AND 掉勾选/regex 范围）
+            dimension_config["dimension_conditions"] = dimension_conditions
+            dimension_config["_dimensions"] = format_dimension_conditions_display(dimension_conditions)
+        else:
+            shield_dimensions = []
+            for dimension in alert.dimensions:
+                dimension_data = dimension.to_dict()
+                # 若传递了dimension_keys，则只保留dimension_keys中指定的维度，用于前端动态删除维度信息
+                if dimension_keys is None or dimension_data["key"] in dimension_keys:
+                    dimension_config[dimension_data["key"]] = dimension_data["value"]
+                    shield_dimensions.append(dimension)
+            dimension_config["_dimensions"] = AlertDimensionFormatter.get_dimensions_str(shield_dimensions)
 
         # 更新alerts的屏蔽状态
         alert_document = AlertDocument(id=alert_id, is_shielded=True, update_time=int(time.time()))
@@ -374,6 +384,7 @@ class AddShieldResource(Resource, EventDimensionMixin):
         shield_obj = Shield.objects.create(
             bk_biz_id=data["bk_biz_id"],
             category=data["category"],
+            end_policy=data.get("end_policy", ShieldEndPolicy.NOTIFY_ONCE),
             begin_time=begin_time,
             end_time=end_time,
             failure_time=end_time,
@@ -421,6 +432,7 @@ class BulkAddAlertShieldResource(AddShieldResource):
     """
 
     def handle_alerts(self, data):
+        # TODO: 批量告警屏蔽暂未支持 dimension_conditions 透传，需补齐时参照 handle_alert() 的透传方式
         alert_ids = data["dimension_config"]["alert_ids"] or [data["dimension_config"]["alert_id"]]
         # dimension_config.dimensions 标记告警保留需要匹配的屏蔽维度
         target_dimension_config: dict = data["dimension_config"].get("dimensions", {})
@@ -501,6 +513,7 @@ class BulkAddAlertShieldResource(AddShieldResource):
                 Shield(
                     bk_biz_id=data["bk_biz_id"],
                     category=data["category"],
+                    end_policy=data.get("end_policy", ShieldEndPolicy.NOTIFY_ONCE),
                     create_user=shield_operator,
                     update_user=shield_operator,
                     begin_time=begin_time,
@@ -526,6 +539,7 @@ class EditShieldResource(Resource):
     """
 
     class RequestSerializer(serializers.Serializer):
+        end_policy = serializers.ChoiceField(choices=ShieldEndPolicy.CHOICES, required=False, label="屏蔽结束处理方式")
         id = serializers.IntegerField(required=True, label="屏蔽id")
         bk_biz_id = serializers.IntegerField(required=True, label="业务id")
         begin_time = serializers.CharField(required=True, label="屏蔽开始时间")
@@ -539,9 +553,12 @@ class EditShieldResource(Resource):
 
     def perform_request(self, data):
         try:
-            shield = Shield.objects.get(id=data["id"])
+            shield = Shield.objects.get(id=data["id"], bk_biz_id=data["bk_biz_id"])
         except Shield.DoesNotExist:
             raise ShieldNotExist({"msg": data["id"]})
+
+        if "end_policy" in data and data["end_policy"] != shield.end_policy:
+            raise ValidationError({"end_policy": _("结束处理方式创建后不可修改")})
 
         # 处理时间数据
         begin_time, end_time = handle_shield_time(
@@ -613,6 +630,11 @@ class DisableShieldResource(Resource):
         shields = Shield.objects.filter(pk__in=data["id"])
         if data.get("bk_biz_id"):
             shields = shields.filter(bk_biz_id=data["bk_biz_id"])
+        else:
+            permission = Permission(username=username, bk_tenant_id=get_request_tenant_id())
+            for biz_id in {shield.bk_biz_id for shield in shields}:
+                if not permission.is_allowed_by_biz(biz_id, ActionEnum.MANAGE_DOWNTIME):
+                    raise ValidationError({"bk_biz_id": f"当前用户无权限解除{biz_id}业务屏蔽配置"})
 
         update_shields = []
         for shield in shields:

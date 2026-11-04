@@ -184,6 +184,19 @@ DEFAULT_DIMENSIONS_MAP = {
     "device_target": DefaultDimensions.device,
 }
 
+
+def get_default_dimension_ids(data_target: str, dimensions: list[dict[str, Any]]) -> list[str]:
+    default_dimensions = [dimension["id"] for dimension in DEFAULT_DIMENSIONS_MAP[data_target]]
+    dimension_ids = {dimension["id"] for dimension in dimensions}
+    if (
+        data_target == DataTarget.HOST_TARGET
+        and "bk_cloud_id" in dimension_ids
+        and "bk_target_cloud_id" not in dimension_ids
+    ):
+        return ["bk_target_ip", "bk_cloud_id"]
+    return default_dimensions
+
+
 UPTIMECHECK_MAP = {
     "HTTP": [AvailableMetric, TaskDurationMetric, ResponseCodeMetric, ResponseMetric],
     "UDP": [AvailableMetric, TaskDurationMetric],
@@ -262,6 +275,17 @@ class BaseMetricCacheManager:
             .annotate(use_frequency=Count("metric_id"))
         }
 
+    @staticmethod
+    def truncate_metric_fields(metric: dict[str, Any]) -> None:
+        """按缓存表字段长度截断可能超长的结果表及派生字段。"""
+        for field_name in ("result_table_id", "result_table_name", "readable_name"):
+            value = metric.get(field_name, "")
+            if not value:
+                continue
+            max_length = MetricListCache._meta.get_field(field_name).max_length
+            if len(value) > max_length:
+                metric[field_name] = value[:max_length]
+
     def _run(self):
         """
         对比数据库已有数据， 实现指标缓存的增量更新
@@ -293,9 +317,7 @@ class BaseMetricCacheManager:
         processed_metric_ids: set[str] = set()
         for table in self.get_tables():
             for metric in self.get_metrics_by_table(table):
-                # 处理result_table_id长度
-                if len(metric.get("result_table_id", "")) > 256:
-                    metric["result_table_id"] = metric["result_table_id"][:256]
+                self.truncate_metric_fields(metric)
 
                 if metric.get("result_table_id", "") in ["bkunifylogbeat_task.base", "bkunifylogbeat_common.base"]:
                     continue
@@ -336,6 +358,7 @@ class BaseMetricCacheManager:
                 if metric_instance is None:
                     _metric = MetricListCache(bk_tenant_id=self.bk_tenant_id, **metric)
                     metric["readable_name"] = _metric.get_human_readable_name()
+                    self.truncate_metric_fields(metric)
                     _metric.readable_name = metric["readable_name"]
                     _metric.metric_md5 = count_md5(metric)
 
@@ -345,6 +368,7 @@ class BaseMetricCacheManager:
 
                 # readable_name 可能会因用户修改data_label而变更，因此跟随周期任务自动更新
                 metric["readable_name"] = metric_instance.get_human_readable_name()
+                self.truncate_metric_fields(metric)
 
                 metric["metric_md5"] = count_md5(metric)
                 # 处理更新逻辑
@@ -494,6 +518,8 @@ class CustomMetricCacheManager(BaseMetricCacheManager):
         # 通过 time_series_group_name 的生成规则过滤掉插件类型的数据
         custom_ts_result = [i for i in custom_ts_result if i["time_series_group_name"] not in db_name_list]
 
+        self.merge_metric_dimensions(custom_ts_result)
+
         # 补充 APM 虚拟指标
         custom_ts_result = self.get_apm_extra_tables(custom_ts_result) + custom_ts_result
 
@@ -502,6 +528,27 @@ class CustomMetricCacheManager(BaseMetricCacheManager):
             self.process_logbeat_table(result)
             self.process_apm_table(result)
             yield result
+
+    @staticmethod
+    def merge_metric_dimensions(tables: list[dict[str, Any]]) -> None:
+        """同一数据源的同名指标跨 scope 合并维度，供缓存去重时保留的首条记录使用。"""
+        metrics: dict[tuple[int, int, str, str], tuple[dict, dict[str, dict]]] = {}
+        for table in tables:
+            for metric in table["metric_info_list"]:
+                if not metric:
+                    continue
+                key = (table["bk_biz_id"], table["time_series_group_id"], table["table_id"], metric["field_name"])
+                _, tags = metrics.setdefault(key, (metric, {}))
+                for tag in metric.get("tag_list", []):
+                    field_name: str = tag["field_name"]
+                    current: dict | None = tags.get(field_name)
+                    if current is None:
+                        tags[field_name] = dict(tag)
+                    elif not current.get("description") and tag.get("description"):
+                        current["description"] = tag["description"]
+
+        for metric, tags in metrics.values():
+            metric["tag_list"] = list(tags.values())
 
     @classmethod
     def process_apm_table(cls, table: dict):
@@ -1085,20 +1132,53 @@ class CustomEventCacheManager(BaseMetricCacheManager):
         )
         event_group_ids = [
             custom_event.bk_event_group_id
-            for custom_event in CustomEventGroup.objects.filter(type="custom_event").only("bk_event_group_id")
+            for custom_event in CustomEventGroup.objects.filter(
+                bk_tenant_id=self.bk_tenant_id, type="custom_event"
+            ).only("bk_event_group_id")
+        ]
+        # 平台级（is_platform=True）自定义事件分组的缓存行统一挂到 bk_biz_id=0，
+        # 复用 bk_biz_id__in=[0, bk_biz_id] 的平台数据可见性通道，保证全业务可见
+        platform_groups = dict(
+            CustomEventGroup.objects.filter(
+                bk_tenant_id=self.bk_tenant_id, type="custom_event", is_platform=True
+            ).values_list("bk_event_group_id", "bk_data_id")
+        )
+        # 平台级分组仅由 bk_biz_id=0 的缓存任务产出：归属业务任务从当前业务查询结果中整体剔除
+        # （主循环与 k8s 集群事件名称匹配均不再产出），避免在归属业务下产生重复缓存行
+        custom_event_result = [
+            result
+            for result in custom_event_result
+            if result["event_group_id"] not in platform_groups or result["bk_biz_id"] == 0
         ]
         # 增加自定义事件筛选，不在监控创建的策略配置时不展示
         for result in custom_event_result:
             if result["event_group_id"] in event_group_ids:
+                yield result
+        if self.bk_biz_id == 0 and platform_groups:
+            # 平台级分组的 EventGroup 挂在归属业务下（metadata 侧无平台标志），按 bk_data_id 补拉，
+            # 缓存行业务改写为 0 后单独产出，不并入 custom_event_result；
+            # EventGroup 本身挂 0 的存量平台分组已在上面产出，此处跳过去重。
+            # 注意：platform_groups 为空时不能发起补拉，空 bk_data_ids 会被 metadata 视为不过滤
+            platform_event_result = api.metadata.query_event_group.request.refresh(
+                bk_tenant_id=self.bk_tenant_id, bk_data_ids=list(platform_groups.values())
+            )
+            for result in platform_event_result:
+                if result["event_group_id"] not in platform_groups or result["bk_biz_id"] == 0:
+                    continue
+                result["bk_biz_id"] = 0
                 yield result
         if self.bk_biz_id < 0:
             space_uid = bk_biz_id_to_space_uid(self.bk_biz_id)
             if space_uid.startswith(SpaceTypeEnum.BKCI.value):
                 space = SpaceApi.get_related_space(space_uid, SpaceTypeEnum.BKCC.value)
                 if space:
-                    custom_event_result += api.metadata.query_event_group.request.refresh(
+                    related_event_result = api.metadata.query_event_group.request.refresh(
                         bk_tenant_id=self.bk_tenant_id, bk_biz_id=space.bk_biz_id
                     )
+                    # 关联业务的平台级分组同样剔除，避免经下方 k8s 名称匹配以负业务身份重复产出
+                    custom_event_result += [
+                        result for result in related_event_result if result["event_group_id"] not in platform_groups
+                    ]
         # 3.k8s 事件
         # 1. 先拿业务下的集群列表
         # 区分 custom_event 和 k8s_event (来自metadata的设计)
@@ -1413,18 +1493,10 @@ class BaseAlarmMetricCacheManager(BaseMetricCacheManager):
             yield metric
 
     def get_tables(self):
-        # 多租户模式下暂时不内置系统事件
-        if settings.ENABLE_MULTI_TENANT_MODE:
-            return
-
         yield {}
 
     def get_metrics_by_table(self, table):
         result_table_label = "os"
-        metric_list = BaseAlarm.objects.filter(is_enable=True)
-        if Platform.te:
-            # te平台不展示ping不可达告警， 同时也不内置
-            metric_list = metric_list.exclude(title="ping-gse")
         base_dict = {
             "bk_biz_id": 0,
             "result_table_id": SYSTEM_EVENT_RT_TABLE_ID,
@@ -1440,20 +1512,33 @@ class BaseAlarmMetricCacheManager(BaseMetricCacheManager):
             "collect_config_ids": [],
         }
 
-        for metric in metric_list:
-            metric_dict = copy.deepcopy(base_dict)
-            metric_dict["metric_field"] = metric.title
-            metric_dict["metric_field_name"] = metric.description
+        # 多租户下 gse 系统事件（AgentLost/DiskReadonly/CoreFile/OOM）及 gse 进程托管事件已改由 V4 custom
+        # 分业务链路内置（CustomEventCacheManager + os/v2，结果表 base_{tenant}_{biz}_event）；此处在多租户
+        # 仅保留下方 extend_metrics 的 proc_port/os_restart（以及按 ENABLE_PING_ALARM 追加的 ping-gse）这几个
+        # bk_monitor 源伪事件——它们的底层时序表 system.proc_port / system.env / pingserver.base 在多租户同样
+        # 产出，仍按 bk_monitor 源 event 内置为目录项，供 os/v3（主机重启/进程端口，多租户专用）、os/v4
+        # （PING，多租户专用）、os/v1（单租户）命中，经 os_loader 的 EVENT_QUERY_CONFIG_MAP 重定向到底层
+        # 时序表后创建。
+        if not settings.ENABLE_MULTI_TENANT_MODE:
+            metric_list = BaseAlarm.objects.filter(is_enable=True)
+            if Platform.te:
+                # te平台不展示ping不可达告警， 同时也不内置
+                metric_list = metric_list.exclude(title="ping-gse")
+            for metric in metric_list:
+                metric_dict = copy.deepcopy(base_dict)
+                metric_dict["metric_field"] = metric.title
+                metric_dict["metric_field_name"] = metric.description
 
-            dimensions = metric.dimensions
-            # 调整oom维度，后续系统事件直接使用json文件记录
-            if metric.title == "oom-gse":
-                dimensions = ["oom_memcg", "task_memcg", "task", "constraint", "process", "message"]
+                dimensions = metric.dimensions
+                # 调整oom维度，后续系统事件直接使用json文件记录
+                if metric.title == "oom-gse":
+                    dimensions = ["oom_memcg", "task_memcg", "task", "constraint", "process", "message"]
 
-            metric_dict["dimensions"] = [{"id": dimension, "name": dimension} for dimension in dimensions]
-            yield metric_dict
+                metric_dict["dimensions"] = [{"id": dimension, "name": dimension} for dimension in dimensions]
+                yield metric_dict
 
-        # 增加额外的系统事件指标
+        # 增加额外的系统事件指标（proc_port/os_restart：底层为 system.proc_port/system.env 时序表，
+        # 单租户与多租户都内置；os_loader 经 EVENT_QUERY_CONFIG_MAP 把查询重定向到底层时序表并套检测算法）
         extend_metrics = [
             # deprecated
             # {
@@ -1475,22 +1560,31 @@ class BaseAlarmMetricCacheManager(BaseMetricCacheManager):
             {"metric_field": "os_restart", "metric_field_name": _("主机重启"), "dimensions": DefaultDimensions.host},
         ]
 
+        # 多租户 PING 不可达：单租户由上方 BaseAlarm(is_enable=True) 内置 ping-gse 目录项（且 te 平台排除）；
+        # 多租户改由全局开关 ENABLE_PING_ALARM 运行时单点治理（而非部署平台 Platform.te），与 os_loader
+        # 创建 PING 策略时的门控口径一致。内置 bk_monitor 源 ping-gse 伪事件目录项，供 os/v4（多租户专用）
+        # 命中、经 EVENT_QUERY_CONFIG_MAP 重定向到底层时序 pingserver.base/loss_percent + PingUnreachable 算法建出。
+        if settings.ENABLE_MULTI_TENANT_MODE and getattr(settings, "ENABLE_PING_ALARM", True):
+            extend_metrics.append(
+                {"metric_field": "ping-gse", "metric_field_name": _("PING不可达"), "dimensions": DefaultDimensions.host}
+            )
+
         for metric in extend_metrics:
             metric_dict = copy.deepcopy(base_dict)
             metric_dict.update(metric)
             yield metric_dict
 
-        # gse进程托管事件指标
-        for metric in self.add_gse_process_event_metrics(result_table_label):
-            yield metric
+        # gse进程托管事件指标（多租户暂走 custom 链路，不在此内置）
+        if not settings.ENABLE_MULTI_TENANT_MODE:
+            for metric in self.add_gse_process_event_metrics(result_table_label):
+                yield metric
 
     @classmethod
     def get_available_biz_ids(cls, bk_tenant_id: str) -> list[int]:
         """获取系统事件相关的业务ID列表"""
-        # 多租户模式下暂时不内置系统事件
-        if settings.ENABLE_MULTI_TENANT_MODE:
-            return []
-        # 系统事件只在业务ID为0的情况下处理
+        # 系统事件只在业务ID为0的情况下处理。多租户同样内置：仅 proc_port/os_restart 两个伪事件走
+        # bk_monitor 源（底层 system.proc_port/system.env 时序在多租户同样产出），其余 gse 系统事件
+        # 改由 custom 链路内置（见 get_metrics_by_table）。
         return [0]
 
 
@@ -1949,6 +2043,14 @@ class BkmonitorMetricCacheManager(BaseMetricCacheManager):
                 for group in group_list:
                     yield from self.get_plugin_ts_metric(group)
 
+        # 预计算输出不属于采集插件，也没有 TimeSeriesGroup，复用 Metadata 的结果表入口。
+        params = {"bk_tenant_id": self.bk_tenant_id, "with_option": False}
+        if self.bk_biz_id is not None:
+            params["bk_biz_id"] = self.bk_biz_id
+        for table in api.metadata.list_monitor_result_table(**params):
+            if table.get("table_type") == "recording_rule":
+                yield from self.get_pre_calculate_metric(table)
+
     def get_metrics_by_table(self, table):
         """
         处理不同类型的表数据， 根据influx_db_name的不同， 进行不同的处理
@@ -1980,7 +2082,7 @@ class BkmonitorMetricCacheManager(BaseMetricCacheManager):
                 yield from self.get_bkci_metric(table)
             elif table.get("table_type") == "plugin":
                 yield from self.get_plugin_metric(table)
-            elif influx_db_name.startswith("bkprecal_"):
+            elif table.get("table_type") == "recording_rule" or influx_db_name.startswith("bkprecal_"):
                 # 预聚合表
                 yield from self.get_pre_calculate_metric(table)
         except BaseException:  # noqa
@@ -1989,7 +2091,12 @@ class BkmonitorMetricCacheManager(BaseMetricCacheManager):
     def get_pre_calculate_metric(self, table):
         base_metric = self.get_base_dict(table)
         base_metric.update(
-            {"related_name": "bk_pre_cal", "related_id": "bk_pre_cal", "category_display": _("预计算指标")}
+            {
+                "bk_biz_id": table["bk_biz_id"],
+                "related_name": "bk_pre_cal",
+                "related_id": "bk_pre_cal",
+                "category_display": _("预计算指标"),
+            }
         )
         return self.get_field_metric_msg(table, base_metric)
 
@@ -2009,7 +2116,7 @@ class BkmonitorMetricCacheManager(BaseMetricCacheManager):
 
         data_target = DataTargetMapping().get_data_target(table["label"], table["source_label"], table["type_label"])
 
-        default_dimensions = list([x["id"] for x in DEFAULT_DIMENSIONS_MAP[data_target]])
+        default_dimensions = get_default_dimension_ids(data_target, dimensions)
 
         return {
             "bk_biz_id": 0,

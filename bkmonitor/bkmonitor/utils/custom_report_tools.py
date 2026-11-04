@@ -15,6 +15,7 @@ import requests
 from django.conf import settings
 from django.utils.translation import gettext as _
 
+from bkmonitor.utils.custom_report_endpoint import get_valid_custom_report_endpoints
 from bkmonitor.utils.thread_backend import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -63,10 +64,20 @@ class custom_report_tool:
         :param access_token: token
         :param parallel: 是否并发请求
         """
-        assert settings.CUSTOM_REPORT_DEFAULT_PROXY_IP, _(
-            "全局配置中: 自定义上报默认服务器[CUSTOM_REPORT_DEFAULT_PROXY_IP]"
-            "未配置，请确认bkmonitorproxy已部署，并在全局配置中配置！"
+        valid_services = get_valid_custom_report_endpoints(
+            getattr(settings, "CUSTOM_REPORT_ENDPOINTS", [])
         )
+        cluster_service = valid_services[0]["endpoint"] if valid_services else None
+        if not (
+            cluster_service or settings.CUSTOM_REPORT_DEFAULT_PROXY_DOMAIN or settings.CUSTOM_REPORT_DEFAULT_PROXY_IP
+        ):
+            raise ValueError(
+                _(
+                    "全局配置中: 自定义上报默认服务器[CUSTOM_REPORT_ENDPOINTS或"
+                    "CUSTOM_REPORT_DEFAULT_PROXY_DOMAIN或CUSTOM_REPORT_DEFAULT_PROXY_IP]"
+                    "未配置，请确认bkmonitorproxy已部署，并在全局配置中配置！"
+                )
+            )
         send_list = [[]]
         chunk_index = 0
         # 避免每次发送的数据太长，分批进行上报
@@ -78,7 +89,14 @@ class custom_report_tool:
 
         send_data = [{"data_id": self.dataid, "access_token": access_token, "data": data} for data in send_list]
 
-        proxy_url = f"http://{settings.CUSTOM_REPORT_DEFAULT_PROXY_IP[0]}:10205/v2/push/"
+        proxy_host = (
+            settings.CUSTOM_REPORT_DEFAULT_PROXY_DOMAIN[0]
+            if settings.CUSTOM_REPORT_DEFAULT_PROXY_DOMAIN
+            else settings.CUSTOM_REPORT_DEFAULT_PROXY_IP[0]
+            if settings.CUSTOM_REPORT_DEFAULT_PROXY_IP
+            else cluster_service
+        )
+        proxy_url = f"http://{proxy_host}:10205/v2/push/"
 
         if not parallel:
             for data in send_data:

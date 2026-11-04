@@ -12,14 +12,14 @@ import base64
 import gzip
 import logging
 
-from jinja2.sandbox import SandboxedEnvironment as Environment
 from django.conf import settings
+from jinja2.sandbox import SandboxedEnvironment as Environment
 from kubernetes import client
 from opentelemetry import trace
 
 from apm.constants import (
     DEFAULT_APM_ATTRIBUTE_CONFIG,
-    DEFAULT_APM_PLATFORM_AS_INT_CONFIG,
+    DEFAULT_APM_PLATFORM_ATTRIBUTE_CONFIG,
     DEFAULT_PLATFORM_API_NAME_CONFIG,
     DEFAULT_PLATFORM_LICENSE_CONFIG,
     GLOBAL_CONFIG_BK_BIZ_ID,
@@ -27,8 +27,10 @@ from apm.constants import (
 from apm.models import BcsClusterDefaultApplicationRelation
 from apm.models.subscription_config import SubscriptionConfig
 from bkmonitor.utils.bcs import BcsKubeClient
-from bkmonitor.utils.bk_collector_config import BkCollectorConfig, BkCollectorClusterConfig
+from bkmonitor.utils.bk_collector_config import BkCollectorClusterConfig, BkCollectorConfig
+from bkmonitor.utils.cipher import get_bk_data_token_aes_key
 from bkmonitor.utils.common_utils import count_md5
+from bkmonitor.utils.new_env import is_biz_id_need_managed
 from constants.apm import SpanKindKey
 from constants.bk_collector import BkCollectorComp
 from constants.common import DEFAULT_TENANT_ID
@@ -71,40 +73,54 @@ class PlatformConfig(BkCollectorConfig):
     @classmethod
     def refresh_k8s(cls):
         """
-        下发平台默认配置到 K8S 集群（不区分租户，每个集群一份平台配置）
+        下发平台默认配置到 K8S 部署（不区分租户，每个目标 namespace 一份平台配置）
 
         # 1. 获取所有集群ID列表
         # 2. 针对每一个集群
         #    2.1 从集群中获取模版配置
         #    2.2 获取到模板，则下发，否则忽略该集群
         """
+
+        from metadata.models.bcs.cluster import BCSClusterInfo
+
         cluster_mapping = BkCollectorClusterConfig.get_cluster_mapping()
 
-        if settings.CUSTOM_REPORT_DEFAULT_DEPLOY_CLUSTER:
-            # 补充中心化集群
-            for cluster_id in settings.CUSTOM_REPORT_DEFAULT_DEPLOY_CLUSTER:
-                cluster_mapping[cluster_id] = [0]
+        # 获取BCS集群与业务ID的映射关系
+        bcs_cluster_to_biz_ids: dict[str, int] = {}
+        for bcs_cluster in BCSClusterInfo.objects.all().only("cluster_id", "bk_biz_id"):
+            bcs_cluster_to_biz_ids[bcs_cluster.cluster_id] = bcs_cluster.bk_biz_id
 
-        for cluster_id, cc_bk_biz_ids in cluster_mapping.items():
+        for cluster_id, namespace, is_global in cluster_mapping.keys():
+            # 如果集群不在BCS集群中，则不下发该集群的配置
+            if cluster_id not in bcs_cluster_to_biz_ids:
+                continue
+
+            # 如果集群对应业务不需要管理，则不下发该集群的配置
+            bk_biz_id = bcs_cluster_to_biz_ids[cluster_id]
+            if not is_biz_id_need_managed(bk_biz_id):
+                continue
+
             try:
-                platform_config_tpl = BkCollectorClusterConfig.platform_config_tpl(cluster_id)
+                platform_config_tpl = BkCollectorClusterConfig.platform_config_tpl(cluster_id, namespace)
                 if platform_config_tpl is None:
                     # 如果集群中不存在 bk-collector 的平台配置模版，则不下发
                     continue
 
-                platform_config_context = PlatformConfig.get_platform_config(cluster_id)
+                platform_config_context = PlatformConfig.get_platform_config(
+                    cluster_id, namespace=namespace, is_global=is_global
+                )
 
                 platform_config = Environment().from_string(platform_config_tpl).render(platform_config_context)
-                PlatformConfig.deploy_to_k8s(cluster_id, platform_config)
+                PlatformConfig.deploy_to_k8s(cluster_id, namespace, platform_config)
             except Exception as e:  # pylint: disable=broad-except
-                logger.error(f"refresh platform config to cluster: {cluster_id} failed, error: {e}")
+                logger.error(f"refresh platform config to target: {cluster_id}/{namespace} failed, error: {e}")
 
     @classmethod
-    def get_platform_config(cls, bcs_cluster_id=None):
+    def get_platform_config(cls, bcs_cluster_id=None, namespace=None, is_global: bool = False):
         plat_config = {
             "apdex_config": cls.get_apdex_config(),
             "sampler_config": cls.get_sampler_config(),
-            "token_checker_config": cls.get_token_checker_config(bcs_cluster_id),
+            "token_checker_config": cls.get_token_checker_config(bcs_cluster_id, is_global=is_global),
             "resource_filter_config": cls.get_resource_filter_config(),
             "qps_config": cls.get_qps_config(),
             "metric_configs": cls.list_metric_config(),
@@ -115,8 +131,8 @@ class PlatformConfig(BkCollectorConfig):
         if settings.APM_FIELD_NORMALIZER_ENABLED:
             plat_config["field_normalizer_config"] = cls.get_field_normalizer_config()
 
-        if bcs_cluster_id and bcs_cluster_id not in settings.CUSTOM_REPORT_DEFAULT_DEPLOY_CLUSTER:
-            resource_fill_dimensions_config = cls.get_resource_fill_dimensions_config(bcs_cluster_id)
+        if bcs_cluster_id and not is_global:
+            resource_fill_dimensions_config = cls.get_resource_fill_dimensions_config(bcs_cluster_id, namespace)
             if resource_fill_dimensions_config:
                 plat_config["resource_fill_dimensions_config"] = resource_fill_dimensions_config
 
@@ -127,7 +143,7 @@ class PlatformConfig(BkCollectorConfig):
         """attribute_config 信息"""
 
         attribute_config = DEFAULT_APM_ATTRIBUTE_CONFIG
-        attribute_config.update(DEFAULT_APM_PLATFORM_AS_INT_CONFIG)
+        attribute_config.update(DEFAULT_APM_PLATFORM_ATTRIBUTE_CONFIG)
         if settings.APM_IS_DISTRIBUTE_PLATFORM_API_NAME_CONFIG:
             attribute_config.update(DEFAULT_PLATFORM_API_NAME_CONFIG)
         return attribute_config
@@ -275,11 +291,8 @@ class PlatformConfig(BkCollectorConfig):
         return {"name": "field_normalizer/otel_mapping", "fields": fields}
 
     @classmethod
-    def get_token_checker_config(cls, bcs_cluster_id=None):
-        # 需要判断是否有指定密钥，如有，优先级最高
-        x_key = getattr(settings, settings.AES_X_KEY_FIELD)
-        if settings.SPECIFY_AES_KEY != "":
-            x_key = settings.SPECIFY_AES_KEY
+    def get_token_checker_config(cls, bcs_cluster_id=None, is_global: bool = False):
+        x_key = get_bk_data_token_aes_key()
 
         token_checker_config = {
             "name": "token_checker/aes256",
@@ -293,7 +306,7 @@ class PlatformConfig(BkCollectorConfig):
             else settings.BK_DATA_AES_IV,
         }
 
-        if bcs_cluster_id and bcs_cluster_id not in settings.CUSTOM_REPORT_DEFAULT_DEPLOY_CLUSTER:
+        if bcs_cluster_id and not is_global:
             # 集群内默认上报 APM 应用
             default_app_relation = BcsClusterDefaultApplicationRelation.objects.filter(
                 cluster_id=bcs_cluster_id
@@ -332,23 +345,16 @@ class PlatformConfig(BkCollectorConfig):
         return data_ids
 
     @classmethod
-    def get_resource_fill_dimensions_config(cls, bcs_cluster_id=None):
+    def get_resource_fill_dimensions_config(cls, bcs_cluster_id: str, namespace: str):
         """
         维度补充配置（目前先固定返回，暂不支持可配置）
         第一层，先根据上报的客户端IP，填充 resource 下的 net.host.ip 字段（如果不存在则赋值）
         第二层，根据 net.host.ip 字段，继续补充 k8s 下的 pod 相关信息
         """
-        if bcs_cluster_id is None:
-            return {}
-
-        if bcs_cluster_id in settings.CUSTOM_REPORT_DEFAULT_DEPLOY_CLUSTER:
-            # 中心化集群，可以接收到所有的数据，不对中心化集群做维度补充逻辑
-            return {}
-
         bcs_client = BcsKubeClient(bcs_cluster_id)
         svc = bcs_client.client_request(
             bcs_client.core_api.list_namespaced_service,
-            namespace=BkCollectorClusterConfig.bk_collector_namespace(bcs_cluster_id),
+            namespace=namespace,
             label_selector="app.kubernetes.io/bk-component=bkmonitor-operator",
         )
         count = len(svc.items)
@@ -427,6 +433,7 @@ class PlatformConfig(BkCollectorConfig):
             "nodes": [{"bk_host_id": bk_host_id} for bk_host_id in bk_host_ids],
         }
         subscription_params = {
+            "bk_tenant_id": bk_tenant_id,
             "scope": scope,
             "steps": [
                 {
@@ -486,7 +493,7 @@ class PlatformConfig(BkCollectorConfig):
                 logger.exception(f"create apm platform config subscription error{e}, params:{subscription_params}")
 
     @classmethod
-    def deploy_to_k8s(cls, cluster_id, platform_config):
+    def deploy_to_k8s(cls, cluster_id: str, namespace: str, platform_config: str):
         secret_info_platform = BkCollectorComp.get_secrets_config_map_by_protocol(cluster_id, "platform") or {}
         secret_name = secret_info_platform.get("secret_name_tpl")
         secret_data_key = secret_info_platform.get("secret_data_key_tpl")
@@ -498,7 +505,6 @@ class PlatformConfig(BkCollectorConfig):
         b64_content = base64.b64encode(gzip_content).decode()
 
         bcs_client = BcsKubeClient(cluster_id)
-        namespace = BkCollectorClusterConfig.bk_collector_namespace(cluster_id)
         secret_label_selector = (
             f"{BkCollectorComp.SECRET_COMMON_LABELS},{secret_info_platform.get('secret_extra_label')}"
         )

@@ -30,14 +30,15 @@ import * as authorityMap from '@/common/authority-map';
 import useRoute from '@/hooks/use-route';
 import useRouter from '@/hooks/use-router';
 import useStore from '@/hooks/use-store';
+import { getExternalDefaultRoute, routeNameToExternalMenu } from '@/router/helper';
 import reportLogStore from '@/store/modules/report-log';
 import { BK_LOG_STORAGE } from '@/store/store.type';
 
 export function useNavMenu(options: {
-  t: (msg: string) => string;
+  t: (_msg: string) => string;
   bkInfo: any;
   http: any;
-  emit?: (event: string, ...args: any[]) => void;
+  emit?: (_event: string, ..._args: any[]) => void;
 }) {
   const { t, bkInfo } = options;
   const store = useStore();
@@ -91,29 +92,38 @@ export function useNavMenu(options: {
   const updateExternalMenuBySpace = (newSpaceUid: string) => {
     const list: string[] = [];
     const curSpace = (mySpaceList.value || []).find((item: any) => item.space_uid === newSpaceUid);
-    for (const permission of curSpace?.external_permission || []) {
+    const externalPermissions: string[] = curSpace?.external_permission || [];
+    for (const permission of externalPermissions) {
       if (permission === 'log_search') {
         list.push('retrieve');
       } else if (permission === 'log_extract') {
         list.push('manage');
+      } else if (permission === 'client_log') {
+        list.push('client-log-search');
       }
     }
-    store.commit('updateState', { externalMenu: list });
+    // 聚类配置等功能级授权项不对应菜单，需要保留原始授权项供页面内判断
+    store.commit('updateState', { externalMenu: list, externalPermissions });
   };
 
   const setRouter = async (newSpaceUid: string) => {
     if (isExternal.value) {
       updateExternalMenuBySpace(newSpaceUid);
     }
-    if (isExternal.value && route.name === 'retrieve' && !externalMenu.value.includes('retrieve')) {
-      router.push({ name: 'extract-home' });
-    } else if (
-      isExternal.value &&
-      ['extract-home', 'extract-create', 'extract-clone'].includes(route.name as string) &&
-      !externalMenu.value.includes('manage')
-    ) {
-      router.push({ name: 'retrieve' });
-    } else if (route.name !== 'retrieve' && !isFirstLoad.value) {
+    // 空间解析失败的恢复跳转由空间选择器统一处理，避免覆盖原始 IndexId。
+    if (store.state.spaceResolveFailed) {
+      return;
+    }
+    // 外部版：当前路由在新业务不可用时，重定向到第一个可用路由
+    if (isExternal.value) {
+      const currentMenu = routeNameToExternalMenu(route.name as string);
+      if (currentMenu !== null && !externalMenu.value.includes(currentMenu)) {
+        const targetRoute = getExternalDefaultRoute(externalMenu.value);
+        router.push({ name: targetRoute === 'manage' ? 'extract-home' : targetRoute });
+        return;
+      }
+    }
+    if (route.name !== 'retrieve' && !isFirstLoad.value) {
       const { name, meta, params, query } = route as any;
       const routingHop = meta.needBack && !isFirstLoad.value ? meta.backName : name ? name : 'retrieve';
       const newQuery = {
@@ -154,7 +164,6 @@ export function useNavMenu(options: {
 
     // 首次加载应用路由触发上报还未获取到 spaceUid ，需手动执行上报
     if (store.state.isAppFirstLoad && newSpaceUid) {
-      store.state.isAppFirstLoad = false;
       const { name, meta } = route as any;
       reportLogStore.reportRouteLog({
         route_id: name,

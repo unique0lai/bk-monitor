@@ -74,22 +74,15 @@ export interface IAssitantInstance {
   sendMessage: (_msg: string) => void;
   setCiteText: (_text: string) => void;
   show: () => void;
-  updateOptions: (
-    _options: Partial<IAssitantOptions>,
-    _type: IAssitantOptionsType,
-  ) => Promise<boolean>;
+  updateOptions: (_options: Partial<IAssitantOptions>, _type: IAssitantOptionsType) => Promise<boolean>;
   getOptions: () => IAssitantOptions;
   isShown: () => boolean;
-  setPosition: (
-    _x?: number,
-    _y?: number,
-    _width?: number,
-    _height?: number,
-  ) => void;
+  setPosition: (_x?: number, _y?: number, _width?: number, _height?: number) => void;
   queryStringShowAiAssistant: (_args: IQueryStringSendData) => void;
 }
 
 export default defineComponent({
+  name: 'BklogAiAssitant',
   setup(_props, { expose, emit }) {
     const aiBlueking = ref<InstanceType<typeof AIBlueking> | null>(null);
 
@@ -118,9 +111,50 @@ export default defineComponent({
     const apiUrl = `${window.AJAX_URL_PREFIX || '/api/v1'}ai_assistant`;
     const shortcuts = ref<any[]>([...AI_BLUEKING_SHORTCUTS]);
 
-    // 暂停聊天
-    const handleStop = () => {
-      aiBlueking.value?.handleStop();
+    /** ai-blueking 内部 stop/abort 的已知噪音，不影响业务继续打开助手 */
+    const isIgnorableAiBluekingError = (error: unknown) => {
+      if (!error) {
+        return false;
+      }
+      const name = (error as { name?: string }).name;
+      if (name === 'AbortError') {
+        return true;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      return (
+        message.includes('signal is aborted') ||
+        message.includes("Cannot read properties of undefined (reading 'content')")
+      );
+    };
+
+    // 暂停聊天。ai-blueking 在无有效流式消息时调用 stop 可能触发 AbortError / 空 content，业务侧兜底。
+    const handleStop = async () => {
+      try {
+        await aiBlueking.value?.handleStop?.();
+      } catch (error) {
+        if (!isIgnorableAiBluekingError(error)) {
+          console.warn('[bklog-ai-assistant] stop failed', error);
+        }
+      }
+    };
+
+    /**
+     * 打开面板。handleShow 内部会对当前 session 执行 stop/abort，
+     * 无进行中请求时也会抛出 AbortError，需吞掉后继续后续 shortcut。
+     */
+    const safeHandleShow = () => {
+      try {
+        return Promise.resolve(aiBlueking.value?.handleShow(undefined, { isTemporary: true })).catch(error => {
+          if (!isIgnorableAiBluekingError(error)) {
+            throw error;
+          }
+        });
+      } catch (error) {
+        if (!isIgnorableAiBluekingError(error)) {
+          throw error;
+        }
+        return Promise.resolve();
+      }
     };
 
     const hiddenAiAssistant = () => {
@@ -145,14 +179,12 @@ export default defineComponent({
     const setAiStart = (sendMsg = false, args: IRowSendData) => {
       chatid = random(10);
       if (sendMsg) {
-        aiBlueking.value?.handleShow(undefined, { isTemporary: true }).then(() => {
+        safeHandleShow().then(() => {
           const shortcut = structuredClone(AI_BLUEKING_SHORTCUTS[0]);
-          shortcut.components.forEach((comp) => {
+          shortcut.components.forEach(comp => {
             const value = args[comp.key];
             if (value) {
-              comp.default = typeof value === 'object'
-                ? JSON.stringify(value).replace(/<\/?mark>/gim, '')
-                : value;
+              comp.default = typeof value === 'object' ? JSON.stringify(value).replace(/<\/?mark>/gim, '') : value;
             }
           });
 
@@ -166,8 +198,7 @@ export default defineComponent({
 
     const showAiAssistant = (sendMsg = false, args: IRowSendData) => {
       if (isShow.value && chatid) {
-        handleStop();
-        setTimeout(() => {
+        handleStop().finally(() => {
           setAiStart(sendMsg, args);
         });
         return;
@@ -186,7 +217,10 @@ export default defineComponent({
      */
     const sendMessage = (msg: string) => {
       if (!isShow.value) {
-        aiBlueking.value?.handleShow(undefined, { isTemporary: true });
+        safeHandleShow().then(() => {
+          aiBlueking.value?.handleSendMessage(msg);
+        });
+        return;
       }
 
       aiBlueking.value?.handleSendMessage(msg);
@@ -198,7 +232,10 @@ export default defineComponent({
      */
     const setCiteText = (text: string) => {
       if (!isShow.value) {
-        aiBlueking.value?.handleShow(undefined, { isTemporary: true });
+        safeHandleShow().then(() => {
+          aiBlueking.value?.setCiteText(text);
+        });
+        return;
       }
 
       aiBlueking.value?.setCiteText(text);
@@ -214,10 +251,7 @@ export default defineComponent({
      * @param type 类型 log_analysis 日志解读，query_string_generate 自然语言转查询语句
      * @returns
      */
-    const updateOptions = (
-      options: Partial<IAssitantOptions> = {},
-      type: IAssitantOptionsType = 'log_analysis',
-    ) => {
+    const updateOptions = (options: Partial<IAssitantOptions> = {}, type: IAssitantOptionsType = 'log_analysis') => {
       if (type === 'query_string_generate') {
         shortcuts.value = [...AI_BLUEKING_QUERY_STRING];
       } else {
@@ -236,11 +270,12 @@ export default defineComponent({
       isUpdated.value = false;
       isShow.value = false;
 
-      return new Promise((resolve) => {
+      return new Promise(resolve => {
         aiAssitantOptions.value = newOptions;
+        // 等 AIBlueking 销毁后再挂载，并再等一帧确保 ref 可用
         nextTick(() => {
           isUpdated.value = true;
-          resolve(true);
+          nextTick(() => resolve(true));
         });
       });
     };
@@ -252,12 +287,7 @@ export default defineComponent({
      * @param width
      * @param height
      */
-    const setPosition = (
-      x?: number,
-      y?: number,
-      width?: number,
-      height?: number,
-    ) => {
+    const setPosition = (x?: number, y?: number, width?: number, height?: number) => {
       if (x !== undefined && y !== undefined) {
         aiBlueking.value?.updatePosition(x, y);
         aiAssitantOptions.value.defaultLeft = x;
@@ -276,14 +306,12 @@ export default defineComponent({
      * @param args
      */
     const queryStringShowAiAssistant = (args: IQueryStringSendData) => {
-      aiBlueking.value?.handleShow(undefined, { isTemporary: true }).then(() => {
+      safeHandleShow().then(() => {
         const shortcut = structuredClone(AI_BLUEKING_QUERY_STRING[0]);
-        shortcut.components.forEach((comp) => {
+        shortcut.components.forEach(comp => {
           const value = args[comp.key];
           if (value) {
-            comp.default = typeof value === 'object'
-              ? JSON.stringify(value).replace(/<\/?mark>/gim, '')
-              : value;
+            comp.default = typeof value === 'object' ? JSON.stringify(value).replace(/<\/?mark>/gim, '') : value;
           }
         });
 
@@ -303,7 +331,7 @@ export default defineComponent({
       close: hiddenAiAssistant,
       sendMessage,
       setCiteText,
-      show: () => aiBlueking.value?.handleShow(undefined, { isTemporary: true }),
+      show: () => safeHandleShow(),
       updateOptions,
       getOptions: () => aiAssitantOptions.value,
       isShown: () => isShow.value,
@@ -319,7 +347,7 @@ export default defineComponent({
           <AIBlueking
             ref={aiBlueking}
             requestOptions={{
-              beforeRequest: (data) => {
+              beforeRequest: data => {
                 return {
                   ...data,
                   headers: {

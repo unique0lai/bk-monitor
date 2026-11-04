@@ -12,16 +12,16 @@ import functools
 import json
 import logging
 import random
+import secrets
 import time
 
-from bk_monitor_base.infras.third_party_api.user.api import get_tenant_admin_username
 import jwt
 from blueapps.account.models import User
 from django.conf import settings
 from django.contrib import auth
 from django.contrib.auth.backends import ModelBackend
 from django.core.cache import caches
-from django.http import HttpRequest, HttpResponseForbidden
+from django.http import HttpRequest, HttpResponse, HttpResponseForbidden, JsonResponse
 from django.utils.deprecation import MiddlewareMixin
 from rest_framework.authentication import SessionAuthentication
 
@@ -31,12 +31,14 @@ from constants.common import DEFAULT_TENANT_ID
 from core.drf_resource import api
 from core.errors.api import BKAPIError
 from core.prometheus import metrics
+from kernel_api.unified_mcp.permissions import log_mcp_event, log_mcp_tool_event, log_mcp_usage_event
 
 logger = logging.getLogger(__name__)
 
-APP_CODE_TOKENS: dict[str, list[str]] = {}
-APP_CODE_UPDATE_TIME = None
+APP_CODE_TOKENS: dict[str, dict[str, list[str]]] = {}
+APP_CODE_UPDATE_TIME: dict[str, float] = {}
 APP_CODE_TOKEN_CACHE_TIME = 300 + random.randint(0, 100)
+MCP_USAGE_SCHEMA_VERSION = 1
 
 OPENCLAW_RECOVERING_MCP_TOOLS = {
     "search_openclaw_spans",
@@ -56,22 +58,32 @@ def is_match_api_token(request, bk_tenant_id: str, app_code: str) -> bool:
     global APP_CODE_TOKENS
     global APP_CODE_UPDATE_TIME
 
-    # 更新缓存
-    if APP_CODE_UPDATE_TIME is None or time.time() - APP_CODE_UPDATE_TIME > APP_CODE_TOKEN_CACHE_TIME:
+    tenant_update_time = APP_CODE_UPDATE_TIME.get(bk_tenant_id)
+
+    # 按租户更新缓存，避免一个租户的应用授权被其他租户复用。
+    if (
+        bk_tenant_id not in APP_CODE_TOKENS
+        or tenant_update_time is None
+        or time.time() - tenant_update_time > APP_CODE_TOKEN_CACHE_TIME
+    ):
         result = {}
         records = ApiAuthToken.objects.filter(type=AuthType.API, bk_tenant_id=bk_tenant_id)
         for record in records:
-            if not record.params.get("app_code"):
+            params = record.params if isinstance(record.params, dict) else {}
+            record_app_code = params.get("app_code")
+            if not isinstance(record_app_code, str) or not record_app_code:
                 continue
-            result[record.params["app_code"]] = record.namespaces
-        APP_CODE_UPDATE_TIME = time.time()
-        APP_CODE_TOKENS = result
+            result[record_app_code] = record.namespaces
+        APP_CODE_UPDATE_TIME[bk_tenant_id] = time.time()
+        APP_CODE_TOKENS[bk_tenant_id] = result
+
+    tenant_tokens = APP_CODE_TOKENS[bk_tenant_id]
 
     # 如果app_code没有对应的token，直接放行
-    if app_code not in APP_CODE_TOKENS:
+    if app_code not in tenant_tokens:
         return True
 
-    namespaces = APP_CODE_TOKENS[app_code]
+    namespaces = tenant_tokens[app_code]
 
     # 校验命名空间
     if "biz#all" in namespaces or f"biz#{request.biz_id}" in namespaces:
@@ -255,10 +267,94 @@ class AuthenticationMiddleware(MiddlewareMixin):
         从请求路径中提取工具名称
         路径格式: /xxx/xx/xxx/tool_name/ -> 提取 tool_name
         """
+        if not path:
+            return ""
+        # 防御 nginx rewrite 等场景下 path 携带 query string / fragment 的情况
+        path = path.split("?", 1)[0].split("#", 1)[0]
         # 去除末尾的斜杠，然后按斜杠分割，取最后一个非空部分
         path = path.rstrip("/")
         parts = path.split("/")
-        return parts[-1] if parts else ""
+        return parts[-1].removesuffix(".json") if parts else ""
+
+    def process_response(self, request, response):
+        """闭合 MCP Trace，并输出一条不含业务正文的运营审计日志。"""
+        operation = getattr(request, "unified_mcp_operation", "")
+        usage_started_at = getattr(request, "mcp_usage_started_at", None)
+        if not operation and usage_started_at is None:
+            return response
+
+        status_code = getattr(response, "status_code", 0)
+        response_data = getattr(response, "data", None)
+        # API 异常由 exception handler 在 request 上留下服务端状态；兼容仍保留 data 的响应，
+        # 但不解析已渲染正文，避免为了审计复制或记录业务响应。
+        application_failed = getattr(request, "unified_mcp_response_failed", False) or (
+            isinstance(response_data, dict) and response_data.get("result") is False
+        )
+        failed = status_code >= 400 or application_failed
+        result_code = getattr(request, "unified_mcp_result_code", None)
+        if result_code is None and isinstance(response_data, dict) and response_data.get("result") is False:
+            result_code = response_data.get("code")
+
+        if operation:
+            started_at = getattr(request, "unified_mcp_started_at", None)
+            fields = {
+                "operation": operation,
+                "tool": getattr(request, "unified_mcp_tool", ""),
+                "decision": "failed" if failed else "succeeded",
+                "status_code": status_code,
+                "duration_ms": round((time.monotonic() - started_at) * 1000) if started_at is not None else None,
+            }
+            if type(result_code) is int:
+                fields["result_code"] = result_code
+            log_mcp_tool_event(
+                "response_finished",
+                request,
+                level=logging.WARNING if failed else logging.INFO,
+                **fields,
+            )
+
+        if usage_started_at is not None:
+            authorization_source = getattr(request, "mcp_permission_source", "none")
+            checked_action_id = (
+                "" if authorization_source == "exempt" else getattr(request, "mcp_permission_action", "")
+            )
+            action_id = checked_action_id if authorization_source in {"native", "legacy", "identity_scoped"} else ""
+            bk_biz_id = getattr(request, "biz_id", None)
+            fields = {
+                "usage_schema_version": MCP_USAGE_SCHEMA_VERSION,
+                "request_event_id": getattr(request, "mcp_usage_event_id", ""),
+                "username": getattr(
+                    request,
+                    "mcp_usage_username",
+                    getattr(getattr(request, "user", None), "username", ""),
+                ),
+                "request_from": request.META.get("HTTP_X_BK_REQUEST_FROM", ""),
+                "request_source": request.META.get("HTTP_X_BK_REQUEST_SOURCE", ""),
+                "app_code": getattr(request, "mcp_usage_app_code", ""),
+                "mcp_server_name": request.META.get("HTTP_X_BKAPI_MCP_SERVER_NAME", ""),
+                "entry_point": getattr(request, "mcp_usage_entry_point", ""),
+                "operation": getattr(request, "mcp_usage_operation", ""),
+                "tool": getattr(request, "mcp_usage_tool", ""),
+                "target_tool": getattr(request, "mcp_usage_target_tool", ""),
+                "action_id": action_id,
+                "checked_action_id": checked_action_id,
+                "authorization_source": authorization_source,
+                "bk_biz_id": str(bk_biz_id) if bk_biz_id not in (None, "") else None,
+                "x_request_id": request.META.get("HTTP_X_REQUEST_ID", ""),
+                "gateway_request_id": request.META.get("HTTP_X_BKAPI_REQUEST_ID", ""),
+                "decision": "failed" if failed else "succeeded",
+                "status_code": status_code,
+                "duration_ms": round((time.monotonic() - usage_started_at) * 1000),
+            }
+            if type(result_code) is int:
+                fields["result_code"] = result_code
+            log_mcp_usage_event(
+                "request_finished",
+                request,
+                level=logging.WARNING if failed else logging.INFO,
+                **fields,
+            )
+        return response
 
     def _report_mcp_metric(self, tool_name, bk_biz_id, username, status, permission_action, mcp_server_name):
         """
@@ -287,9 +383,90 @@ class AuthenticationMiddleware(MiddlewareMixin):
             # 立即推送指标
             metrics.report_all()
         except Exception as err:  # pylint: disable=broad-except
-            logger.exception(f"MCPAuthentication: Failed to report mcp_requests metrics, error: {err}")
+            log_mcp_event("metrics_report_failed", level=logging.WARNING, error_type=type(err).__name__)
 
-    def _handle_mcp_auth(self, request, username=None):
+    def _handle_native_mcp(self, request, tool, tool_args, unified=False):
+        """复用目录工具的执行逻辑，并按 standalone／Unified 入口渲染响应。"""
+        request.mcp_usage_tool = tool.name
+        from rest_framework.exceptions import APIException, ValidationError
+        from rest_framework.response import Response
+
+        from bkmonitor.views.renderers import MonitorJSONRenderer
+        from kernel_api.adapters import ApiRenderer
+        from kernel_api.unified_mcp.permissions import _principal, execute_native_tool
+
+        status, status_code, error_type = "error", 503, ""
+        try:
+            if not unified:
+                tool_args = tool.normalize_standalone_args(tool_args)
+            if tool.native_permission:
+                data = execute_native_tool(tool, tool_args, request)
+            else:
+                # Reuse Unified's schema and complete MCP action checks when SaaS fallback is disabled.
+                from kernel_api.resource.unified_mcp import ExecuteToolResource
+
+                _principal(request, tool_args.get(tool.resource_arg))
+                request.unified_mcp_permission_checked = False
+                request.skip_check = False
+                result = ExecuteToolResource().perform_request({"tool_name": tool.name, "tool_args": tool_args})
+                data = result["data"]
+                request.mcp_permission_source = "exempt" if tool.permission_exempt else "legacy"
+                request.mcp_permission_action = "" if tool.permission_exempt else tool.iam_action
+            if unified:
+                data = {"status": "success", "tool_name": tool.name, "data": data, "meta": {"truncated": False}}
+            renderer = (
+                MonitorJSONRenderer()
+                if not unified and tool.backend_path.startswith("/api/v3/meta/")
+                else ApiRenderer()
+            )
+            content = renderer.render(data, renderer_context={"request": request, "response": Response()})
+            status, status_code = "accessed", 200
+            return HttpResponse(content, content_type="application/json")
+        except APIException as exc:
+            status_code, error_type = exc.status_code, type(exc).__name__
+            status = "permission_denied" if exc.status_code == 403 else "error"
+            message = "MCP permission or execution rejected"
+            if isinstance(exc, ValidationError):
+                status, message = "invalid_params", "MCP request validation failed"
+            return JsonResponse(
+                {
+                    "result": False,
+                    "code": exc.status_code,
+                    "message": message,
+                    "data": exc.detail,
+                },
+                status=exc.status_code,
+            )
+        except Exception as exc:
+            error_type = type(exc).__name__
+            return JsonResponse(
+                {"result": False, "code": 503, "message": "MCP request failed; no data returned"},
+                status=503,
+            )
+        finally:
+            log_mcp_event(
+                "response_finished",
+                request,
+                level=logging.INFO if status_code < 400 else logging.WARNING,
+                tool=tool.name,
+                entry_point="unified" if unified else "standalone",
+                status_code=status_code,
+                error_type=error_type,
+                bk_biz_id=getattr(request, "biz_id", None),
+                authorization_source=getattr(request, "mcp_permission_source", "none"),
+                action_id=getattr(request, "mcp_permission_action", ""),
+            )
+            resolved_permission = tool.resolve_native_permission(tool_args if isinstance(tool_args, dict) else {}) or {}
+            self._report_mcp_metric(
+                tool.name,
+                getattr(request, "biz_id", None),
+                getattr(getattr(request, "user", None), "username", ""),
+                status,
+                getattr(request, "mcp_permission_action", "") or resolved_permission.get("action_id", tool.iam_action),
+                request.META.get("HTTP_X_BKAPI_MCP_SERVER_NAME", ""),
+            )
+
+    def _handle_mcp_auth(self, request, username=None, resolved_tool=None):
         """
         处理MCP权限校验
         MCP请求已经通过API网关认证，这里只需要额外的MCP权限校验
@@ -297,22 +474,53 @@ class AuthenticationMiddleware(MiddlewareMixin):
         # 导入放在这里避免循环依赖
         from bkmonitor.iam.action import get_action_by_id
         from bkmonitor.iam.drf import MCPPermission
-        from constants.mcp import MCP_SERVER_NAME_TO_PERMISSION_ACTION
-
-        logger.info("MCPAuthentication: Handling MCP authentication")
+        from constants.mcp import get_mcp_permission_action_by_server_name
+        from kernel_api.unified_mcp.registry import is_unified_diagnostic_route, native_tool_names
 
         # 提取MCP服务名称（用于指标上报）
+        if not getattr(request, "mcp_usage_event_id", ""):
+            request.mcp_usage_event_id = secrets.token_hex(16)
         mcp_server_name = request.META.get("HTTP_X_BKAPI_MCP_SERVER_NAME", "")
-
-        # 提取工具名称，检查是否在豁免白名单中
         tool_name = self.extract_tool_name_from_path(request.path)
+        is_unified_mcp_path = "/unified_mcp/" in request.path
+        request.mcp_usage_started_at = time.monotonic()
+        request.mcp_usage_entry_point = "unified" if is_unified_mcp_path else "standalone"
+        request.mcp_usage_operation = tool_name
+        request.mcp_usage_tool = tool_name
+        request.mcp_usage_target_tool = ""
+        request.mcp_permission_action = ""
+        request.mcp_permission_source = "none"
+        is_unified_execute_tool = tool_name == "execute_tool" and is_unified_mcp_path
+        if is_unified_mcp_path:
+            # 只在 request 对象上保存 operation、tool 和起始时间，供最终响应日志闭环。
+            request.unified_mcp_operation = tool_name
+            request.unified_mcp_tool = ""
+            request.unified_mcp_started_at = time.monotonic()
+        is_unified_facade_tool = is_unified_diagnostic_route(request.method, request.path)
+        log_mcp_event("auth_begin", request, tool=tool_name, mcp_server=mcp_server_name, username=username)
 
         openclaw_mcp_server_name = getattr(settings, "OPENCLAW_RECOVERING_MCP_SERVER_NAME", "")
         if openclaw_mcp_server_name and mcp_server_name == openclaw_mcp_server_name:
             if not username:
+                log_mcp_event(
+                    "openclaw_denied",
+                    request,
+                    level=logging.WARNING,
+                    reason="missing_username",
+                    mcp_server=mcp_server_name,
+                )
                 return HttpResponseForbidden("Missing username in request")
 
             if tool_name not in OPENCLAW_RECOVERING_MCP_TOOLS:
+                log_mcp_event(
+                    "openclaw_denied",
+                    request,
+                    level=logging.WARNING,
+                    reason="invalid_tool",
+                    tool=tool_name,
+                    mcp_server=mcp_server_name,
+                    username=username,
+                )
                 return HttpResponseForbidden("Invalid OpenClaw MCP tool")
 
             # OpenClaw 数据统一上报到一个业务，入口只固定业务上下文；
@@ -320,6 +528,16 @@ class AuthenticationMiddleware(MiddlewareMixin):
             request.biz_id = int(getattr(settings, "OPENCLAW_RECOVERING_BK_BIZ_ID", 0) or 0)
             request.skip_check = True
             request.openclaw_identity_scoped = True
+            request.mcp_permission_action = "identity_scoped"
+            request.mcp_permission_source = "identity_scoped"
+            log_mcp_event(
+                "openclaw_allowed",
+                request,
+                tool=tool_name,
+                mcp_server=mcp_server_name,
+                username=username,
+                bk_biz_id=request.biz_id,
+            )
             self._report_mcp_metric(
                 tool_name=tool_name,
                 bk_biz_id=request.biz_id,
@@ -331,24 +549,160 @@ class AuthenticationMiddleware(MiddlewareMixin):
             return None
 
         # 获取权限动作ID
-        # 优先从 MCP Server Name 映射中获取，如果没有则从旧的请求头中获取
+        # 普通 MCP 仍按 Server Name 映射；统一 MCP 的 execute_tool 按内层工具目录动态路由。
         permission_action_id = ""
+        permission_action_source = ""
+        mcp_request_data = {}
+        if request.method == "POST":
+            try:
+                body = request.body.decode("utf-8")
+                if body:
+                    parsed_data = json.loads(body)
+                    if isinstance(parsed_data, dict):
+                        mcp_request_data = parsed_data
+                    else:
+                        log_mcp_event(
+                            "mcp_json_body_invalid",
+                            request,
+                            level=logging.WARNING,
+                            expected="object",
+                            actual=type(parsed_data).__name__,
+                        )
+            except Exception as e:  # pylint: disable=broad-except
+                log_mcp_event("mcp_json_body_parse_failed", request, level=logging.WARNING, error_type=type(e).__name__)
 
-        if mcp_server_name:
-            # 从映射表中获取对应的权限动作ID
-            permission_action_id = MCP_SERVER_NAME_TO_PERMISSION_ACTION.get(mcp_server_name, "")
-            logger.info(
-                f"MCPAuthentication: MCP Server Name: {mcp_server_name}, mapped permission_action_id: {permission_action_id}"
+        if is_unified_mcp_path:
+            # 仅记录内层工具名，禁止把 tool_args 写入统一日志。
+            nested_tool_name = mcp_request_data.get("tool_name", "")
+            request.unified_mcp_tool = nested_tool_name if isinstance(nested_tool_name, str) else ""
+            if is_unified_execute_tool:
+                request.mcp_usage_tool = request.unified_mcp_tool or tool_name
+            else:
+                request.mcp_usage_tool = tool_name
+                request.mcp_usage_target_tool = request.unified_mcp_tool
+            log_mcp_tool_event(
+                "request_received",
+                request,
+                operation=tool_name,
+                tool=request.unified_mcp_tool,
+                mcp_server=mcp_server_name,
+                content_type=request.content_type,
             )
 
-        # 如果没有从 MCP Server Name 获取到，则尝试从旧的请求头中获取
+        if resolved_tool is not None:
+            # The middleware resolved this server-owned ToolDefinition after gateway authentication.
+            tool_args = request.GET.dict() if request.method in {"GET", "HEAD"} else mcp_request_data
+            return self._handle_native_mcp(request, resolved_tool, tool_args)
+
+        if is_unified_execute_tool:
+            from kernel_api.unified_mcp.registry import get_tool_registry
+
+            nested_tool_name = request.unified_mcp_tool
+            try:
+                unified_tool = get_tool_registry().get(nested_tool_name)
+            except KeyError:
+                log_mcp_event(
+                    "unified_tool_denied",
+                    request,
+                    level=logging.WARNING,
+                    reason="unknown_tool",
+                    tool=nested_tool_name,
+                    username=username,
+                )
+                return HttpResponseForbidden("Invalid unified MCP tool")
+            except Exception as exc:
+                log_mcp_event("routing_failed", request, level=logging.WARNING, error_type=type(exc).__name__)
+                return JsonResponse({"result": False, "message": "MCP routing is unavailable"}, status=503)
+            if unified_tool.permission_exempt:
+                log_mcp_event("tool_exempt", request, tool=nested_tool_name, permission_action="")
+                request.skip_check = True
+                request.mcp_permission_source = "exempt"
+                request.unified_mcp_permission_checked = True
+                self._report_mcp_metric(
+                    tool_name=nested_tool_name,
+                    bk_biz_id=None,
+                    username=username,
+                    status="exempt",
+                    permission_action="",
+                    mcp_server_name=mcp_server_name,
+                )
+                return None
+            permission_action_id = unified_tool.iam_action
+            permission_action_source = "unified_tool_registry"
+        else:
+            from kernel_api.unified_mcp.registry import get_tool_registry
+
+            try:
+                standalone_tool = get_tool_registry().get_by_backend(request.method, request.path)
+            except Exception as exc:
+                log_mcp_event("routing_failed", request, level=logging.WARNING, error_type=type(exc).__name__)
+                return JsonResponse({"result": False, "message": "MCP routing is unavailable"}, status=503)
+            if standalone_tool is not None:
+                permission_action_id = standalone_tool.iam_action
+                permission_action_source = "tool_registry"
+
+        if not permission_action_id and mcp_server_name:
+            permission_action_id = get_mcp_permission_action_by_server_name(mcp_server_name)
+            if permission_action_id:
+                permission_action_source = "server_name_map"
+
+        # 原生 standalone 与 Unified 共用同一个 ToolDefinition 和执行器；
+        # 此处直接返回已渲染响应，禁止旧 View 再执行一次。
+        native_tool = None
+        try:
+            if native_tool_names():
+                from kernel_api.unified_mcp.registry import get_tool_registry
+
+                native_tool = (
+                    unified_tool
+                    if is_unified_execute_tool
+                    else get_tool_registry().get_by_backend(request.method, request.path)
+                )
+        except Exception as exc:
+            log_mcp_event("routing_failed", request, level=logging.WARNING, error_type=type(exc).__name__)
+            return JsonResponse({"result": False, "message": "MCP routing is unavailable"}, status=503)
+        if native_tool and native_tool.native_permission:
+            tool_args = (
+                mcp_request_data.get("tool_args")
+                if is_unified_execute_tool
+                else request.GET.dict()
+                if request.method == "GET"
+                else mcp_request_data
+            )
+            return self._handle_native_mcp(request, native_tool, tool_args, unified=is_unified_execute_tool)
+
+        # 如果没有从 MCP Server Name / 统一工具目录获取到，则尝试旧请求头。
         if not permission_action_id:
             permission_action_id = request.META.get("HTTP_X_BKAPI_PERMISSION_ACTION", "")
-            logger.info(f"MCPAuthentication: Using permission_action_id from header: {permission_action_id}")
+            if permission_action_id:
+                permission_action_source = "permission_action_header"
 
-        if tool_name and tool_name in settings.MCP_PERMISSION_EXEMPT_TOOLS:
-            logger.info(f"MCPAuthentication: Tool '{tool_name}' is in exempt list, skipping permission check")
+        request.mcp_permission_action = permission_action_id
+        log_mcp_event(
+            "permission_action_resolved",
+            request,
+            mcp_server=mcp_server_name,
+            permission_action=permission_action_id,
+            source=permission_action_source or "none",
+        )
+
+        if is_unified_facade_tool:
+            from rest_framework.exceptions import PermissionDenied
+
+            from kernel_api.unified_mcp.permissions import _principal
+
+            # 诊断免除的是单一业务 Action 的前置检查，不免除网关用户和租户认证。
+            # Resource 内仍强制检查权限，预检结果不能授权后续业务请求。
+            try:
+                _principal(request)
+            except PermissionDenied as exc:
+                log_mcp_event("gateway_auth_denied", request, level=logging.WARNING, reason="invalid_principal")
+                return JsonResponse({"result": False, "message": str(exc.detail)}, status=403)
+
+        if is_unified_facade_tool or (tool_name and tool_name in settings.MCP_PERMISSION_EXEMPT_TOOLS):
+            log_mcp_event("tool_exempt", request, tool=tool_name, permission_action=permission_action_id)
             request.skip_check = True
+            request.mcp_permission_source = "exempt"
             # 上报豁免工具的调用指标
             self._report_mcp_metric(
                 tool_name=tool_name,
@@ -369,22 +723,37 @@ class AuthenticationMiddleware(MiddlewareMixin):
             try:
                 bk_biz_id = request.POST.get("bk_biz_id")
             except Exception as e:  # pylint: disable=broad-except
-                logger.warning("MCPAuthentication: Failed to get bk_biz_id from POST form data, error: %s", e)
+                log_mcp_event(
+                    "bk_biz_id_parse_failed",
+                    request,
+                    level=logging.WARNING,
+                    source="post_form",
+                    error_type=type(e).__name__,
+                )
 
-            # 如果表单数据中没有，尝试从JSON body中获取
+            # 如果表单数据中没有，尝试从 JSON body 中获取。
             if not bk_biz_id:
-                try:
-                    body = request.body.decode("utf-8")
-                    logger.info(f"MCPAuthentication: request post body: {body}")
-                    if body:
-                        data = json.loads(body)
-                        bk_biz_id = data.get("bk_biz_id")
-                        logger.warning(f"MCPAuthentication: Got bk_biz_id from JSON body: {bk_biz_id}")
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning("MCPAuthentication: Failed to get bk_biz_id from JSON body, error: %s", e)
+                if is_unified_execute_tool:
+                    tool_args = mcp_request_data.get("tool_args") or {}
+                    if not isinstance(tool_args, dict):
+                        log_mcp_event(
+                            "unified_tool_denied",
+                            request,
+                            level=logging.WARNING,
+                            reason="invalid_tool_args",
+                            username=username,
+                        )
+                        return HttpResponseForbidden("Invalid unified MCP tool_args")
+                    bk_biz_id = tool_args.get(getattr(unified_tool, "resource_arg", "bk_biz_id"))
+                    source = "unified_tool_args"
+                else:
+                    bk_biz_id = mcp_request_data.get("bk_biz_id")
+                    source = "json_body"
+                if bk_biz_id:
+                    log_mcp_event("bk_biz_id_resolved", request, source=source, bk_biz_id=bk_biz_id)
 
         if not bk_biz_id:
-            logger.error("MCPAuthentication: Missing bk_biz_id in request parameters")
+            log_mcp_event("bk_biz_id_missing", request, level=logging.ERROR, tool=tool_name, username=username)
             # 上报参数缺失的调用指标
             self._report_mcp_metric(
                 tool_name=tool_name,
@@ -399,7 +768,7 @@ class AuthenticationMiddleware(MiddlewareMixin):
         try:
             request.biz_id = int(bk_biz_id)
         except (ValueError, TypeError):
-            logger.error(f"MCPAuthentication: Invalid bk_biz_id format: {bk_biz_id}")
+            log_mcp_event("bk_biz_id_invalid", request, level=logging.ERROR, bk_biz_id=bk_biz_id, username=username)
             # 上报参数格式错误的调用指标
             self._report_mcp_metric(
                 tool_name=tool_name,
@@ -411,8 +780,6 @@ class AuthenticationMiddleware(MiddlewareMixin):
             )
             return HttpResponseForbidden(f"Invalid bk_biz_id format: {bk_biz_id}")
 
-        logger.info(f"MCPAuthentication: Permission action from header: {permission_action_id}")
-
         # 使用 MCPPermission 进行权限校验
         try:
             # 根据请求头动态获取权限动作
@@ -420,17 +787,33 @@ class AuthenticationMiddleware(MiddlewareMixin):
             if permission_action_id:
                 try:
                     action = get_action_by_id(permission_action_id)
-                    logger.info(f"MCPAuthentication: Using action: {action.id} - {action.name}")
+                    log_mcp_event("iam_action_resolved", request, permission_action=action.id)
                 except Exception as e:
-                    logger.warning(f"MCPAuthentication: Failed to get action by id '{permission_action_id}': {e}")
+                    log_mcp_event(
+                        "iam_action_resolve_failed",
+                        request,
+                        level=logging.WARNING,
+                        permission_action=permission_action_id,
+                        error_type=type(e).__name__,
+                    )
                     # 如果找不到对应的权限，使用默认权限
 
             permission = MCPPermission(action=action)
+            request.mcp_permission_action = permission.actions[0].id if permission.actions else ""
             # 创建一个简单的 mock view 对象
             mock_view = type("MockView", (), {"kwargs": {}})()
 
             if not permission.has_permission(request, mock_view):
-                logger.warning(f"MCPAuthentication: Permission denied for user={username}, bk_biz_id={request.biz_id}")
+                log_mcp_event(
+                    "permission_denied",
+                    request,
+                    level=logging.WARNING,
+                    username=username,
+                    bk_biz_id=request.biz_id,
+                    permission_action=permission_action_id,
+                    tool=tool_name,
+                    mcp_server=mcp_server_name,
+                )
                 # 上报权限拒绝的调用指标
                 self._report_mcp_metric(
                     tool_name=tool_name,
@@ -442,7 +825,7 @@ class AuthenticationMiddleware(MiddlewareMixin):
                 )
                 return HttpResponseForbidden("Permission denied: insufficient MCP permissions")
         except Exception as e:
-            logger.exception(f"MCPAuthentication: Permission check failed: {e}")
+            log_mcp_event("permission_check_failed", request, level=logging.WARNING, error_type=type(e).__name__)
             # 上报异常的调用指标
             self._report_mcp_metric(
                 tool_name=tool_name,
@@ -454,7 +837,16 @@ class AuthenticationMiddleware(MiddlewareMixin):
             )
             return HttpResponseForbidden(f"Permission denied: {e}")
 
-        logger.info(f"MCPAuthentication: Authentication Success: user={username}, bk_biz_id={request.biz_id}")
+        request.mcp_permission_source = "legacy"
+        log_mcp_event(
+            "auth_success",
+            request,
+            username=username,
+            bk_biz_id=request.biz_id,
+            permission_action=permission_action_id,
+            tool=tool_name,
+            mcp_server=mcp_server_name,
+        )
         # 上报成功的调用指标
         self._report_mcp_metric(
             tool_name=tool_name,
@@ -464,6 +856,8 @@ class AuthenticationMiddleware(MiddlewareMixin):
             permission_action=permission_action_id,
             mcp_server_name=mcp_server_name,
         )
+        if is_unified_execute_tool:
+            request.unified_mcp_permission_checked = True
         return None
 
     def _handle_api_token_auth(self, request, view):
@@ -482,7 +876,6 @@ class AuthenticationMiddleware(MiddlewareMixin):
         if not record.is_allowed_view(view):
             return HttpResponseForbidden("API Token is not allowed")
 
-        # TODO: 检查命名空间与租户id是否匹配
         if not record.is_allowed_namespace(f"biz#{request.biz_id}"):
             if not request.biz_id:
                 return HttpResponseForbidden("params `bk_biz_id` is required")
@@ -490,16 +883,18 @@ class AuthenticationMiddleware(MiddlewareMixin):
                 f"namespace biz#{request.biz_id} is not allowed in [{','.join(record.namespaces)}]"
             )
 
-        # grafana、as_code场景权限模式：替换请求用户为令牌创建者
-        if record.type.lower() in ["as_code", "grafana"]:
-            username = "system" if record.type.lower() == "as_code" else "admin"
-            user = auth.authenticate(username=username, tenant_id=record.bk_tenant_id)
+        # 与 ApiAuthToken.is_allowed_view 保持一致，按精确类型判断
+        token_type = record.type
+        # grafana、as_code场景权限模式：使用当前租户的管理员用户
+        if token_type in ["as_code", "grafana"]:
+            username = get_admin_username(record.bk_tenant_id)
+            user = auth.authenticate(username=username, bk_tenant_id=record.bk_tenant_id)
             auth.login(request, user)
             request.skip_check = True
-        elif record.type.lower() == "entity":
+        elif token_type == "entity":
             # 实体关系权限模式：替换请求用户为令牌创建者
-            username = record.create_user or "system"
-            user = auth.authenticate(username=username, tenant_id=record.bk_tenant_id)
+            username = record.create_user or get_admin_username(record.bk_tenant_id)
+            user = auth.authenticate(username=username, bk_tenant_id=record.bk_tenant_id)
             auth.login(request, user)
             request.token = token
             request.skip_check = True
@@ -509,21 +904,43 @@ class AuthenticationMiddleware(MiddlewareMixin):
         return
 
     def process_view(self, request, view, *args, **kwargs):
+        from kernel_api.mcp_read_routes import MCP_READ_PREFIX, is_application_read_route
+
+        # Django resolves path_info after stripping SCRIPT_NAME on mounted deployments.
+        backend_path = getattr(request, "path_info", request.path)
+        is_application = is_application_read_route(request.method, backend_path)
+        is_mcp_read = backend_path.startswith(MCP_READ_PREFIX)
+        if is_application and not self.use_apigw_auth(request):
+            return HttpResponseForbidden("Application read APIs require an authenticated gateway application")
+
         # 登录豁免
-        if getattr(view, "login_exempt", False):
+        if not is_application and not is_mcp_read and getattr(view, "login_exempt", False):
             return None
 
         if self.use_apigw_auth(request):
             request.jwt = BkJWTClient(request, self.get_apigw_public_keys())
             result, error_message = request.jwt.validate()
             if not result:
+                if self.use_mcp_auth(request, ""):
+                    log_mcp_event("gateway_auth_denied", request, level=logging.WARNING, reason="invalid_jwt")
                 return HttpResponseForbidden(error_message)
 
-            app_code = request.jwt.app.app_code
-            username = request.jwt.user.username
+            if not is_application and ("app_code" not in request.jwt.app or "username" not in request.jwt.user):
+                return HttpResponseForbidden("Gateway identity claims are incomplete")
+            app_code = request.jwt.app.get("app_code")
+            username = request.jwt.user.get("username")
+            if is_application and (
+                request.jwt.app.get("verified") is not True
+                or not app_code
+                or self.use_mcp_auth(request, app_code)
+                or self.use_api_token_auth(request)
+            ):
+                return HttpResponseForbidden("Application read APIs require a verified gateway application")
             if settings.ENABLE_MULTI_TENANT_MODE:
                 bk_tenant_id = request.META.get("HTTP_X_BK_TENANT_ID")
                 if not bk_tenant_id:
+                    if self.use_mcp_auth(request, app_code):
+                        log_mcp_event("gateway_auth_denied", request, level=logging.WARNING, reason="missing_tenant")
                     return HttpResponseForbidden("lack of tenant_id")
             else:
                 bk_tenant_id = DEFAULT_TENANT_ID
@@ -532,52 +949,42 @@ class AuthenticationMiddleware(MiddlewareMixin):
             username = request.META.get("HTTP_BK_USERNAME")
             bk_tenant_id = DEFAULT_TENANT_ID
 
+        # Resolve standalone read-only tools independently of transport markers/app identity.
+        # Registry/configuration errors fail closed instead of silently using the ordinary API path.
+        from kernel_api.unified_mcp.registry import is_unified_diagnostic_route, resolve_readonly_tool
+
+        is_diagnostic = is_unified_diagnostic_route(request.method, request.path)
+        try:
+            resolved_tool = None if is_application else resolve_readonly_tool(request.method, backend_path)
+        except Exception as exc:
+            log_mcp_event("routing_failed", request, level=logging.WARNING, error_type=type(exc).__name__)
+            return JsonResponse({"result": False, "message": "MCP routing is unavailable"}, status=503)
+        if is_mcp_read and resolved_tool is None:
+            return HttpResponseForbidden("Invalid MCP read route")
+        if resolved_tool is not None or is_diagnostic:
+            jwt_client = getattr(request, "jwt", None)
+            if not (getattr(jwt_client, "is_valid", False) and jwt_client.user.get("verified") is True and username):
+                return HttpResponseForbidden("Read-only tools require a verified gateway user")
+
         # MCP权限校验（在用户认证完成后）
-        if self.use_mcp_auth(request, app_code):
+        if resolved_tool is not None or is_diagnostic or self.use_mcp_auth(request, app_code):
             request.user = auth.authenticate(username=username, bk_tenant_id=bk_tenant_id)
-            logger.info("=" * 80)
-            logger.info("MCPAuthentication: Handling MCP authentication")
-
-            # 打印认证信息
-            logger.info(f"MCPAuthentication: app_code={app_code}, username={username}, tenant_id={bk_tenant_id}")
-
-            # 打印请求基本信息
-            logger.info(f"MCPAuthentication: method={request.method}, path={request.path}")
-
-            # 打印关键请求头
-            logger.info("MCPAuthentication: Request Headers:")
-            key_headers = [
-                "HTTP_X_BK_REQUEST_SOURCE",
-                "HTTP_X_BKAPI_FROM",
-                "HTTP_X_BK_TENANT_ID",
-                "HTTP_BK_USERNAME",
-                "HTTP_BK_APP_CODE",
-                "HTTP_X_BKAPI_MCP_SERVER_NAME",
-                "HTTP_X_BKAPI_PERMISSION_ACTION",
-                "Content-Type",
-            ]
-            for header_key in key_headers:
-                header_value = request.META.get(header_key, "N/A")
-                logger.info(f"MCPAuthentication: Header - {header_key}: {header_value}")
-
-            # 打印GET参数
-            if request.GET:
-                logger.info(f"MCPAuthentication: GET params: {dict(request.GET)}")
-            else:
-                logger.info("MCPAuthentication: GET params: (empty)")
-
-            # 打印POST参数
-            if request.method == "POST":
-                try:
-                    if request.POST:
-                        logger.info(f"MCPAuthentication: POST params: {dict(request.POST)}")
-                    else:
-                        logger.info("MCPAuthentication: POST params: (empty)")
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning(f"MCPAuthentication: Failed to read POST params: {e}")
-
-            logger.info("=" * 80)
-
+            request.mcp_usage_event_id = secrets.token_hex(16)
+            request.mcp_usage_username = username or ""
+            request.mcp_usage_app_code = app_code or ""
+            log_mcp_event(
+                "request_received",
+                request,
+                app_code=app_code,
+                username=username,
+                tenant_id=bk_tenant_id,
+                mcp_server=request.META.get("HTTP_X_BKAPI_MCP_SERVER_NAME", ""),
+                gateway_source=request.META.get("HTTP_X_BKAPI_FROM", ""),
+                request_event_id=request.mcp_usage_event_id,
+                content_type=request.content_type,
+            )
+            if resolved_tool is not None:
+                return self._handle_mcp_auth(request, username=username, resolved_tool=resolved_tool)
             return self._handle_mcp_auth(request, username=username)
 
         if self.use_api_token_auth(request):
@@ -593,10 +1000,11 @@ class AuthenticationMiddleware(MiddlewareMixin):
         # 校验app_code权限范围
         if not app_code or is_match_api_token(request, bk_tenant_id, app_code):
             if not username or username == "admin":
-                username = get_tenant_admin_username(bk_tenant_id)
+                username = get_admin_username(bk_tenant_id)
             request.user = auth.authenticate(username=username, bk_tenant_id=bk_tenant_id)
             user = request.user
             if settings.ENABLE_MULTI_TENANT_MODE and user and user.tenant_id != bk_tenant_id:
+                logger.error(f"user({user.username}) tenant_id is {user.tenant_id} not match {bk_tenant_id}")
                 return HttpResponseForbidden(
                     f"user({user.username}) tenant_id is {user.tenant_id} not match {bk_tenant_id}"
                 )

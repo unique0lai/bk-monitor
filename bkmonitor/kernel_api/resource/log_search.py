@@ -14,10 +14,79 @@ from typing import Any
 from rest_framework import serializers
 
 from bkm_space.utils import bk_biz_id_to_space_uid
-from core.drf_resource import Resource, api
+from core.drf_resource import api
+from kernel_api.resource.mcp_response import MCPResource as Resource
+from kernel_api.resource.mcp_response import is_mcp_request
 from kernel_api.serializers.mixins import TimeSpanValidationPassThroughSerializer
+from kernel_api.unified_mcp.permissions import call_log_api
 
 logger = logging.getLogger(__name__)
+
+CLUSTERING_FIELD_PREFIX = "__dist"
+CLUSTERING_QUERY_FIELD = "__dist_05"
+
+
+def normalize_timestamp_to_milliseconds(timestamp: int | str) -> str:
+    timestamp = int(timestamp)
+    if timestamp >= 1_000_000_000_000_000_000:
+        timestamp //= 1_000_000
+    elif timestamp < 1_000_000_000_000:
+        timestamp *= 1000
+    return str(timestamp)
+
+
+def project_log_items(items: list[dict[str, Any]], keep_columns: list[str] | None) -> list[dict[str, Any]]:
+    """按点分字段路径投影日志，并保留原有的嵌套 JSON 结构。"""
+    if not keep_columns:
+        return items
+
+    selection: dict[str, Any] = {}
+    for column in keep_columns:
+        parts = column.split(".")
+        current = selection
+        for index, part in enumerate(parts):
+            if index == len(parts) - 1:
+                current[part] = None
+                break
+            child = current.setdefault(part, {})
+            # 已选择整个父字段时，无需继续记录子路径。
+            if child is None:
+                break
+            current = child
+
+    def project_value(value: Any, selected_fields: dict[str, Any] | None) -> Any:
+        if selected_fields is None:
+            return value
+        if isinstance(value, list):
+            return [project_value(item, selected_fields) for item in value]
+        if not isinstance(value, dict):
+            return value
+        return {
+            field: project_value(value[field], nested_fields)
+            for field, nested_fields in selected_fields.items()
+            if field in value
+        }
+
+    return [project_value(item, selection) for item in items]
+
+
+class SceneRouteConditionSerializer(serializers.Serializer):
+    field_name = serializers.CharField(required=True, label="路由字段名")
+    value = serializers.ListField(child=serializers.CharField(), required=True, label="路由字段值")
+    op = serializers.ChoiceField(choices=["eq", "ne", "req", "nreq"], required=True, label="匹配操作符")
+
+
+def get_log_unify_query_table(
+    index_set_id: int | str, conditions: dict[str, Any] | None = None, query_string: str | None = None
+) -> str:
+    """根据查询条件选择日志索引集的普通表或聚类表。"""
+    field_list = (conditions or {}).get("field_list") or []
+    has_clustering_condition = any(
+        isinstance(condition, dict) and str(condition.get("field_name", "")).startswith(CLUSTERING_FIELD_PREFIX)
+        for condition in field_list
+    )
+    suffix = "_clustered" if has_clustering_condition or CLUSTERING_QUERY_FIELD in (query_string or "") else ""
+    return f"bklog_index_set_{index_set_id}{suffix}"
 
 
 class GetIndexSetListResource(Resource):
@@ -31,7 +100,7 @@ class GetIndexSetListResource(Resource):
     def perform_request(self, validated_request_data):
         bk_biz_id = validated_request_data.get("bk_biz_id")
         logger.info("SearchIndexSetListResource: try to search index set list, bk_biz_id->[%s]", bk_biz_id)
-        result = api.log_search.search_index_set(bk_biz_id=bk_biz_id)
+        result = call_log_api("search_index_set", bk_biz_id=bk_biz_id)
         return result
 
 
@@ -52,8 +121,87 @@ class GetIndexSetFieldListResource(Resource):
             index_set_id,
             bk_biz_id,
         )
-        result = api.log_search.log_search_index_set(index_set_id=index_set_id)
+        result = call_log_api("log_search_index_set", index_set_id=index_set_id)
         return result
+
+
+class ListLogScenesResource(Resource):
+    """获取业务可用的日志场景及场景维度定义。"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        logger.info("ListLogScenesResource: list log scenes, bk_biz_id->[%s]", bk_biz_id)
+        scenes = call_log_api("list_scenes", bk_biz_id=bk_biz_id)
+        return {"scenes": scenes}
+
+
+class ListSceneDimensionValuesResource(Resource):
+    """获取场景动态路由维度的合法值列表。"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
+        scene = serializers.CharField(required=True, label="场景标识")
+        dimension_key = serializers.CharField(required=True, label="维度字段名")
+        filters = serializers.ListField(
+            child=SceneRouteConditionSerializer(), required=False, default=list, label="级联筛选条件"
+        )
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        scene = validated_request_data["scene"]
+        dimension_key = validated_request_data["dimension_key"]
+        filters = validated_request_data["filters"]
+        logger.info(
+            "ListSceneDimensionValuesResource: list dimension values, "
+            "bk_biz_id->[%s], scene->[%s], dimension_key->[%s], filter_count->[%s]",
+            bk_biz_id,
+            scene,
+            dimension_key,
+            len(filters),
+        )
+        return call_log_api(
+            "scene_dimension_values",
+            bk_biz_id=bk_biz_id,
+            scene=scene,
+            dimension_key=dimension_key,
+            filters=filters,
+        )
+
+
+class GetSceneLogFieldsResource(Resource):
+    """获取场景路由条件命中结果表的聚合字段信息。"""
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
+        # 禁止空外层和空 AND 分组，并在 MCP 边界校验条件结构，避免宽泛选表或无效请求。
+        table_id_conditions = serializers.ListField(
+            child=serializers.ListField(child=SceneRouteConditionSerializer(), allow_empty=False),
+            required=True,
+            allow_empty=False,
+            label="结果表路由条件，外层为 OR，内层为 AND",
+        )
+
+    def perform_request(self, validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        table_id_conditions = validated_request_data["table_id_conditions"]
+        logger.info(
+            "GetSceneLogFieldsResource: get scene fields, bk_biz_id->[%s], condition_groups->[%s]",
+            bk_biz_id,
+            len(table_id_conditions),
+        )
+        result = call_log_api(
+            "scene_fields",
+            space_uid=bk_biz_id_to_space_uid(bk_biz_id),
+            bk_biz_id=bk_biz_id,
+            table_id_conditions=table_id_conditions,
+        )
+        return {
+            "fields": result.get("fields") or [],
+            "time_field": result.get("time_field", ""),
+        }
 
 
 class SearchLogResource(Resource):
@@ -63,44 +211,170 @@ class SearchLogResource(Resource):
 
     class RequestSerializer(TimeSpanValidationPassThroughSerializer):
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
-        index_set_id = serializers.IntegerField(required=True, label="索引集ID")
-        query_string = serializers.CharField(required=False, default="*", label="查询字符串")
+        target_type = serializers.ChoiceField(
+            choices=["index_set", "scene"], required=False, default="index_set", label="检索目标类型"
+        )
+        index_set_id = serializers.IntegerField(required=False, allow_null=True, label="索引集ID")
+        # 场景检索的结果表路由条件。禁止空外层和空 AND 分组，避免 [] 或 [[]] 导致宽泛选表。
+        table_id_conditions = serializers.ListField(
+            child=serializers.ListField(child=SceneRouteConditionSerializer(), allow_empty=False),
+            required=False,
+            allow_empty=False,
+            label="结果表路由条件，外层为 OR，内层为 AND",
+        )
+        query_string = serializers.CharField(required=False, default="*", label="查询字符串(检索语法)")
+        # 索引集检索的结构化过滤条件，与 query_string 可同时使用（AND 关系），适合精确的字段级过滤。
+        # 场景检索暂不支持该参数，请使用 query_string 表达日志过滤条件。
+        # 格式：{"field_list": [{"field_name": "level", "op": "eq", "value": ["ERROR", "WARN"]}], "condition_list": ["and"]}
+        # field_list: 字段筛选规则列表，op 支持 eq/ne/req(正则) 等；value 为多值列表(默认 OR 关系)。
+        # condition_list: 逻辑运算符列表，长度为 field_list.length - 1，例如 ["and", "or"]。
+        conditions = serializers.DictField(required=False, allow_null=True, default=None, label="结构化过滤条件")
+        # 需要保留的输出字段列表，用于裁剪返回内容、降低返回数据量(避免 LLM 上下文超限)，例如 ["dtEventTimeStamp", "log", "resource.cluster_id"]
+        keep_columns = serializers.ListField(
+            child=serializers.CharField(),
+            required=False,
+            allow_null=True,
+            allow_empty=True,
+            default=None,
+            label="保留输出字段列表",
+        )
+        # 排序字段列表，"-" 前缀表示降序，例如 ["-dtEventTimeStamp"] 表示按时间倒序(最新在前)
+        order_by = serializers.ListField(
+            child=serializers.CharField(),
+            required=False,
+            allow_null=True,
+            allow_empty=True,
+            default=None,
+            label="排序字段列表",
+        )
         start_time = serializers.CharField(required=True, label="开始时间")
         end_time = serializers.CharField(required=True, label="结束时间")
-        limit = serializers.IntegerField(required=False, default=10, label="返回条数")
+        offset = serializers.IntegerField(required=False, default=0, min_value=0, label="偏移量(分页用)")
+        limit = serializers.IntegerField(required=False, default=10, min_value=1, max_value=10000, label="返回条数")
+
+        def validate(self, attrs):
+            attrs = super().validate(attrs)
+            target_type = attrs.get("target_type", "index_set")
+            index_set_id = attrs.get("index_set_id")
+            table_id_conditions = attrs.get("table_id_conditions")
+
+            if target_type == "index_set":
+                if index_set_id is None:
+                    raise serializers.ValidationError(
+                        {"index_set_id": "index_set_id is required when target_type is index_set."}
+                    )
+                return attrs
+
+            if not table_id_conditions:
+                raise serializers.ValidationError(
+                    {"table_id_conditions": "table_id_conditions is required when target_type is scene."}
+                )
+
+            if attrs.get("conditions") is not None:
+                raise serializers.ValidationError(
+                    {"conditions": "conditions is not supported when target_type is scene; use query_string instead."}
+                )
+
+            return attrs
 
     def perform_request(self, validated_request_data):
+        if validated_request_data.get("target_type", "index_set") == "scene":
+            return self._search_by_scene(validated_request_data)
+        return self._search_by_index_set(validated_request_data)
+
+    @staticmethod
+    def _search_by_scene(validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        table_id_conditions = validated_request_data["table_id_conditions"]
+        offset = validated_request_data.get("offset", 0)
+        limit = validated_request_data.get("limit", 10)
+        order_by = validated_request_data.get("order_by") or []
+        keep_columns = validated_request_data.get("keep_columns")
+        start_time = normalize_timestamp_to_milliseconds(validated_request_data["start_time"])
+        end_time = normalize_timestamp_to_milliseconds(validated_request_data["end_time"])
+        sort_list = [
+            [field_name[1:], "desc"] if field_name.startswith("-") else [field_name, "asc"] for field_name in order_by
+        ]
+
+        logger.info(
+            "SearchLogResource: search scene logs, bk_biz_id->[%s], condition_groups->[%s], offset->[%s], limit->[%s]",
+            bk_biz_id,
+            len(table_id_conditions),
+            offset,
+            limit,
+        )
+        result = call_log_api(
+            "scene_search",
+            space_uid=bk_biz_id_to_space_uid(bk_biz_id),
+            bk_biz_id=bk_biz_id,
+            table_id_conditions=table_id_conditions,
+            keyword=validated_request_data.get("query_string") or "*",
+            start_time=start_time,
+            end_time=end_time,
+            begin=offset,
+            size=limit,
+            sort_list=sort_list,
+            record_history=False,
+        )
+        items = project_log_items(result.get("list") or [], keep_columns)
+        return {
+            "list": items,
+            "total": result.get("total", 0),
+            "took": result.get("took", 0),
+        }
+
+    @staticmethod
+    def _search_by_index_set(validated_request_data):
         index_set_id = validated_request_data.get("index_set_id")
         bk_biz_id = validated_request_data.get("bk_biz_id")
         query_string = validated_request_data.get("query_string", "*")
+        conditions = validated_request_data.get("conditions")
+        keep_columns = validated_request_data.get("keep_columns")
+        order_by = validated_request_data.get("order_by")
         start_time = validated_request_data.get("start_time")
         end_time = validated_request_data.get("end_time")
+        offset = validated_request_data.get("offset", 0)
         limit = validated_request_data.get("limit")
 
         logger.info(
-            "SearchLogResource: try to search log, index_set_id->[%s], bk_biz_id->[%s]", index_set_id, bk_biz_id
+            "SearchLogResource: try to search log, index_set_id->[%s], bk_biz_id->[%s], offset->[%s], limit->[%s]",
+            index_set_id,
+            bk_biz_id,
+            offset,
+            limit,
         )
 
         # 构造 unify_query.query_raw 请求参数
-        table_id = f"bklog_index_set_{index_set_id}"  # 日志索引集规则
+        table_id = get_log_unify_query_table(index_set_id, conditions, query_string)
         space_uid = bk_biz_id_to_space_uid(bk_biz_id)  # 业务ID转SPACE_UID，用于构建Headers
 
+        query_item = {
+            "data_source": "bklog",
+            "table_id": table_id,
+            "query_string": query_string,
+        }
+        if conditions:
+            query_item["conditions"] = conditions
+        if keep_columns:
+            query_item["keep_columns"] = keep_columns
+
         query_params = {
-            "query_list": [
-                {
-                    "data_source": "bklog",
-                    "table_id": table_id,
-                    "query_string": query_string,
-                }
-            ],
+            "query_list": [query_item],
             "metric_merge": "a",  # 返回引用名为 "a" 的查询结果，便于后续使用,日志侧无需关心
             "start_time": start_time,
             "end_time": end_time,
             "step": "auto",
             "limit": limit,
+            "_from": offset,  # query_raw 内部会转换为 "from"
             "space_uid": space_uid,
         }
+        if order_by:
+            query_params["order_by"] = order_by
 
+        if is_mcp_request():
+            from kernel_api.resource.mcp_uq import query_uq
+
+            return query_uq("query_raw", query_params)
         result = api.unify_query.query_raw(**query_params)
         return result
 
@@ -139,7 +413,7 @@ class SearchIndexSetContextResource(Resource):
             validated_request_data.get("bk_biz_id"),
         )
 
-        result = api.log_search.search_index_set_context(**validated_request_data)
+        result = call_log_api("search_index_set_context", **validated_request_data)
         return result
 
 
@@ -147,11 +421,14 @@ class FieldAnalyzeResource(Resource):
     """
     日志查询服务 -- 字段分析
 
+    target_type=index_set 时直查 unify-query；target_type=scene 时转调日志平台，
+    由日志平台按 table_id_conditions 路由多结果表并合并聚合结果后返回。
+
     支持多种字段分析场景：
     1. Top K 分析：按字段值分组统计，按值排序，限制条数
        示例：{"group_by": true, "order_by": "value", "limit": 20}
-    2. 时间序列分析：按字段值分组统计，按时间排序
-       示例：{"group_by": true, "order_by": "time"}
+    2. 场景时间序列分析：按全时段计数选出 limit 个字段值，再按 step 分桶，保留各组的全部时间点
+       示例：{"target_type": "scene", "group_by": true, "order_by": "time", "limit": 20, "step": "5m"}
     3. 总体统计：整体计数，不分组
        示例：{"group_by": false, "order_by": "time"}
     4. 分布分析：按字段值分组统计，无限制
@@ -164,9 +441,19 @@ class FieldAnalyzeResource(Resource):
         "time": ["-dtEventTimeStamp", "-gseIndex", "-iterationIndex"],
     }
 
-    class RequestSerializer(serializers.Serializer):
+    class RequestSerializer(TimeSpanValidationPassThroughSerializer):
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
-        index_set_id = serializers.IntegerField(required=True, label="索引集ID")
+        target_type = serializers.ChoiceField(
+            choices=["index_set", "scene"], required=False, default="index_set", label="分析目标类型"
+        )
+        index_set_id = serializers.IntegerField(required=False, allow_null=True, label="索引集ID")
+        # 场景分析的结果表路由条件，外层 OR、内层 AND，禁止空分组。
+        table_id_conditions = serializers.ListField(
+            child=serializers.ListField(child=SceneRouteConditionSerializer(), allow_empty=False),
+            required=False,
+            allow_empty=False,
+            label="结果表路由条件，外层为 OR，内层为 AND",
+        )
         field_name = serializers.CharField(required=True, label="字段名称")
         query_string = serializers.CharField(required=False, default="*", label="查询字符串")
         group_by = serializers.BooleanField(required=False, default=True, label="是否按字段分组")
@@ -176,12 +463,34 @@ class FieldAnalyzeResource(Resource):
             default="time",
             label="排序方式：value-按值排序，time-按时间排序",
         )
-        limit = serializers.IntegerField(required=False, default=None, allow_null=True, label="限制返回条数")
+        limit = serializers.IntegerField(
+            required=False, default=None, allow_null=True, min_value=1, max_value=1000, label="限制返回条数"
+        )
         step = serializers.CharField(required=False, default="1h", label="时间步长")
         # 过滤条件，格式：{"field_list": [{"field_name": "xxx", "value": ["xxx"], "op": "eq"}], "condition_list": []}
         conditions = serializers.DictField(required=False, allow_null=True, label="过滤条件")
         start_time = serializers.CharField(required=True, label="开始时间")
         end_time = serializers.CharField(required=True, label="结束时间")
+
+        def validate(self, attrs):
+            attrs = super().validate(attrs)
+            target_type = attrs.get("target_type", "index_set")
+            if target_type == "index_set":
+                if attrs.get("index_set_id") is None:
+                    raise serializers.ValidationError(
+                        {"index_set_id": "index_set_id is required when target_type is index_set."}
+                    )
+                return attrs
+
+            if not attrs.get("table_id_conditions"):
+                raise serializers.ValidationError(
+                    {"table_id_conditions": "table_id_conditions is required when target_type is scene."}
+                )
+            if attrs.get("conditions") is not None:
+                raise serializers.ValidationError(
+                    {"conditions": "conditions is not supported when target_type is scene; use query_string instead."}
+                )
+            return attrs
 
     def _build_aggregation_function(self, field_name: str, group_by: bool) -> list[dict[str, Any]]:
         """构建聚合函数配置"""
@@ -215,6 +524,11 @@ class FieldAnalyzeResource(Resource):
         return query_item
 
     def perform_request(self, validated_request_data):
+        if validated_request_data.get("target_type", "index_set") == "scene":
+            return self._analyze_by_scene(validated_request_data)
+        return self._analyze_by_index_set(validated_request_data)
+
+    def _analyze_by_index_set(self, validated_request_data):
         # 提取参数
         bk_biz_id = validated_request_data["bk_biz_id"]
         index_set_id = validated_request_data["index_set_id"]
@@ -240,7 +554,7 @@ class FieldAnalyzeResource(Resource):
         )
 
         # 构建查询参数
-        table_id = f"bklog_index_set_{index_set_id}"
+        table_id = get_log_unify_query_table(index_set_id, conditions, query_string)
         space_uid = bk_biz_id_to_space_uid(bk_biz_id)
         aggregation_function = self._build_aggregation_function(field_name, group_by)
         query_item = self._build_query_item(table_id, field_name, query_string, conditions, aggregation_function, limit)
@@ -255,7 +569,35 @@ class FieldAnalyzeResource(Resource):
             "space_uid": space_uid,
         }
 
+        if is_mcp_request():
+            from kernel_api.resource.mcp_uq import query_uq
+
+            return query_uq("query_reference", query_params)
         return api.unify_query.query_reference(**query_params)
+
+    @staticmethod
+    def _analyze_by_scene(validated_request_data):
+        bk_biz_id = validated_request_data["bk_biz_id"]
+        logger.info(
+            "FieldAnalyzeResource: analyze scene field, bk_biz_id->[%s], field_name->[%s], condition_groups->[%s]",
+            bk_biz_id,
+            validated_request_data["field_name"],
+            len(validated_request_data["table_id_conditions"]),
+        )
+        return call_log_api(
+            "scene_field_analyze",
+            space_uid=bk_biz_id_to_space_uid(bk_biz_id),
+            bk_biz_id=bk_biz_id,
+            table_id_conditions=validated_request_data["table_id_conditions"],
+            field_name=validated_request_data["field_name"],
+            keyword=validated_request_data.get("query_string") or "*",
+            group_by=validated_request_data.get("group_by", True),
+            order_by=validated_request_data.get("order_by", "time"),
+            limit=validated_request_data.get("limit"),
+            step=validated_request_data.get("step", "1h"),
+            start_time=normalize_timestamp_to_milliseconds(validated_request_data["start_time"]),
+            end_time=normalize_timestamp_to_milliseconds(validated_request_data["end_time"]),
+        )
 
 
 class SearchLogClusteringPatternResource(Resource):
@@ -265,7 +607,7 @@ class SearchLogClusteringPatternResource(Resource):
 
     class RequestSerializer(TimeSpanValidationPassThroughSerializer):
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
-        index_set_id = serializers.CharField(required=True, label="索引集ID")
+        index_set_id = serializers.IntegerField(required=True, label="索引集ID")
         keyword = serializers.CharField(required=False, default="*", label="搜索关键字")
         start_time = serializers.CharField(required=True, label="开始时间")
         end_time = serializers.CharField(required=True, label="结束时间")
@@ -277,6 +619,9 @@ class SearchLogClusteringPatternResource(Resource):
             label="敏感度：01 03 05 07 09",
         )
         show_new_pattern = serializers.BooleanField(required=True, label="只显示新类")
+        group_by = serializers.ListField(
+            child=serializers.CharField(), required=False, default=list, label="聚类模式分组字段"
+        )
 
     def perform_request(self, validated_request_data):
         index_set_id = validated_request_data.get("index_set_id")
@@ -285,5 +630,5 @@ class SearchLogClusteringPatternResource(Resource):
             "SearchPatternResource: try to search pattern, index_set_id->[%s], bk_biz_id->[%s]", index_set_id, bk_biz_id
         )
 
-        result = api.log_search.search_pattern(**validated_request_data)
+        result = call_log_api("search_pattern", **validated_request_data)
         return result

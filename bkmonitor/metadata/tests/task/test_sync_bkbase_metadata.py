@@ -15,8 +15,13 @@ import pytest
 
 from metadata import models
 from metadata.resources import ListBkBaseRtInfoByBizIdResource
-from metadata.task.bkbase import sync_all_bkbase_cluster_info, sync_bkbase_rt_meta_info_all
-from metadata.task.tasks import sync_bkbase_v4_metadata
+from metadata.task.bkbase import (
+    sync_all_bkbase_cluster_info,
+    sync_bkbase_cluster_info,
+    sync_bkbase_rt_meta_info_all,
+    sync_bkbase_v4_metadata,
+)
+from metadata.task.constants import BKBASE_V4_KIND_STORAGE_CONFIGS
 from metadata.tests.common_utils import consul_client
 
 # 定义 Mock 的 Redis hgetall 返回值
@@ -299,6 +304,50 @@ def test_sync_bkbase_v4_metadata_for_metric(create_or_delete_records, mocker):
 
 
 @pytest.mark.django_db(databases="__all__")
+@pytest.mark.parametrize("bk_base_data_id", [50012, 70012])
+def test_sync_bkbase_v4_metadata_for_same_table_in_different_tenants(create_or_delete_records, mocker, bk_base_data_id):
+    table_id = "1001_bkmonitor_time_series_50010.__default__"
+    bk_tenant_id = "other-tenant"
+    ds = models.DataSource.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        bk_data_id=50012,
+        data_name="data_link_test_metric",
+        mq_cluster_id=1,
+        mq_config_id=1,
+        etl_config="test",
+        is_custom_source=False,
+        created_from="bkdata",
+    )
+    models.ResultTable.objects.create(
+        bk_tenant_id=bk_tenant_id, table_id=table_id, bk_biz_id=1001, is_custom_table=False
+    )
+    models.DataSourceResultTable.objects.create(bk_tenant_id=bk_tenant_id, table_id=table_id, bk_data_id=ds.bk_data_id)
+    models.AccessVMRecord.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        result_table_id=table_id,
+        vm_result_table_id="other_tenant_vm_test_metric",
+        bk_base_data_id=bk_base_data_id,
+    )
+    redis_client = mocker.patch("metadata.task.bkbase.bkbase_redis_client").return_value
+    redis_client.hgetall.return_value = redis_value_for_metric_when_cluster_not_exists
+    sync_kafka = mocker.patch("metadata.task.bkbase.sync_kafka_metadata")
+    sync_vm = mocker.patch("metadata.task.bkbase.sync_vm_metadata")
+
+    sync_bkbase_v4_metadata(f"databus_v4_dataid:{bk_base_data_id}")
+
+    sync_kafka.assert_called_once_with(
+        bk_tenant_id=bk_tenant_id,
+        kafka_info=json.loads(redis_value_for_metric_when_cluster_not_exists[b"kafka"]),
+        ds=ds,
+        bk_data_id=ds.bk_data_id,
+    )
+    sync_vm.assert_called_once_with(
+        bk_tenant_id=bk_tenant_id,
+        vm_info=json.loads(redis_value_for_metric_when_cluster_not_exists[b"vm"]),
+    )
+
+
+@pytest.mark.django_db(databases="__all__")
 def test_sync_bkbase_v4_metadata_for_log(create_or_delete_records, mocker):
     """
     测试计算平台元数据同步更新能力 -- 日志链路
@@ -340,6 +389,7 @@ def test_sync_bkbase_clusters(create_or_delete_records):
             "spec": {
                 "host": "es.example.com",
                 "port": 9200,
+                "schema": "https",
                 "user": "es_user",  # 注意这里键名是 user
                 "password": "es_password",
             },
@@ -353,7 +403,13 @@ def test_sync_bkbase_clusters(create_or_delete_records):
                 "namespace": "bkmonitor",
                 "name": "test_vm_cluster",
             },
-            "spec": {"insertHost": "vm.example.com", "insertPort": 8480, "user": "vm_user", "password": "vm_password"},
+            "spec": {
+                "insertHost": "vm.example.com",
+                "insertPort": 8480,
+                "user": "vm_user",
+                "password": "vm_password",
+                "bkBizId": 1001,
+            },
         }
     ]
 
@@ -370,6 +426,7 @@ def test_sync_bkbase_clusters(create_or_delete_records):
                 "table_bucket_num": None,
                 "shard_minutes": 1,
                 "v3_rename": None,
+                "bk_biz_id": 100380,
             },
             "status": {
                 "phase": "Ok",
@@ -379,24 +436,251 @@ def test_sync_bkbase_clusters(create_or_delete_records):
             },
         }
     ]
+    mock_surrealdb_data = [
+        {
+            "kind": "SurrealDB",
+            "metadata": {"namespace": "bkmonitor", "name": "surreal_test", "labels": {}, "annotations": {}},
+            "spec": {
+                "host": "surreal_test.test",
+                "port": 8000,
+                "user": "root",
+                "password": "root",
+                "version": "2.3.2",
+            },
+            "status": {"phase": "Ok"},
+        }
+    ]
+
+    def list_data_link_side_effect(*args, **kwargs):
+        kind = kwargs["kind"]
+        namespace = kwargs["namespace"]
+        if kind == "elasticsearchs" and namespace == "bklog":
+            return mock_es_data
+        if kind == "vmstorages" and namespace == "bkmonitor":
+            return mock_vm_data
+        if kind == "surrealdbs" and namespace == "bkmonitor":
+            return mock_surrealdb_data
+        if kind == "dorises" and namespace == "bklog":
+            return mock_doris_data
+        return []
+
     with patch("core.drf_resource.api.bkdata.list_data_link") as mock_api:
-        mock_api.side_effect = [mock_es_data, mock_vm_data, mock_doris_data]
+        mock_api.side_effect = list_data_link_side_effect
         sync_all_bkbase_cluster_info()
 
         es_cluster = models.ClusterInfo.objects.get(domain_name="es.example.com")
         assert es_cluster.username == "es_user"
         assert es_cluster.password == "es_password"
         assert es_cluster.cluster_type == models.ClusterInfo.TYPE_ES
+        assert es_cluster.schema == "https"
 
         vm_cluster = models.ClusterInfo.objects.get(domain_name="vm.example.com")
         assert vm_cluster.username == "vm_user"
         assert vm_cluster.password == "vm_password"
         assert vm_cluster.cluster_type == models.ClusterInfo.TYPE_VM
+        assert vm_cluster.default_settings["bk_biz_id"] == 1001
 
         doris_cluster = models.ClusterInfo.objects.get(domain_name="doris_test.test")
         assert doris_cluster.username == "testuser"
         assert doris_cluster.password == "testpwd"
         assert doris_cluster.cluster_type == models.ClusterInfo.TYPE_DORIS
+        assert doris_cluster.default_settings["bk_biz_id"] == 100380
+        assert doris_cluster.custom_option == json.dumps({"bk_biz_id": 100380})
+
+        surrealdb_cluster = models.ClusterInfo.objects.get(domain_name="surreal_test.test")
+        assert surrealdb_cluster.username == "root"
+        assert surrealdb_cluster.password == "root"
+        assert surrealdb_cluster.cluster_type == models.ClusterInfo.TYPE_SURREALDB
+        assert surrealdb_cluster.version == "2.3.2"
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_sync_bkbase_es_cluster_schema_only_when_not_empty():
+    es_config = next(
+        config for config in BKBASE_V4_KIND_STORAGE_CONFIGS if config["cluster_type"] == models.ClusterInfo.TYPE_ES
+    )
+    cluster_data = {
+        "kind": "ElasticSearch",
+        "metadata": {"namespace": "bklog", "name": "es_schema", "labels": {}, "annotations": {}},
+        "spec": {
+            "host": "es_schema.test",
+            "port": 9200,
+            "schema": "https",
+            "user": "testuser",
+            "password": "testpwd",
+        },
+    }
+    cluster = models.ClusterInfo.objects.create(
+        bk_tenant_id="system",
+        cluster_type=models.ClusterInfo.TYPE_ES,
+        cluster_name="es_schema",
+        display_name="es_schema",
+        domain_name="es_schema.test",
+        port=9200,
+        description="",
+        is_default_cluster=False,
+        schema="http",
+    )
+
+    sync_bkbase_cluster_info(
+        bk_tenant_id="system",
+        cluster_data=cluster_data,
+        field_mappings=es_config["field_mappings"],
+        cluster_type=models.ClusterInfo.TYPE_ES,
+        update=True,
+    )
+    cluster.refresh_from_db()
+    assert cluster.schema == "https"
+
+    cluster_data["spec"]["schema"] = ""
+    sync_bkbase_cluster_info(
+        bk_tenant_id="system",
+        cluster_data=cluster_data,
+        field_mappings=es_config["field_mappings"],
+        cluster_type=models.ClusterInfo.TYPE_ES,
+        update=True,
+    )
+    cluster.refresh_from_db()
+    assert cluster.schema == "https"
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_sync_bkbase_doris_cluster_custom_option(create_or_delete_records):
+    doris_config = next(
+        config for config in BKBASE_V4_KIND_STORAGE_CONFIGS if config["cluster_type"] == models.ClusterInfo.TYPE_DORIS
+    )
+    cluster_data = {
+        "kind": "Doris",
+        "metadata": {"namespace": "bklog", "name": "doris_custom_option", "labels": {}, "annotations": {}},
+        "spec": {
+            "host": "doris_custom_option.test",
+            "port": 9030,
+            "user": "testuser",
+            "password": "testpwd",
+            "bk_biz_id": 100380,
+        },
+    }
+
+    models.ClusterInfo.objects.create(
+        bk_tenant_id="system",
+        cluster_type=models.ClusterInfo.TYPE_DORIS,
+        cluster_name="doris_custom_option",
+        display_name="doris_custom_option",
+        domain_name="doris_custom_option.test",
+        port=9030,
+        description="",
+        is_default_cluster=False,
+    )
+    sync_bkbase_cluster_info(
+        bk_tenant_id="system",
+        cluster_data=cluster_data,
+        field_mappings=doris_config["field_mappings"],
+        cluster_type=models.ClusterInfo.TYPE_DORIS,
+        update=True,
+    )
+    cluster = models.ClusterInfo.objects.get(cluster_name="doris_custom_option")
+    assert cluster.custom_option == json.dumps({"bk_biz_id": 100380})
+    assert cluster.registered_system == models.ClusterInfo.BKDATA_REGISTERED_SYSTEM
+
+    cluster.custom_option = json.dumps({"source": "manual", "visible_config": {"visible_type": "current_biz"}})
+    cluster.save(update_fields=["custom_option"])
+    sync_bkbase_cluster_info(
+        bk_tenant_id="system",
+        cluster_data=cluster_data,
+        field_mappings=doris_config["field_mappings"],
+        cluster_type=models.ClusterInfo.TYPE_DORIS,
+        update=True,
+    )
+    cluster.refresh_from_db()
+    assert json.loads(cluster.custom_option) == {
+        "source": "manual",
+        "visible_config": {"visible_type": "current_biz"},
+        "bk_biz_id": 100380,
+    }
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_sync_bkbase_doris_owner_normalization_ignores_update_switch(create_or_delete_records):
+    doris_config = next(
+        config for config in BKBASE_V4_KIND_STORAGE_CONFIGS if config["cluster_type"] == models.ClusterInfo.TYPE_DORIS
+    )
+    cluster_data = {
+        "kind": "Doris",
+        "metadata": {"namespace": "bklog", "name": "legacy_private_doris", "labels": {}, "annotations": {}},
+        "spec": {
+            "host": "legacy_private_doris.test",
+            "port": 9030,
+            "user": "testuser",
+            "password": "testpwd",
+            "bk_biz_id": 100380,
+        },
+    }
+    cluster = models.ClusterInfo.objects.create(
+        bk_tenant_id="system",
+        cluster_type=models.ClusterInfo.TYPE_DORIS,
+        cluster_name="legacy_private_doris",
+        display_name="legacy_private_doris",
+        domain_name="legacy_private_doris.test",
+        port=9030,
+        description="",
+        is_default_cluster=False,
+        custom_option=json.dumps({"source": "manual", "visible_config": {"visible_type": "current_biz"}}),
+    )
+
+    sync_bkbase_cluster_info(
+        bk_tenant_id="system",
+        cluster_data=cluster_data,
+        field_mappings=doris_config["field_mappings"],
+        cluster_type=models.ClusterInfo.TYPE_DORIS,
+        update=False,
+    )
+
+    cluster.refresh_from_db()
+    assert cluster.registered_system == models.ClusterInfo.BKDATA_REGISTERED_SYSTEM
+    assert json.loads(cluster.custom_option) == {
+        "source": "manual",
+        "visible_config": {"visible_type": "current_biz"},
+        "bk_biz_id": 100380,
+    }
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_sync_bkbase_legacy_public_doris_without_owner_remains_default(create_or_delete_records):
+    doris_config = next(
+        config for config in BKBASE_V4_KIND_STORAGE_CONFIGS if config["cluster_type"] == models.ClusterInfo.TYPE_DORIS
+    )
+    cluster_data = {
+        "kind": "Doris",
+        "metadata": {"namespace": "bklog", "name": "legacy_public_doris", "labels": {}, "annotations": {}},
+        "spec": {
+            "host": "legacy_public_doris.test",
+            "port": 9030,
+            "user": "testuser",
+            "password": "testpwd",
+        },
+    }
+    cluster = models.ClusterInfo.objects.create(
+        bk_tenant_id="system",
+        cluster_type=models.ClusterInfo.TYPE_DORIS,
+        cluster_name="legacy_public_doris",
+        display_name="legacy_public_doris",
+        domain_name="legacy_public_doris.test",
+        port=9030,
+        description="",
+        is_default_cluster=False,
+    )
+
+    sync_bkbase_cluster_info(
+        bk_tenant_id="system",
+        cluster_data=cluster_data,
+        field_mappings=doris_config["field_mappings"],
+        cluster_type=models.ClusterInfo.TYPE_DORIS,
+        update=False,
+    )
+
+    cluster.refresh_from_db()
+    assert cluster.registered_system == models.ClusterInfo.DEFAULT_REGISTERED_SYSTEM
+    assert cluster.custom_option == ""
 
 
 # 计算平台Meta接口的返回值(这里只Mock了监控平台需要关注的部分)

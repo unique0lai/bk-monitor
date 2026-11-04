@@ -31,10 +31,11 @@ from apps.iam.handlers.drf import (
     ViewBusinessPermission,
     insert_permission_field,
 )
-from apps.log_databus.constants import STORAGE_CLUSTER_TYPE
+from apps.log_databus.constants import ClusterTypeEnum, STORAGE_CLUSTER_TYPE
 from apps.log_databus.exceptions import StorageCreateException, StorageNotExistException
 from apps.log_databus.handlers.storage import StorageHandler
 from apps.log_databus.serializers import (
+    DorisVisibleConfigUpdateSerializer,
     StorageBatchDetectSerializer,
     StorageCreateSerializer,
     StorageDetectSerializer,
@@ -53,7 +54,7 @@ class StorageViewSet(APIViewSet):
     def get_permissions(self):
         if self.action == "create":
             return [BusinessActionPermission([ActionEnum.CREATE_ES_SOURCE])]
-        if self.action == "update":
+        if self.action in ["update", "update_visible_config"]:
             return [InstanceActionPermission([ActionEnum.MANAGE_ES_SOURCE], ResourceEnum.ES_SOURCE)]
         return [ViewBusinessPermission()]
 
@@ -134,7 +135,9 @@ class StorageViewSet(APIViewSet):
         data = self.params_valid(StorageListSerializer)
         return Response(
             StorageHandler().get_cluster_groups_filter(
-                bk_biz_id=data["bk_biz_id"], enable_archive=data.get("enable_archive", False)
+                bk_biz_id=data["bk_biz_id"],
+                cluster_query_type=data.get("cluster_type", ClusterTypeEnum.ES.value),
+                enable_archive=data.get("enable_archive", False),
             )
         )
 
@@ -164,11 +167,16 @@ class StorageViewSet(APIViewSet):
         @apiSuccess {String} auth_info.username 用户
         @apiSuccess {String} auth_info.password 密码
         @apiSuccess {Bool} is_editable 是否可编辑（为false时不可编辑）
-        @apiSuccess {Object} cluster_stats 集群状态 连接出错该对象不存在
+        @apiSuccess {Object} cluster_stats 集群状态，探测失败时为空
         @apiSuccess {String} cluster_stats.status 集群状况 green yellow red
-        @apiSuccess {Int} cluster_stats.indices_count 集群索引数量
-        @apiSuccess {Int} cluster_stats.indices_doc_count 集群文档数量
+        @apiSuccess {Int} [cluster_stats.indices_count] ES 集群索引数量
+        @apiSuccess {Int} [cluster_stats.indices_docs_count] ES 集群文档数量
         @apiSuccess {Int} cluster_stats.indices_store 集群存储大小 单位Byte
+        @apiSuccess {Int} cluster_stats.node_count 节点总数
+        @apiSuccess {Int} [cluster_stats.available_node_count] Doris 可用节点数
+        @apiSuccess {Int} [cluster_stats.tablet_count] Doris Tablet 数量
+        @apiSuccess {Float} [cluster_stats.max_disk_used_percent] Doris 最大磁盘使用率
+        @apiSuccess {String} [cluster_stats.storage_status] Doris 原始状态 available/degraded/unavailable
         @apiSuccessExample {json} 成功返回:
         {
             "result": true,
@@ -235,7 +243,11 @@ class StorageViewSet(APIViewSet):
         """
         data = self.params_valid(StorageListSerializer)
         return Response(
-            StorageHandler().list(bk_biz_id=data["bk_biz_id"], enable_archive=data.get("enable_archive", False))
+            StorageHandler().list(
+                bk_biz_id=data["bk_biz_id"],
+                cluster_query_type=data.get("cluster_type", ClusterTypeEnum.ES.value),
+                enable_archive=data.get("enable_archive", False),
+            )
         )
 
     def retrieve(self, request, *args, **kwargs):
@@ -502,6 +514,46 @@ class StorageViewSet(APIViewSet):
         """
         return Response(StorageHandler(cluster_id).destroy())
 
+    @detail_route(methods=["PUT"], url_path="visible_config")
+    def update_visible_config(self, request, *args, **kwargs):
+        """
+        @api {put} /databus/storage/$cluster_id/visible_config/ 06_存储集群-更新Doris可见范围与存储设置
+        @apiName update_storage_visible_config
+        @apiGroup 09_StorageCluster
+        @apiDescription 仅更新 Doris 集群可见范围与存储设置（不涉及域名/账号/连通性）
+        @apiParam {Int} cluster_id 集群ID
+        @apiParam {Int} bk_biz_id 业务ID
+        @apiParam {Object} visible_config 可见业务配置
+        @apiParam {string} visible_config.visible_type 可见业务配置类型 current_biz 当前业务，all_biz 全部业务 biz_attr 业务属性 multi_biz 多个业务
+        @apiParam {List} [visible_config.visible_bk_biz] multi_biz 类型设置该参数
+        @apiParam {Object} [visible_config.bk_biz_labels] biz_attr 类型设置该参数
+        @apiParam {Object} [setup_config] 存储设置，不传则保持原配置
+        @apiParam {Int} setup_config.retention_days_max 最大保留天数
+        @apiParam {Int} setup_config.retention_days_default 默认保留天数，不得大于最大保留天数
+        @apiParamExample {Json} 请求参数
+        {
+            "bk_biz_id": 2,
+            "visible_config": {
+                "visible_type": "multi_biz",
+                "visible_bk_biz": [100, 101]
+            },
+            "setup_config": {
+                "retention_days_max": 30,
+                "retention_days_default": 14
+            }
+        }
+        @apiSuccessExample {json} 成功返回:
+        {
+            "result": true,
+            "data": {},
+            "code": 0,
+            "message": ""
+        }
+        """
+        request.data["cluster_id"] = kwargs["cluster_id"]
+        data = self.params_valid(DorisVisibleConfigUpdateSerializer)
+        return Response(StorageHandler(kwargs["cluster_id"]).update_visible_config(data))
+
     @list_route(methods=["POST"], url_path="connectivity_detect")
     def connectivity_detect(self, request, *args, **kwargs):
         """
@@ -631,15 +683,19 @@ class StorageViewSet(APIViewSet):
         @apiGroup 09_StorageCluster
         @apiDescription 批量连通性测试
         @apiParam {Array(Dict)} cluster_list 集群ID列表
-        @apiParam {Int} cluster_list.status 连接状态
-        @apiParam {Int} cluster_list.status_stats 集群状态
-        @apiParam {Int} cluster_list.status_stats.node_count 集群状态
-        @apiParam {Int} cluster_list.status_stats.indices_count 集群索引数量
-        @apiParam {Int} cluster_list.status_stats.indices_docs_count 集群索引文档数量
-        @apiParam {Int} cluster_list.status_stats.status 集群状态
-        @apiParam {Int} cluster_list.status_stats.shards_pri 集群主切片数量
-        @apiParam {Int} cluster_list.status_stats.shared_total 集群切片数量
-        @apiParam {Int} cluster_list.status_stats.total_store 全部存储
+        @apiSuccess {Bool} status 连接状态
+        @apiSuccess {Object} cluster_stats 集群状态
+        @apiSuccess {Int} cluster_stats.node_count 节点总数
+        @apiSuccess {Int} [cluster_stats.indices_count] ES 集群索引数量
+        @apiSuccess {Int} [cluster_stats.indices_docs_count] ES 集群索引文档数量
+        @apiSuccess {String} cluster_stats.status 集群状态 green yellow red
+        @apiSuccess {Int} [cluster_stats.shards_pri] ES 集群主分片数量
+        @apiSuccess {Int} [cluster_stats.shards_total] ES 集群分片数量
+        @apiSuccess {Int} cluster_stats.total_store 全部存储
+        @apiSuccess {Int} [cluster_stats.available_node_count] Doris 可用节点数
+        @apiSuccess {Int} [cluster_stats.tablet_count] Doris Tablet 数量
+        @apiSuccess {Float} [cluster_stats.max_disk_used_percent] Doris 最大磁盘使用率
+        @apiSuccess {String} [cluster_stats.storage_status] Doris 原始状态 available/degraded/unavailable
         @apiParamExample {Json} 请求参数
         {
             "cluster_list": [3,8]

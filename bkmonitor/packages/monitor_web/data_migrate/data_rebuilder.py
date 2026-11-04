@@ -1,5 +1,6 @@
 import logging
 import time
+from copy import deepcopy
 from typing import Any, Literal
 
 from bk_monitor_base.uptime_check import control_task, refresh_task_status
@@ -9,8 +10,9 @@ from django.db.models import Q
 from pydantic import BaseModel, Field
 
 from apm.models.datasource import LogDataSource, MetricDataSource, ProfileDataSource, TraceDataSource
+from apm_web.models import ApmMetaConfig, Application as ApmWebApplication
 from bk_dataview.api import DashboardPermissionActions, get_or_create_user, sync_user_role
-from bk_dataview.models import BuiltinRole, Dashboard, Org, Permission, Role
+from bk_dataview.models import BuiltinRole, Dashboard, Folder, Org, Permission, Role
 from bk_dataview.permissions import GrafanaPermission
 from bk_dataview.utils import generate_uid
 from bkmonitor.models import StrategyModel
@@ -58,6 +60,8 @@ logger = logging.getLogger(__name__)
 UPTIME_CHECK_CLOSE_RECORDS_MODEL_LABEL = "monitor.uptimechecktask"
 COLLECT_CONFIG_CLOSE_RECORDS_MODEL_LABEL = "monitor_web.collectconfigmeta"
 STRATEGY_CLOSE_RECORDS_MODEL_LABEL = "bkmonitor.strategymodel"
+MIGRATE_ROUTE_NAME_TEMPLATE = "migrate_kafka_data_id_{data_id}"
+PROFILING_MIGRATE_ROUTE_NAME_TEMPLATE = "migrate_profiling_data_id_{data_id}"
 
 
 DEFAULT_KAFKA_CLUSTER_NAMES = {
@@ -67,6 +71,55 @@ DEFAULT_KAFKA_CLUSTER_NAMES = {
 }
 
 DEFAULT_ES_CLUSTER_NAMES = {"log": "log-es-public-1", "event": "event-es-public-1"}
+APM_APPLICATION_STORAGE_CONFIG_KEYS = (
+    ApmWebApplication.APPLICATION_DATASOURCE_CONFIG_KEY,
+    ApmWebApplication.APPLICATION_LOG_DATASOURCE_CONFIG_KEY,
+)
+APM_STORAGE_CLUSTER_CONFIG_FIELDS = (ApmWebApplication.DatasourceConfig.ES_STORAGE_CLUSTER,)
+
+BUILTIN_ROLE_MANAGED_NAMES = {
+    "Admin": "managed:builtins:admin:permissions",
+    "Editor": "managed:builtins:editor:permissions",
+    "Viewer": "managed:builtins:viewer:permissions",
+}
+
+FOLDER_PERMISSION_ACTIONS = {
+    GrafanaPermission.View: [
+        "folders:read",
+        "dashboards:read",
+        "library.panels:read",
+    ],
+    GrafanaPermission.Edit: [
+        "folders:read",
+        "folders:write",
+        "folders:delete",
+        "dashboards:create",
+        "dashboards:read",
+        "dashboards:write",
+        "dashboards:delete",
+        "library.panels:create",
+        "library.panels:read",
+        "library.panels:write",
+        "library.panels:delete",
+    ],
+    GrafanaPermission.Admin: [
+        "folders:read",
+        "folders:write",
+        "folders:delete",
+        "folders.permissions:read",
+        "folders.permissions:write",
+        "dashboards:create",
+        "dashboards:read",
+        "dashboards:write",
+        "dashboards:delete",
+        "dashboards.permissions:read",
+        "dashboards.permissions:write",
+        "library.panels:create",
+        "library.panels:read",
+        "library.panels:write",
+        "library.panels:delete",
+    ],
+}
 
 
 def _delete_gse_route_with_fallback(delete_params: dict[str, Any]) -> None:
@@ -108,6 +161,60 @@ def _get_plugin_data_label(plugin: CollectorPluginMeta) -> str | None:
         return qcloud_exporter_plugin_id
 
     return None
+
+
+def _replace_apm_storage_config_value(config_value: Any, storage_cluster_id: int) -> tuple[Any, bool]:
+    """替换 APM 应用级存储配置里的 ES 集群 ID。"""
+    if not isinstance(config_value, dict):
+        return config_value, False
+
+    updated_config = deepcopy(config_value)
+    changed = False
+
+    for field_name in APM_STORAGE_CLUSTER_CONFIG_FIELDS:
+        if updated_config.get(field_name) == storage_cluster_id:
+            continue
+        updated_config[field_name] = storage_cluster_id
+        changed = True
+
+    return updated_config, changed
+
+
+def rebuild_apm_application_storage_config(bk_tenant_id: str, bk_biz_id: int, es_cluster_id: int) -> int:
+    """同步 rebuild 后 APM 应用级 trace/log 存储配置里的 ES 集群 ID。"""
+    application_ids = list(
+        ApmWebApplication.objects.filter(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id).values_list(
+            "application_id", flat=True
+        )
+    )
+    if not application_ids:
+        return 0
+
+    updated_count = 0
+    configs = ApmMetaConfig.objects.filter(
+        config_level=ApmMetaConfig.APPLICATION_LEVEL,
+        level_key__in=[str(application_id) for application_id in application_ids],
+        config_key__in=APM_APPLICATION_STORAGE_CONFIG_KEYS,
+    )
+    for apm_config in configs:
+        config_value, changed = _replace_apm_storage_config_value(
+            config_value=apm_config.config_value, storage_cluster_id=es_cluster_id
+        )
+        if not changed:
+            continue
+
+        apm_config.config_value = config_value
+        apm_config.save(update_fields=["config_value"])
+        updated_count += 1
+
+    logger.info(
+        "rebuild_apm_application_storage_config: bk_tenant_id=%s bk_biz_id=%s es_cluster_id=%s updated_count=%s",
+        bk_tenant_id,
+        bk_biz_id,
+        es_cluster_id,
+        updated_count,
+    )
+    return updated_count
 
 
 def rebuild_system_data(bk_tenant_id: str, bk_biz_id: int):
@@ -209,16 +316,8 @@ def init_global_plugin(bk_tenant_id: str):
             )
 
 
-def _get_closed_record_ids_from_application_config(bk_biz_id: int, model_label: str) -> set[int]:
-    """从 ``ApplicationConfig`` 中获取导入阶段记录的关闭对象 ID。"""
-    config = ApplicationConfig.objects.filter(
-        cc_biz_id=bk_biz_id,
-        key=DATA_MIGRATE_CLOSED_RECORDS_APPLICATION_CONFIG_KEY,
-    ).first()
-    if not config or not isinstance(config.value, dict):
-        return set()
-
-    raw_record_ids = config.value.get(model_label, [])
+def _normalize_closed_record_ids(raw_record_ids: Any, bk_biz_id: int, model_label: str) -> set[int]:
+    """将配置中的关闭对象 ID 规范化为整数集合。"""
     if not isinstance(raw_record_ids, list):
         return set()
 
@@ -234,6 +333,73 @@ def _get_closed_record_ids_from_application_config(bk_biz_id: int, model_label: 
                 record_id,
             )
     return closed_record_ids
+
+
+def _get_closed_record_ids_from_application_config(bk_biz_id: int, model_label: str) -> set[int]:
+    """从 ``ApplicationConfig`` 中获取导入阶段记录的关闭对象 ID。"""
+    config = ApplicationConfig.objects.filter(
+        cc_biz_id=bk_biz_id,
+        key=DATA_MIGRATE_CLOSED_RECORDS_APPLICATION_CONFIG_KEY,
+    ).first()
+    if not config or not isinstance(config.value, dict):
+        return set()
+
+    return _normalize_closed_record_ids(config.value.get(model_label, []), bk_biz_id, model_label)
+
+
+def disable_enabled_strategies(
+    bk_biz_ids: list[int],
+    dry_run: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """关闭业务下当前启用的策略，并将策略 ID 记录到 ``ApplicationConfig`` 供后续恢复。"""
+    disable_results: dict[int, dict[str, Any]] = {}
+    for bk_biz_id in bk_biz_ids:
+        with transaction.atomic():
+            enabled_strategy_ids = set(
+                StrategyModel.objects.select_for_update()
+                .filter(bk_biz_id=bk_biz_id, is_enabled=True)
+                .values_list("id", flat=True)
+            )
+
+            config = (
+                ApplicationConfig.objects.select_for_update()
+                .filter(
+                    cc_biz_id=bk_biz_id,
+                    key=DATA_MIGRATE_CLOSED_RECORDS_APPLICATION_CONFIG_KEY,
+                )
+                .first()
+            )
+            config_value = deepcopy(config.value) if config and isinstance(config.value, dict) else {}
+            previously_recorded_ids = _normalize_closed_record_ids(
+                config_value.get(STRATEGY_CLOSE_RECORDS_MODEL_LABEL, []),
+                bk_biz_id,
+                STRATEGY_CLOSE_RECORDS_MODEL_LABEL,
+            )
+            recorded_strategy_ids = previously_recorded_ids | enabled_strategy_ids
+
+            disabled_count = 0
+            if enabled_strategy_ids and not dry_run:
+                config_value[STRATEGY_CLOSE_RECORDS_MODEL_LABEL] = sorted(recorded_strategy_ids)
+                ApplicationConfig.objects.update_or_create(
+                    cc_biz_id=bk_biz_id,
+                    key=DATA_MIGRATE_CLOSED_RECORDS_APPLICATION_CONFIG_KEY,
+                    defaults={"value": config_value},
+                )
+                disabled_count = StrategyModel.objects.filter(
+                    bk_biz_id=bk_biz_id,
+                    id__in=enabled_strategy_ids,
+                    is_enabled=True,
+                ).update(is_enabled=False, update_user="system")
+
+            disable_results[bk_biz_id] = {
+                "enabled_count": len(enabled_strategy_ids),
+                "previously_recorded_count": len(previously_recorded_ids),
+                "newly_recorded_count": len(enabled_strategy_ids - previously_recorded_ids),
+                "recorded_count": len(recorded_strategy_ids),
+                "disabled_count": disabled_count,
+                "dry_run": dry_run,
+            }
+    return disable_results
 
 
 def enable_closed_strategies_from_application_config(bk_biz_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -300,9 +466,13 @@ def rebuild_collect_plugins(
         Q(bk_biz_id=bk_biz_id, plugin_id__in=plugin_ids) | Q(bk_biz_id=0, plugin_id="bkprocessbeat"),
         bk_tenant_id=bk_tenant_id,
     )
+    exists_global_plugin_ids = CollectorPluginMeta.objects.filter(
+        bk_tenant_id=bk_tenant_id, bk_biz_id=0, plugin_id__in=plugin_ids
+    ).values_list("plugin_id", flat=True)
     exists_plugin_ids = plugins.values_list("plugin_id", flat=True)
-    if not set(exists_plugin_ids).issuperset(set(plugin_ids)):
-        missing_plugin_ids = set(plugin_ids) - set(exists_plugin_ids)
+
+    missing_plugin_ids = set(plugin_ids) - set(exists_plugin_ids) - set(exists_global_plugin_ids)
+    if missing_plugin_ids:
         raise ValueError(f"插件不存在: {missing_plugin_ids}")
 
     # 如果进程插件不需要，则不需要在本轮进行重建
@@ -543,23 +713,60 @@ def rebuild_event_group(
         result_table.modify(operator="system", is_enable=True)
 
 
-def rebuild_bklog_data_source_route(bk_tenant_id: str, bk_biz_id: int, kafka_cluster_name: str, es_cluster_name: str):
+def _get_apm_log_table_ids_and_data_ids(bk_biz_id: int) -> tuple[set[str], set[int]]:
+    """获取 APM trace/log 对应的日志类结果表和数据 ID。"""
+    apm_table_ids: set[str] = set()
+    apm_data_ids: set[int] = set()
+    for model in (TraceDataSource, LogDataSource):
+        for result_table_id, bk_data_id in model.objects.filter(bk_biz_id=bk_biz_id).values_list(
+            "result_table_id", "bk_data_id"
+        ):
+            if result_table_id:
+                apm_table_ids.add(result_table_id)
+            if bk_data_id and bk_data_id != -1:
+                apm_data_ids.add(bk_data_id)
+    return apm_table_ids, apm_data_ids
+
+
+def rebuild_bklog_data_source_route(
+    bk_tenant_id: str,
+    bk_biz_id: int,
+    kafka_cluster_name: str,
+    es_cluster_name: str,
+    apm_kafka_cluster_name: str | None = None,
+    apm_es_cluster_name: str | None = None,
+):
     """重建bklog数据源路由
     Args:
         bk_tenant_id (str): 租户ID
         bk_biz_id (int): 业务ID
-        cluster_name (str): 集群名称
+        kafka_cluster_name (str): 日志 Kafka 集群名称
+        es_cluster_name (str): 日志 ES 集群名称
+        apm_kafka_cluster_name (str): APM Kafka 集群名称；为空时沿用日志 Kafka
+        apm_es_cluster_name (str): APM ES 集群名称；为空时沿用日志 ES
 
     1. 替换ESStorage/StorageClusterRecord的集群信息
     2. 替换数据源的集群信息
     3. 注册数据源到gse和bkbase
-    4. 结果表和虚拟结果表全部为停用状态，后续由日志/APM方便自行开启
+    4. 同步 APM 应用级 trace/log 存储配置中的 ES 集群信息
+    5. 结果表和虚拟结果表全部为停用状态，后续由日志/APM方便自行开启
     """
     kafka_cluster = ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=kafka_cluster_name)
     es_cluster = ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=es_cluster_name)
+    apm_kafka_cluster = (
+        ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=apm_kafka_cluster_name)
+        if apm_kafka_cluster_name
+        else kafka_cluster
+    )
+    apm_es_cluster = (
+        ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=apm_es_cluster_name)
+        if apm_es_cluster_name
+        else es_cluster
+    )
     biz_result_tables = ResultTable.objects.filter(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id)
+    apm_table_ids, apm_bk_data_ids = _get_apm_log_table_ids_and_data_ids(bk_biz_id)
 
-    # 排除trace
+    # APM trace/log 与普通日志同属 flat batch，需要在指定 APM 集群时拆开处理。
     log_data_sources = DataSource.objects.filter(bk_tenant_id=bk_tenant_id, etl_config=EtlConfigs.BK_FLAT_BATCH.value)
     dsrt = DataSourceResultTable.objects.filter(
         table_id__in=biz_result_tables.values_list("table_id", flat=True),
@@ -567,32 +774,53 @@ def rebuild_bklog_data_source_route(bk_tenant_id: str, bk_biz_id: int, kafka_clu
     )
     bk_data_ids: list[int] = [dsrt.bk_data_id for dsrt in dsrt]
     real_table_ids: list[str] = [dsrt.table_id for dsrt in dsrt]
-    virtual_table_ids = list(
-        ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, origin_table_id__in=real_table_ids).values_list(
-            "table_id", flat=True
+    apm_real_table_ids = [table_id for table_id in real_table_ids if table_id in apm_table_ids]
+    log_real_table_ids = [table_id for table_id in real_table_ids if table_id not in apm_table_ids]
+    virtual_table_records = list(
+        ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, origin_table_id__in=real_table_ids).values(
+            "table_id", "origin_table_id"
         )
     )
+    apm_virtual_table_ids = [
+        record["table_id"] for record in virtual_table_records if record["origin_table_id"] in apm_real_table_ids
+    ]
+    log_virtual_table_ids = [
+        record["table_id"] for record in virtual_table_records if record["origin_table_id"] not in apm_real_table_ids
+    ]
 
     data_sources = DataSource.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id__in=bk_data_ids)
 
-    # real_result_tables = ResultTable.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=real_table_ids)
-    # virtual_result_tables = ResultTable.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=virtual_table_ids)
-    real_ess = ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=real_table_ids)
-    virtual_ess = ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=virtual_table_ids)
-    storage_cluster_records = StorageClusterRecord.objects.filter(
-        bk_tenant_id=bk_tenant_id, table_id__in=real_table_ids + virtual_table_ids
-    )
-
     # 替换ess的集群信息
-    real_ess.update(storage_cluster_id=es_cluster.cluster_id)
-    virtual_ess.update(need_create_index=False, storage_cluster_id=es_cluster.cluster_id)
-    storage_cluster_records.update(cluster_id=es_cluster.cluster_id)
+    ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=log_real_table_ids).update(
+        storage_cluster_id=es_cluster.cluster_id
+    )
+    ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=log_virtual_table_ids).update(
+        need_create_index=False,
+        storage_cluster_id=es_cluster.cluster_id,
+    )
+    StorageClusterRecord.objects.filter(
+        bk_tenant_id=bk_tenant_id, table_id__in=log_real_table_ids + log_virtual_table_ids
+    ).update(cluster_id=es_cluster.cluster_id)
+    if apm_real_table_ids or apm_virtual_table_ids:
+        ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=apm_real_table_ids).update(
+            storage_cluster_id=apm_es_cluster.cluster_id
+        )
+        ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id__in=apm_virtual_table_ids).update(
+            need_create_index=False,
+            storage_cluster_id=apm_es_cluster.cluster_id,
+        )
+        StorageClusterRecord.objects.filter(
+            bk_tenant_id=bk_tenant_id, table_id__in=apm_real_table_ids + apm_virtual_table_ids
+        ).update(cluster_id=apm_es_cluster.cluster_id)
 
     # 替换数据源的集群信息
-    data_sources.update(mq_cluster_id=kafka_cluster.cluster_id)
+    log_data_sources_for_update = data_sources.exclude(bk_data_id__in=apm_bk_data_ids)
+    apm_data_sources_for_update = data_sources.filter(bk_data_id__in=apm_bk_data_ids)
+    log_data_sources_for_update.update(mq_cluster_id=kafka_cluster.cluster_id)
+    apm_data_sources_for_update.update(mq_cluster_id=apm_kafka_cluster.cluster_id)
 
     # 替换数据源kafka并注册到gse和bkbase
-    for data_source in data_sources:
+    for data_source in DataSource.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id__in=bk_data_ids):
         if not data_source.is_enable:
             continue
         _register_data_source(
@@ -608,6 +836,12 @@ def rebuild_bklog_data_source_route(bk_tenant_id: str, bk_biz_id: int, kafka_clu
     for trace_table in trace_tables:
         trace_table.modify(operator="system", is_enable=True)
 
+    rebuild_apm_application_storage_config(
+        bk_tenant_id=bk_tenant_id,
+        bk_biz_id=bk_biz_id,
+        es_cluster_id=apm_es_cluster.cluster_id,
+    )
+
 
 def _ensure_builtin_role(org_id: int, role_name: str, managed_role_name: str) -> Role:
     """确保 org 下存在指定的内置角色，不存在则创建。
@@ -622,26 +856,108 @@ def _ensure_builtin_role(org_id: int, role_name: str, managed_role_name: str) ->
     """
     builtin_role = BuiltinRole.objects.filter(org_id=org_id, role=role_name).first()
     if builtin_role:
-        return Role.objects.get(id=builtin_role.role_id)
+        try:
+            return Role.objects.get(id=builtin_role.role_id)
+        except Role.DoesNotExist:
+            logger.warning(
+                "_ensure_builtin_role: org_id=%s role=%s 对应 role_id=%s 不存在，尝试重建",
+                org_id,
+                role_name,
+                builtin_role.role_id,
+            )
 
     try:
-        role = Role.objects.create(
+        role, _ = Role.objects.get_or_create(
             org_id=org_id,
             name=managed_role_name,
-            uid=generate_uid(exclude_model=Role),
+            defaults={"uid": generate_uid(exclude_model=Role)},
         )
-        BuiltinRole.objects.create(org_id=org_id, role=role_name, role_id=role.id)
+        if builtin_role:
+            builtin_role.role_id = role.id
+            builtin_role.save(update_fields=["role_id"])
+        elif not BuiltinRole.objects.filter(org_id=org_id, role=role_name).exists():
+            BuiltinRole.objects.create(org_id=org_id, role=role_name, role_id=role.id)
     except IntegrityError:
         role = Role.objects.get(org_id=org_id, name=managed_role_name)
+        if builtin_role:
+            builtin_role.role_id = role.id
+            builtin_role.save(update_fields=["role_id"])
+        elif not BuiltinRole.objects.filter(org_id=org_id, role=role_name).exists():
+            BuiltinRole.objects.create(org_id=org_id, role=role_name, role_id=role.id)
     return role
+
+
+def _rebuild_folder_records(org_id: int) -> tuple[int, int, int]:
+    """按 org 将 legacy dashboard folder 同步到 Grafana 新 folder 表。
+
+    Grafana 仍以 dashboard 表中 ``is_folder=1`` 的记录作为 legacy folder，
+    但 folder 更新/移动会同时写新 ``folder`` 表。迁移缺失 ``folder`` 表时，
+    会出现 GET/search 正常、PUT /api/folders/:uid 报 folder.notFound 的情况。
+
+    Args:
+        org_id: Grafana 组织 ID
+
+    Returns:
+        (created_count, updated_count, deleted_count)
+    """
+    dashboard_folders = list(
+        Dashboard.objects.filter(org_id=org_id, is_folder=1, uid__isnull=False)
+        .exclude(uid="")
+        .values("uid", "title", "folder_uid", "created", "updated")
+    )
+    folder_uids = [folder["uid"] for folder in dashboard_folders]
+    existing_folders = {folder.uid: folder for folder in Folder.objects.filter(org_id=org_id, uid__in=folder_uids)}
+
+    create_folders: list[Folder] = []
+    update_folders: list[Folder] = []
+    for dashboard_folder in dashboard_folders:
+        parent_uid = dashboard_folder["folder_uid"] or None
+        folder = existing_folders.get(dashboard_folder["uid"])
+        if folder is None:
+            create_folders.append(
+                Folder(
+                    org_id=org_id,
+                    uid=dashboard_folder["uid"],
+                    title=dashboard_folder["title"],
+                    description=None,
+                    parent_uid=parent_uid,
+                    created=dashboard_folder["created"],
+                    updated=dashboard_folder["updated"],
+                )
+            )
+            continue
+
+        changed = False
+        if folder.title != dashboard_folder["title"]:
+            folder.title = dashboard_folder["title"]
+            changed = True
+        if folder.parent_uid != parent_uid:
+            folder.parent_uid = parent_uid
+            changed = True
+        if folder.updated != dashboard_folder["updated"]:
+            folder.updated = dashboard_folder["updated"]
+            changed = True
+        if changed:
+            update_folders.append(folder)
+
+    if create_folders:
+        Folder.objects.bulk_create(create_folders, batch_size=500, ignore_conflicts=True)
+    if update_folders:
+        Folder.objects.bulk_update(update_folders, fields=["title", "parent_uid", "updated"], batch_size=500)
+
+    delete_queryset = Folder.objects.filter(org_id=org_id)
+    if folder_uids:
+        delete_queryset = delete_queryset.exclude(uid__in=folder_uids)
+    deleted_count, _ = delete_queryset.delete()
+    return len(create_folders), len(update_folders), deleted_count
 
 
 def rebuild_dashboard(bk_biz_id: int):
     """重建仪表盘权限配置。
 
     将 admin 用户加入业务对应的 Grafana Org 并赋予 Admin 角色，
-    然后为 Org 下所有仪表盘重建基于内置角色的权限：
-    - Admin 角色：拥有全部管理权限（通过 OrgUser.role=Admin 隐式生效）
+    同步 Org 下的 folder 表记录，然后为仪表盘和目录重建基于内置角色的权限：
+    - Admin 角色：可读、可写、可删除、可管理权限
     - Editor 角色：可读、可写、可删除
     - Viewer 角色：只读
 
@@ -657,52 +973,84 @@ def rebuild_dashboard(bk_biz_id: int):
 
     # 确保 admin 用户存在并赋予 Admin 角色
     admin_user = get_or_create_user("admin")
-    sync_user_role(org_id, admin_user["id"], "Admin")
+    with transaction.atomic():
+        sync_user_role(org_id, admin_user["id"], "Admin")
 
-    # 确保 Editor / Viewer 内置角色存在
-    editor_role = _ensure_builtin_role(org_id, "Editor", "managed:builtins:editor:permissions")
-    viewer_role = _ensure_builtin_role(org_id, "Viewer", "managed:builtins:viewer:permissions")
+        # 确保 Admin / Editor / Viewer 内置角色存在
+        admin_role = _ensure_builtin_role(org_id, "Admin", BUILTIN_ROLE_MANAGED_NAMES["Admin"])
+        editor_role = _ensure_builtin_role(org_id, "Editor", BUILTIN_ROLE_MANAGED_NAMES["Editor"])
+        viewer_role = _ensure_builtin_role(org_id, "Viewer", BUILTIN_ROLE_MANAGED_NAMES["Viewer"])
 
-    # 获取 Org 下所有仪表盘 UID（排除 folder）
-    dashboard_uids = list(Dashboard.objects.filter(org_id=org_id, is_folder=0).values_list("uid", flat=True))
-    if not dashboard_uids:
-        logger.info("rebuild_dashboard: bk_biz_id=%s org_id=%s 下无仪表盘，跳过权限重建", bk_biz_id, org_id)
-        return
+        folder_created_count, folder_updated_count, folder_deleted_count = _rebuild_folder_records(org_id)
 
-    # 构建每个角色对应的权限 scope 集合
-    role_permission_map: dict[int, list[str]] = {
-        editor_role.id: DashboardPermissionActions[GrafanaPermission.Edit],
-        viewer_role.id: DashboardPermissionActions[GrafanaPermission.View],
-    }
-
-    # 清理 editor/viewer 角色的旧仪表盘权限
-    role_ids = [editor_role.id, viewer_role.id]
-    Permission.objects.filter(
-        role_id__in=role_ids,
-        scope__startswith="dashboards:uid:",
-    ).delete()
-
-    # 批量创建新权限
-    permission_objs: list[Permission] = []
-    for role_id, actions in role_permission_map.items():
-        for uid in dashboard_uids:
-            for action in actions:
-                permission_objs.append(
-                    Permission(
-                        role_id=role_id,
-                        action=action,
-                        scope=f"dashboards:uid:{uid}",
-                    )
-                )
-
-    if permission_objs:
-        Permission.objects.bulk_create(permission_objs, batch_size=500, ignore_conflicts=True)
-        logger.info(
-            "rebuild_dashboard: bk_biz_id=%s org_id=%s 重建权限完成，共 %d 条 Permission",
-            bk_biz_id,
-            org_id,
-            len(permission_objs),
+        # 获取 Org 下所有仪表盘 / 目录 UID
+        dashboard_uids = list(
+            Dashboard.objects.filter(org_id=org_id, is_folder=0, uid__isnull=False)
+            .exclude(uid="")
+            .values_list("uid", flat=True)
         )
+        folder_uids = list(
+            Dashboard.objects.filter(org_id=org_id, is_folder=1, uid__isnull=False)
+            .exclude(uid="")
+            .values_list("uid", flat=True)
+        )
+
+        dashboard_permission_map: dict[int, list[str]] = {
+            admin_role.id: DashboardPermissionActions[GrafanaPermission.Admin],
+            editor_role.id: DashboardPermissionActions[GrafanaPermission.Edit],
+            viewer_role.id: DashboardPermissionActions[GrafanaPermission.View],
+        }
+        folder_permission_map: dict[int, list[str]] = {
+            admin_role.id: FOLDER_PERMISSION_ACTIONS[GrafanaPermission.Admin],
+            editor_role.id: FOLDER_PERMISSION_ACTIONS[GrafanaPermission.Edit],
+            viewer_role.id: FOLDER_PERMISSION_ACTIONS[GrafanaPermission.View],
+        }
+
+        # 清理 builtin 角色的旧仪表盘和目录权限
+        role_ids = [admin_role.id, editor_role.id, viewer_role.id]
+        Permission.objects.filter(role_id__in=role_ids).filter(
+            Q(scope__startswith="dashboards:uid:") | Q(scope__startswith="folders:uid:")
+        ).delete()
+
+        # 批量创建新权限
+        permission_objs: list[Permission] = []
+        for role_id, actions in dashboard_permission_map.items():
+            for uid in dashboard_uids:
+                for action in actions:
+                    permission_objs.append(
+                        Permission(
+                            role_id=role_id,
+                            action=action,
+                            scope=f"dashboards:uid:{uid}",
+                        )
+                    )
+
+        for role_id, actions in folder_permission_map.items():
+            for uid in folder_uids:
+                for action in actions:
+                    permission_objs.append(
+                        Permission(
+                            role_id=role_id,
+                            action=action,
+                            scope=f"folders:uid:{uid}",
+                        )
+                    )
+
+        if permission_objs:
+            Permission.objects.bulk_create(permission_objs, batch_size=500, ignore_conflicts=True)
+
+    logger.info(
+        "rebuild_dashboard: bk_biz_id=%s org_id=%s 重建完成，dashboard=%d folder=%d "
+        "folder_created=%d folder_updated=%d folder_deleted=%d permission=%d",
+        bk_biz_id,
+        org_id,
+        len(dashboard_uids),
+        len(folder_uids),
+        folder_created_count,
+        folder_updated_count,
+        folder_deleted_count,
+        len(permission_objs),
+    )
 
 
 def rebuild_custom_report(
@@ -711,6 +1059,7 @@ def rebuild_custom_report(
     metric_kafka_cluster_name: str,
     event_kafka_cluster_name: str,
     es_cluster_name: str,
+    apm_kafka_cluster_name: str | None = None,
 ):
     """重建自定义报告权限配置。
 
@@ -720,6 +1069,11 @@ def rebuild_custom_report(
 
     metric_kafka_cluster = ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=metric_kafka_cluster_name)
     event_kafka_cluster = ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=event_kafka_cluster_name)
+    apm_kafka_cluster = (
+        ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=apm_kafka_cluster_name)
+        if apm_kafka_cluster_name
+        else metric_kafka_cluster
+    )
     es_cluster = ClusterInfo.objects.get(bk_tenant_id=bk_tenant_id, cluster_name=es_cluster_name)
 
     ts_tables = CustomTSTable.objects.filter(bk_biz_id=bk_biz_id)
@@ -747,7 +1101,7 @@ def rebuild_custom_report(
     rebuild_time_series_group(
         bk_tenant_id=bk_tenant_id,
         bk_biz_id=bk_biz_id,
-        kafka_cluster_name=metric_kafka_cluster.cluster_name,
+        kafka_cluster_name=apm_kafka_cluster.cluster_name,
         time_series_group_ids=list(time_series_groups.values_list("time_series_group_id", flat=True)),
     )
 
@@ -768,12 +1122,12 @@ def rebuild_k8s_data(
     metric_data_ids = [cluster.K8sMetricDataID for cluster in clusters if cluster.K8sMetricDataID] + [
         cluster.CustomMetricDataID for cluster in clusters if cluster.CustomMetricDataID
     ]
-    event_data_ids = [cluster.K8sEventDataID for cluster in clusters if cluster.K8sEventDataID]
+    event_data_ids = [cluster.K8sEventDataID for cluster in clusters if cluster.K8sEventDataID] + [
+        cluster.CustomEventDataID for cluster in clusters if cluster.CustomEventDataID
+    ]
 
     if metric_data_ids:
-        time_series_groups = TimeSeriesGroup.objects.filter(
-            bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id, bk_data_id__in=metric_data_ids
-        )
+        time_series_groups = TimeSeriesGroup.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id__in=metric_data_ids)
         rebuild_time_series_group(
             bk_tenant_id=bk_tenant_id,
             bk_biz_id=bk_biz_id,
@@ -782,9 +1136,7 @@ def rebuild_k8s_data(
         )
 
     if event_data_ids:
-        event_groups = EventGroup.objects.filter(
-            bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id, bk_data_id__in=event_data_ids
-        )
+        event_groups = EventGroup.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id__in=event_data_ids)
         rebuild_event_group(
             bk_tenant_id=bk_tenant_id,
             bk_biz_id=bk_biz_id,
@@ -966,6 +1318,153 @@ def get_data_id_to_cluster_name(bk_tenant_id: str, bk_data_ids: list[int]) -> di
     return {data_source.bk_data_id: cluster_id_to_names[data_source.mq_cluster_id] for data_source in data_sources}
 
 
+def update_migrate_data_id_routes(
+    data_id_to_kafka_cluster_name: dict[int, str], dry_run: bool = False
+) -> dict[int, dict[str, Any]]:
+    """更新迁移的上报dataid的双写路由
+
+    查询该dataid是否存在迁移的双写路由，如果不存在，则不用更新，如果存在，则更新该dataid的双写路由
+
+    Args:
+        data_id_to_kafka_cluster_name: 数据ID到迁移kafka集群名称的映射
+        dry_run: 是否为试运行，开启后只计算变更不实际调用gse更新接口
+
+    Returns:
+        dict[int, dict[str, Any]]: 成功匹配到迁移路由的dataid变更前后的route配置，结构为
+            {data_id: {"before": 变更前route配置, "after": 变更后route配置}}
+    """
+
+    # 获取迁移的kafka集群
+    migrate_kafka_clusters = {
+        c.cluster_name: c
+        for c in ClusterInfo.objects.filter(cluster_type=ClusterInfo.TYPE_KAFKA, cluster_name__startswith="migrate_")
+    }
+
+    # 记录每个dataid变更前后的route配置
+    route_changes: dict[int, dict[str, Any]] = {}
+
+    for data_id, kafka_cluster_name in data_id_to_kafka_cluster_name.items():
+        # 先检查迁移kafka集群是否存在，不存在则跳过
+        cluster_name = f"migrate_{kafka_cluster_name}"
+        cluster = migrate_kafka_clusters.get(cluster_name)
+        if cluster is None:
+            raise ValueError(f"kafka cluster({cluster_name}) not found")
+
+        data_source = DataSource.objects.filter(bk_data_id=data_id).first()
+        if data_source is None:
+            print(f"data_id({data_id}) migrate failed, data source not found")
+            continue
+
+        # 查询是否存在gse路由配置
+        try:
+            exist_gse_router_config = api.gse.query_route(
+                condition={"plat_name": config.DEFAULT_GSE_API_PLAT_NAME, "channel_id": data_id},
+                operation={"operator_name": settings.COMMON_USERNAME},
+            )
+        except BKAPIError as e:
+            print(f"data_id({data_id}) migrate failed, query gse router failed, error:({e})")
+            continue
+
+        # 如果gse路由配置为空，则跳过
+        if not exist_gse_router_config:
+            print(f"data_id({data_id}) migrate failed, gse router config is empty")
+            continue
+
+        # 获取存量gse路由配置并检查
+        exist_route_config = exist_gse_router_config[0]["route"]
+        if not exist_route_config:
+            print(f"data_id({data_id}) migrate failed, gse router config is empty")
+            continue
+
+        # 查询该dataid是否存在迁移的双写路由，不存在则不用更新
+        migrate_route_name = MIGRATE_ROUTE_NAME_TEMPLATE.format(data_id=data_id)
+        migrate_route_index = next(
+            (
+                index
+                for index, route_config in enumerate(exist_route_config)
+                if route_config["name"] == migrate_route_name
+            ),
+            None,
+        )
+        if migrate_route_index is None:
+            print(f"data_id({data_id}) skip update, migrate gse route not found")
+            continue
+
+        # 更新已存在的迁移双写路由，保留原topic_name，仅更新指向的迁移kafka集群
+        new_route_config = deepcopy(exist_route_config)
+        new_route_config[migrate_route_index]["stream_to"]["stream_to_id"] = cluster.gse_stream_to_id
+
+        # 记录变更前后的route配置，无论是否dry_run都返回
+        route_changes[data_id] = {
+            "before": deepcopy(exist_route_config),
+            "after": new_route_config,
+        }
+
+        # 试运行模式下只计算变更，不实际更新gse路由
+        if dry_run:
+            print(f"data_id({data_id}) dry run, skip update gse router")
+            continue
+
+        # 更新gse路由配置
+        params = {
+            "condition": {"channel_id": data_id, "plat_name": config.DEFAULT_GSE_API_PLAT_NAME},
+            "operation": {"operator_name": data_source.creator},
+            "specification": {"route": new_route_config},
+        }
+        try:
+            api.gse.update_route(**params)
+        except BKAPIError as e:
+            print(f"data_id({data_id}) migrate failed, update gse router failed, error:({e})")
+            continue
+
+    return route_changes
+
+
+def delete_migrate_data_id_routes(bk_data_ids: list[int], dry_run: bool = False) -> dict[int, dict[str, Any]]:
+    """批量删除上报 Data ID 的迁移双写路由。
+
+    Args:
+        bk_data_ids: 需要删除迁移双写路由的 Data ID 列表。
+        dry_run: 是否为试运行，开启后只查询并计算变更，不实际删除路由。
+
+    Returns:
+        成功匹配到迁移双写路由的 Data ID 变更前后配置。
+    """
+
+    route_changes: dict[int, dict[str, Any]] = {}
+    for data_id in bk_data_ids:
+        migrate_route_name = MIGRATE_ROUTE_NAME_TEMPLATE.format(data_id=data_id)
+        try:
+            route_group = _query_gse_route_group(data_id)
+        except ValueError as error:
+            print(error)
+            continue
+
+        exist_route_config = route_group.get("route") or []
+        if not any(route.get("name") == migrate_route_name for route in exist_route_config):
+            print(f"data_id({data_id}) skip delete, migrate gse route not found")
+            continue
+
+        route_changes[data_id] = {
+            "before": deepcopy(exist_route_config),
+            "after": [deepcopy(route) for route in exist_route_config if route.get("name") != migrate_route_name],
+        }
+        if dry_run:
+            print(f"data_id({data_id}) dry run, skip delete gse router")
+            continue
+
+        delete_params = {
+            "condition": {"channel_id": data_id, "plat_name": "tgdp"},
+            "operation": {"operator_name": settings.COMMON_USERNAME, "method": "specification"},
+            "specification": {"route": [migrate_route_name]},
+        }
+        try:
+            _delete_gse_route_with_fallback(delete_params)
+        except BKAPIError as error:
+            print(f"data_id({data_id}) migrate failed, delete gse router failed, error:({error})")
+    return route_changes
+
+
 def add_new_migrate_data_id_routes(data_id_infos: dict[int, dict[str, Any]]):
     """为迁移的上报dataid添加双写路由
 
@@ -1020,13 +1519,13 @@ def add_new_migrate_data_id_routes(data_id_infos: dict[int, dict[str, Any]]):
             continue
 
         for route_config in exist_route_config:
-            if route_config["name"] == f"migrate_kafka_data_id_{data_id}":
+            if route_config["name"] == MIGRATE_ROUTE_NAME_TEMPLATE.format(data_id=data_id):
                 print(f"data_id({data_id}) migrate failed, gse router config already has this route")
                 continue
 
         # 追加新的route
         new_route = {
-            "name": f"migrate_kafka_data_id_{data_id}",
+            "name": MIGRATE_ROUTE_NAME_TEMPLATE.format(data_id=data_id),
             "stream_to": {
                 "stream_to_id": cluster.gse_stream_to_id,
                 ClusterInfo.TYPE_KAFKA: {"topic_name": topic_name},
@@ -1044,6 +1543,290 @@ def add_new_migrate_data_id_routes(data_id_infos: dict[int, dict[str, Any]]):
         except BKAPIError as e:
             print(f"data_id({data_id}) migrate failed, update gse router failed, error:({e})")
             continue
+
+
+def _build_profiling_migrate_route(
+    *, source_route: dict[str, Any], data_id: int, migrate_route_name: str, migrate_stream_to_id: int
+) -> dict[str, Any]:
+    migrate_route = deepcopy(source_route)
+    migrate_route["name"] = migrate_route_name
+    source_stream_to = source_route.get("stream_to")
+    if not isinstance(source_stream_to, dict):
+        raise ValueError(f"data_id({data_id}) source gse router stream_to config is invalid")
+
+    if "pulsar" in source_stream_to:
+        pulsar_config = source_stream_to.get("pulsar")
+        topic_name = None
+        if isinstance(pulsar_config, dict):
+            topic_name = pulsar_config.get("topic_name") or pulsar_config.get("name")
+        if not topic_name:
+            raise ValueError(f"data_id({data_id}) source pulsar router topic_name is empty")
+        migrate_route["stream_to"] = {
+            "stream_to_id": migrate_stream_to_id,
+            ClusterInfo.TYPE_KAFKA: {"topic_name": topic_name},
+        }
+    else:
+        migrate_route["stream_to"]["stream_to_id"] = migrate_stream_to_id
+    return migrate_route
+
+
+def _is_gse_route_stream_type(route: dict[str, Any], stream_type: str) -> bool:
+    stream_to = route.get("stream_to")
+    return isinstance(stream_to, dict) and isinstance(stream_to.get(stream_type), dict)
+
+
+def _build_profiling_kafka_route(
+    *, source_route: dict[str, Any], data_id: int, kafka_stream_to_id: int
+) -> dict[str, Any]:
+    """将 profiling 存量路由转换为 Kafka 路由，保持 topic_name 不变。"""
+
+    kafka_route = deepcopy(source_route)
+    source_stream_to = source_route.get("stream_to")
+    if not isinstance(source_stream_to, dict):
+        raise ValueError(f"data_id({data_id}) source gse router stream_to config is invalid")
+
+    topic_name = None
+    if isinstance(source_stream_to.get(ClusterInfo.TYPE_KAFKA), dict):
+        topic_name = source_stream_to[ClusterInfo.TYPE_KAFKA].get("topic_name")
+    elif isinstance(source_stream_to.get("pulsar"), dict):
+        pulsar_config = source_stream_to["pulsar"]
+        topic_name = pulsar_config.get("topic_name") or pulsar_config.get("name")
+    if not topic_name:
+        raise ValueError(f"data_id({data_id}) source gse router topic_name is empty")
+
+    route_name = str(source_route.get("name") or "")
+    if not route_name:
+        raise ValueError(f"data_id({data_id}) source gse router name is empty")
+    if "_pulsar_" in route_name:
+        route_name = route_name.replace("_pulsar_", "_kafka_", 1)
+    kafka_route["name"] = route_name
+    kafka_route["stream_to"] = {
+        "stream_to_id": kafka_stream_to_id,
+        ClusterInfo.TYPE_KAFKA: {"topic_name": topic_name},
+    }
+    return kafka_route
+
+
+def add_profiling_migrate_data_id_route(
+    *,
+    bk_tenant_id: str,
+    bk_biz_id: int,
+    app_name: str,
+    migrate_cluster_name: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """为 profiling dataid 添加迁移双写路由。
+
+    Profiling 的 topic 只存在于 GSE 路由中，因此这里以存量非迁移 route 为模板。
+    Kafka 源路由保留原 stream_to 细节并替换 stream_to_id；Pulsar 源路由则保留
+    topic_name，将 stream_to 转换为目标 Kafka 配置格式。
+    """
+
+    bk_tenant_id = bk_tenant_id.strip()
+    app_name = app_name.strip()
+    migrate_cluster_name = migrate_cluster_name.strip()
+    profile_datasource = ProfileDataSource.objects.filter(bk_biz_id=bk_biz_id, app_name=app_name).first()
+    if profile_datasource is None or profile_datasource.bk_data_id <= 0:
+        raise ValueError(f"profile datasource not found: bk_biz_id={bk_biz_id}, app_name={app_name}")
+
+    cluster = _get_migrate_kafka_cluster(bk_tenant_id=bk_tenant_id, migrate_cluster_name=migrate_cluster_name)
+    if cluster.gse_stream_to_id == -1:
+        raise ValueError(f"kafka cluster({cluster.cluster_name}) gse_stream_to_id is not initialized")
+
+    data_id = profile_datasource.bk_data_id
+    route_group = _query_gse_route_group(data_id)
+    exist_route_config = route_group.get("route") or []
+    if not exist_route_config:
+        raise ValueError(f"data_id({data_id}) gse router config is empty")
+
+    migrate_route_name = PROFILING_MIGRATE_ROUTE_NAME_TEMPLATE.format(data_id=data_id)
+    source_route = next((route for route in exist_route_config if route.get("name") != migrate_route_name), None)
+    if source_route is None:
+        raise ValueError(f"data_id({data_id}) source gse router config not found")
+
+    migrate_route = _build_profiling_migrate_route(
+        source_route=source_route,
+        data_id=data_id,
+        migrate_route_name=migrate_route_name,
+        migrate_stream_to_id=cluster.gse_stream_to_id,
+    )
+
+    replaced = False
+    new_route_config = []
+    for route in exist_route_config:
+        if route.get("name") == migrate_route_name:
+            new_route_config.append(migrate_route)
+            replaced = True
+            continue
+        new_route_config.append(deepcopy(route))
+    if not replaced:
+        new_route_config.append(migrate_route)
+
+    result = {
+        "bk_tenant_id": bk_tenant_id,
+        "bk_biz_id": bk_biz_id,
+        "app_name": app_name,
+        "bk_data_id": data_id,
+        "migrate_cluster_name": cluster.cluster_name,
+        "migrate_stream_to_id": cluster.gse_stream_to_id,
+        "migrate_route_name": migrate_route_name,
+        "updated": not dry_run,
+        "replaced": replaced,
+        "before": deepcopy(exist_route_config),
+        "after": new_route_config,
+    }
+    if dry_run:
+        return result
+
+    try:
+        api.gse.update_route(
+            condition={"channel_id": data_id, "plat_name": config.DEFAULT_GSE_API_PLAT_NAME},
+            operation={"operator_name": settings.COMMON_USERNAME},
+            specification={"route": new_route_config},
+        )
+    except BKAPIError as error:
+        raise ValueError(f"data_id({data_id}) update gse router failed, error:({error})") from error
+    return result
+
+
+def replace_profiling_data_id_route(
+    *,
+    bk_tenant_id: str,
+    bk_biz_id: int,
+    app_name: str,
+    kafka_cluster_name: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """将 profiling dataid 存量 GSE 路由原地替换为指定 Kafka 集群。
+
+    该操作可重入：优先刷新已有正式 Kafka 路由；若尚未存在，则从 Pulsar 路由保留
+    topic 并生成 Kafka 路由。更新成功后清理存量 Pulsar 和迁移双写路由。
+    """
+
+    bk_tenant_id = bk_tenant_id.strip()
+    app_name = app_name.strip()
+    kafka_cluster_name = kafka_cluster_name.strip()
+    profile_datasource = ProfileDataSource.objects.filter(bk_biz_id=bk_biz_id, app_name=app_name).first()
+    if profile_datasource is None or profile_datasource.bk_data_id <= 0:
+        raise ValueError(f"profile datasource not found: bk_biz_id={bk_biz_id}, app_name={app_name}")
+
+    cluster = _get_kafka_cluster(bk_tenant_id=bk_tenant_id, kafka_cluster_name=kafka_cluster_name)
+    if cluster.gse_stream_to_id == -1:
+        raise ValueError(f"kafka cluster({cluster.cluster_name}) gse_stream_to_id is not initialized")
+
+    data_id = profile_datasource.bk_data_id
+    route_group = _query_gse_route_group(data_id)
+    exist_route_config = route_group.get("route") or []
+    if not exist_route_config:
+        raise ValueError(f"data_id({data_id}) gse router config is empty")
+
+    migrate_route_name = PROFILING_MIGRATE_ROUTE_NAME_TEMPLATE.format(data_id=data_id)
+    formal_routes = [route for route in exist_route_config if route.get("name") != migrate_route_name]
+    source_route = next(
+        (route for route in formal_routes if _is_gse_route_stream_type(route, ClusterInfo.TYPE_KAFKA)),
+        None,
+    )
+    if source_route is None:
+        source_route = next(
+            (route for route in formal_routes if _is_gse_route_stream_type(route, "pulsar")),
+            exist_route_config[0],
+        )
+    kafka_route = _build_profiling_kafka_route(
+        source_route=source_route,
+        data_id=data_id,
+        kafka_stream_to_id=cluster.gse_stream_to_id,
+    )
+    new_route_config = [kafka_route]
+    deleted_route_names = sorted(
+        {
+            route_name
+            for route in exist_route_config
+            if (route_name := route.get("name"))
+            and route_name != kafka_route["name"]
+            and (route_name == migrate_route_name or _is_gse_route_stream_type(route, "pulsar"))
+        }
+    )
+
+    result = {
+        "bk_tenant_id": bk_tenant_id,
+        "bk_biz_id": bk_biz_id,
+        "app_name": app_name,
+        "bk_data_id": data_id,
+        "kafka_cluster_name": cluster.cluster_name,
+        "kafka_stream_to_id": cluster.gse_stream_to_id,
+        "route_name": kafka_route["name"],
+        "deleted_route_names": deleted_route_names,
+        "updated": not dry_run,
+        "before": deepcopy(exist_route_config),
+        "after": new_route_config,
+    }
+    if dry_run:
+        return result
+
+    try:
+        api.gse.update_route(
+            condition={"channel_id": data_id, "plat_name": config.DEFAULT_GSE_API_PLAT_NAME},
+            operation={"operator_name": settings.COMMON_USERNAME},
+            specification={"route": new_route_config},
+        )
+    except BKAPIError as error:
+        raise ValueError(f"data_id({data_id}) update gse router failed, error:({error})") from error
+
+    if deleted_route_names:
+        delete_params = {
+            "condition": {"channel_id": data_id, "plat_name": "tgdp"},
+            "operation": {"operator_name": settings.COMMON_USERNAME, "method": "specification"},
+            "specification": {"route": deleted_route_names},
+        }
+        try:
+            _delete_gse_route_with_fallback(delete_params)
+        except BKAPIError as error:
+            raise ValueError(f"data_id({data_id}) delete old gse router failed, error:({error})") from error
+    return result
+
+
+def _get_migrate_kafka_cluster(*, bk_tenant_id: str, migrate_cluster_name: str) -> ClusterInfo:
+    if migrate_cluster_name.startswith("migrate_"):
+        cluster_names = [migrate_cluster_name]
+    else:
+        cluster_names = [f"migrate_{migrate_cluster_name}", migrate_cluster_name]
+
+    clusters = ClusterInfo.objects.filter(
+        bk_tenant_id=bk_tenant_id,
+        cluster_type=ClusterInfo.TYPE_KAFKA,
+        cluster_name__in=cluster_names,
+    )
+    cluster_map = {cluster.cluster_name: cluster for cluster in clusters}
+    for cluster_name in cluster_names:
+        cluster = cluster_map.get(cluster_name)
+        if cluster is not None:
+            return cluster
+    raise ValueError(f"kafka cluster({migrate_cluster_name}) not found in tenant({bk_tenant_id})")
+
+
+def _get_kafka_cluster(*, bk_tenant_id: str, kafka_cluster_name: str) -> ClusterInfo:
+    cluster = ClusterInfo.objects.filter(
+        bk_tenant_id=bk_tenant_id,
+        cluster_type=ClusterInfo.TYPE_KAFKA,
+        cluster_name=kafka_cluster_name,
+    ).first()
+    if cluster is None:
+        raise ValueError(f"kafka cluster({kafka_cluster_name}) not found in tenant({bk_tenant_id})")
+    return cluster
+
+
+def _query_gse_route_group(data_id: int) -> dict[str, Any]:
+    try:
+        route_info_list = api.gse.query_route(
+            condition={"plat_name": config.DEFAULT_GSE_API_PLAT_NAME, "channel_id": data_id},
+            operation={"operator_name": settings.COMMON_USERNAME},
+        )
+    except BKAPIError as error:
+        raise ValueError(f"data_id({data_id}) query gse router failed, error:({error})") from error
+
+    if not route_info_list:
+        raise ValueError(f"data_id({data_id}) gse router config is empty")
+    return route_info_list[0]
 
 
 class ClusterData(BaseModel):

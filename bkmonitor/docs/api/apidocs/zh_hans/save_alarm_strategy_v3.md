@@ -12,12 +12,12 @@
 | actions    | list    | 是   | 处理套餐列表(ActionRelation)   |
 | bk_biz_id  | int     | 是   | 业务ID           |
 | detects    | list    | 是   | 检测配置列表(Detect) |
-| id         | int     | 是   | 策略ID           |
+| id         | int     | 否   | 策略ID；创建时不传，编辑时传已有策略ID |
 | items      | list    | 是   | 监控项表(Item)     |
 | labels     | list    | 否   | 策略标签列表         |
 | name       | string  | 是   | 策略名称           |
 | scenario   | string  | 是   | 监控对象           |
-| source     | string  | 是   | 监控源            |
+| source     | string  | 否   | 监控源，默认取调用应用 |
 | is_enabled | boolean | 否   | 是否开启，默认开启      |
 | notice | object | 是   | 通知套餐(NoticeRelation)      |
 
@@ -129,6 +129,35 @@
 | no_data_config.is_enabled | bool   | 是   | 是否开启无数据告警           |
 | no_data_config.continuous | int    | 否   | 无数据告警检测周期数          |
 | target                    | list   | 是   | 监控目标                |
+| query_output_config       | object/null | 否 | UQ 命名多输出配置；省略时保留已有值，传 `null` 时删除 |
+
+##### QueryOutputConfig
+
+该字段用于让 UQ 在保留当前 Item 计算结果的同时返回参与计算的命名输出。当前只支持 `named_outputs/v1`：
+
+```json
+{
+  "query_output_config": {
+    "response_contract": "named_outputs/v1",
+    "legacy_output_ref": "C",
+    "output_list": [
+      {"reference_name": "A", "expression": "a"},
+      {"reference_name": "B", "expression": "b"},
+      {"reference_name": "C", "expression": "a / b * 100"}
+    ]
+  }
+}
+```
+
+| 字段 | 类型 | 必选 | 描述 |
+|------|------|------|------|
+| response_contract | string | 是 | 固定为 `named_outputs/v1` |
+| legacy_output_ref | string | 是 | 指向与 Item 当前 `expression` 和 `functions` 等价的主输出 |
+| output_list | list | 是 | 命名输出列表，至少一项 |
+| output_list[].reference_name | string | 是 | 唯一的合法标识符，也是通知模板读取的引用名 |
+| output_list[].expression | string | 是 | 大小写敏感；非主输出必须精确使用当前 `query_configs[].alias`，主输出必须匹配最终发送给 UQ 的计算表达式和函数 |
+
+更新策略时，省略 `query_output_config` 表示保留当前配置；显式传 `null` 表示删除；传对象表示完整替换。若保留的配置与本次提交的查询别名、表达式或函数不再兼容，接口会拒绝保存。调用方应在同一次完整保存中同步更新该对象，或显式传 `null` 删除，不能依赖局部更新接口修改该字段。
 
 #### Target
 
@@ -327,7 +356,7 @@ host_set_template
 
 | 字段          | 类型     | 必选  | 描述     |
 |-------------|--------|-----|--------|
-| config      | list   | 是   | 算法配置列表 |
+| config      | json   | 是   | 算法配置；具体类型取决于算法 |
 | level       | int    | 是   | 告警级别   |
 | type        | string | 是   | 算法类型   |
 | unit_prefix | string | 否   | 算法单位前缀 |
@@ -410,6 +439,143 @@ host_set_template
   "shock": 1,
   "days": 1,
   "threshold": 1
+}
+```
+
+##### 新维度值检测NewSeries
+
+`config` 为对象，不是静态阈值算法使用的嵌套数组。
+
+```json
+{
+  "detect_range": 3600,
+  "threshold": 0,
+  "max_series": 100000,
+  "alert_mode": "once"
+}
+```
+
+| 字段 | 类型 | 必选 | 默认值 | 描述 |
+|---|---|---|---:|---|
+| detect_range | int | 是 | — | 检测窗口，单位为秒；必须大于 0，且不能小于查询的 `agg_interval` |
+| threshold | int | 否 | 0 | 仅当数据值严格大于该阈值时参与首次出现判断；允许负整数 |
+| max_series | int | 否 | 100000 | 单个监控项、维度签名和阈值分组保留的最大已见维度值数量，必须大于 0 |
+| effective_delay | int | 否 | detect_range | 建议不传；后端会将其归一为 `detect_range` |
+| alert_mode | string | 否 | once | `once` 表示仅首次出现时告警；`continuous` 表示维度持续有效出现时保持告警 |
+
+保存限制：
+
+- 含 NewSeries 的监控项只能配置一个 `query_config`。
+- 支持任意数据源的 `time_series`，以及日志平台的 `bk_log_search` / `log` 日志关键字查询；不支持事件数据。
+- NewSeries 必须独占告警级别。策略内其它算法不能使用 NewSeries 已占用的 `level`。
+- `trigger_config.count` 使用 `1`；后端也会将 NewSeries 对应告警级别的触发次数强制为 `1`。
+- `alert_mode` 只控制告警状态生命周期，不控制通知次数；通知频率仍由通知与收敛配置决定。
+- `continuous` 复用 `detect_range` 作为观察窗口。同一维度再次满足阈值时只续期窗口，不重复产生异常事件；完整窗口内没有再次有效出现时，按 `recovery_config.status_setter` 恢复或关闭。
+
+#### NewSeries 创建示例
+
+创建时不传策略 `id`。调用前请替换业务 ID、结果表、指标、聚合维度和通知组 ID。
+
+```json
+{
+  "bk_biz_id": 100001,
+  "scenario": "os",
+  "name": "新维度值检测示例",
+  "labels": [],
+  "is_enabled": true,
+  "items": [
+    {
+      "name": "AVG(指标值)",
+      "no_data_config": {
+        "continuous": 5,
+        "is_enabled": false,
+        "agg_dimension": [
+          "bk_target_ip",
+          "bk_target_cloud_id"
+        ],
+        "level": 2
+      },
+      "target": [],
+      "expression": "a",
+      "origin_sql": "",
+      "query_configs": [
+        {
+          "data_source_label": "bk_monitor",
+          "data_type_label": "time_series",
+          "alias": "a",
+          "result_table_id": "system.example",
+          "agg_method": "AVG",
+          "agg_interval": 60,
+          "agg_dimension": [
+            "bk_target_ip",
+            "bk_target_cloud_id"
+          ],
+          "agg_condition": [],
+          "metric_field": "value",
+          "unit": "",
+          "functions": []
+        }
+      ],
+      "algorithms": [
+        {
+          "type": "NewSeries",
+          "level": 1,
+          "unit_prefix": "",
+          "config": {
+            "detect_range": 3600,
+            "threshold": 0,
+            "max_series": 100000,
+            "alert_mode": "continuous"
+          }
+        }
+      ]
+    }
+  ],
+  "detects": [
+    {
+      "level": 1,
+      "expression": "",
+      "trigger_config": {
+        "count": 1,
+        "check_window": 1
+      },
+      "recovery_config": {
+        "check_window": 5
+      },
+      "connector": "and"
+    }
+  ],
+  "notice": {
+    "user_groups": [12345],
+    "signal": [
+      "abnormal",
+      "recovered"
+    ],
+    "options": {
+      "converge_config": {
+        "need_biz_converge": false
+      },
+      "start_time": "00:00:00",
+      "end_time": "23:59:59"
+    },
+    "config": {
+      "interval_notify_mode": "standard",
+      "notify_interval": 7200,
+      "template": [
+        {
+          "signal": "abnormal",
+          "message_tmpl": "",
+          "title_tmpl": ""
+        },
+        {
+          "signal": "recovered",
+          "message_tmpl": "",
+          "title_tmpl": ""
+        }
+      ]
+    }
+  },
+  "actions": []
 }
 ```
 
@@ -568,8 +734,4 @@ data返回保存的策略结构，与请求参数一致（示例数据中省略�
   "data": {}
 }
 ```
-
-
-
-
 

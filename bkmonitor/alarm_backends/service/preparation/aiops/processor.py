@@ -210,7 +210,8 @@ class TsDependPreparationProcess(BasePreparationProcess):
                         )
                     )
 
-            as_completed(tasks)
+            for task in as_completed(tasks):
+                task.result()
 
     def prefetch_item_records(self, item: Item, prefetch_results: dict, start_time: int, end_time: int):
         """预加载查询结果
@@ -285,7 +286,12 @@ class TsDependPreparationProcess(BasePreparationProcess):
                         "enable_week_compare": extra_config.get("enable_week_compare", False),
                     }
                     tasks.append(
-                        executor.submit(init_depend_api_func, dependency_data=init_data, serving_config=serving_config)
+                        executor.submit(
+                            init_depend_api_func,
+                            dependency_data=init_data,
+                            serving_config=serving_config,
+                            bk_tenant_id=strategy.bk_tenant_id,
+                        )
                     )
                     init_data = []
 
@@ -299,7 +305,13 @@ class TsDependPreparationProcess(BasePreparationProcess):
                     "enable_week_compare": extra_config.get("enable_week_compare", False),
                 }
                 tasks.append(
-                    executor.submit(init_depend_api_func, dependency_data=init_data, serving_config=serving_config)
+                    executor.submit(
+                        init_depend_api_func,
+                        dependency_data=init_data,
+                        serving_config=serving_config,
+                        bk_tenant_id=strategy.bk_tenant_id,
+                    )
                 )
 
-        as_completed(tasks)
+        for task in as_completed(tasks):
+            task.result()

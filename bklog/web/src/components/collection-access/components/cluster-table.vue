@@ -43,8 +43,9 @@
       </div>
     </div>
     <div
-      class="cluster-main"
       v-show="isShowTable"
+      v-bkloading="{ isLoading: tableLoading }"
+      class="cluster-main"
     >
       <template v-if="tableList.length">
         <bk-table
@@ -61,8 +62,8 @@
             <template #default="{ row }">
               <bk-radio :checked="clusterSelect === row.storage_cluster_id">
                 <div
-                  class="overflow-tips"
                   v-bk-overflow-tips
+                  class="overflow-tips"
                 >
                   <span @click.stop>{{ row.storage_display_name }}</span>
                 </div>
@@ -110,13 +111,13 @@
           </bk-table-column>
         </bk-table>
         <div
+          v-show="!!activeItem && !isDorisMode"
           class="cluster-illustrate"
-          v-show="!!activeItem"
         >
           <p class="illustrate-title">{{ $t('说明') }}</p>
           <div
-            class="illustrate-container"
             v-en-class="'en-container'"
+            class="illustrate-container"
           >
             <div
               v-for="[key, value] of Object.entries(illustrateLabelData)"
@@ -188,6 +189,14 @@
         type: Boolean,
         require: true,
       },
+      externalDorisMode: {
+        type: Boolean,
+        default: false,
+      },
+      tableLoading: {
+        type: Boolean,
+        default: false,
+      },
     },
     data() {
       return {
@@ -212,13 +221,16 @@
       tableShowType() {
         return this.tableType !== 'exclusive';
       },
+      isDorisMode() {
+        return this.externalDorisMode;
+      },
     },
     watch: {
       storageClusterId(val) {
         if (val === undefined) return;
         this.clusterSelect = val;
         this.activeItem = this.tableList.find(item => item.storage_cluster_id === val);
-        if (!!this.activeItem) {
+        if (this.activeItem) {
           const { number_of_replicas_max: replicasMax, retention_days_max: daysMax } = this.activeItem.setup_config;
           const { enable_hot_warm: hotWarm, enable_archive: archive } = this.activeItem;
           this.illustrateLabelData = {
@@ -265,7 +277,7 @@
             spaceUid: this.$store.state.spaceUid,
           },
         });
-        window.open(newUrl.href, '_blank');
+        window.open(newUrl.href, '_blank', 'noopener,noreferrer');
       },
       getPercent($row) {
         return (100 - $row.storage_usage) / 100;

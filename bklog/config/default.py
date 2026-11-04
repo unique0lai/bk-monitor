@@ -19,6 +19,8 @@ We undertake not to change the open source license (MIT license) applicable to t
 the project delivered to anyone in the future.
 """
 
+# ruff: noqa: F405
+
 import os
 import sys
 
@@ -29,9 +31,18 @@ from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
 from config.log import get_logging_config_dict
+from config import kms
+from apps.utils.crypto import LEGACY_SYMMETRIC_CIPHER_CLASSES
 
 # 使用k8s部署模式
 IS_K8S_DEPLOY_MODE = os.getenv("DEPLOY_MODE") == "kubernetes"
+
+# 交互式 shell 不需要在启动期同步 pipeline 组件模型；该同步会直接 print 到屏幕，影响维护命令操作。
+IS_DJANGO_SHELL = len(sys.argv) > 1 and sys.argv[1] in {"shell", "shell_plus"}
+SILENCE_DJANGO_SHELL_LOG = os.getenv("BKAPP_SILENCE_DJANGO_SHELL_LOG", "on") == "on"
+SILENCE_DJANGO_SHELL_OUTPUT = IS_K8S_DEPLOY_MODE and IS_DJANGO_SHELL and SILENCE_DJANGO_SHELL_LOG
+if SILENCE_DJANGO_SHELL_OUTPUT:
+    AUTO_UPDATE_COMPONENT_MODELS = False
 
 # 这里是默认的 INSTALLED_APPS，大部分情况下，不需要改动
 # 如果你已经了解每个默认 APP 的作用，确实需要去掉某些 APP，请去掉下面的注释，然后修改
@@ -105,6 +116,8 @@ else:
     SESSION_ENGINE = "django.contrib.sessions.backends.cache"
     INSTALLED_APPS += ("version_log",)
 
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
+
 # 设置pyinstrument的profiler开关
 PYINSTRUMENT_URL_ARGUMENT = "bk-log-profile"
 
@@ -151,7 +164,13 @@ MIDDLEWARE = (
     # 项目空间参数注入
     "bkm_space.middleware.ParamInjectMiddleware",
     "apps.log_audit.middleware.RequestProvider",
+    # 租户ID校验中间件
+    "apps.middleware.tenant_middleware.TenantValidationMiddleware",
 )
+
+# Resource Call owns an explicit, discoverable params schema. Avoid recursively
+# adding space fields to its opaque ``params`` envelope before schema validation.
+BKM_SPACE_INJECT_REQUEST_EXCLUDED_PATHS = ("/api/v1/admin/resource/call/",)
 
 # 所有环境的日志级别可以在这里配置
 # LOG_LEVEL = 'INFO'
@@ -212,7 +231,9 @@ CELERY_ACCEPT_CONTENT = ["pickle"]
 
 CELERY_IMPORTS = (
     "apps.log_search.tasks.bkdata",
-    "apps.log_search.tasks.async_export",
+    "apps.log_search.tasks.scene_async_export",
+    "apps.log_search.tasks.unify_query_async_export",
+    "apps.log_search.tasks.sharded_export",
     "apps.log_search.tasks.project",
     "apps.log_search.tasks.space",
     "apps.log_search.tasks.cmdb",
@@ -223,6 +244,10 @@ CELERY_IMPORTS = (
     "apps.log_databus.tasks.itsm",
     "apps.log_databus.tasks.bkdata",
     "apps.log_databus.tasks.archive",
+    "apps.log_databus.tasks.nodeman_v3",
+    "apps.log_databus.tasks.scene",
+    "apps.log_admin_resource.tasks",
+    "apps.log_admin_resource.k8s_tasks",
     "apps.log_measure.tasks.report",
     "apps.log_extract.tasks",
     "apps.log_clustering.tasks.msg",
@@ -235,8 +260,9 @@ if os.environ.get("BKAPP_FEATURE_TGPA_TASK", "off") == "on":
     CELERY_IMPORTS += ("apps.tgpa.tasks",)
 
 # bk crypto sdk配置
-BKPAAS_BK_CRYPTO_KEY = os.getenv("BKPAAS_BK_CRYPTO_KEY")
+BKPAAS_BK_CRYPTO_KEY = kms.value("encryption", "bk_crypto_key", os.getenv("BKPAAS_BK_CRYPTO_KEY"))
 BKCRYPTO = {
+    "SYMMETRIC_CIPHER_CLASSES": LEGACY_SYMMETRIC_CIPHER_CLASSES,
     "SYMMETRIC_CIPHERS": {
         "default": {
             "get_key_config": "apps.utils.aes.get_default_symmetric_key_config",
@@ -350,6 +376,8 @@ if IS_K8S_DEPLOY_MODE:
                 "propagate": True,
             },
             "bk_monitor": {"handlers": ["stdout"], "level": LOG_LEVEL, "propagate": True},
+            # 审计事件，bk_audit 的 exporter 会关闭 propagate，必须显式挂 handler
+            "bk_audit": {"handlers": ["stdout"], "level": LOG_LEVEL, "propagate": True},
         },
     }
     #
@@ -360,6 +388,15 @@ if IS_K8S_DEPLOY_MODE:
         }
         for v in LOGGING["loggers"].values():
             v["handlers"].append("otlp")
+
+    if SILENCE_DJANGO_SHELL_OUTPUT:
+        # 仅静默当前 shell 进程，web/celery/gunicorn 仍保持 stdout 日志采集。
+        LOGGING["handlers"]["shell_null"] = {"class": "logging.NullHandler"}
+        LOGGING["root"] = {"handlers": ["shell_null"], "level": "CRITICAL"}
+        for logger_config in LOGGING["loggers"].values():
+            logger_config["handlers"] = ["shell_null"]
+            logger_config["level"] = "CRITICAL"
+            logger_config["propagate"] = False
 
 OTLP_TRACE = os.getenv("BKAPP_OTLP_TRACE", "off") == "on"
 OTLP_GRPC_HOST = os.getenv("BKAPP_OTLP_GRPC_HOST", "http://localhost:4317")
@@ -381,6 +418,8 @@ else:
 BKDATA_URL = BK_PAAS_HOST
 MONITOR_URL = ""
 BK_DOC_URL = "https://bk.tencent.com/docs/"
+BK_LOG_ACCESS_GUIDE_URL = os.getenv("BKAPP_LOG_ACCESS_GUIDE_URL", "")
+BK_LOG_PERMISSION_GUIDE_URL = os.getenv("BKAPP_LOG_PERMISSION_GUIDE_URL", "")
 BK_DOC_STATIC_URL = ""
 BK_DOC_QUERY_URL = "https://bk.tencent.com/docs/document/5.1/90/3822/"
 BK_FAQ_URL = "https://bk.tencent.com/s-mart/community"
@@ -418,9 +457,15 @@ BK_HOT_WARM_CONFIG_URL = (
 BK_COMPONENT_API_URL = os.environ.get("BK_COMPONENT_API_URL")
 DEPLOY_MODE = os.environ.get("DEPLOY_MODE", "")
 
-BK_IAM_APIGATEWAY_URL = os.getenv("BKAPP_IAM_API_BASE_URL") or f"{BK_COMPONENT_API_URL}/api/bk-iam/prod/"
+from iam_engine.settings import load_iam_settings, resolve_iam_gateway_url
+
+BK_IAM_APIGATEWAY_URL = resolve_iam_gateway_url(BK_COMPONENT_API_URL, os.getenv("BKAPP_IAM_API_BASE_URL"), version="v3")
+
+# Both products share the BKLog environment contract (including string defaults).
+globals().update(load_iam_settings(component_api_url=BK_COMPONENT_API_URL))
 
 BK_USER_HOST = os.getenv("BKAPP_BKUSER_HOST", BK_BKLOG_HOST.replace("bklog", "bkuser"))
+SHOW_PERSONAL_SETTINGS = os.getenv("BKAPP_SHOW_PERSONAL_SETTINGS", "on") == "on"
 
 # ===============================================================================
 # 企业版登录重定向
@@ -605,8 +650,12 @@ FEATURE_TOGGLE = {
     "trace": os.environ.get("BKAPP_FEATURE_TRACE", "off"),
     # 日志脱敏
     "log_desensitize": os.environ.get("BKAPP_FEATURE_DESENSITIZE", "on"),
+    # 新版采集管理
+    "log_manage_v2": os.environ.get("BKAPP_FEATURE_LOG_MANAGE_V2", "on"),
     # 客户端日志
     "tgpa_task": os.environ.get("BKAPP_FEATURE_TGPA_TASK", "off"),
+    # 场景化检索
+    "scene_search": os.environ.get("BKAPP_FEATURE_SCENE_SEARCH", "off"),
 }
 
 SAAS_MONITOR = "bk_monitorv3"
@@ -615,6 +664,7 @@ SAAS_BKDATA = "bk_dataweb"
 # 前端菜单配置
 MENUS = [
     {"id": "retrieve", "name": _("检索"), "feature": "on", "icon": ""},
+    {"id": "client_log_search", "name": _("客户端日志"), "feature": "on", "icon": ""},
     {
         "id": "trace",
         "name": _("调用链"),
@@ -729,6 +779,12 @@ MENUS = [
                         "name": _("日志脱敏"),
                         "feature": FEATURE_TOGGLE["log_desensitize"],
                         "icon": "rizhituomin",
+                    },
+                    {
+                        "id": "grok_manage",
+                        "name": "Grok管理",
+                        "feature": "on",
+                        "icon": "grok",
                     },
                 ],
             },
@@ -849,6 +905,12 @@ MENUS = [
 # TAM
 TAM_AEGIS_KEY = os.environ.get("BKAPP_TAM_AEGIS_KEY", "")
 
+# RUM 接入配置
+BKLOG_RUM_SDK = os.getenv("BKLOG_RUM_SDK", "otlp")
+BKLOG_RUM_ENDPOINT = os.getenv("BKLOG_RUM_ENDPOINT", "")
+BKLOG_RUM_TOKEN = os.getenv("BKLOG_RUM_TOKEN", "")
+BKLOG_RUM_ENABLED = str(os.getenv("BKLOG_RUM_ENABLED", False)).lower() == "true"
+
 # 任务过期天数
 EXTRACT_EXPIRED_DAYS = int(os.getenv("BKAPP_EXTRACT_EXPIRED_DAYS", 1))
 # windows系统名称列表
@@ -908,10 +970,8 @@ FEATURE_EXPORT_SCROLL = os.environ.get("BKAPP_FEATURE_EXPORT_SCROLL", False)
 
 # BCS
 BCS_API_GATEWAY_TOKEN = os.getenv("BKAPP_BCS_API_GATEWAY_TOKEN", "")
-BCS_CC_SSM_SWITCH = os.getenv("BKAPP_BCS_CC_SSM_SWITCH", "on")
 BCS_APIGATEWAY_HOST = os.getenv("BKAPP_BCS_APIGATEWAY_HOST", "")
 BCS_CC_APIGATEWAY_HOST = os.getenv("BKAPP_BCS_CC_APIGATEWAY_HOST", "")
-BK_SSM_HOST = os.getenv("BKAPP_SSM_HOST", "http://bkssm.service.consul:5000/api/v1/auth/access-tokens")
 BCS_WEB_CONSOLE_DOMAIN = os.getenv("BKAPP_BCS_WEB_CONSOLE_DOMAIN", BK_BKLOG_HOST.replace("bklog", "bcs"))
 BKLOG_CONFIG_KIND = os.getenv("BKAPP_BKLOG_CONFIG_KIND", "BkLogConfig")
 BKLOG_CONFIG_API_VERSION = os.getenv("BKAPP_BKLOG_CONFIG_API_VERSION", "bk.tencent.com/v1alpha1")
@@ -989,6 +1049,13 @@ ESQUERY_WHITE_LIST = [
     "bk_apigateway",
 ] + ESQUERY_EXTRA_WHITE_LIST
 
+# Resource Call 的 API 网关主动授权提供只读准入；此白名单只提升管理能力。
+# 默认继承现有 ESQUERY 白名单以保持已部署管理端兼容，各环境可通过环境变量逐步切换到
+# 专用 APP Code。最终边界由 AdminResourceRegistry.call 在真实 Handler 调用入口执行。
+RESOURCE_CALL_APP_CODE_WHITE_LIST = [
+    app for app in os.getenv("BKAPP_RESOURCE_CALL_APP_CODE_WHITE_LIST", ",".join(ESQUERY_WHITE_LIST)).split(",") if app
+]
+
 # BK repo conf
 BKREPO_ENDPOINT_URL = os.getenv("BKREPO_ENDPOINT_URL") or os.getenv("BKAPP_BKREPO_ENDPOINT_URL")
 BKREPO_USERNAME = os.getenv("BKREPO_USERNAME") or os.getenv("BKAPP_BKREPO_USERNAME")
@@ -1063,6 +1130,8 @@ if REDIS_MODE == "sentinel" and not BKAPP_IS_BKLOG_API:
     REDIS_SENTINEL_PORT = int(os.getenv("BKAPP_REDIS_SENTINEL_PORT", 26379))
     REDIS_SENTINEL_MASTER_NAME = os.getenv("BKAPP_REDIS_SENTINEL_MASTER_NAME", "mymaster")
     REDIS_SENTINEL_PASSWORD = os.getenv("BKAPP_REDIS_SENTINEL_MASTER_PASSWORD", "")
+
+REDIS_PASSWD = kms.value("redis", "password", REDIS_PASSWD)
 
 # BKLOG 后台QOS配置
 BKLOG_QOS_USE = os.getenv("BKAPP_QOS_USE", "on") == "on"
@@ -1301,6 +1370,13 @@ INITIALIZED_TENANT_LIST = [BK_APP_TENANT_ID]
 APIGW_ENABLED = not (ENABLE_MULTI_TENANT_MODE or "test" in sys.argv)
 USE_APIGW = os.getenv("BKAPP_USE_APIGW", "false").lower() == "true"
 
+# 与监控统一的 NodeMan V3 环境级总开关，默认关闭。
+ENABLE_NODEMAN_V3 = os.getenv("BKAPP_ENABLE_NODEMAN_V3", "false").lower() == "true"
+
+# 节点管理 V3 网关地址。留空时按 APIGW 约定拼接，联调环境可直连指定地址；
+# 该地址配置不承担启用开关职责。
+BKNODEMAN_V3_API_BASE_URL = os.getenv("BKAPP_BKNODEMAN_V3_API_BASE_URL", "")
+
 # 预查询时间, 默认6h小时, 0代表禁用
 try:
     PRE_SEARCH_SECONDS = int(os.getenv("BKAPP_PRE_SEARCH_SECONDS", 6 * 60 * 60))
@@ -1311,6 +1387,32 @@ except ValueError:
 TGPA_TASK_APIGW_ROOT = os.getenv("BKAPP_TGPA_TASK_APIGATEWAY_ROOT", "")
 TGPA_TRANSCEIVER_TOOL_URL = os.getenv("BKAPP_TGPA_TRANSCEIVER_TOOL_URL", "")
 TGPA_SDK_DOC_URL = os.getenv("BKAPP_TGPA_SDK_DOC_URL", "")
+
+# 异步下载最大并发任务数
+MAX_CONCURRENT_EXPORT_TASKS = int(os.getenv("BKAPP_MAX_CONCURRENT_EXPORT_TASKS", 3))
+
+# ===============================================================================
+# 分片异步导出（ExportJob / ExportPart）
+# ===============================================================================
+ASYNC_EXPORT_COORDINATE_INTERVAL_SECONDS = int(os.getenv("BKAPP_ASYNC_EXPORT_COORDINATE_INTERVAL_SECONDS", 10))
+ASYNC_EXPORT_COORDINATE_LOCK_TIMEOUT = int(os.getenv("BKAPP_ASYNC_EXPORT_COORDINATE_LOCK_TIMEOUT", 120))
+ASYNC_EXPORT_COORDINATE_SOFT_TIME_LIMIT = int(
+    os.getenv("BKAPP_ASYNC_EXPORT_COORDINATE_SOFT_TIME_LIMIT", max(1, ASYNC_EXPORT_COORDINATE_LOCK_TIMEOUT - 30))
+)
+ASYNC_EXPORT_COORDINATE_DEADLINE_SECONDS = int(
+    os.getenv("BKAPP_ASYNC_EXPORT_COORDINATE_DEADLINE_SECONDS", max(1, ASYNC_EXPORT_COORDINATE_SOFT_TIME_LIMIT - 15))
+)
+ASYNC_EXPORT_COORDINATE_BATCH = int(os.getenv("BKAPP_ASYNC_EXPORT_COORDINATE_BATCH", 100))
+ASYNC_EXPORT_ENQUEUE_LEASE_SECONDS = int(os.getenv("BKAPP_ASYNC_EXPORT_ENQUEUE_LEASE_SECONDS", 60))
+ASYNC_EXPORT_PLANNING_TIMEOUT = int(os.getenv("BKAPP_ASYNC_EXPORT_PLANNING_TIMEOUT", 600))
+ASYNC_EXPORT_FINALIZATION_TIMEOUT = int(os.getenv("BKAPP_ASYNC_EXPORT_FINALIZATION_TIMEOUT", 300))
+# 合并超时须覆盖「按序下载全部已成功分片 + 上传整包」的总时长，是收尾阶段的长尾步骤
+ASYNC_EXPORT_MERGE_TIMEOUT = int(os.getenv("BKAPP_ASYNC_EXPORT_MERGE_TIMEOUT", 3600))
+ASYNC_EXPORT_PART_TIMEOUT = int(os.getenv("BKAPP_ASYNC_EXPORT_PART_TIMEOUT", 1800))
+# 取数预算须明显小于回收超时，给打包与上传留出余量，否则大分片总会在上传途中被回收
+ASYNC_EXPORT_PART_FETCH_TIMEOUT = int(
+    os.getenv("BKAPP_ASYNC_EXPORT_PART_FETCH_TIMEOUT", max(1, ASYNC_EXPORT_PART_TIMEOUT * 2 // 3))
+)
 
 """
 以下为框架代码 请勿修改

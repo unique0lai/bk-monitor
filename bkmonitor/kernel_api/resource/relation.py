@@ -12,7 +12,9 @@ import logging
 
 from rest_framework import serializers
 
-from core.drf_resource import Resource, api
+from core.drf_resource import api
+from kernel_api.resource.mcp_response import MCPResource as Resource
+from kernel_api.resource.mcp_response import is_mcp_request
 from kernel_api.serializers.mixins import TimeSpanValidationPassThroughSerializer
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,10 @@ class QueryMultiResourceRelationResource(Resource):
             path_resource = serializers.ListField(
                 child=serializers.CharField(), required=False, allow_empty=True, label="关联路径资源类型列表"
             )
+            target_info_show = serializers.BooleanField(required=False, label="是否展示目标资源扩展信息")
+            look_back_delta = serializers.CharField(
+                required=False, allow_blank=True, label="instant 回看窗口，如 1440m"
+            )
 
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
         query_list = serializers.ListField(child=QueryListItemSerializer(), min_length=1, label="查询列表")
@@ -41,7 +47,11 @@ class QueryMultiResourceRelationResource(Resource):
         query_list = validated_request_data["query_list"]
 
         logger.info("QueryMultiResourceRelationResource: try to query relation,bk_biz_id->[%s]", bk_biz_id)
-        return api.unify_query.query_multi_resource(bk_biz_ids=[str(bk_biz_id)], query_list=query_list)
+        if is_mcp_request():
+            from kernel_api.resource.mcp_uq import query_uq
+
+            return query_uq("query_multi", {"bk_biz_ids": [str(bk_biz_id)], "query_list": query_list})
+        return api.unify_query.query_multi(bk_biz_ids=[str(bk_biz_id)], query_list=query_list)
 
 
 class QueryMultiResourceRelationRangeResource(Resource):
@@ -60,6 +70,10 @@ class QueryMultiResourceRelationRangeResource(Resource):
             path_resource = serializers.ListField(
                 child=serializers.CharField(), required=False, allow_empty=True, label="关联路径资源类型列表"
             )
+            target_info_show = serializers.BooleanField(required=False, label="是否展示目标资源扩展信息")
+            look_back_delta = serializers.CharField(
+                required=False, allow_blank=True, label="instant 回看窗口，如 1440m"
+            )
 
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
         query_list = serializers.ListField(child=QueryListItemSerializer(), min_length=1, label="查询列表")
@@ -69,4 +83,8 @@ class QueryMultiResourceRelationRangeResource(Resource):
         query_list = validated_request_data["query_list"]
 
         logger.info("QueryMultiResourceRelationRangeResource: try to query relation,bk_biz_id->[%s]", bk_biz_id)
+        if is_mcp_request():
+            from kernel_api.resource.mcp_uq import query_uq
+
+            return query_uq("query_multi_resource_range", {"bk_biz_ids": [str(bk_biz_id)], "query_list": query_list})
         return api.unify_query.query_multi_resource_range(bk_biz_ids=[str(bk_biz_id)], query_list=query_list)

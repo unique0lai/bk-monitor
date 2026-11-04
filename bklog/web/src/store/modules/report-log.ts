@@ -43,10 +43,10 @@ class ReportLogStore extends VuexModule {
     }
 
     if (
-      !isAppFirstLoad
-      && oldspaceUid === spaceUid
-      && params.nav_name !== '日志聚类'
-      && (oldRouteId === params.route_id || oldNavId === params.nav_id)
+      !isAppFirstLoad &&
+      oldspaceUid === spaceUid &&
+      params.nav_name !== '日志聚类' &&
+      (oldRouteId === params.route_id || oldNavId === params.nav_id)
     ) {
       return;
     }
@@ -83,6 +83,11 @@ class ReportLogStore extends VuexModule {
         },
       )
       .catch(() => false);
+
+    // 首条路由事件进入上报流程后，启用后续路由去重。
+    if (isAppFirstLoad) {
+      store.commit('updateState', { isAppFirstLoad: false });
+    }
   }
 }
 export default getModule(ReportLogStore);

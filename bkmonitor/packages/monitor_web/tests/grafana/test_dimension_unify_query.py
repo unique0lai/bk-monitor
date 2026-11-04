@@ -10,8 +10,13 @@ specific language governing permissions and limitations under the License.
 
 import pytest
 
+from bkmonitor.models import MetricListCache
 from constants.data_source import DataSourceLabel, DataTypeLabel
-from monitor_web.grafana.resources.unify_query import DimensionUnifyQuery
+from monitor_web.grafana.resources.unify_query import (
+    DimensionCountUnifyQuery,
+    DimensionUnifyQuery,
+    GetDrillDimensionsResource,
+)
 
 get_dimension_data_return = {
     "values": {
@@ -64,6 +69,7 @@ class TestDimensionUnifyQuery:
         mocker.patch(
             "api.unify_query.default.GetDimensionDataResource.perform_request", return_value=get_dimension_data_return
         )
+        mocker.patch("api.cmdb.default.GetBusiness.perform_request", return_value=[])
         dimension_unify_query = DimensionUnifyQuery()
         params = get_params_by_bkmonitor_timeseries(
             dimension_field="bk_biz_id", data_source_label=DataSourceLabel.BK_MONITOR_COLLECTOR
@@ -115,6 +121,7 @@ class TestDimensionUnifyQuery:
         mocker.patch(
             "api.unify_query.default.GetDimensionDataResource.perform_request", return_value=get_dimension_data_return
         )
+        mocker.patch("api.cmdb.default.GetBusiness.perform_request", return_value=[])
         dimension_unify_query = DimensionUnifyQuery()
         params = get_params_by_bkmonitor_timeseries(
             dimension_field="bk_biz_id", data_source_label=DataSourceLabel.CUSTOM
@@ -314,6 +321,14 @@ class TestDimensionUnifyQuery:
         mocker.patch(
             "api.log_search.default.ESQuerySearchResource.perform_request", return_value=es_query_search_return
         )
+        mocker.patch(
+            "api.unify_query.default.GetDimensionDataResource.perform_request",
+            return_value={
+                "values": {
+                    "span_name": ["influxdb-query-select", "handle-ts-query", "influxdb-client-query"],
+                }
+            },
+        )
         dimension_unify_query = DimensionUnifyQuery()
         data = dimension_unify_query.request(params)
         assert {item["value"] for item in data} == {"influxdb-query-select", "handle-ts-query", "influxdb-client-query"}
@@ -346,7 +361,7 @@ class TestDimensionUnifyQuery:
                     "interval": 60,
                     "metrics": [{"alias": "a", "field": "_index", "method": "COUNT"}],
                     "query_string": '"access-tokens" AND NOT iam',
-                    "table": "2_bklog.dillon_test",
+                    "table": "test_log_table",
                     "time_field": "dtEventTimeStamp",
                     "where": [],
                 }
@@ -387,7 +402,7 @@ class TestDimensionUnifyQuery:
                 "hits": [
                     {
                         "_id": "6a425a1ca64f1f4e526f147fd1a39aba",
-                        "_index": "v2_2_bklog_dillon_test_20210831_0",
+                        "_index": "v2_test_log_20210831_0",
                         "_score": 0.0,
                         "_source": {
                             "cloudId": 0,
@@ -413,9 +428,45 @@ class TestDimensionUnifyQuery:
         mocker.patch(
             "api.log_search.default.ESQuerySearchResource.perform_request", return_value=es_query_search_return
         )
+        mocker.patch(
+            "api.unify_query.default.GetDimensionDataResource.perform_request",
+            return_value={"values": {"path": ["/var/log/messages"]}},
+        )
         dimension_unify_query = DimensionUnifyQuery()
         data = dimension_unify_query.request(params)
         assert data == [{"label": "/var/log/messages", "value": "/var/log/messages"}]
+
+    @pytest.mark.parametrize(("values", "expected"), [(["test-value-a", "test-value-b"], 2), ([], 0)])
+    def test_log_search_dimension_count(self, mocker, values, expected):
+        params = {
+            "bk_biz_id": 999,
+            "dimension_field": "path",
+            "end_time": 1630723218,
+            "expression": "a",
+            "query_configs": [
+                {
+                    "data_source_label": DataSourceLabel.BK_LOG_SEARCH,
+                    "data_type_label": DataTypeLabel.LOG,
+                    "filter_dict": {},
+                    "functions": [],
+                    "group_by": ["path"],
+                    "index_set_id": "999",
+                    "interval": 60,
+                    "metrics": [{"alias": "a", "field": "_index", "method": "COUNT"}],
+                    "query_string": "test-query",
+                    "table": "test_log_table",
+                    "time_field": "dtEventTimeStamp",
+                    "where": [],
+                }
+            ],
+            "start_time": 1630719618,
+        }
+        mocker.patch(
+            "api.unify_query.default.GetDimensionDataResource.perform_request",
+            return_value={"values": {"path": values}},
+        )
+
+        assert DimensionCountUnifyQuery().perform_request(params) == expected
 
     def test_bkmonitor_log(self, mocker):
         """
@@ -529,6 +580,10 @@ class TestDimensionUnifyQuery:
         }
         dimension_unify_query = DimensionUnifyQuery()
         mocker.patch("api.metadata.default.GetEsDataResource.perform_request", return_value=get_es_data_return)
+        mocker.patch(
+            "api.unify_query.default.GetDimensionDataResource.perform_request",
+            return_value={"values": {"event_name": ["login_count", "login_failed_count"]}},
+        )
         data = dimension_unify_query.request(params)
         data.sort(key=lambda x: x["value"])
         assert data == [
@@ -621,6 +676,61 @@ class TestDimensionUnifyQuery:
         }
         dimension_unify_query = DimensionUnifyQuery()
         mocker.patch("api.metadata.default.GetEsDataResource.perform_request", return_value=get_es_data_return)
+        mocker.patch(
+            "api.unify_query.default.GetDimensionDataResource.perform_request",
+            return_value={"values": {"dimensions.kind": ["Pod"]}},
+        )
         data = dimension_unify_query.request(params)
         data.sort(key=lambda x: x["value"])
         assert data == [{"label": "Pod", "value": "Pod"}]
+
+
+@pytest.mark.django_db(databases="__all__")
+class TestGetDrillDimensionsResource:
+    def test_filter_not_aggregatable_metric_dimensions(self, mocker):
+        mocker.patch("monitor_web.grafana.resources.unify_query.get_process_extra_dimensions", return_value={})
+        MetricListCache.objects.create(
+            bk_biz_id=100674,
+            category_display="日志平台",
+            collect_config="",
+            collect_config_ids=[],
+            collect_interval=1,
+            data_source_label=DataSourceLabel.BK_LOG_SEARCH,
+            data_target="",
+            data_type_label=DataTypeLabel.LOG,
+            default_condition=[],
+            default_dimensions=[],
+            description="日志关键字",
+            dimensions=[
+                {"id": "codefile", "is_dimension": False, "name": "代码文件", "type": "keyword"},
+                {"id": "ip", "is_dimension": True, "name": "IP", "type": "keyword"},
+            ],
+            extend_fields={},
+            metric_field="_index",
+            metric_field_name="日志关键字",
+            plugin_type="",
+            related_id="21877",
+            related_name="索引集",
+            result_table_id="100674_bklog.jkminiformal_log",
+            result_table_label="log",
+            result_table_label_name="日志",
+            result_table_name="业务日志",
+            unit="",
+            unit_conversion=1.0,
+            use_frequency=0,
+        )
+
+        data = GetDrillDimensionsResource().perform_request(
+            {
+                "bk_biz_id": 100674,
+                "query_configs": [
+                    {
+                        "result_table_id": "100674_bklog.jkminiformal_log",
+                        "metric_field": "_index",
+                        "configured_dimensions": [],
+                    }
+                ],
+            }
+        )
+
+        assert data == [{"value": "ip", "text": "IP"}]

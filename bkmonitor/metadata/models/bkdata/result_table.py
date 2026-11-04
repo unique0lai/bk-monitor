@@ -13,7 +13,6 @@ from django.db import models
 from metadata.models.data_link.constants import DataLinkResourceStatus
 from metadata.models.storage import ClusterInfo
 
-
 # ------------------------------------------------------ #
 # ------------------ BkBase相关暂不修改 ------------------ #
 # ------------------------------------------------------ #
@@ -23,7 +22,7 @@ class BkBaseResultTable(models.Model):
     """
     计算平台结果表
     data_link_name作为唯一主键，
-    Note：新接入的链路，data_link_name和bkbase_data_name相同，都是根据数据源的data_name拼接而成，V3->V4迁移场景下不同
+    data_link_name 为链路身份，bkbase_data_name 为实际 DataId 资源名，不能假定二者相同。
     除bkbase_table_id外，其余均为声明式字段，bkbase_table_id相当于链路status的一部分
     """
 
@@ -31,15 +30,18 @@ class BkBaseResultTable(models.Model):
         (DataLinkResourceStatus.INITIALIZING.value, "初始化中"),
         (DataLinkResourceStatus.CREATING.value, "创建中"),
         (DataLinkResourceStatus.PENDING.value, "等待中"),
+        (DataLinkResourceStatus.FAILED.value, "失败"),
+        (DataLinkResourceStatus.TERMINATING.value, "终止中"),
+        (DataLinkResourceStatus.TERMINATED.value, "已终止"),
         (DataLinkResourceStatus.OK.value, "已就绪"),
     )
 
-    # 在V3->V4迁移场景中，data_link_name和bkbase_data_name不一定相同，故需设计为分别全局唯一
+    # 一个自定义格式 DataSource 可为多个 ResultTable 派生独立 DataLink，故 DataId 名称允许复用。
     data_link_name = models.CharField(
         verbose_name="链路名称", max_length=255, primary_key=True, db_index=True, unique=True
     )
     bkbase_data_name = models.CharField(
-        verbose_name="计算平台数据源名称", max_length=128, unique=True, null=True, blank=True
+        verbose_name="计算平台数据源名称", max_length=128, null=True, blank=True, db_index=True
     )
     storage_type = models.CharField(
         "存储类型", max_length=32, choices=ClusterInfo.CLUSTER_TYPE_CHOICES, default=ClusterInfo.TYPE_VM

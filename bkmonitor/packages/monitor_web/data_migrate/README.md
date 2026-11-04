@@ -7,11 +7,19 @@
 - `apply_auto_increment_from_directory`
 - `export_auto_increment_to_directory`
 - `export_biz_data_to_directory`
+- `export_partial_data_to_directory`
 - `import_biz_data_from_directory`
+- `import_partial_data_from_directory`
 - `disable_models_in_directory`
 - `replace_tenant_id_in_directory`
 - `restore_disabled_models_in_directory`
 - `sanitize_cluster_info_in_directory`
+- `stop_biz_subscription_tasks`
+- `install_biz_bk_collector`
+- `stop_biz_bk_collector`
+- `refresh_biz_bk_collector_proxy_configs`
+- `check_biz_bk_collector_proxy_config_delivery`
+- `retry_biz_bk_collector_proxy_config_delivery`
 
 代码导出位置见 [__init__.py](/Users/unique0lai/Documents/Codes/bk-monitor/bk-monitor/worktrees/data-migrate/bkmonitor/bkmonitor/data_migrate/__init__.py)。
 
@@ -20,11 +28,22 @@
 - `python manage.py data_migrate apply-sequences ...`
 - `python manage.py data_migrate export ...`
 - `python manage.py data_migrate import ...`
+- `python manage.py data_migrate rebuild ...`
+- `python manage.py data_migrate partial-export ...`
+- `python manage.py data_migrate partial-import ...`
+- `python manage.py data_migrate partial-rebuild ...`
+- `python manage.py data_migrate disable-enabled-strategies ...`
 - `python manage.py data_migrate enable-closed-strategies ...`
+- `python manage.py data_migrate update-migrate-data-id-routes ...`
 - `python manage.py data_migrate disable-models ...`
 - `python manage.py data_migrate replace-tenant-id ...`
 - `python manage.py data_migrate restore-disabled-models ...`
 - `python manage.py data_migrate sanitize-cluster-info ...`
+- `python manage.py data_migrate stop-biz-subscription-tasks ...`
+- `python manage.py data_migrate install-biz-bk-collector ...`
+- `python manage.py data_migrate stop-biz-bk-collector ...`
+- `python manage.py data_migrate refresh-biz-bk-collector-configs ...`
+- `python manage.py data_migrate retry-biz-bk-collector-config-delivery ...`
 
 ## 使用方式
 
@@ -61,6 +80,7 @@ python manage.py data_migrate import \
 - 默认按 `manifest.json` 中记录的业务列表全量导入
 - 如果显式传入 `--bk-biz-ids`，则只导入对应业务
 - `0` 代表同时导入 `global/` 下的全局数据
+- 导入业务数据后会自动转换本次导入业务下的内置系统事件策略到多租户 custom event 链路
 
 可选参数：
 
@@ -68,6 +88,69 @@ python manage.py data_migrate import \
   - 仅导入指定业务 ID 列表
 - `--disable-atomic`
   - 是否按单个文件事务导入
+
+### 局部导出 / 导入 / 重建
+
+```bash
+python manage.py data_migrate partial-export \
+  --directory /tmp \
+  --bk-tenant-id tencent \
+  --bk-biz-id 2 \
+  --bcs-cluster-ids BCS-K8S-00000 \
+  --custom-report-data-ids 123 456 \
+  --app-names demo-app
+
+python manage.py data_migrate partial-import \
+  --directory /tmp/bkmonitor-partial-data-migrate-20260307120000
+
+python manage.py data_migrate partial-rebuild \
+  --directory /tmp/bkmonitor-partial-data-migrate-20260307120000 \
+  --event-kafka-cluster-name log-kafka-public-1
+```
+
+说明：
+
+- `partial-export` 是独立于全量 `export` 的局部导出入口，目前支持 BCS 集群、自定义上报 Data ID 和 APM 应用三个选择器
+- `partial-import` 导入前会检查 `bk_data_id`、`data_name`、`table_id`、`time_series_group_name`、`event_group_name` 等关键字段冲突，命中则失败且不写入
+- `partial-import` 会先完整预扫描导出目录，随后复用通用导入逻辑写入；大目录会有一次额外解析开销，并发写入导致的最终唯一性冲突仍以数据库约束和导入事务为准
+- `partial-import` 不执行整业务清理，避免局部增量导入影响同业务的其他配置
+- `partial-rebuild` 可直接从导出目录的 `manifest.json` 读取局部范围，也可以显式传入相同选择器
+- `partial-rebuild` 支持独立指定 `--metric-kafka-cluster-name`、`--log-kafka-cluster-name`、`--event-kafka-cluster-name`、`--log-es-cluster-name`、`--event-es-cluster-name`
+- `partial-rebuild` 会在重建后基于新环境生成 `data_id_infos`；传入 `--directory` 时会写入 `partial_data_id_infos.json`，可继续传给 `add-migrate-data-id-routes` 复用双写路由逻辑
+
+### 数据重建
+
+```bash
+python manage.py data_migrate rebuild \
+  --bk-tenant-id tencent \
+  --metric-kafka-cluster-name metric-kafka-public-1 \
+  --log-kafka-cluster-name log-kafka-public-1 \
+  --log-es-cluster-name log-es-public-1 \
+  --event-es-cluster-name event-es-public-1 \
+  --bk-biz-ids 2 3
+```
+
+说明：
+
+- `--bk-biz-ids` 支持正数和负数业务 ID，不支持 `0`
+- 正数业务会完整执行仪表盘、日志/APM 路由、内置系统数据、拨测、采集插件、K8S 和自定义上报重建
+- 负数业务会跳过内置系统数据、拨测和采集插件重建，只执行仪表盘、日志/APM 路由、K8S 和自定义上报重建
+
+### 关闭老环境中已启用的策略
+
+```bash
+python manage.py data_migrate disable-enabled-strategies \
+  --bk-biz-ids 2 3 \
+  --dry-run
+```
+
+说明：
+
+- 查询指定业务下当前 `is_enabled=True` 的策略
+- 非 `dry-run` 模式下，先把策略 ID 合并写入业务维度的 `ApplicationConfig.data_migrate_closed_records`，再将策略关闭
+- 已有配置中的其他模型记录和历史策略 ID 都会保留，方便迁移到新环境后回溯和重新开启
+- 配置写入和策略关闭按业务放在同一个事务中执行
+- `--bk-biz-ids` 支持正数和负数业务 ID，不支持 `0`
 
 ### 开启导入阶段关闭的策略
 
@@ -81,7 +164,34 @@ python manage.py data_migrate enable-closed-strategies \
 - 从业务维度的 `ApplicationConfig` 中读取 `data_migrate_closed_records`
 - 只处理其中 `bkmonitor.strategymodel` 对应的策略 ID
 - 仅重新开启当前仍处于关闭状态的策略，并输出每个业务的处理统计
-- `--bk-biz-ids` 仅支持正整数业务 ID
+- `--bk-biz-ids` 支持正数和负数业务 ID，不支持 `0`
+
+### 查询自定义上报迁移 Data ID
+
+```bash
+python manage.py data_migrate find-custom-report-data-ids \
+  --bk-tenant-id tencent \
+  --bk-biz-ids 2 3
+```
+
+说明：
+
+- 覆盖页面创建的自定义指标/事件、K8S 内置指标、APM 和日志自定义上报
+- `--bk-biz-ids` 支持正数和负数业务 ID，不支持 `0`
+
+### 更新单个迁移双写路由
+
+```bash
+python manage.py data_migrate update-migrate-data-id-routes \
+  --bk-data-id 123 \
+  --kafka-cluster-name kafka_cluster
+```
+
+说明：
+
+- 当前仅支持单个数据 ID
+- 会查找名称为 `migrate_kafka_data_id_<bk_data_id>` 的既有迁移双写路由
+- `--kafka-cluster-name` 传迁移前 Kafka 集群名称，命令内部会更新到对应的 `migrate_<kafka_cluster_name>` 集群
 
 ### 恢复自增游标
 
@@ -197,6 +307,137 @@ python manage.py data_migrate restore-disabled-models \
 - 恢复依据来自 `recovery_records/` 目录中的按“批次 / 业务 / 模型”拆分记录
 - 恢复成功后，会在对应的 `disable-models` 记录上补 `restored_at`
 - 同时会追加一条 `restore_disable_models` 执行历史
+
+### 停用业务下订阅任务
+
+```bash
+python manage.py data_migrate stop-biz-subscription-tasks \
+  --bk-tenant-id tencent \
+  --bk-biz-ids 2 3 \
+  --operator admin
+```
+
+说明：
+
+- 会找出业务下拨测任务对应的节点管理订阅，关闭巡检并执行 `STOP`
+- 会找出业务下插件采集配置对应的节点管理订阅，关闭巡检并执行 `STOP`
+- 会额外找出业务下 k8s 采集配置并停用，k8s 采集不依赖节点管理订阅
+- 负数业务 ID 会直接跳过，并在返回结果的 `skipped_biz_ids` 中说明原因
+- 支持 `--dry-run` 只输出待处理对象，不执行停用
+- 每个任务独立执行并输出结果；单个失败不会中断其他任务
+
+### 安装业务 Proxy 上的 bk-collector
+
+```bash
+python manage.py data_migrate install-biz-bk-collector \
+  --bk-tenant-id tencent \
+  --bk-biz-ids 2 3 \
+  --operator admin
+```
+
+说明：
+
+- 会找出业务下正在使用的 proxy 主机，并安装或升级节点管理中可用的 latest 版本 `bk-collector`
+- 默认不检查 Agent 状态、不跳过任何主机（保持全量安装）
+- 如需跳过 Agent 未安装（`NOT_INSTALLED` 或节点管理未返回该主机）的机器，可加 `--skip-hosts-without-agent`
+- 被跳过的主机会记录在明细的 `skipped_hosts` 中，并汇总到返回结果的 `skip_summary`（含 `bk_host_id`、`ip`、`agent_status` 和 `reason`），命令执行结束后也会集中打印跳过的机器和原因
+- 支持 `--dry-run` 只输出待安装主机，不执行安装
+- 实际执行时每条成功明细会在 `operate_result` 中透传节点管理返回结果
+- 会根据 `operate_result.job_id` 轮询节点管理任务详情，并在 `job_status` 中输出成功、失败或超时状态
+- 如果安装失败或超时，可在 `failure_summary` 中查看异常业务、任务和主机
+- 可通过 `--job-wait-timeout` 和 `--job-poll-interval` 控制等待超时和轮询间隔，默认等待 90 秒
+- 每个业务独立执行并输出结果；单个失败不会中断其他业务
+
+### 停止业务 Proxy 上的 bk-collector
+
+```bash
+python manage.py data_migrate stop-biz-bk-collector \
+  --bk-tenant-id tencent \
+  --bk-biz-ids 2 3 \
+  --operator admin
+```
+
+说明：
+
+- 会找出业务下正在使用的 proxy 主机，并停止已安装的 `bk-collector`
+- 默认会检查主机 Agent 状态，仅 `RUNNING` 状态的机器会执行停止；其他状态、空状态或节点管理未返回的机器均会跳过；如需对这些主机也执行停止，可加 `--no-skip-hosts-without-agent`
+- 未安装 `bk-collector` 的主机始终会跳过
+- 被跳过的主机会记录在明细的 `skipped_hosts` 中，并汇总到返回结果的 `skip_summary`（含 `bk_host_id`、`ip`、`agent_status` 和 `reason`），命令执行结束后也会集中打印跳过的机器和原因
+- 支持 `--dry-run` 只输出待停止主机，不执行停止
+- 实际执行时每条成功明细会在 `operate_result` 中透传节点管理返回结果
+- 会根据 `operate_result.job_id` 轮询节点管理任务详情，并在 `job_status` 中输出成功、失败或超时状态
+- 如果停用失败或超时，可在 `failure_summary` 中查看异常业务、任务和主机
+- 可通过 `--job-wait-timeout` 和 `--job-poll-interval` 控制等待超时和轮询间隔，默认等待 90 秒
+- 每个业务独立执行并输出结果；单个失败不会中断其他业务
+
+### 刷新业务 Proxy 上的 bk-collector 配置
+
+```bash
+python manage.py data_migrate refresh-biz-bk-collector-configs \
+  --bk-tenant-id tencent \
+  --bk-biz-ids 2 3 \
+  --config-types apm_application custom_report log \
+  --operator admin
+```
+
+说明：
+
+- `--config-types` 可选值为 `apm_application`、`custom_report`、`log`
+- 不传 `--config-types` 时默认执行全部类型
+- `custom_report` 只触发 NodeMan proxy 下发，不触发 K8s 配置下发
+- 支持 `--dry-run` 只输出待刷新对象，不执行配置下发
+- 非 dry-run 默认会串联配置下发检查，并在返回结果的 `delivery_check.summary` 中输出配置渲染下发汇总
+- 如果存在下发失败、pending、unknown 或超时，可在 `delivery_check.failure_summary` 中查看异常订阅和异常主机
+- 下发检查发现 render 失败时，默认会复用检查结果对失败订阅调用 `retry_subscription` 自动补一轮执行（不重复检查），补发与复检结果在返回结果的 `retry` 中输出；可用 `--skip-render-failure-retry` 关闭
+- 默认不会输出完整 `details`，避免命令输出过长；需要排查明细时可使用 `--include-details`
+- 串联检查默认会包含默认业务配置，和 `custom_report` 的刷新范围保持一致
+- 可通过 `--delivery-wait-timeout` 和 `--delivery-poll-interval` 控制配置下发检查的等待超时和轮询间隔，默认等待 90 秒
+- 如只需要触发刷新、不等待下发结果，可使用 `--skip-delivery-check`
+
+### 检查业务 Proxy 上的 bk-collector 配置下发
+
+```python
+from monitor_web.data_migrate import check_biz_bk_collector_proxy_config_delivery
+
+result = check_biz_bk_collector_proxy_config_delivery(
+    bk_tenant_id="tencent",
+    bk_biz_ids=[2, 3],
+    config_types=["apm_application", "custom_report", "log"],
+    wait_timeout=90,
+    poll_interval=10,
+)
+```
+
+说明：
+
+- 会查询匹配业务下的 bk-collector proxy 配置订阅，并拉取节点管理任务详情
+- 成功标准是每台 proxy 的 `render_and_push_config` 子步骤为 `SUCCESS`
+- 订阅任务总状态失败、后续重载进程失败，不会影响配置渲染下发成功的判定
+- 返回结果顶层 `result` 表示是否全部 proxy 配置都成功完成渲染下发
+- 默认（`only_current_bk_biz_id=True`）只统计属于本业务的 proxy 主机（业务自有 proxy 及默认直连区域全局主机），忽略订阅中从其他业务借用的 proxy 主机的下发异常，避免因借用主机失败误判本业务结果；被忽略的主机数量在各订阅及 `summary` 的 `ignored_count` 中输出。传 `only_current_bk_biz_id=False` 可恢复对订阅下全部主机的全量检查
+- 忽略借用主机同样作用于 render 失败自动补执行，`retry_subscription` 只会对本业务主机补发，不会触碰其他业务的 proxy
+- 不传 `wait_timeout` 时只做一次检查；传入正数时会轮询直到成功、失败或超时
+
+### 对 render 失败的 bk-collector 配置订阅补一轮下发
+
+```bash
+python manage.py data_migrate retry-biz-bk-collector-config-delivery \
+  --bk-tenant-id tencent \
+  --bk-biz-ids 2 3 \
+  --config-types apm_application custom_report log \
+  --operator admin
+```
+
+说明：
+
+- 用于解决节点管理对多次失败的订阅不再自动重试、`refresh` 在配置未变化时无法触发下发的问题
+- 会先做一次即时下发检查，找出各订阅下 `render_and_push_config` 失败的 proxy 实例
+- 仅对 render 失败（非 pending、非 unknown）的实例调用节点管理 `retry_subscription` 精准补一轮执行，不影响正常主机
+- 检查结果汇总在返回结果的 `initial_delivery_check` 中，每个订阅的重试明细在 `details` 中（`--include-details` 时输出）
+- 支持 `--dry-run` 只输出待重试的订阅和实例数量，不实际触发
+- 非 dry-run 且确有重试时，默认会串联下发状态复检，并在 `delivery_check` 中输出复检结果；可用 `--skip-delivery-recheck` 跳过
+- 可通过 `--delivery-wait-timeout` 和 `--delivery-poll-interval` 控制复检的等待超时和轮询间隔，默认等待 90 秒
+- 每个订阅独立执行并输出结果；单个失败不会中断其他订阅
 
 ## 导出目录结构
 

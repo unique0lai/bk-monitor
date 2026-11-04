@@ -7,6 +7,7 @@
 
   .collection-box {
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     justify-content: center;
     width: 32px;
@@ -24,5 +25,38 @@
     &:hover {
       background-color: #eaebf0;
     }
+  }
+
+  .subbar-container {
+    flex: 1;
+    min-width: 0;
+
+    .retrieve-type-switch {
+      flex-shrink: 0;
+    }
+
+    .box-biz-select {
+      justify-content: flex-start;
+
+      .retrieve-tab-item-title {
+        flex-shrink: 0;
+      }
+    }
+
+    .box-right-option {
+      position: static;
+      flex-shrink: 0;
+      align-self: stretch;
+      margin-left: auto;
+    }
+  }
+}
+
+// 场景模式下二级导航栏始终吸顶
+.is-scene-mode {
+  .v3-bklog-toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
   }
 }

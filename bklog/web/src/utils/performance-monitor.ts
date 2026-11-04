@@ -13,7 +13,8 @@ interface PerformanceMetric {
 
 class PerformanceMonitor {
   private metrics: Map<string, PerformanceMetric> = new Map();
-  private enabled: boolean = process.env.NODE_ENV === 'development' || window.localStorage.getItem('bklog_perf_monitor') === 'true';
+  private enabled: boolean =
+    process.env.NODE_ENV === 'development' || window.localStorage.getItem('bklog_perf_monitor') === 'true';
 
   /**
    * 开始记录性能指标
@@ -68,11 +69,11 @@ class PerformanceMonitor {
       const result = fn();
       if (result instanceof Promise) {
         return result.then(
-          (value) => {
+          value => {
             this.end(name, metadata);
             return value;
           },
-          (error) => {
+          error => {
             this.end(name, { ...metadata, error: error.message });
             throw error;
           },
@@ -121,7 +122,7 @@ class PerformanceMonitor {
     }
 
     console.group('[Performance Report]');
-    metrics.forEach((metric) => {
+    metrics.forEach(metric => {
       if (metric.duration) {
         console.log(`${metric.name}: ${metric.duration.toFixed(2)}ms`, metric.metadata || '');
       }
@@ -163,9 +164,11 @@ class PerformanceMonitor {
 // 导出单例
 export const performanceMonitor = new PerformanceMonitor();
 
-// 在开发环境下，将性能监控器挂载到 window 对象，方便调试
+// 在开发环境下，将旧版轻量性能计时器挂载到独立命名空间，方便调试。
+// 注意：`window.__BKLOG_PERF_MONITOR__` 已由 IndexedDB 性能诊断服务占用，提供 enable/mark/export 等能力。
+// 这里不能再覆盖该全局对象，否则会导致控制台调用 `__BKLOG_PERF_MONITOR__.enable/mark` 为 undefined。
 if (process.env.NODE_ENV === 'development') {
-  (window as any).__BKLOG_PERF_MONITOR__ = performanceMonitor;
+  (window as any).__BKLOG_LEGACY_PERF_MONITOR__ = performanceMonitor;
   (window as any).__BKLOG_PERF_REPORT__ = () => performanceMonitor.report();
   (window as any).__BKLOG_PERF_SUMMARY__ = () => {
     const summary = performanceMonitor.getSummary();

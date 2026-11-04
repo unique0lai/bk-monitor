@@ -87,9 +87,29 @@ class Config:
             "schedule": crontab(minute="*/1"),
             "enabled": True,
         },
+        "rum_web.tasks.application_create_check": {
+            "task": "rum_web.tasks.application_create_check",
+            "schedule": crontab(minute="*/1"),
+            "enabled": True,
+        },
+        "rum_web.tasks.refresh_application": {
+            "task": "rum_web.tasks.refresh_application",
+            "schedule": crontab(minute="*/10"),
+            "enabled": True,
+        },
         "apm_web.tasks.cache_application_scope_name": {
             "task": "apm_web.tasks.cache_application_scope_name",
             "schedule": crontab(minute="*/10"),
+            "enabled": True,
+        },
+        "apm_web.tasks.cache_application_k8s_related_indexes": {
+            "task": "apm_web.tasks.cache_application_k8s_related_indexes",
+            "schedule": crontab(minute=0, hour="*/2"),
+            "enabled": True,
+        },
+        "apm_web.tasks.refresh_related_log_index_status": {
+            "task": "apm_web.tasks.refresh_related_log_index_status",
+            "schedule": crontab(minute="*/5"),
             "enabled": True,
         },
         "monitor_web.tasks.refresh_dashboard_strategy_snapshot": {
@@ -133,5 +153,17 @@ class Config:
             "task": "apm_web.tasks.auto_apply_strategy_template",
             "schedule": crontab(minute="*/30"),
             "enabled": True,
+        },
+        "fta_web.tasks.sync_tapd_issue_status": {
+            "task": "fta_web.tasks.sync_tapd_issue_status",
+            "schedule": crontab(minute="*/10"),
+            "enabled": True,
+            "options": {"queue": "celery_resource"},
+        },
+        "fta_web.tasks.recover_source_analysis_executions": {
+            "task": "fta_web.tasks.recover_source_analysis_executions",
+            "schedule": crontab(minute="*/10"),
+            "enabled": True,
+            "options": {"queue": "celery_resource"},
         },
     }

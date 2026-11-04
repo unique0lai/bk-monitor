@@ -1,20 +1,446 @@
+import hashlib
 import json
 import logging
 import random
 import string
 
+from django.conf import settings
+from django.db import transaction
 from pydantic import ValidationError
 
 from alarm_backends.service.scheduler.app import app
-from metadata.models import DataSource, DataSourceResultTable, ResultTable, ResultTableOption
+from bkmonitor.utils.tenant import get_tenant_default_biz_id
+from constants.common import DEFAULT_TENANT_ID
+from metadata.config import DATABASE_CONNECTION_NAME
+from metadata.models import (
+    AccessVMRecord,
+    DataSource,
+    DataSourceResultTable,
+    ResultTable,
+    ResultTableOption,
+    Space,
+    SpaceVMInfo,
+)
 from metadata.models.bkdata.result_table import BkBaseResultTable
 from metadata.models.constants import DataIdCreatedFromSystem
+from metadata.models.data_link.constants import (
+    BKBASE_NAMESPACE_BK_LOG,
+    BKBASE_NAMESPACE_BK_MONITOR,
+    DataLinkKind,
+    DataLinkNameScene,
+    DataLinkResourceStatus,
+)
 from metadata.models.data_link.data_link import DataLink
-from metadata.models.data_link.data_link_configs import DorisStorageBindingConfig, ESStorageBindingConfig
-from metadata.models.result_table import LogV4DataLinkOption
-from metadata.models.storage import ClusterInfo, DorisStorage, ESStorage
+from metadata.models.data_link.data_link_configs import (
+    DorisStorageBindingConfig,
+    ESStorageBindingConfig,
+)
+from metadata.models.data_link.service import get_data_link_component_config
+from metadata.models.data_link.utils import (
+    compose_transfer_consumer_group,
+    find_registered_bkdata_data_id_name,
+    generate_bkdata_resource_name,
+    get_registered_bkdata_data_id_name,
+)
+from metadata.models.result_table import (
+    CustomFormatV4DataLinkOption,
+    GraphRelationV4DataLinkOption,
+    LogV4DataLinkOption,
+)
+from metadata.models.space.constants import EtlConfigs
+from metadata.models.storage import ClusterInfo, DorisStorage, ESStorage, SurrealDBStorage
 
 logger = logging.getLogger(__name__)
+
+
+def compose_custom_format_data_link_name(bk_tenant_id: str, bk_data_id: int, table_id: str) -> str:
+    """生成不超过组件 64 字符限制且可重复计算的链路名称。"""
+    digest = hashlib.sha256(f"{bk_tenant_id}:{bk_data_id}:{table_id}".encode()).hexdigest()[:16]
+    return f"cf_{bk_data_id}_{digest}"
+
+
+def _resolve_custom_format_vm_dependencies(rt: ResultTable) -> tuple[ClusterInfo, str]:
+    """只读取已有 VM 路由与 inner KafkaChannel，不隐式创建资源。"""
+    space_data = Space.objects.get_space_info_by_biz_id(int(rt.get_target_bk_biz_id()))
+    space_type = space_data.get("space_type") or space_data.get("space_type_id")
+    space_id = space_data.get("space_id")
+    if not space_type or not space_id:
+        raise ValueError(f"自定义格式 ResultTable({rt.table_id}) 无法定位所属空间")
+    space_vm = SpaceVMInfo.objects.filter(space_type=space_type, space_id=space_id).first()
+    if space_vm is None:
+        raise ValueError(f"自定义格式 ResultTable({rt.table_id}) 缺少空间 VM 路由")
+    vm_cluster = ClusterInfo.objects.get(
+        bk_tenant_id=rt.bk_tenant_id,
+        cluster_id=space_vm.vm_cluster_id,
+        cluster_type=ClusterInfo.TYPE_VM,
+    )
+
+    mapping = settings.BKBASE_INNER_KAFKA_CHANNEL_MAP
+    channel_name = mapping.get(f"{rt.bk_tenant_id}:{BKBASE_NAMESPACE_BK_MONITOR}")
+    if channel_name is None and isinstance(mapping.get(rt.bk_tenant_id), dict):
+        channel_name = mapping[rt.bk_tenant_id].get(BKBASE_NAMESPACE_BK_MONITOR)
+    if not channel_name:
+        raise ValueError(f"缺少 {rt.bk_tenant_id}:{BKBASE_NAMESPACE_BK_MONITOR} 的 inner KafkaChannel 映射")
+    channel_config = get_data_link_component_config(
+        bk_tenant_id=rt.bk_tenant_id,
+        kind=DataLinkKind.KAFKACHANNEL.value,
+        namespace=BKBASE_NAMESPACE_BK_MONITOR,
+        component_name=channel_name,
+    )
+    if not channel_config:
+        raise ValueError(f"inner KafkaChannel({channel_name}) 不存在")
+    if channel_config.get("spec", {}).get("role") != "inner":
+        raise ValueError(f"KafkaChannel({channel_name}) role 不是 inner")
+    return vm_cluster, channel_name
+
+
+@app.task(ignore_result=True, queue="celery_metadata_task_worker")
+def apply_custom_format_datalink(bk_tenant_id: str, table_id: str) -> None:
+    """按 ResultTable Option 创建或更新一条自定义格式单目标 DataLink。"""
+    rt = ResultTable.objects.get(bk_tenant_id=bk_tenant_id, table_id=table_id)
+    relations = list(
+        DataSourceResultTable.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).values_list(
+            "bk_data_id", flat=True
+        )[:2]
+    )
+    if len(relations) != 1:
+        raise ValueError(f"自定义格式 ResultTable({table_id}) 必须且只能关联一个 DataSource")
+    data_source = DataSource.objects.get(bk_tenant_id=bk_tenant_id, bk_data_id=relations[0])
+    if data_source.etl_config != EtlConfigs.BK_CUSTOM_FORMAT.value:
+        raise ValueError(f"DataSource({data_source.bk_data_id}) 不是 bk_custom_format 类型")
+    data_source_created_from = data_source.created_from
+
+    enabled = ResultTableOption.objects.filter(
+        bk_tenant_id=bk_tenant_id,
+        table_id=table_id,
+        name=ResultTableOption.OPTION_ENABLE_CUSTOM_FORMAT_V4_DATA_LINK,
+    ).first()
+    if enabled is None or not enabled.get_value():
+        return
+    option_record = ResultTableOption.objects.get(
+        bk_tenant_id=bk_tenant_id,
+        table_id=table_id,
+        name=ResultTableOption.OPTION_CUSTOM_FORMAT_V4_DATA_LINK,
+    )
+    option = CustomFormatV4DataLinkOption.from_option_value(option_record.get_value())
+    is_influxdb_vm_compatible = (
+        rt.default_storage == ClusterInfo.TYPE_INFLUXDB and option.target_storage_type == ClusterInfo.TYPE_VM
+    )
+    if rt.default_storage != option.target_storage_type and not is_influxdb_vm_compatible:
+        raise ValueError(
+            f"自定义格式 ResultTable({table_id}) default_storage({rt.default_storage}) "
+            f"与 target_storage_type({option.target_storage_type}) 不一致"
+        )
+    strategy = {
+        ClusterInfo.TYPE_VM: DataLink.CUSTOM_FORMAT_VM,
+        ClusterInfo.TYPE_ES: DataLink.CUSTOM_FORMAT_ES,
+        ClusterInfo.TYPE_DORIS: DataLink.CUSTOM_FORMAT_DORIS,
+    }[option.target_storage_type]
+    namespace = (
+        BKBASE_NAMESPACE_BK_MONITOR if option.target_storage_type == ClusterInfo.TYPE_VM else BKBASE_NAMESPACE_BK_LOG
+    )
+    data_link_name = compose_custom_format_data_link_name(bk_tenant_id, data_source.bk_data_id, table_id)
+
+    existing_records = BkBaseResultTable.objects.filter(bk_tenant_id=bk_tenant_id, monitor_table_id=table_id)
+    for record in existing_records:
+        existing_strategy = (
+            DataLink.objects.filter(bk_tenant_id=bk_tenant_id, data_link_name=record.data_link_name)
+            .values_list("data_link_strategy", flat=True)
+            .first()
+        )
+        if (
+            existing_strategy
+            in {
+                DataLink.CUSTOM_FORMAT_VM,
+                DataLink.CUSTOM_FORMAT_ES,
+                DataLink.CUSTOM_FORMAT_DORIS,
+            }
+            and existing_strategy != strategy
+        ):
+            raise ValueError(f"自定义格式 ResultTable({table_id}) 创建后不能修改目标存储")
+
+    datalink, _ = DataLink.objects.update_or_create(
+        bk_tenant_id=bk_tenant_id,
+        data_link_name=data_link_name,
+        defaults={
+            "namespace": namespace,
+            "data_link_strategy": strategy,
+            "bk_data_id": data_source.bk_data_id,
+            "table_ids": [table_id],
+        },
+    )
+    target_bk_biz_id = rt.get_target_bk_biz_id()
+    data_id_name = find_registered_bkdata_data_id_name(data_source, namespace=namespace)
+    vm_cluster = None
+    inner_kafka_channel_name = ""
+    storage_cluster_id: int | None = None
+    try:
+        if not data_id_name:
+            data_source.register_to_bkbase(bk_biz_id=target_bk_biz_id, namespace=namespace)
+        data_id_name = get_registered_bkdata_data_id_name(data_source, namespace=namespace)
+
+        if option.target_storage_type == ClusterInfo.TYPE_VM:
+            vm_cluster, inner_kafka_channel_name = _resolve_custom_format_vm_dependencies(rt)
+            storage_cluster_id = vm_cluster.cluster_id
+        elif option.target_storage_type == ClusterInfo.TYPE_ES:
+            storage = ESStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).first()
+            if storage is None:
+                raise ValueError(f"自定义格式 ResultTable({table_id}) 缺少 ESStorage")
+            storage_cluster_id = storage.storage_cluster_id
+        else:
+            storage = DorisStorage.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).first()
+            if storage is None:
+                raise ValueError(f"自定义格式 ResultTable({table_id}) 缺少 DorisStorage")
+            storage_cluster_id = storage.storage_cluster_id
+
+        datalink.apply_data_link(
+            bk_biz_id=target_bk_biz_id,
+            data_source=data_source,
+            table_id=table_id,
+            storage_cluster_name=vm_cluster.cluster_name if vm_cluster else "",
+            inner_kafka_channel_name=inner_kafka_channel_name,
+            storage_type=option.target_storage_type,
+            cleanup_absent_components=True,
+        )
+        datalink.sync_metadata(table_id=table_id, storage_cluster_id=storage_cluster_id)
+    except Exception:
+        BkBaseResultTable.objects.update_or_create(
+            bk_tenant_id=bk_tenant_id,
+            data_link_name=data_link_name,
+            defaults={
+                "monitor_table_id": table_id,
+                "bkbase_data_name": data_id_name,
+                "storage_type": option.target_storage_type,
+                "storage_cluster_id": storage_cluster_id,
+                "status": DataLinkResourceStatus.FAILED.value,
+            },
+        )
+        raise
+
+    if option.target_storage_type == ClusterInfo.TYPE_VM and vm_cluster is not None:
+        bkbase_rt = BkBaseResultTable.objects.get(bk_tenant_id=bk_tenant_id, data_link_name=data_link_name)
+        AccessVMRecord.objects.update_or_create(
+            bk_tenant_id=bk_tenant_id,
+            result_table_id=table_id,
+            defaults={
+                "data_type": AccessVMRecord.ACCESS_VM,
+                "storage_cluster_id": vm_cluster.cluster_id,
+                "vm_cluster_id": vm_cluster.cluster_id,
+                "bk_base_data_id": data_source.bk_data_id,
+                "bk_base_data_name": data_id_name,
+                "vm_result_table_id": bkbase_rt.bkbase_table_id,
+            },
+        )
+    if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value:
+        data_source.delete_consul_config()
+
+
+def _resolve_graph_relation_vm_cluster(rt: ResultTable) -> ClusterInfo:
+    vm_record = AccessVMRecord.objects.filter(
+        bk_tenant_id=rt.bk_tenant_id,
+        result_table_id=rt.table_id,
+    ).last()
+    if vm_record:
+        cluster = ClusterInfo.objects.filter(
+            bk_tenant_id=rt.bk_tenant_id,
+            cluster_id=vm_record.vm_cluster_id,
+            cluster_type=ClusterInfo.TYPE_VM,
+        ).first()
+        if cluster:
+            return cluster
+
+    from metadata.models import Space
+    from metadata.models.vm.utils import get_vm_cluster_id_name
+
+    space_data = {}
+    try:
+        space_data = Space.objects.get_space_info_by_biz_id(int(rt.get_target_bk_biz_id()))
+    except Exception as error:  # pylint: disable=broad-except
+        logger.warning(
+            "resolve_graph_relation_vm_cluster: get space failed, tenant(%s) table(%s), error=%s",
+            rt.bk_tenant_id,
+            rt.table_id,
+            error,
+        )
+    vm_cluster = get_vm_cluster_id_name(
+        bk_tenant_id=rt.bk_tenant_id,
+        space_type=space_data.get("space_type", ""),
+        space_id=space_data.get("space_id", ""),
+    )
+    return ClusterInfo.objects.get(
+        bk_tenant_id=rt.bk_tenant_id,
+        cluster_id=vm_cluster["cluster_id"],
+        cluster_type=ClusterInfo.TYPE_VM,
+    )
+
+
+@app.task(ignore_result=True, queue="celery_metadata_task_worker")
+def apply_graph_relation_v4_datalink(bk_tenant_id: str, table_id: str) -> None:
+    """根据 ResultTableOption 创建或更新统一 Graph Relation V4 DataLink。
+
+    VM 与 SurrealDB 共用一条 DataLink，具体写入目标由
+    ``graph_relation_v4_data_link`` Option 决定。该任务只负责准备接入参数和
+    回填监控侧元数据，组件的完整期望状态及分支清理由 Graph V4 compose/apply 负责。
+
+    Args:
+        bk_tenant_id: 结果表所属租户。
+        table_id: 需要接入 Graph V4 链路的监控结果表。
+    """
+    # 1. 读取并校验写入目标，同时定位当前 RT 唯一的数据源。
+    rt = ResultTable.objects.get(bk_tenant_id=bk_tenant_id, table_id=table_id)
+    option_record = ResultTableOption.objects.get(
+        bk_tenant_id=bk_tenant_id,
+        table_id=table_id,
+        name=ResultTableOption.OPTION_GRAPH_RELATION_V4_DATA_LINK,
+    )
+    option = GraphRelationV4DataLinkOption.from_option_value(option_record.get_value())
+    dsrt = DataSourceResultTable.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).last()
+    if dsrt is None:
+        raise ValueError(f"apply_graph_relation_v4_datalink: tenant({bk_tenant_id}) {table_id} datasource not found")
+    data_source = DataSource.objects.get(bk_tenant_id=bk_tenant_id, bk_data_id=dsrt.bk_data_id)
+    target_bk_biz_id = rt.get_target_bk_biz_id()
+
+    # 2. 沿用普通 VM 接入的数据源注册规则。非 BKData 数据源需要保留
+    # Transfer consumer group，但它只传给 VM DataBus 承接原消费位点；
+    # SurrealDB DataBus 使用独立消费组，避免双写时与 VM 竞争 Kafka 分区。
+    consumer_group = None
+    data_source_created_from = data_source.created_from
+    if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value:
+        consumer_group = compose_transfer_consumer_group(data_source)
+        data_source.register_to_bkbase(
+            bk_biz_id=target_bk_biz_id,
+            namespace="bkmonitor",
+        )
+    # 3. 只解析 Option 实际启用分支的依赖：
+    # SurrealDB-only 不要求 AccessVMRecord/VM 集群，VM-only 不要求 SurrealDBStorage。
+    vm_cluster = _resolve_graph_relation_vm_cluster(rt) if option.should_write_vm else None
+    surrealdb_storage = None
+    if option.should_write_surrealdb:
+        surrealdb_storage = SurrealDBStorage.objects.filter(
+            bk_tenant_id=bk_tenant_id,
+            table_id=table_id,
+        ).first()
+        if surrealdb_storage is None:
+            raise ValueError(
+                f"apply_graph_relation_v4_datalink: tenant({bk_tenant_id}) {table_id} surrealdb storage not found"
+            )
+
+    # 4. 优先复用该 RT 已有的普通 VM 或 Graph DataLink，避免双写时额外创建
+    # 一条并行 VM 链路。旧配置生成的 Graph DataLink 也可以直接认领；
+    # ResultTableOption 会让复用后的链路在本次 apply 中进入 V4 compose。
+    storage_type = ClusterInfo.TYPE_VM if option.should_write_vm else ClusterInfo.TYPE_SURREALDB
+    # 与普通 VM 入口锁同一 RT，锁内重新查建并保存映射，避免并发分配多个随机主名称。
+    with transaction.atomic(using=DATABASE_CONNECTION_NAME):
+        ResultTable.objects.select_for_update().get(bk_tenant_id=bk_tenant_id, table_id=table_id)
+        configured_rt = None
+        candidates = BkBaseResultTable.objects.filter(
+            bk_tenant_id=bk_tenant_id,
+            monitor_table_id=table_id,
+        ).order_by("-last_modify_time", "-create_time")
+        for candidate in candidates:
+            strategy = (
+                DataLink.objects.filter(
+                    bk_tenant_id=bk_tenant_id,
+                    data_link_name=candidate.data_link_name,
+                )
+                .values_list("data_link_strategy", flat=True)
+                .first()
+            )
+            if strategy in {DataLink.BK_STANDARD_V2_TIME_SERIES, DataLink.GRAPH_RELATION_TIME_SERIES}:
+                configured_rt = candidate
+                break
+
+        datalink_query = DataLink.objects.filter(bk_tenant_id=bk_tenant_id, namespace="bkmonitor")
+        if configured_rt:
+            datalink = datalink_query.filter(data_link_name=configured_rt.data_link_name).first()
+        else:
+            bkbase_data_name = get_registered_bkdata_data_id_name(data_source, namespace="bkmonitor")
+            datalink = datalink_query.filter(
+                bk_data_id=data_source.bk_data_id,
+                table_ids__contains=[table_id],
+                data_link_strategy=DataLink.GRAPH_RELATION_TIME_SERIES,
+            ).first()
+            if datalink is None:
+                # 与普通 VM 入口一致，兼容尚未回填来源字段、且 RT 映射缺失的旧链路。
+                datalink = datalink_query.filter(
+                    data_link_name=bkbase_data_name,
+                    data_link_strategy__in=[DataLink.BK_STANDARD_V2_TIME_SERIES, DataLink.GRAPH_RELATION_TIME_SERIES],
+                ).first()
+        if datalink is None:
+            datalink = DataLink.objects.create(
+                bk_tenant_id=bk_tenant_id,
+                # 仅新建时分配主名称；已有映射指向缺失主记录时仍按保存的原名补建。
+                data_link_name=configured_rt.data_link_name
+                if configured_rt
+                else generate_bkdata_resource_name(DataLinkNameScene.GRAPH, data_source.bk_data_id),
+                namespace="bkmonitor",
+                data_link_strategy=DataLink.GRAPH_RELATION_TIME_SERIES,
+                bk_data_id=data_source.bk_data_id,
+                table_ids=[table_id],
+            )
+        else:
+            datalink.namespace = "bkmonitor"
+            datalink.data_link_strategy = DataLink.GRAPH_RELATION_TIME_SERIES
+            datalink.bk_data_id = data_source.bk_data_id
+            datalink.table_ids = [table_id]
+            datalink.save(
+                update_fields=["namespace", "data_link_strategy", "bk_data_id", "table_ids", "last_modify_time"]
+            )
+        BkBaseResultTable.objects.get_or_create(
+            bk_tenant_id=bk_tenant_id,
+            data_link_name=datalink.pk,
+            defaults={"monitor_table_id": table_id, "storage_type": storage_type},
+        )
+
+    # 5. Graph V4 复用原 graph_relation_time_series strategy；ResultTableOption
+    # 决定 compose 走普通组件路径。包含 VM 时 VM 是查询主存储，SurrealDB-only
+    # 才将 SurrealDB 记录为主存储。远端下发放在事务提交之后。
+    datalink.apply_data_link(
+        bk_biz_id=target_bk_biz_id,
+        data_source=data_source,
+        table_id=table_id,
+        storage_cluster_name=vm_cluster.cluster_name if vm_cluster else "",
+        storage_type=storage_type,
+        consumer_group=consumer_group,
+    )
+    primary_cluster = vm_cluster if vm_cluster else surrealdb_storage.storage_cluster
+    datalink.sync_metadata(table_id=table_id, storage_cluster_id=primary_cluster.cluster_id)
+
+    # 6. AccessVMRecord 同时承载 VM 分支的历史接入身份：VM 单写/双写时回填；
+    # SurrealDB-only 不新建也不删除已有记录，以便后续切回 VM 时继续复用原
+    # VM 集群和结果表名称。当前实际主存储仍以 BkBaseResultTable.storage_type
+    # 及 ResultTableOption 为准，不由 AccessVMRecord 是否存在决定。
+    if option.should_write_vm and vm_cluster:
+        bkbase_rt = BkBaseResultTable.objects.get(
+            bk_tenant_id=bk_tenant_id,
+            data_link_name=datalink.data_link_name,
+        )
+        vm_record = AccessVMRecord.objects.filter(
+            bk_tenant_id=bk_tenant_id,
+            result_table_id=table_id,
+        ).last()
+        vm_record_values = {
+            "bk_base_data_id": data_source.bk_data_id,
+            "bk_base_data_name": bkbase_rt.bkbase_data_name
+            or get_registered_bkdata_data_id_name(data_source, namespace="bkmonitor"),
+            "vm_cluster_id": vm_cluster.cluster_id,
+            "vm_result_table_id": bkbase_rt.bkbase_table_id,
+        }
+        if vm_record:
+            for field, value in vm_record_values.items():
+                setattr(vm_record, field, value)
+            vm_record.save(update_fields=list(vm_record_values))
+        else:
+            AccessVMRecord.objects.create(
+                bk_tenant_id=bk_tenant_id,
+                result_table_id=table_id,
+                **vm_record_values,
+            )
+
+    # 7. 非 BKData 数据源已经切换到 BKBase DataBus 消费，清理旧 Transfer
+    # Consul 配置，保持与普通 VM V4 接入流程一致。
+    if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value:
+        data_source.delete_consul_config()
 
 
 @app.task(ignore_result=True, queue="celery_metadata_task_worker")
@@ -25,6 +451,8 @@ def apply_log_datalink(bk_tenant_id: str, table_id: str):
         bk_tenant_id: 租户ID
         table_id: 结果表ID
     """
+
+    logger.info("apply_log_datalink: tenant(%s) %s start", bk_tenant_id, table_id)
 
     # 获取结果表和数据源信息
     rt = ResultTable.objects.get(bk_tenant_id=bk_tenant_id, table_id=table_id)
@@ -46,8 +474,20 @@ def apply_log_datalink(bk_tenant_id: str, table_id: str):
             raise ValueError(f"apply_log_v4_datalink: tenant({bk_tenant_id}) {table_id} cannot switch back to transfer")
         return
 
+    # 如果这次是从transfer链路切换到V4链路，则需要设置consumer_group，避免数据链路切换时消费组不一致
+    consumer_group = (
+        compose_transfer_consumer_group(ds)
+        if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value
+        else None
+    )
+
     # 如果datasource是gse创建的，需要在bkbase上注册
     if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value:
+        logger.info(
+            "apply_log_datalink: tenant(%s) %s datasource created_from change to bkdata, register to bkbase",
+            bk_tenant_id,
+            table_id,
+        )
         ds.register_to_bkbase(bk_biz_id=rt.bk_biz_id, namespace="bklog")
 
     # 读取option中的日志链路配置
@@ -106,6 +546,11 @@ def apply_log_datalink(bk_tenant_id: str, table_id: str):
             data_link_name = f"bklog_{bk_biz_id_str}_{random_str}"
 
         # 创建链路
+        logger.info(
+            "apply_log_datalink: tenant(%s) bkbase_rt not found, create datalink name->[%s]",
+            bk_tenant_id,
+            data_link_name,
+        )
         datalink = DataLink.objects.create(
             bk_tenant_id=bk_tenant_id,
             data_link_name=data_link_name,
@@ -116,19 +561,24 @@ def apply_log_datalink(bk_tenant_id: str, table_id: str):
         )
     else:
         # 获取链路
-        datalink = DataLink.objects.get(
-            bk_tenant_id=bk_tenant_id, data_link_name=bkbase_rt.data_link_name, namespace="bklog"
+        logger.info(
+            "apply_log_datalink: tenant(%s) bkbase_rt found, update datalink name->[%s]",
+            bk_tenant_id,
+            bkbase_rt.data_link_name,
         )
-        update_fields: list[str] = []
-        if datalink.bk_data_id != ds.bk_data_id:
-            datalink.bk_data_id = ds.bk_data_id
-            update_fields.append("bk_data_id")
-        if datalink.table_ids != [table_id]:
-            datalink.table_ids = [table_id]
-            update_fields.append("table_ids")
-        if update_fields:
-            datalink.save(update_fields=update_fields)
-    datalink.apply_data_link(bk_biz_id=rt.bk_biz_id, data_source=ds, table_id=table_id)
+        datalink, _ = DataLink.objects.update_or_create(
+            bk_tenant_id=bk_tenant_id,
+            data_link_name=bkbase_rt.data_link_name,
+            namespace="bklog",
+            data_link_strategy=DataLink.BK_LOG,
+            defaults={"bk_data_id": ds.bk_data_id, "table_ids": [table_id]},
+        )
+
+        # 更新BkBaseResultTable状态
+        bkbase_rt.status = DataLinkResourceStatus.CREATING.value
+        bkbase_rt.save()
+
+    datalink.apply_data_link(bk_biz_id=rt.bk_biz_id, data_source=ds, table_id=table_id, consumer_group=consumer_group)
 
     # 回填 BkBaseResultTable 的 bkbase_rt_name / bkbase_table_id / bkbase_data_name 等。
     # 当 ES / Doris 两种存储同时存在时，按 ResultTable.default_storage 选择记录的存储类型；
@@ -193,6 +643,8 @@ def apply_log_datalink(bk_tenant_id: str, table_id: str):
         )
         ds.delete_consul_config()
 
+    logger.info("apply_log_datalink: tenant(%s) %s end", bk_tenant_id, table_id)
+
 
 @app.task(ignore_result=True, queue="celery_metadata_task_worker")
 def apply_event_group_datalink(bk_tenant_id: str, table_id: str):
@@ -202,6 +654,8 @@ def apply_event_group_datalink(bk_tenant_id: str, table_id: str):
         bk_tenant_id: 租户ID
         table_id: 结果表ID
     """
+
+    logger.info("apply_event_group_datalink: tenant(%s) %s start", bk_tenant_id, table_id)
 
     # 获取结果表和数据源信息
     rt = ResultTable.objects.get(bk_tenant_id=bk_tenant_id, table_id=table_id)
@@ -225,14 +679,30 @@ def apply_event_group_datalink(bk_tenant_id: str, table_id: str):
             )
         return
 
+    consumer_group = (
+        compose_transfer_consumer_group(ds)
+        if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value
+        else None
+    )
+
     # 如果datasource是gse创建的，需要在bkbase上注册
     if data_source_created_from != DataIdCreatedFromSystem.BKDATA.value:
+        logger.info(
+            "apply_event_group_datalink: tenant(%s) %s datasource created_from change to bkdata, register to bkbase",
+            bk_tenant_id,
+            table_id,
+        )
         ds.register_to_bkbase(bk_biz_id=rt.bk_biz_id, namespace="bklog")
 
     # 获取数据链路
     bkbase_rt = BkBaseResultTable.objects.filter(bk_tenant_id=bk_tenant_id, monitor_table_id=table_id).first()
     if not bkbase_rt:
         data_link_name = f"bkmonitor_custom_event_{ds.bk_data_id}"
+        logger.info(
+            "apply_event_group_datalink: tenant(%s) bkbase_rt not found, create datalink name->[%s]",
+            bk_tenant_id,
+            data_link_name,
+        )
         datalink = DataLink.objects.create(
             bk_tenant_id=bk_tenant_id,
             data_link_name=data_link_name,
@@ -242,22 +712,25 @@ def apply_event_group_datalink(bk_tenant_id: str, table_id: str):
             table_ids=[table_id],
         )
     else:
-        datalink = DataLink.objects.get(
-            bk_tenant_id=bk_tenant_id, data_link_name=bkbase_rt.data_link_name, namespace="bklog"
+        logger.info(
+            "apply_event_group_datalink: tenant(%s) bkbase_rt found, update datalink name->[%s]",
+            bk_tenant_id,
+            bkbase_rt.data_link_name,
         )
-        data_link_name = bkbase_rt.data_link_name
-        update_fields: list[str] = []
-        if datalink.bk_data_id != ds.bk_data_id:
-            datalink.bk_data_id = ds.bk_data_id
-            update_fields.append("bk_data_id")
-        if datalink.table_ids != [table_id]:
-            datalink.table_ids = [table_id]
-            update_fields.append("table_ids")
-        if update_fields:
-            datalink.save(update_fields=update_fields)
+        datalink, _ = DataLink.objects.update_or_create(
+            bk_tenant_id=bk_tenant_id,
+            data_link_name=bkbase_rt.data_link_name,
+            namespace="bklog",
+            data_link_strategy=DataLink.BK_STANDARD_V2_EVENT,
+            defaults={"bk_data_id": ds.bk_data_id, "table_ids": [table_id]},
+        )
+
+        # 更新BkBaseResultTable状态
+        bkbase_rt.status = DataLinkResourceStatus.CREATING.value
+        bkbase_rt.save()
 
     # 创建/更新链路配置
-    datalink.apply_data_link(bk_biz_id=rt.bk_biz_id, data_source=ds, table_id=table_id)
+    datalink.apply_data_link(bk_biz_id=rt.bk_biz_id, data_source=ds, table_id=table_id, consumer_group=consumer_group)
 
     # 回填 BkBaseResultTable 的 bkbase_rt_name / bkbase_table_id / bkbase_data_name 等。
     # 事件组 V4 链路使用 ES 存储，按 table_id 关联到 ESStorage 拿到 storage_cluster_id。
@@ -280,3 +753,59 @@ def apply_event_group_datalink(bk_tenant_id: str, table_id: str):
             ds.bk_data_id,
         )
         ds.delete_consul_config()
+
+    logger.info("apply_event_group_datalink: tenant(%s) %s end", bk_tenant_id, table_id)
+
+
+def rebuild_built_in_metric_datalink(bk_data_id: int, kafka_cluster_id: int):
+    """重建内置指标数据链路
+
+    1. 1100006 - bkunifylogbeat_common_metrics
+    2. 1100007 - bkunifylogbeat_task_metrics
+    3. 1100013 - bkm_statistics
+    4. 1100011 - custom_report_aggate_dataid
+
+    Args:
+        bk_tenant_id: 租户ID
+        bk_data_id: 数据源ID
+    """
+
+    bk_tenant_id = DEFAULT_TENANT_ID
+
+    logger.info("rebuild_built_in_metric_datalink: tenant(%s) bk_data_id->[%s] start", bk_tenant_id, bk_data_id)
+
+    # 获取数据源
+    ds = DataSource.objects.get(bk_tenant_id=bk_tenant_id, bk_data_id=bk_data_id)
+    if not ds:
+        raise ValueError(
+            f"rebuild_built_in_metric_datalink: tenant({bk_tenant_id}) bk_data_id->[%s] not found", bk_data_id
+        )
+
+    table_ids = DataSourceResultTable.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id=bk_data_id).values_list(
+        "table_id", flat=True
+    )
+    if not table_ids:
+        raise ValueError(
+            f"rebuild_built_in_metric_datalink: tenant({bk_tenant_id}) bk_data_id->[%s] not found", bk_data_id
+        )
+    if len(table_ids) != 1:
+        raise ValueError(
+            f"rebuild_built_in_metric_datalink: tenant({bk_tenant_id}) bk_data_id->[%s] has multiple table_ids",
+            bk_data_id,
+        )
+    rt = ResultTable.objects.get(bk_tenant_id=bk_tenant_id, table_id=table_ids[0])
+
+    # 修改数据源配置
+    ds.is_enable = True
+    ds.mq_cluster_id = kafka_cluster_id
+    ds.created_from = DataIdCreatedFromSystem.BKDATA.value
+    ds.save()
+
+    # gse路由注册与bkbase注册
+    ds.refresh_gse_config_to_gse()
+    ds.register_to_bkbase(bk_biz_id=get_tenant_default_biz_id(bk_tenant_id), namespace="bkmonitor")
+
+    # 链路重建
+    rt.is_enable = True
+    rt.save()
+    rt.apply_datalink(force_update=True, delay=False)

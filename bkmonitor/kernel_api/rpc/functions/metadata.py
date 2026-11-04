@@ -759,10 +759,9 @@ def refresh_unify_query_redis_route(params: dict[str, Any]) -> dict[str, Any]:
 
     if resolved_table_ids:
         space_client.push_table_id_detail(
+            bk_tenant_id=bk_tenant_id,
             table_id_list=resolved_table_ids,
             is_publish=True,
-            include_es_table_ids=True,
-            bk_tenant_id=bk_tenant_id,
         )
 
     if resolved_table_ids or resolved_data_labels:
@@ -1719,6 +1718,7 @@ def _serialize_federal_info(
 
     def _to_item(record: models.BcsFederalClusterInfo) -> dict[str, Any]:
         return {
+            "bk_tenant_id": record.bk_tenant_id,
             "fed_cluster_id": record.fed_cluster_id,
             "host_cluster_id": record.host_cluster_id,
             "sub_cluster_id": record.sub_cluster_id,
@@ -1902,19 +1902,22 @@ def metadata_bcs_cluster_related_info(params: dict[str, Any]) -> dict[str, Any]:
 
     # 联邦集群拓扑
     fed_by_host = list(
-        models.BcsFederalClusterInfo.objects.filter(host_cluster_id=cluster.cluster_id).order_by(
-            "fed_cluster_id", "sub_cluster_id"
-        )
+        models.BcsFederalClusterInfo.objects.filter(
+            bk_tenant_id=cluster.bk_tenant_id,
+            host_cluster_id=cluster.cluster_id,
+        ).order_by("fed_cluster_id", "sub_cluster_id")
     )
     fed_by_sub = list(
-        models.BcsFederalClusterInfo.objects.filter(sub_cluster_id=cluster.cluster_id).order_by(
-            "fed_cluster_id", "host_cluster_id"
-        )
+        models.BcsFederalClusterInfo.objects.filter(
+            bk_tenant_id=cluster.bk_tenant_id,
+            sub_cluster_id=cluster.cluster_id,
+        ).order_by("fed_cluster_id", "host_cluster_id")
     )
     fed_by_fed = list(
-        models.BcsFederalClusterInfo.objects.filter(fed_cluster_id=cluster.cluster_id).order_by(
-            "host_cluster_id", "sub_cluster_id"
-        )
+        models.BcsFederalClusterInfo.objects.filter(
+            bk_tenant_id=cluster.bk_tenant_id,
+            fed_cluster_id=cluster.cluster_id,
+        ).order_by("host_cluster_id", "sub_cluster_id")
     )
 
     cluster_info = {

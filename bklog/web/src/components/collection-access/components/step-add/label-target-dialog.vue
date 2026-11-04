@@ -36,16 +36,16 @@
     @cancel="handelCancelDialog"
   >
     <div
-      class="log-target-container"
       v-bkloading="{ isLoading: treeLoading, zIndex: 10 }"
+      class="log-target-container"
     >
       <div
         :style="`width : ${leftPreWidth}px`"
         :class="['label-tree', activeStretchBtn === 'left' && 'right-border-light']"
       >
         <bk-input
-          class="tree-search"
           v-model="filterStr"
+          class="tree-search"
           right-icon="bk-icon icon-search"
           clearable
           @change="search"
@@ -67,8 +67,8 @@
             <div>
               <div class="item-slot">
                 <span
-                  class="item-name"
                   v-bk-overflow-tips
+                  class="item-name"
                   >{{ data.name }}</span
                 >
                 <span
@@ -93,8 +93,8 @@
         ></div>
       </div>
       <div
-        class="label-operate"
         v-bkloading="{ isLoading: labelLoading, zIndex: 10 }"
+        class="label-operate"
       >
         <div
           v-if="!isEmpty"
@@ -110,8 +110,8 @@
               <bk-checkbox-group v-model="matchCheckedList">
                 <bk-checkbox
                   v-for="labItem in matchCheckedItemList"
-                  ext-cls="select-item"
                   :key="labItem.id"
+                  ext-cls="select-item"
                   :value="labItem.id"
                 >
                   <match-label-item
@@ -131,8 +131,8 @@
             <bk-checkbox-group v-model="matchSelectList">
               <bk-checkbox
                 v-for="labItem in matchSelectItemList"
-                ext-cls="select-item"
                 :key="labItem.id"
+                ext-cls="select-item"
                 :value="labItem.id"
               >
                 <match-label-item
@@ -214,6 +214,8 @@
         leftPreWidth: 300,
         treeLoading: false, // 树loading
         labelLoading: false, // 标签loading
+        treeRequestId: 0,
+        labelRequestId: 0,
         activeStretchBtn: '',
         treeIsEmpty: false, // 树结构是否搜索为空
         cacheRequestParams: {
@@ -246,8 +248,14 @@
     watch: {
       isShowDialog(val) {
         if (val) {
-          const { bk_biz_id, bcs_cluster_id, type, namespaceStr } = this.labelParams;
-          const requestParams = { bk_biz_id, bcs_cluster_id, type, namespace: namespaceStr };
+          const { bk_biz_id, bcs_cluster_id, type, namespaceStr, namespacesExclude } = this.labelParams;
+          const namespaceKey = namespacesExclude === '!=' ? 'namespaces_exclude' : 'namespace';
+          const requestParams = {
+            bk_biz_id,
+            bcs_cluster_id,
+            type,
+            ...(type === 'node' ? {} : { [namespaceKey]: namespaceStr === '*' ? undefined : namespaceStr }),
+          };
           this.treeList = [];
           this.defaultExpandList = [];
           this.cacheRequestParams = requestParams;
@@ -265,12 +273,19 @@
         }
       },
     },
+    beforeDestroy() {
+      this.treeRequestId += 1;
+      this.labelRequestId += 1;
+    },
     methods: {
       handleSelectTreeItem(treeItem) {
+        this.labelRequestId += 1;
+        const requestId = this.labelRequestId;
+        this.catchCheckedItemList();
+        this.matchSelectList = [];
+        this.matchSelectItemList = [];
+        this.labelLoading = false;
         if (!['pod', 'node'].includes(treeItem.data.type)) {
-          this.catchCheckedItemList();
-          this.matchSelectList = [];
-          this.matchSelectItemList = [];
           return;
         }
 
@@ -279,11 +294,10 @@
         const query = { namespace: nameSpaceStr, bcs_cluster_id, type, bk_biz_id, name: nameStr };
         if (type === 'node') delete query.namespace;
         this.labelLoading = true;
-        this.catchCheckedItemList();
         this.$http
           .request('container/getNodeLabelList', { query })
           .then(res => {
-            if (res.code === 0) {
+            if (requestId === this.labelRequestId && res.code === 0) {
               this.matchSelectItemList = res.data
                 .filter(item => {
                   // 先生成已选列表和主页已选列表 若为没有 则全返回
@@ -301,7 +315,9 @@
             console.warn(err);
           })
           .finally(() => {
-            this.labelLoading = false;
+            if (requestId === this.labelRequestId) {
+              this.labelLoading = false;
+            }
           });
       },
       // 切换树选项时缓存备选列表里的值
@@ -322,6 +338,10 @@
       },
       // 关闭弹窗 重置备选 已选数组
       resetSelect() {
+        this.treeRequestId += 1;
+        this.labelRequestId += 1;
+        this.treeLoading = false;
+        this.labelLoading = false;
         this.matchSelectList = [];
         this.matchSelectItemList = [];
         this.matchCheckedList = [];
@@ -343,14 +363,21 @@
        * @desc: 根据请求类型获取树列表
        */
       getTreeList() {
-        const { bk_biz_id, bcs_cluster_id, type, namespaceStr } = this.labelParams;
-        const query = { namespace: namespaceStr, bcs_cluster_id, type, bk_biz_id };
-        if (type === 'node') delete query.namespace;
+        const { bk_biz_id, bcs_cluster_id, type, namespaceStr, namespacesExclude } = this.labelParams;
+        const namespaceKey = namespacesExclude === '!=' ? 'namespaces_exclude' : 'namespace';
+        const query = {
+          bcs_cluster_id,
+          type,
+          bk_biz_id,
+          ...(type === 'node' ? {} : { [namespaceKey]: namespaceStr === '*' ? undefined : namespaceStr }),
+        };
         this.treeLoading = true;
+        this.treeRequestId += 1;
+        const requestId = this.treeRequestId;
         this.$http
           .request('container/getPodTree', { query })
           .then(res => {
-            if (res.code === 0) {
+            if (requestId === this.treeRequestId && res.code === 0) {
               // 树列表
               this.treeList = this.initTreeList(typeof res.data === 'object' ? [res.data] : res.data);
               const expandList = this.getResultStrList(this.treeList);
@@ -362,7 +389,9 @@
             console.warn(err);
           })
           .finally(() => {
-            this.treeLoading = false;
+            if (requestId === this.treeRequestId) {
+              this.treeLoading = false;
+            }
           });
       },
       /**
@@ -400,7 +429,7 @@
         return treeList.map(item => {
           if (item.type === 'cluster') {
             const cluster = this.clusterList.find(cItem => cItem.id === item.id);
-            if (!!cluster) item.name = `${cluster.name} (${item.id})`;
+            if (cluster) item.name = `${cluster.name} (${item.id})`;
           }
           return item;
         });
@@ -453,6 +482,7 @@
         window.addEventListener('mouseup', handleMouseUp);
       },
       handelCancelDialog() {
+        this.resetSelect();
         this.$emit('update:is-show-dialog', false);
       },
       isSelectItem(listName, key) {

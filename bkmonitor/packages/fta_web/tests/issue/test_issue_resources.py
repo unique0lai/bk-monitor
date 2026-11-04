@@ -1,0 +1,1115 @@
+"""
+Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
+Copyright (C) 2017-2025 Tencent. All rights reserved.
+Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+Issue 合并/拆分功能单测：覆盖 Resolver fast-path noop + 异常类 + content JSON 格式。
+"""
+
+import threading
+
+import pytest
+
+from bkmonitor.issue_merge import (
+    IssueMergeResolver,
+    MergeResolverContext,
+)
+
+
+class TestIssueLogContentResource:
+    @staticmethod
+    def _issue_ids(count: int) -> list[str]:
+        return [f"1700000000{i:02d}" for i in range(count)]
+
+    @staticmethod
+    def _prepare_resource(monkeypatch, issue_ids: list[str], *, with_alert: bool = False):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from constants.data_source import DataSourceLabel, DataTypeLabel
+        from fta_web.issue import resources
+
+        issue_hits = []
+        for issue_id in issue_ids:
+            hit = MagicMock()
+            hit.meta.id = issue_id
+            hit.strategy_id = 1001
+            hit.first_alert_time = int(issue_id[:10]) - 60
+            issue_hits.append(hit)
+
+        issue_search = MagicMock()
+        issue_search.filter.return_value = issue_search
+        issue_search.source.return_value = issue_search
+        issue_search.params.return_value = issue_search
+        issue_search.execute.return_value = SimpleNamespace(hits=issue_hits)
+        monkeypatch.setattr(resources.IssueDocument, "search", lambda **kwargs: issue_search)
+
+        query_configs = MagicMock()
+        query_configs.values.return_value = [
+            {
+                "strategy_id": 1001,
+                "data_source_label": DataSourceLabel.BK_LOG_SEARCH,
+                "data_type_label": DataTypeLabel.LOG,
+            }
+        ]
+        query_config_model = MagicMock()
+        query_config_model.objects.filter.return_value = query_configs
+        monkeypatch.setattr(resources, "QueryConfigModel", query_config_model)
+
+        buckets = []
+        if with_alert:
+            for index, issue_id in enumerate(issue_ids):
+                bucket = MagicMock()
+                bucket.key = issue_id
+                alert_hit = MagicMock()
+                alert_hit.to_dict.return_value = {"_source": {"id": f"1700000000{index:03d}"}}
+                bucket.latest_alert.hits.hits = [alert_hit]
+                buckets.append(bucket)
+
+        alert_result = MagicMock()
+        alert_result.aggs.issues.buckets = buckets
+        alert_search = MagicMock()
+        alert_search.filter.return_value = alert_search
+        alert_search.aggs.bucket.return_value = MagicMock()
+        alert_search.__getitem__.return_value.execute.return_value = alert_result
+        return resources, alert_search
+
+    def test_serializer_rejects_more_than_ten_issues(self):
+        from fta_web.issue.resources import IssueLogContentResource
+
+        serializer = IssueLogContentResource.RequestSerializer(
+            data={"bk_biz_ids": [2], "issue_ids": self._issue_ids(11)}
+        )
+
+        assert not serializer.is_valid()
+        assert "issue_ids" in serializer.errors
+
+    def test_alert_search_uses_issue_time_range(self, monkeypatch):
+        issue_ids = ["170000000000", "170000010000"]
+        resources, alert_search = self._prepare_resource(monkeypatch, issue_ids)
+        captured = {}
+
+        def _search(**kwargs):
+            captured.update(kwargs)
+            return alert_search
+
+        monkeypatch.setattr(resources.AlertDocument, "search", _search)
+        monkeypatch.setattr(resources.time, "time", lambda: 1_700_001_000)
+
+        resources.IssueLogContentResource().perform_request({"bk_biz_ids": [2], "issue_ids": issue_ids})
+
+        assert captured == {"start_time": 1_699_999_940, "end_time": 1_700_001_000}
+
+    def test_alert_search_falls_back_to_issue_id_time(self, monkeypatch):
+        issue_ids = ["170000000000"]
+        resources, alert_search = self._prepare_resource(monkeypatch, issue_ids)
+        captured = {}
+
+        resources.IssueDocument.search().execute().hits[0].first_alert_time = 0
+
+        def _search(**kwargs):
+            captured.update(kwargs)
+            return alert_search
+
+        monkeypatch.setattr(resources.AlertDocument, "search", _search)
+        monkeypatch.setattr(resources.time, "time", lambda: 1_700_001_000)
+
+        resources.IssueLogContentResource().perform_request({"bk_biz_ids": [2], "issue_ids": issue_ids})
+
+        assert captured == {"start_time": 1_700_000_000, "end_time": 1_700_001_000}
+
+    def test_batch_timeout_does_not_wait_for_slow_log_query(self, monkeypatch):
+        import threading
+        import time
+
+        issue_ids = self._issue_ids(1)
+        resources, alert_search = self._prepare_resource(monkeypatch, issue_ids, with_alert=True)
+        monkeypatch.setattr(resources.AlertDocument, "search", lambda **kwargs: alert_search)
+        monkeypatch.setattr(resources.IssueLogContentResource, "BATCH_TIMEOUT", 0.01, raising=False)
+
+        release = threading.Event()
+
+        def _slow_query(*args, **kwargs):
+            release.wait(timeout=1)
+            return "late log"
+
+        monkeypatch.setattr(resources, "get_alert_relation_info", _slow_query)
+        original_submit = resources.IssueLogContentResource.EXECUTOR.submit
+        submitted_futures = []
+
+        def _capture_submit(*args, **kwargs):
+            future = original_submit(*args, **kwargs)
+            submitted_futures.append(future)
+            return future
+
+        monkeypatch.setattr(resources.IssueLogContentResource.EXECUTOR, "submit", _capture_submit)
+
+        try:
+            started_at = time.monotonic()
+            result = resources.IssueLogContentResource().perform_request({"bk_biz_ids": [2], "issue_ids": issue_ids})
+
+            assert time.monotonic() - started_at < 0.1
+            assert result == {issue_ids[0]: {"log_content": ""}}
+        finally:
+            release.set()
+            for future in submitted_futures:
+                future.result(timeout=1)
+
+    def test_log_query_inherits_request_local_tenant(self, monkeypatch):
+        from bkmonitor.utils.local import local
+        from bkmonitor.utils.tenant import get_local_tenant_id
+
+        issue_ids = self._issue_ids(1)
+        resources, alert_search = self._prepare_resource(monkeypatch, issue_ids, with_alert=True)
+        monkeypatch.setattr(resources.AlertDocument, "search", lambda **kwargs: alert_search)
+        monkeypatch.setattr(local, "bk_tenant_id", "tenant-a", raising=False)
+
+        observed_tenant_ids = []
+
+        def _query(*args, **kwargs):
+            observed_tenant_ids.append(get_local_tenant_id())
+            return "log content"
+
+        monkeypatch.setattr(resources, "get_alert_relation_info", _query)
+
+        result = resources.IssueLogContentResource().perform_request({"bk_biz_ids": [2], "issue_ids": issue_ids})
+
+        assert observed_tenant_ids == ["tenant-a"]
+        assert result == {issue_ids[0]: {"log_content": "log content"}}
+
+    def test_bk_data_time_series_query_config_is_delegated_to_relation_info(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from constants.data_source import DataSourceLabel, DataTypeLabel
+
+        issue_ids = self._issue_ids(1)
+        resources, alert_search = self._prepare_resource(monkeypatch, issue_ids, with_alert=True)
+        resources.QueryConfigModel.objects.filter.return_value.values.return_value = [
+            {
+                "strategy_id": 1001,
+                "data_source_label": DataSourceLabel.BK_DATA,
+                "data_type_label": DataTypeLabel.TIME_SERIES,
+            }
+        ]
+        monkeypatch.setattr(resources.AlertDocument, "search", lambda **kwargs: alert_search)
+        relation_info = MagicMock(return_value='{"log": "clustered log"}')
+        monkeypatch.setattr(resources, "get_alert_relation_info", relation_info)
+
+        result = resources.IssueLogContentResource().perform_request({"bk_biz_ids": [2], "issue_ids": issue_ids})
+
+        assert result == {issue_ids[0]: {"log_content": "clustered log"}}
+        relation_info.assert_called_once()
+        assert relation_info.call_args.kwargs == {
+            "length_limit": False,
+            "query_config": {
+                "data_source_label": DataSourceLabel.BK_DATA,
+                "data_type_label": DataTypeLabel.TIME_SERIES,
+            },
+        }
+
+    def test_repeated_timeouts_share_global_concurrency_limit(self, monkeypatch):
+        import threading
+
+        issue_ids = self._issue_ids(10)
+        resources, alert_search = self._prepare_resource(monkeypatch, issue_ids, with_alert=True)
+        monkeypatch.setattr(resources.AlertDocument, "search", lambda **kwargs: alert_search)
+        monkeypatch.setattr(resources.IssueLogContentResource, "BATCH_TIMEOUT", 0.05, raising=False)
+
+        release = threading.Event()
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def _slow_query(*args, **kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                release.wait(timeout=1)
+                return "late log"
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr(resources, "get_alert_relation_info", _slow_query)
+        original_submit = resources.IssueLogContentResource.EXECUTOR.submit
+        submitted_futures = []
+        max_outstanding = 0
+
+        def _counting_submit(*args, **kwargs):
+            nonlocal max_outstanding
+            future = original_submit(*args, **kwargs)
+            submitted_futures.append(future)
+            max_outstanding = max(max_outstanding, sum(not item.done() for item in submitted_futures))
+            return future
+
+        monkeypatch.setattr(resources.IssueLogContentResource.EXECUTOR, "submit", _counting_submit)
+
+        try:
+            resource = resources.IssueLogContentResource()
+            resource.perform_request({"bk_biz_ids": [2], "issue_ids": issue_ids})
+            resource.perform_request({"bk_biz_ids": [2], "issue_ids": issue_ids})
+            assert max_active <= 10
+            assert max_outstanding <= 10
+        finally:
+            release.set()
+            for future in submitted_futures:
+                future.result(timeout=1)
+
+
+class TestListMergeSourcesAnomalyMessage:
+    """``_fetch_member_anomaly_messages`` 行为：
+
+    1) 正常路径：terms agg + top_hits 返回 description → 命中的 member 进入结果字典
+    2) 部分 member 无 alert → 不在结果字典（caller 兜底 ``"--"``）
+    3) AlertDocument.search 抛异常 → 返回空 dict (fail-open)
+    4) first_alert_time 全空 → 走 ``now - 30d`` 兜底窗口（不应抛异常）
+    """
+
+    @staticmethod
+    def _build_search_stub(buckets: list, on_search=None):
+        """构造一条链式可调用的 ES search stub，``buckets`` 即 ``result.aggs.issues.buckets``。"""
+        from unittest.mock import MagicMock
+
+        result = MagicMock()
+        result.aggs.issues.buckets = buckets
+
+        search_obj = MagicMock()
+        search_obj.filter.return_value = search_obj
+        search_obj.__getitem__.return_value.execute.return_value = result
+
+        def _search(**kwargs):
+            if on_search is not None:
+                on_search(kwargs)
+            return search_obj
+
+        return _search, search_obj
+
+    @staticmethod
+    def _make_bucket(member_id: str, description: str | None):
+        """模拟单个 issue_id terms 桶。``description=None`` 表示 top_hits 命中但 description 为空。"""
+        from unittest.mock import MagicMock
+
+        bucket = MagicMock()
+        bucket.key = member_id
+        if description is None:
+            bucket.latest_alert.hits.hits = []
+        else:
+            hit = MagicMock()
+            hit.to_dict.return_value = {"_source": {"event": {"description": description}}}
+            bucket.latest_alert.hits.hits = [hit]
+        return bucket
+
+    def test_normal_path_returns_description_map(self, monkeypatch):
+        from bkmonitor.documents import alert as alert_mod
+        from fta_web.issue.resources import _fetch_member_anomaly_messages
+
+        buckets = [
+            self._make_bucket("b1", "AVG(CPU) >= 10%, 当前值 10.19%"),
+            self._make_bucket("b2", "Disk IO 异常"),
+        ]
+        search_fn, _ = self._build_search_stub(buckets)
+        monkeypatch.setattr(alert_mod.AlertDocument, "search", search_fn)
+
+        result = _fetch_member_anomaly_messages(["b1", "b2"], {"b1": 1_700_000_000, "b2": 1_700_000_500})
+        assert result == {
+            "b1": "AVG(CPU) >= 10%, 当前值 10.19%",
+            "b2": "Disk IO 异常",
+        }
+
+    def test_partial_miss_omits_member(self, monkeypatch):
+        from bkmonitor.documents import alert as alert_mod
+        from fta_web.issue.resources import _fetch_member_anomaly_messages
+
+        # b1 命中、b2 top_hits 为空、b3 description 为空字符串：均不进入结果
+        buckets = [
+            self._make_bucket("b1", "CPU 异常"),
+            self._make_bucket("b2", None),
+            self._make_bucket("b3", ""),
+        ]
+        search_fn, _ = self._build_search_stub(buckets)
+        monkeypatch.setattr(alert_mod.AlertDocument, "search", search_fn)
+
+        result = _fetch_member_anomaly_messages(["b1", "b2", "b3"], {"b1": 1_700_000_000, "b2": 0, "b3": 0})
+        assert result == {"b1": "CPU 异常"}
+
+    def test_empty_member_ids_returns_empty(self):
+        from fta_web.issue.resources import _fetch_member_anomaly_messages
+
+        # 空入参不应触发 ES 查询，直接返回空 dict
+        assert _fetch_member_anomaly_messages([], {}) == {}
+
+    def test_search_exception_fail_open(self, monkeypatch):
+        from bkmonitor.documents import alert as alert_mod
+        from fta_web.issue.resources import _fetch_member_anomaly_messages
+
+        def _explode(**kwargs):
+            raise RuntimeError("ES cluster unreachable")
+
+        monkeypatch.setattr(alert_mod.AlertDocument, "search", _explode)
+
+        # fail-open：返回空 dict，由 caller 在 list_merge_sources 中兜底为 "--"
+        assert _fetch_member_anomaly_messages(["b1"], {"b1": 1_700_000_000}) == {}
+
+    def test_all_first_alert_time_empty_uses_fallback_window(self, monkeypatch):
+        """所有 member 的 first_alert_time 为空（如旧数据）→ 走 now-30d 兜底窗口，不抛异常。"""
+        from bkmonitor.documents import alert as alert_mod
+        from fta_web.issue.resources import _MERGE_SOURCES_ANOMALY_FALLBACK_BUFFER, _fetch_member_anomaly_messages
+
+        captured: dict = {}
+
+        def _capture(kwargs):
+            captured.update(kwargs)
+
+        search_fn, _ = self._build_search_stub([self._make_bucket("b1", "fallback window hit")], on_search=_capture)
+        monkeypatch.setattr(alert_mod.AlertDocument, "search", search_fn)
+
+        result = _fetch_member_anomaly_messages(["b1"], {"b1": 0})
+        assert result == {"b1": "fallback window hit"}
+        # 兜底窗口 ≈ now - 30d；允许少量调用时延误差
+        assert captured["end_time"] - captured["start_time"] == _MERGE_SOURCES_ANOMALY_FALLBACK_BUFFER
+
+
+class TestListMergeSourcesAlertTimes:
+    """``ListMergeSourcesResource.perform_request`` 成员告警时间字段契约：
+
+    1) active_members / split_history 条目均携带 first_alert_time / last_alert_time（秒级时间戳）
+    2) ES 未命中的 member → 两字段兜底 0
+    3) ES 属性为 None → 兜底 0，不抛异常
+    """
+
+    @staticmethod
+    def _make_relation(member_issue_id: str, status: str):
+        from datetime import datetime
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            member_issue_id=member_issue_id,
+            bk_biz_id=2,
+            status=status,
+            merge_reasons=["异常类型 / 日志模块相近"],
+            create_user="tester",
+            create_time=datetime(2026, 9, 4, 12, 0, 0),
+            update_user=None,
+            update_time=datetime(2026, 9, 4, 13, 0, 0),
+            split_reasons=None,
+            split_kind=None,
+            via_issue_id=None,
+        )
+
+    @staticmethod
+    def _make_hit(member_id: str, first: int, last):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            meta=SimpleNamespace(id=member_id),
+            name=f"issue-{member_id}",
+            status="unresolved",
+            first_alert_time=first,
+            last_alert_time=last,
+        )
+
+    @staticmethod
+    def _prepare(monkeypatch, relations: list, hits: list):
+        from types import SimpleNamespace
+
+        from fta_web.issue import resources
+
+        relation_model = SimpleNamespace(
+            STATUS_SPLIT="split",
+            objects=SimpleNamespace(filter=lambda **kwargs: SimpleNamespace(order_by=lambda *args: relations)),
+        )
+        monkeypatch.setattr(resources, "IssueMergeRelation", relation_model)
+
+        result = SimpleNamespace(hits=hits)
+        search_obj = SimpleNamespace()
+        search_obj.filter = lambda *a, **k: search_obj
+        search_obj.source = lambda *a, **k: search_obj
+        search_obj.params = lambda *a, **k: search_obj
+        search_obj.execute = lambda: result
+        monkeypatch.setattr(resources.IssueDocument, "search", lambda **kwargs: search_obj)
+
+        monkeypatch.setattr(resources, "_fetch_member_anomaly_messages", lambda member_ids, first_map: {})
+
+    def test_members_contain_alert_times(self, monkeypatch):
+        from fta_web.issue import resources
+
+        relations = [self._make_relation("b1", "active"), self._make_relation("b2", "split")]
+        hits = [
+            self._make_hit("b1", 1_700_000_000, 1_700_000_500),
+            self._make_hit("b2", 1_700_100_000, 1_700_100_999),
+        ]
+        self._prepare(monkeypatch, relations, hits)
+
+        data = resources.ListMergeSourcesResource().perform_request({"bk_biz_id": 2, "main_issue_id": "17main"})
+        assert data["active_members"][0]["first_alert_time"] == 1_700_000_000
+        assert data["active_members"][0]["last_alert_time"] == 1_700_000_500
+        assert data["split_history"][0]["first_alert_time"] == 1_700_100_000
+        assert data["split_history"][0]["last_alert_time"] == 1_700_100_999
+
+    def test_missing_es_hit_defaults_zero(self, monkeypatch):
+        from fta_web.issue import resources
+
+        # b2 在 ES 中无文档（如文档已清理）→ 两字段兜底 0
+        relations = [self._make_relation("b1", "active"), self._make_relation("b2", "active")]
+        hits = [self._make_hit("b1", 1_700_000_000, 1_700_000_500)]
+        self._prepare(monkeypatch, relations, hits)
+
+        data = resources.ListMergeSourcesResource().perform_request({"bk_biz_id": 2, "main_issue_id": "17main"})
+        member_ids = {item["member_issue_id"]: item for item in data["active_members"]}
+        assert member_ids["b1"]["last_alert_time"] == 1_700_000_500
+        assert member_ids["b2"]["first_alert_time"] == 0
+        assert member_ids["b2"]["last_alert_time"] == 0
+
+    def test_none_alert_time_defaults_zero(self, monkeypatch):
+        from fta_web.issue import resources
+
+        # last_alert_time 为 None（旧文档缺字段）→ 兜底 0，first 正常返回
+        relations = [self._make_relation("b1", "active")]
+        hits = [self._make_hit("b1", 1_700_000_000, None)]
+        self._prepare(monkeypatch, relations, hits)
+
+        data = resources.ListMergeSourcesResource().perform_request({"bk_biz_id": 2, "main_issue_id": "17main"})
+        assert data["active_members"][0]["first_alert_time"] == 1_700_000_000
+        assert data["active_members"][0]["last_alert_time"] == 0
+
+
+class TestListMergeSourcesAlertCount:
+    """``ListMergeSourcesResource`` 成员条目 alert_count 字段契约。
+
+    1) source 列表含 alert_count，条目输出成员文档冻结值
+    2) ES 缺失 alert_count（旧文档）→ 兜底 0
+    3) active_members 与 split_history 两个分区都透出该字段
+    """
+
+    @staticmethod
+    def _prepare(monkeypatch, alert_counts: dict):
+        """mock 关系表 + IssueDocument.search，返回可调用 perform_request 的资源。
+
+        alert_counts: member_issue_id → alert_count；未提供的 member 视为 ES 缺失。
+        """
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from fta_web.issue import resources
+
+        active_ids = ["170000000100", "170000000200"]
+        split_ids = ["170000000300"]
+
+        def _relation(member_id, status):
+            rel = MagicMock()
+            rel.member_issue_id = member_id
+            rel.status = status
+            rel.merge_reasons = ["同根因"]
+            rel.create_user = "admin"
+            rel.create_time = None
+            rel.update_user = "admin"
+            rel.update_time = None
+            rel.via_issue_id = None
+            return rel
+
+        relations = [_relation(mid, "active") for mid in active_ids]
+        relations.append(_relation(split_ids[0], "split"))
+        monkeypatch.setattr(
+            resources.IssueMergeRelation.objects,
+            "filter",
+            lambda *a, **kw: MagicMock(order_by=lambda *a, **kw: relations),
+        )
+
+        hits = []
+        for mid in active_ids + split_ids:
+            hit = MagicMock()
+            hit.meta.id = mid
+            hit.name = f"issue-{mid}"
+            hit.status = "UNRESOLVED"
+            hit.first_alert_time = 1_700_000_000
+            if mid in alert_counts:
+                hit.alert_count = alert_counts[mid]
+            else:
+                del hit.alert_count
+            hits.append(hit)
+
+        issue_search = MagicMock()
+        issue_search.filter.return_value = issue_search
+        issue_search.source.return_value = issue_search
+        issue_search.params.return_value = issue_search
+        issue_search.execute.return_value = SimpleNamespace(hits=hits)
+        monkeypatch.setattr(resources.IssueDocument, "search", lambda **kwargs: issue_search)
+        monkeypatch.setattr(resources, "_fetch_member_anomaly_messages", lambda member_ids, window: {})
+
+        return resources.ListMergeSourcesResource(), active_ids, split_ids
+
+    def test_alert_count_output_and_fallback(self, monkeypatch):
+        resource, active_ids, split_ids = self._prepare(monkeypatch, {"170000000100": 12, "170000000300": 5})
+        result = resource.perform_request({"bk_biz_id": 2, "main_issue_id": "170000000000"})
+
+        counts = {item["member_issue_id"]: item["alert_count"] for item in result["active_members"]}
+        counts.update({item["member_issue_id"]: item["alert_count"] for item in result["split_history"]})
+        # 命中文档值 / ES 缺失兜底 0
+        assert counts == {"170000000100": 12, "170000000200": 0, "170000000300": 5}
+
+    def test_source_includes_alert_count(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from fta_web.issue import resources
+
+        resource, _, _ = self._prepare(monkeypatch, {"170000000100": 1})
+        captured = {}
+
+        issue_search = MagicMock()
+        issue_search.filter.return_value = issue_search
+        issue_search.source.side_effect = lambda fields: (captured.update(source=fields), issue_search)[1]
+        issue_search.params.return_value = issue_search
+        issue_search.execute.return_value = SimpleNamespace(hits=[])
+        monkeypatch.setattr(resources.IssueDocument, "search", lambda **kwargs: issue_search)
+
+        resource.perform_request({"bk_biz_id": 2, "main_issue_id": "170000000000"})
+
+        assert "alert_count" in captured["source"]
+
+    def test_alert_count_none_defaults_zero(self, monkeypatch):
+        """ES 文档存在但 alert_count 为 null（旧文档缺字段，区别于整个文档缺失）→ 兜底 0，不抛异常。"""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from fta_web.issue import resources
+
+        resource, _, _ = self._prepare(monkeypatch, {})
+        hit = MagicMock()
+        hit.meta.id = "170000000100"
+        hit.name = "issue-170000000100"
+        hit.status = "UNRESOLVED"
+        hit.first_alert_time = 1_700_000_000
+        hit.alert_count = None
+        issue_search = MagicMock()
+        issue_search.filter.return_value = issue_search
+        issue_search.source.return_value = issue_search
+        issue_search.params.return_value = issue_search
+        issue_search.execute.return_value = SimpleNamespace(hits=[hit])
+        monkeypatch.setattr(resources.IssueDocument, "search", lambda **kwargs: issue_search)
+
+        result = resource.perform_request({"bk_biz_id": 2, "main_issue_id": "170000000000"})
+        counts = {item["member_issue_id"]: item["alert_count"] for item in result["active_members"]}
+        counts.update({item["member_issue_id"]: item["alert_count"] for item in result["split_history"]})
+        assert counts["170000000100"] == 0
+
+    def test_empty_relations_skips_es_query(self, monkeypatch):
+        """主 Issue 无任何合并关系 → 早退空结果，且不发起 ES 查询（alert_count 查询位于早退之后）。"""
+        from unittest.mock import MagicMock
+
+        from fta_web.issue import resources
+
+        monkeypatch.setattr(
+            resources.IssueMergeRelation.objects,
+            "filter",
+            lambda *a, **kw: MagicMock(order_by=lambda *a, **kw: []),
+        )
+        issue_search = MagicMock()
+        monkeypatch.setattr(resources.IssueDocument, "search", issue_search)
+
+        result = resources.ListMergeSourcesResource().perform_request({"bk_biz_id": 2, "main_issue_id": "170000000000"})
+        assert result == {"main_issue_id": "170000000000", "active_members": [], "split_history": []}
+        issue_search.assert_not_called()
+
+
+class TestSearchInjectsSplitInfo:
+    """``IssueQueryHandler.search()`` 列表契约：被拆出的独立 Issue 注入 split_info。
+
+    独立守护"search 流程真的会塞 split_info"——避免后续重构 search 时 resolver 单测仍过、
+    但列表契约悄悄断裂。patch 掉 ES / 翻译 / 趋势等重链路，只验证注入这一刀。
+    """
+
+    @pytest.mark.skip(
+        reason="跨层耦合：fta_web.issue.handlers 在 import 链上会 transitively 引入 "
+        "alarm_backends.service.scheduler（模块级读取 worker-only 配置 DEFAULT_CRONTAB / "
+        "ACTION_TASK_CRONTAB 等），纯 web 角色无法完成 import。待 feature owner 将该 import "
+        "改为惰性或提供 web+worker 全栈测试配置后移除 skip。"
+    )
+    def test_split_member_injected_normal_untouched(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from fta_web.alert.handlers import translator as translator_mod
+        from fta_web.issue.handlers.issue import IssueQueryHandler
+
+        # __new__ 跳过 BaseBizQueryHandler.__init__（避免触发 IAM 权限装配）
+        handler = IssueQueryHandler.__new__(IssueQueryHandler)
+        handler.bk_biz_ids = [2]
+
+        issues = [{"id": "split-1", "bk_biz_id": 2}, {"id": "normal-1", "bk_biz_id": 2}]
+
+        fake_result = MagicMock()
+        fake_result.hits.total.value = len(issues)
+
+        # patch 重链路：ES 查询 / 清洗 / 翻译 / 合并 ctx 加载 / 告警趋势
+        monkeypatch.setattr(handler, "search_raw", lambda **kw: (fake_result, None))
+        monkeypatch.setattr(handler, "handle_hit_list", lambda sr: issues)
+        monkeypatch.setattr(handler, "add_alert_trend", lambda items: None)
+        monkeypatch.setattr(translator_mod.StrategyTranslator, "translate_from_dict", lambda self, *a, **k: None)
+        monkeypatch.setattr(translator_mod.BizTranslator, "translate_from_dict", lambda self, *a, **k: None)
+        monkeypatch.setattr(MergeResolverContext, "load", lambda self: None)
+        monkeypatch.setattr(
+            IssueMergeResolver,
+            "get_split_info_map",
+            classmethod(
+                lambda cls, ids: {
+                    "split-1": {
+                        "split_from_main_issue_id": "A",
+                        "split_from_main_issue_name": None,
+                        "split_reasons": ["误合并，根因不同"],
+                        "split_kind": "manual",
+                        "split_time": 1716580800,
+                        "split_operator": "willgchen",
+                    }
+                }
+            ),
+        )
+
+        result = handler.search()
+        by_id = {i["id"]: i for i in result["issues"]}
+        # 被拆出的独立 Issue 注入 split_info
+        assert "split_info" in by_id["split-1"]
+        assert by_id["split-1"]["split_info"]["split_reasons"] == ["误合并，根因不同"]
+        # 普通 Issue 不注入
+        assert "split_info" not in by_id["normal-1"]
+
+
+class TestReorderIssuesByAggregatedTime:
+    """IssueQueryHandler._reorder_issues_by_aggregated_time 页内重排契约。
+
+    合并视图展示与 ES 排序口径对齐（TAPD 1010158081137884678）：hydrate_aggregations 把成员
+    时间 min/max 并入主 Issue 行（仅展示层），ES 排序仍用存储值 → 合并主 Issue 在
+    时间降序时沉底。重排发生在 hydrate 之后，用聚合后的展示值恢复正确顺序。
+    """
+
+    @staticmethod
+    def _make_handler():
+        from fta_web.issue.handlers.issue import IssueQueryHandler
+
+        # __new__ 跳过 BaseBizQueryHandler.__init__（避免触发 IAM 权限装配）
+        handler = IssueQueryHandler.__new__(IssueQueryHandler)
+        return handler
+
+    def test_desc_last_alert_time_main_issue_floats_to_top(self):
+        """降序 last_alert_time：成员有新告警的合并主 Issue 按聚合后时间浮到最前。"""
+        issues = [
+            {"id": "single-new", "last_alert_time": 200, "first_alert_time": 200},
+            {"id": "main-old-store", "last_alert_time": 100, "first_alert_time": 50},  # hydrate 已改为 300
+        ]
+        # 模拟 hydrate 后的展示值：主 Issue last 已被 union 成员值改写为 300
+        issues[1]["last_alert_time"] = 300
+        handler = self._make_handler()
+        handler.ordering = ["-last_alert_time"]
+        handler._reorder_issues_by_aggregated_time(issues)
+        assert [i["id"] for i in issues] == ["main-old-store", "single-new"]
+
+    def test_desc_first_alert_time_main_issue_sinks_to_bottom(self):
+        """降序 first_alert_time：并入更早成员告警的主 Issue 按聚合后时间沉底。"""
+        issues = [
+            {"id": "main-union-older", "first_alert_time": 10},  # hydrate 后 min(50, 10)=10
+            {"id": "single", "first_alert_time": 50},
+        ]
+        handler = self._make_handler()
+        handler.ordering = ["-first_alert_time"]
+        handler._reorder_issues_by_aggregated_time(issues)
+        assert [i["id"] for i in issues] == ["single", "main-union-older"]
+
+    def test_asc_order_also_reorders(self):
+        """升序同样按聚合后时间重排（问题双向存在，仅方向相反）。"""
+        issues = [
+            {"id": "main-union-older", "first_alert_time": 10},
+            {"id": "single", "first_alert_time": 50},
+        ]
+        handler = self._make_handler()
+        handler.ordering = ["first_alert_time"]
+        handler._reorder_issues_by_aggregated_time(issues)
+        assert [i["id"] for i in issues] == ["main-union-older", "single"]
+
+    def test_missing_value_sinks_last_both_orders(self):
+        """缺失值（None/空/非数值）升序降序均沉到页内最后（有意偏离 ES 默认，见实现 docstring）。"""
+        issues = [
+            {"id": "missing", "last_alert_time": None},
+            {"id": "normal", "last_alert_time": 100},
+            {"id": "empty-str", "last_alert_time": ""},
+            {"id": "bad-type", "last_alert_time": "abc"},
+        ]
+        handler = self._make_handler()
+        handler.ordering = ["-last_alert_time"]
+        handler._reorder_issues_by_aggregated_time(issues)
+        assert [i["id"] for i in issues] == ["normal", "missing", "empty-str", "bad-type"]
+
+        handler.ordering = ["last_alert_time"]
+        handler._reorder_issues_by_aggregated_time(issues)
+        assert [i["id"] for i in issues] == ["normal", "missing", "empty-str", "bad-type"]
+
+    def test_non_time_primary_key_skipped(self):
+        """主排序键非时间字段（priority 等）时不重排，保持 ES 既有顺序。"""
+        issues = [
+            {"id": "b", "priority": "P1"},
+            {"id": "a", "priority": "P0"},
+        ]
+        handler = self._make_handler()
+        handler.ordering = ["priority", "status"]
+        handler._reorder_issues_by_aggregated_time(issues)
+        assert [i["id"] for i in issues] == ["b", "a"]
+
+    def test_stable_sort_preserves_secondary_es_order(self):
+        """主键相同的行保持稳定（不破坏 ES 次级排序键 priority 的顺序）。"""
+        issues = [
+            {"id": "x-high", "last_alert_time": 100, "priority": "P0"},
+            {"id": "y-high", "last_alert_time": 100, "priority": "P1"},
+            {"id": "z-low", "last_alert_time": 50, "priority": "P0"},
+        ]
+        handler = self._make_handler()
+        handler.ordering = ["-last_alert_time", "priority"]
+        handler._reorder_issues_by_aggregated_time(issues)
+        assert [i["id"] for i in issues] == ["x-high", "y-high", "z-low"]
+
+
+class TestSearchReordersAfterHydrate:
+    """``IssueQueryHandler.search()`` 集成守护：hydrate 改写主 Issue 时间后页内重排真实生效。
+
+    纯方法单测（TestReorderIssuesByAggregatedTime）只守护重排算法本身；本用例守护
+    "search 流程真的会在 hydrate 之后调用重排"——避免后续重构 search 时删掉调用行、
+    单测仍全绿但列表契约悄悄断裂（与 TestSearchInjectsSplitInfo 同款守护思路）。
+    """
+
+    def test_search_reorders_issues_after_hydrate(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from bkmonitor.issue_merge import IssueMergeResolver, MergeResolverContext
+        from fta_web.alert.handlers import translator as translator_mod
+        from fta_web.issue.handlers.issue import IssueQueryHandler
+
+        handler = IssueQueryHandler.__new__(IssueQueryHandler)
+        handler.bk_biz_ids = [2]
+        handler.ordering = ["-last_alert_time"]
+
+        # ES 返回顺序：single(200) 在前、main(存储值 100) 在后 —— 即降序错位的现状
+        issues = [
+            {"id": "single", "bk_biz_id": 2, "last_alert_time": 200},
+            {"id": "main", "bk_biz_id": 2, "last_alert_time": 100},
+        ]
+
+        fake_result = MagicMock()
+        fake_result.hits.total.value = len(issues)
+
+        # patch 重链路：ES 查询 / 清洗 / 翻译 / 趋势
+        monkeypatch.setattr(handler, "search_raw", lambda **kw: (fake_result, None))
+        monkeypatch.setattr(handler, "handle_hit_list", lambda sr: issues)
+        monkeypatch.setattr(handler, "add_alert_trend", lambda items: None)
+        monkeypatch.setattr(translator_mod.StrategyTranslator, "translate_from_dict", lambda self, *a, **k: None)
+        monkeypatch.setattr(translator_mod.BizTranslator, "translate_from_dict", lambda self, *a, **k: None)
+
+        def fake_hydrate(issue_list, ctx):
+            # 模拟 hydrate Step 2：主 Issue 的 last_alert_time 被成员最新值改写为 300
+            for issue in issue_list:
+                if issue["id"] == "main":
+                    issue["merge_status"] = {"role": "main"}
+                    issue["last_alert_time"] = 300
+
+        monkeypatch.setattr(MergeResolverContext, "load", lambda self: None)
+        monkeypatch.setattr(
+            IssueMergeResolver, "hydrate_aggregations", classmethod(lambda cls, iss, ctx: fake_hydrate(iss, ctx))
+        )
+        monkeypatch.setattr(IssueMergeResolver, "get_split_info_map", classmethod(lambda cls, ids, bk_biz_ids=None: {}))
+
+        # tapd_count 链路 mock 到空结果（真实 ORM 依赖 DB，集成用例不引入 DB 依赖）
+        mock_tapd = MagicMock()
+        mock_tapd.objects.filter.return_value.values.return_value.annotate.return_value.values_list.return_value = []
+        monkeypatch.setattr("fta_web.issue.handlers.issue.IssueTapdRelation", mock_tapd)
+
+        result = handler.search()
+        # hydrate 把 main 的展示时间改写为 300 后，重排应使 main 按聚合值浮到最前
+        assert [i["id"] for i in result["issues"]] == ["main", "single"]
+        assert result["total"] == 2
+
+
+class TestRunBatchFreezePropagation:
+    """_run_batch：状态机冻结经 web→api 中转后以 BKAPIError 回来。
+
+    custom_exception_handler 把 Error.extra **平铺到响应顶层**（result.update(exc.extra)），
+    故 BKAPIError.data 顶层即带 business_code / conflicting_main_issue_id。web 侧须从顶层识别
+    并回填 detail，供前端构造"跳主 Issue"引导。这里用真实平铺 payload 形状防回归。
+    """
+
+    def test_bkapi_error_flattened_payload_recognized(self):
+        from core.errors.api import BKAPIError
+        from fta_web.issue.resources import _run_batch
+
+        # 模拟 api role custom_exception_handler 渲染：extra 平铺在 result_json 顶层
+        result_json = {
+            "result": False,
+            "code": 3337109,
+            "message": "Issue b1 已被合并到 #a1，请前往主 Issue 操作或先拆分",
+            "data": None,
+            "business_code": "MERGE_FREEZE_VIOLATION",
+            "conflicting_main_issue_id": "a1",
+            "issue_id": "b1",
+        }
+
+        def _action(bk_biz_id, issue_id):
+            raise BKAPIError(system_name="bkmonitor.issue", url="resolve", result=result_json)
+
+        out = _run_batch([{"bk_biz_id": 2, "issue_id": "b1"}], _action)
+        assert out["succeeded"] == []
+        assert len(out["failed"]) == 1
+        failed = out["failed"][0]
+        assert failed["issue_id"] == "b1"
+        assert failed["code"] == "MERGE_FREEZE_VIOLATION"
+        assert failed["detail"]["conflicting_main_issue_id"] == "a1"
+
+    def test_bkapi_error_non_freeze_only_message(self):
+        from core.errors.api import BKAPIError
+        from fta_web.issue.resources import _run_batch
+
+        result_json = {"result": False, "code": 3337104, "message": "其他业务错误"}
+
+        def _action(bk_biz_id, issue_id):
+            raise BKAPIError(system_name="bkmonitor.issue", url="resolve", result=result_json)
+
+        out = _run_batch([{"bk_biz_id": 2, "issue_id": "x1"}], _action)
+        failed = out["failed"][0]
+        # 非冻结错误：只保留 message，不带 code/detail
+        assert "code" not in failed
+        assert "detail" not in failed
+        assert failed["message"] == "其他业务错误"
+
+
+class TestSplitReasonsOptional:
+    """拆分依据 reasons 改为非必填：缺省 / 空列表均通过校验，validated_data 兜底为 []。
+
+    下游 bulk_reset_for_split（reasons or []）、模型 split_reasons（null=True）、读侧
+    split_info（split_reasons or []）本就容忍空，故只需放开两处 serializer。
+    """
+
+    # 合法 Issue ID：前 10 位为时间戳（IssueIDField → IssueDocument.parse_timestamp_by_id）
+    VALID_ID = "1716000000abcdef01"
+
+    def test_web_split_serializer_reasons_optional(self):
+        from fta_web.issue.resources import SplitIssueResource
+
+        s = SplitIssueResource.RequestSerializer(data={"bk_biz_id": 2, "member_issue_ids": [self.VALID_ID]})
+        assert s.is_valid(), s.errors
+        assert s.validated_data["reasons"] == []
+
+
+class TestSplitIssueBatchContract:
+    """SplitIssueResource 拆分契约：``member_issue_ids``（批量 ≤50，单条传长度 1 的列表）
+    与旧单条 ``member_issue_id`` 二选一（旧入参兼容保留至前端适配完成），单次透传到
+    api role 端（kernel_api SplitResource 双参数契约；批量逐条独立 + ES 按主分组合并重置）。
+    """
+
+    # 合法 Issue ID：前 10 位为时间戳（IssueIDField → IssueDocument.parse_timestamp_by_id）
+    VALID_ID = "1716000000abcdef01"
+    VALID_ID_2 = "1716000000abcdef02"
+
+    def test_batch_ids_accepted_and_reasons_default_empty(self):
+        from fta_web.issue.resources import SplitIssueResource
+
+        s = SplitIssueResource.RequestSerializer(
+            data={"bk_biz_id": 2, "member_issue_ids": [self.VALID_ID, self.VALID_ID_2]}
+        )
+        assert s.is_valid(), s.errors
+        assert s.validated_data["member_issue_ids"] == [self.VALID_ID, self.VALID_ID_2]
+        assert s.validated_data["reasons"] == []
+
+    def test_split_params_required(self):
+        """member_issue_id / member_issue_ids 均不传 → 拒绝（二选一必传）。"""
+        from fta_web.issue.resources import SplitIssueResource
+
+        s = SplitIssueResource.RequestSerializer(data={"bk_biz_id": 2})
+        assert not s.is_valid()
+
+    def test_both_params_rejected(self):
+        """旧单条与批量同时传 → 拒绝（二选一）。"""
+        from fta_web.issue.resources import SplitIssueResource
+
+        s = SplitIssueResource.RequestSerializer(
+            data={"bk_biz_id": 2, "member_issue_id": self.VALID_ID, "member_issue_ids": [self.VALID_ID]}
+        )
+        assert not s.is_valid()
+
+    def test_old_single_param_accepted(self):
+        """旧单条 member_issue_id 单独传 → 合法（兼容保留，前端未适配期间发布不中断）。"""
+        from fta_web.issue.resources import SplitIssueResource
+
+        s = SplitIssueResource.RequestSerializer(data={"bk_biz_id": 2, "member_issue_id": self.VALID_ID})
+        assert s.is_valid(), s.errors
+        assert s.validated_data["reasons"] == []
+
+    def test_invalid_issue_id_rejected(self):
+        from fta_web.issue.resources import SplitIssueResource
+
+        s = SplitIssueResource.RequestSerializer(data={"bk_biz_id": 2, "member_issue_ids": ["bad-id"]})
+        assert not s.is_valid()
+        assert "member_issue_ids" in s.errors
+
+    def test_batch_over_50_rejected(self):
+        from fta_web.issue.resources import SplitIssueResource
+
+        ids = [f"1716000000{i:02d}abcdef" for i in range(51)]
+        s = SplitIssueResource.RequestSerializer(data={"bk_biz_id": 2, "member_issue_ids": ids})
+        assert not s.is_valid()
+
+    def test_perform_request_passes_batch_payload(self, monkeypatch):
+        """web 薄壳单次透传 member_issue_ids，批量执行收敛在 api role 端（kernel_api 原生批量）。"""
+        from types import SimpleNamespace
+
+        from fta_web.issue import resources
+
+        captured = {}
+
+        def _fake_split(**kwargs):
+            captured.update(kwargs)
+            return {
+                "status": "ok",
+                "results": [
+                    {"member_issue_id": self.VALID_ID, "status": "ok"},
+                    {"member_issue_id": self.VALID_ID_2, "status": "skipped", "message": "relation not active"},
+                ],
+            }
+
+        monkeypatch.setattr(resources.api, "issue", SimpleNamespace(split=_fake_split))
+        monkeypatch.setattr(resources, "get_request_username", lambda: "alice")
+
+        result = resources.SplitIssueResource().perform_request(
+            {"bk_biz_id": 2, "member_issue_ids": [self.VALID_ID, self.VALID_ID_2], "reasons": ["误合并"]}
+        )
+
+        # 响应原样透传（逐条结果由 api role 生成）
+        assert result == {
+            "status": "ok",
+            "results": [
+                {"member_issue_id": self.VALID_ID, "status": "ok"},
+                {"member_issue_id": self.VALID_ID_2, "status": "skipped", "message": "relation not active"},
+            ],
+        }
+        assert captured == {
+            "bk_biz_id": 2,
+            "member_issue_ids": [self.VALID_ID, self.VALID_ID_2],
+            "reasons": ["误合并"],
+            "operator": "alice",
+        }
+
+    def test_perform_request_old_single_param_passthrough(self, monkeypatch):
+        """旧单条入参原样透传 member_issue_id，旧响应 shape 与抛错语义由 api role 端保证。"""
+        from types import SimpleNamespace
+
+        from fta_web.issue import resources
+
+        captured = {}
+
+        def _fake_split(**kwargs):
+            captured.update(kwargs)
+            return {"status": "ok", "member_issue_id": self.VALID_ID}
+
+        monkeypatch.setattr(resources.api, "issue", SimpleNamespace(split=_fake_split))
+        monkeypatch.setattr(resources, "get_request_username", lambda: "alice")
+
+        result = resources.SplitIssueResource().perform_request(
+            {"bk_biz_id": 2, "member_issue_id": self.VALID_ID, "reasons": []}
+        )
+
+        # 响应原样透传（旧单条 shape）
+        assert result == {"status": "ok", "member_issue_id": self.VALID_ID}
+        assert captured == {
+            "bk_biz_id": 2,
+            "member_issue_id": self.VALID_ID,
+            "reasons": [],
+            "operator": "alice",
+        }
+
+
+class TestIssueTopNResource:
+    """时间跨度超过 7 天才走分片分支，此时基数聚合在子线程中并行执行。"""
+
+    START_TIME = 1711900800
+    END_TIME = START_TIME + 10 * 24 * 3600
+
+    def test_sliced_top_n_excludes_empty_bucket_without_cardinality(self, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from fta_web.issue import resources as issue_resources
+
+        handler = issue_resources.IssueQueryHandler(bk_biz_ids=None, need_bucket_count=False)
+        search_object = MagicMock()
+        search_object.params.return_value = search_object
+        search_object.extra.return_value = search_object
+        search_object.execute.return_value = SimpleNamespace(
+            hits=SimpleNamespace(total=SimpleNamespace(value=105)),
+            aggs=SimpleNamespace(
+                name=SimpleNamespace(
+                    buckets=[
+                        SimpleNamespace(key="", doc_count=100),
+                        SimpleNamespace(key="normal", doc_count=5),
+                    ]
+                )
+            ),
+        )
+        monkeypatch.setattr(handler, "get_search_object", lambda: search_object)
+        monkeypatch.setattr(handler, "add_conditions", lambda value: value)
+        monkeypatch.setattr(handler, "add_query_string", lambda value: value)
+        monkeypatch.setattr(handler, "add_agg_bucket", lambda *_args, **_kwargs: None)
+
+        result = handler.top_n(["name"], size=10, translators={"unused": object()}, char_add_quotes=False)
+
+        assert result["fields"][0]["bucket_count"] is None
+        assert result["fields"][0]["buckets"] == [{"id": "normal", "name": "normal", "count": 5}]
+
+    def test_bucket_count_gets_full_time_range_when_partitioned(self, monkeypatch):
+        # 基数聚合无法由分片结果相加得到，子线程必须拿到完整时间范围；主线程紧随其后就会
+        # pop 掉 start/end 换成分片区间，共享同一 dict 时覆盖区间会随线程调度漂移。
+        # 用 Event 把子线程的读取排到 pop 之后，避免子线程抢跑导致用例对旧实现假阴性。
+        from types import SimpleNamespace
+
+        from fta_web.issue import resources as issue_resources
+
+        captured = {}
+        sliced_params = []
+        popped = threading.Event()
+
+        def fake_get_bucket_count(request_data):
+            captured["ordered"] = popped.wait(timeout=30)
+            captured["request_data"] = dict(request_data)
+            return {}
+
+        def fake_bulk_request(params):
+            # 走到批量分片查询时，主线程已经 pop 掉 start_time / end_time
+            popped.set()
+            sliced_params.extend(params)
+            return []
+
+        monkeypatch.setattr(
+            issue_resources,
+            "resource",
+            SimpleNamespace(issue=SimpleNamespace(issue_top_n_result=SimpleNamespace(bulk_request=fake_bulk_request))),
+        )
+
+        top_n_resource = issue_resources.IssueTopNResource.__new__(issue_resources.IssueTopNResource)
+        monkeypatch.setattr(top_n_resource, "get_bucket_count", fake_get_bucket_count)
+
+        result = top_n_resource.perform_request(
+            {
+                "bk_biz_ids": None,
+                "fields": ["issue_name"],
+                "size": 10,
+                "start_time": self.START_TIME,
+                "end_time": self.END_TIME,
+                "need_time_partition": True,
+            }
+        )
+
+        # 确认真的走了分片分支，而不是被 7 天阈值挡回单次查询
+        assert len(sliced_params) > 1
+        assert captured["ordered"] is True, "子线程未能排到主线程 pop 之后，用例时序失控"
+        assert captured["request_data"]["start_time"] == self.START_TIME
+        assert captured["request_data"]["end_time"] == self.END_TIME
+        assert all(issue_resources.IssueQueryHandler(**params).bucket_count_suffix == "" for params in sliced_params)
+        assert result == {"doc_count": 0, "fields": []}

@@ -9,12 +9,19 @@ specific language governing permissions and limitations under the License.
 """
 
 import copy
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence, Callable
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any
 
+from django.utils.functional import classproperty
+from django.utils.translation import gettext_lazy as _
+from django.db.models import Q
+
+from bkmonitor.data_source.utils.base import DataSourceTarget
 from bkmonitor.data_source.unify_query.builder import QueryConfigBuilder
-from constants.data_source import DataSourceLabel, DataTypeLabel
+from bkmonitor.data_source.utils import types
+from constants.apm import ApmGlobalTablePrefix
+from constants.data_source import DataSourceLabel, DataTypeLabel, OperatorGroupRelation
 
 
 @dataclass(frozen=True)
@@ -26,24 +33,44 @@ class APMAppTarget:
 
 
 @dataclass(frozen=True)
-class TraceDatasourceTarget:
-    """Trace 数据源查询目标，表示一条`table_id -> APM 应用`的绑定关系"""
+class LevelTarget:
+    """数据源层级目标，承载同一查询层级下的结果表。"""
 
-    table_id: str
+    name: str
+    table_ids: list[str]
+
+
+@dataclass(frozen=True)
+class TraceDatasourceTarget(DataSourceTarget):
+    """Trace 数据源查询目标，承载原始表、应用、过期时间和层级结果表。"""
+
     app: APMAppTarget
+    levels: list[LevelTarget] = dataclass_field(default_factory=list)
 
     @classmethod
-    def build(cls, bk_biz_id: int, app_name: str, table_id: str) -> "TraceDatasourceTarget":
-        return cls(table_id=table_id, app=APMAppTarget(bk_biz_id=bk_biz_id, app_name=app_name))
+    def build(
+        cls,
+        bk_biz_id: int,
+        app_name: str,
+        table_id: str,
+        retention: int | None = None,
+        levels: list[LevelTarget] | None = None,
+    ) -> "TraceDatasourceTarget":
+        return cls(
+            table_id=table_id,
+            app=APMAppTarget(bk_biz_id=bk_biz_id, app_name=app_name),
+            retention=retention,
+            levels=levels or [],
+        )
+
+    def get_level_table_ids(self, level_name: str) -> list[str]:
+        return [table_id for level in self.levels if level.name == level_name for table_id in level.table_ids]
 
 
 class TraceQueryGuard:
     """Trace 原始表查询隔离守卫
     只对共享 Trace 数据源的结果表追加 bk_biz_id 和 app_name 过滤；独占表、预计算表、历史表不追加过滤，避免存量数据缺字段导致查询不到数据
     """
-
-    # 共享 Trace 数据源的结果表前缀，命中该前缀的 table_id 的查询必须携带应用上下文
-    SHARED_TRACE_TABLE_PREFIXES: tuple[str, ...] = ("apm_global.shared",)
 
     # 共享表上用于应用隔离的字段
     BK_BIZ_ID_FIELD: str = "bk_biz_id"
@@ -52,7 +79,7 @@ class TraceQueryGuard:
     @classmethod
     def is_shared_table(cls, table_id: str) -> bool:
         """判断 table_id 是否命中共享 Trace 结果表前缀"""
-        return table_id.startswith(cls.SHARED_TRACE_TABLE_PREFIXES)
+        return table_id.startswith(ApmGlobalTablePrefix.SHARED)
 
     @staticmethod
     def _normalize_bool_clause(raw_clause: Any) -> list[Any]:
@@ -134,3 +161,117 @@ class TraceQueryGuard:
             }
         }
         return new_body
+
+
+class FilterOperator:
+    # 走ES查询可以使用的操作符
+    EXISTS = "exists"
+    NOT_EXISTS = "not exists"
+    EQUAL = "equal"
+    NOT_EQUAL = "not_equal"
+    BETWEEN = "between"
+    LIKE = "like"
+    NOT_LIKE = "not_like"
+    GT = "gt"
+    LT = "lt"
+    GTE = "gte"
+    LTE = "lte"
+
+    UNIFY_QUERY_OPERATOR_MAPPING = {
+        EXISTS: "exists",
+        NOT_EXISTS: "nexists",
+        EQUAL: "eq",
+        NOT_EQUAL: "neq",
+        LIKE: "include",
+        NOT_LIKE: "exclude",
+        GT: "gt",
+        LT: "lt",
+        GTE: "gte",
+        LTE: "lte",
+    }
+
+    UNIFY_QUERY_WILDCARD_OPERATOR_MAPPING = {
+        LIKE: "wildcard",
+        NOT_LIKE: "nwildcard",
+    }
+
+    @classproperty
+    def operator_handler_mapping(cls) -> dict[str, Callable[[QueryConfigBuilder, str, types.FilterValue], Q]]:
+        return {
+            cls.BETWEEN: cls._between_operator_handler,
+            cls.EXISTS: cls._existence_operator_handler,
+            cls.NOT_EXISTS: cls._existence_operator_handler,
+        }
+
+    @classmethod
+    def _between_operator_handler(
+        cls, q: Q, operator: str, field: str, value: types.FilterValue, options: dict[str, Any]
+    ) -> Q:
+        return q & Q(**{f"{field}__gte": value[0], f"{field}__lt": value[1]})
+
+    @classmethod
+    def _default_operator_handler(
+        cls, q: Q, operator: str, field: str, value: types.FilterValue, options: dict[str, Any]
+    ) -> Q:
+        # 字段不等于 "" 的情况下，需要过滤出字段存在的情况
+        if operator == FilterOperator.NOT_EQUAL and "" in value:
+            q &= Q(**{f"{field}__{FilterOperator.EXISTS}": [""]})
+
+        # 操作符映射，如果是通配符查询的话需要映射到特定操作符
+        if operator in cls.UNIFY_QUERY_WILDCARD_OPERATOR_MAPPING and options.get("is_wildcard"):
+            operator = cls.UNIFY_QUERY_WILDCARD_OPERATOR_MAPPING[operator]
+        else:
+            operator = cls.UNIFY_QUERY_OPERATOR_MAPPING[operator]
+
+        # 处理组间关系查询
+        if options.get("group_relation") == OperatorGroupRelation.AND:
+            result_q = Q()
+            for v in value:
+                result_q &= Q(**{f"{field}__{operator}": v})
+        else:
+            result_q = Q(**{f"{field}__{operator}": value})
+
+        return q & result_q
+
+    @classmethod
+    def _existence_operator_handler(
+        cls, q: Q, operator: str, field: str, value: types.FilterValue, options: dict[str, Any]
+    ) -> Q:
+        """
+        处理存在性相关操作符 (exists/not exists)
+        """
+        operator = cls.UNIFY_QUERY_OPERATOR_MAPPING[operator]
+        return q & Q(**{f"{field}__{operator}": [""]})
+
+    @classmethod
+    def get_handler(cls, operator: str) -> Callable[[Q, str, str, types.FilterValue, dict[str, Any]], Q]:
+        if operator in cls.UNIFY_QUERY_OPERATOR_MAPPING or operator in cls.operator_handler_mapping:
+            return cls.operator_handler_mapping.get(operator, cls._default_operator_handler)
+        raise ValueError(_(f"不支持的查询操作符: {operator}"))
+
+
+class LogicSupportOperator:
+    # 走特殊逻辑可以使用的操作符
+    LOGIC = "logic"
+
+
+class APMQueryFilterMixin:
+    @classmethod
+    def _build_filters(cls, filters: list[types.Filter] | None) -> Q:
+        if not filters:
+            return Q()
+
+        q: Q = Q()
+        for f in filters:
+            operator = f["operator"]
+            key = cls._translate_field(f["key"])
+            # 更新 q，叠加查询条件
+            if operator == LogicSupportOperator.LOGIC:
+                q = cls._add_logic_filter(q, key, f["value"])
+            else:
+                q = FilterOperator.get_handler(operator)(q, operator, key, f["value"], f.get("options", {}))
+        return q
+
+    @classmethod
+    def _add_logic_filter(cls, q: Q, field: str, value: types.FilterValue) -> Q:
+        return q

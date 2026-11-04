@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -27,6 +26,8 @@ def api_exception_handler(exc, context):
     """
     针对CustomException返回的错误进行特殊处理，增加了传递数据的特性
     """
+    from core.errors.recording_rule import RecordingRulePreviewError
+
     # 有些预期内的错误， 比如ValidationError， 不需要记录日志
     if not isinstance(exc, IGNORE_EXCEPTIONS):
         logger.exception(exc)
@@ -38,7 +39,28 @@ def api_exception_handler(exc, context):
         json_data["detail"] = exc.detail
         code = getattr(exc, "status_code", code)
 
+    # 透传 CustomException 的结构化字段 error_code/next_actions（failed() 默认清空 data）。
+    # 只放行这两个自有键，不整体透出 exc.data——BKAPIError 等会把上游原始响应体塞进 data，
+    # 整体透出会让所有 API 角色端点泄露内部信息。
+    exc_data = getattr(exc, "data", None)
+    if isinstance(exc_data, dict):
+        structured = {key: exc_data[key] for key in ("error_code", "next_actions") if key in exc_data}
+        if structured:
+            json_data["data"] = structured
+    if isinstance(exc, RecordingRulePreviewError):
+        # 只透传本地预解析构造的错误条目，不放开其他异常的上游原始 data。
+        json_data["data"] = {"errors": exc.data["errors"]}
+
     json_data["code"] = code
     json_data.pop("msg", None)
 
-    return Response(json_data, content_type="application/json")
+    response = Response(json_data, content_type="application/json")
+    request = context.get("request") if isinstance(context, dict) else None
+    raw_request = getattr(request, "_request", request)
+    if raw_request is not None and getattr(raw_request, "unified_mcp_operation", ""):
+        # DRF Request 只是 Django request 的包装；状态必须写回原请求，外层 Middleware 才能读取。
+        # 只传递整数结果码，不复制异常或响应正文。
+        raw_request.unified_mcp_response_failed = True
+        if type(code) is int:
+            raw_request.unified_mcp_result_code = code
+    return response

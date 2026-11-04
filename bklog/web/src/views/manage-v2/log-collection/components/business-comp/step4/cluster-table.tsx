@@ -121,6 +121,11 @@ export default defineComponent({
       type: Boolean,
       default: false,
     },
+    /** 是否显示集群说明 */
+    showDesc: {
+      type: Boolean,
+      default: true,
+    },
   },
   emits: ['choose'],
 
@@ -142,7 +147,7 @@ export default defineComponent({
     const columns = computed(() => {
       const baseColumns = [
         {
-          title: t('采集名'),
+          title: t('集群名'),
           colKey: 'storage_display_name',
           cell: (h, { row }: { row: IClusterItem }) => (
             <bk-radio checked={isSelected(row)}>
@@ -221,6 +226,7 @@ export default defineComponent({
      * 当有选中的集群且该集群存在于列表中时显示
      */
     const isShowDesc = computed(() => {
+      if (!props.showDesc) return false;
       if (!props.clusterSelect) {
         return false;
       }

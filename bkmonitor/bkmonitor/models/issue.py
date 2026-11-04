@@ -16,7 +16,70 @@ from django.dispatch import receiver
 from bkmonitor.utils.db import JsonField
 from bkmonitor.utils.model_manager import AbstractRecordModel
 
-__all__ = ["StrategyIssueConfig", "StrategyIssueConfigService"]
+__all__ = ["StrategyIssueConfig", "StrategyIssueConfigService", "IssueMergeRelation"]
+
+
+class IssueMergeRelation(AbstractRecordModel):
+    """Issue 合并/拆分关系表（独立映射层，与 IssueDocument 完全解耦）。
+
+    设计要点：
+    - 复用 AbstractRecordModel.create_time / create_user 表示合并发生时间 / 合并操作人；
+    - status='split' 时，update_time / update_user 即为拆分时间 / 拆分操作人；
+    - merge_reasons 与 split_reasons 单独保留，便于审计追溯；
+    - 索引全部为普通索引，无 UNIQUE 强约束；唯一性由应用层 SELECT 校验保证，
+      极小概率 race window 通过 bkm-cli list_conflicts 发现 + management command 修复。
+
+    **关系深度恒为 1**（member 不会同时是别行的 active main）。合并两个已成组的主 Issue 时，
+    被并入主的成员会被改挂（reparent）到新主，成为平级 member，而不是形成多层嵌套——
+    ``IssueMergeResolver`` 的 main_of / members_of / expand_to_full_ids / hydrate_aggregations
+    与 ``IssueDocument._cascade_follow_status`` 全部按单层实现，依赖该不变量。
+    """
+
+    STATUS_ACTIVE = "active"
+    STATUS_SPLIT = "split"
+
+    # 仅保留 MANUAL：主状态变更不再触发"拆分"，而是走 _cascade_follow_status 同步 ES status
+    # 历史数据中可能存在 by_main_resolve / by_main_archive 值（旧 cascade_split 路径写入），
+    # models 字段无 choices 约束可正常读出；新写入只用 MANUAL。
+    SPLIT_KIND_MANUAL = "manual"
+
+    class Meta:
+        db_table = "bkmonitor_issue_merge_relation"
+        verbose_name = "Issue 合并关系"
+        indexes = [
+            models.Index(fields=["bk_biz_id", "status", "main_issue_id"], name="idx_imr_biz_status_main"),
+            models.Index(fields=["main_issue_id", "status"], name="idx_imr_main_status"),
+            models.Index(fields=["member_issue_id", "status"], name="idx_imr_member_status"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=~models.Q(main_issue_id=models.F("member_issue_id")),
+                name="ck_imr_main_ne_member",
+            ),
+        ]
+
+    bk_biz_id = models.IntegerField(verbose_name="业务 ID")
+    main_issue_id = models.CharField(max_length=64, verbose_name="主 Issue ID")
+    member_issue_id = models.CharField(max_length=64, verbose_name="并入 Issue ID")
+    status = models.CharField(max_length=16, default=STATUS_ACTIVE, verbose_name="关系状态")
+    merge_reasons = JsonField(default=list, verbose_name="合并依据")
+    split_reasons = JsonField(default=None, null=True, blank=True, verbose_name="拆分依据")
+    split_kind = models.CharField(max_length=16, default=None, null=True, blank=True, verbose_name="拆分触发类型")
+    # 上一跳主 Issue：本行 member 是"随着某个主 Issue 一起被并入"时，记录它此前所属的主。
+    # 直接合并进来的 member 为 None。
+    #
+    # 为什么需要它：reparent 只改 main_issue_id，create_time / create_user 保留原始合并事实
+    # （"U1 在 T1 把 m1 并入 A"）。若不记上一跳，行会读成"U1 在 T1 把 m1 并入 B"，而 U1 当时
+    # 并的是 A，关系表不再自证。
+    #
+    # 只保留**最近一跳**：A→B 后再 B→C，本字段被覆盖为 B；完整链路由 IssueActivityDocument 的
+    # MERGED_INTO(kind=reparent) 承载（append-only）。
+    #
+    # 该值可能指向一个已不在本组的 Issue（如上一跳主随后被拆分），仅作溯源展示，
+    # 不得假设它仍是本组成员。不加索引：无按它过滤的查询路径。
+    via_issue_id = models.CharField(
+        max_length=64, default=None, null=True, blank=True, verbose_name="上一跳主 Issue ID"
+    )
 
 
 class StrategyIssueConfig(AbstractRecordModel):
@@ -174,3 +237,40 @@ def refresh_strategy_cache_on_issue_config_change(sender, instance, **kwargs):
         StrategyCacheManager.cache.set(cache_key, json.dumps(strategy_dict), StrategyCacheManager.CACHE_TIMEOUT)
     except Exception:
         pass
+
+
+class IssueTapdRelation(AbstractRecordModel):
+    """
+    Issue 与 TAPD 单据关联关系
+    """
+
+    bk_biz_id = models.IntegerField(verbose_name="业务 ID")
+    issue_id = models.CharField(max_length=64, verbose_name="Issue ID")
+    workspace_id = models.IntegerField(verbose_name="TAPD 项目 ID")
+    tapd_id = models.CharField(max_length=64, verbose_name="TAPD 单据 ID")
+    tapd_type = models.CharField(
+        max_length=16,
+        verbose_name="TAPD 单据类型",
+        choices=[
+            ("story", "需求"),
+            ("bug", "缺陷"),
+        ],
+    )
+    tapd_title = models.CharField(max_length=255, verbose_name="TAPD 单据标题", default="")
+    link_mode = models.CharField(
+        max_length=16,
+        verbose_name="关联模式",
+        choices=[
+            ("create", "新建单据"),
+            ("link", "关联已有"),
+        ],
+        default="create",
+    )
+    sync_status = models.BooleanField(default=False, verbose_name="是否同步单据状态")
+
+    class Meta:
+        db_table = "bkmonitor_issue_tapd_relation"
+        verbose_name = "Issue TAPD 关联关系"
+        constraints = [
+            models.UniqueConstraint(fields=["bk_biz_id", "issue_id", "workspace_id", "tapd_id"], name="uniq_issue_tapd")
+        ]

@@ -6,21 +6,30 @@
   display: flex;
   flex-direction: column;
 
+  &.is-loading-rows {
+    .alarm-loading-row {
+      pointer-events: none;
+    }
+  }
+
   // 最小高度应为骨架屏高度避免出现空白
   // min-height: 370px;
 
-  .common-table {
-    @include tableCommonTheme.table-theme;
-
-    .common-table-ellipsis {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
+  // 事件委托包裹层：不影响布局，仅作为事件监听容器
+  .common-table-event-root {
+    display: contents; // 使该元素不产生影响布局的盒模型
   }
 
   // 在根元素容器高度仍有剩余的情况下，表格是否自适应填满根元素容器的剩余空间
   &.fill-remaining-space {
+    .common-table-event-root {
+      display: flex;
+      flex-grow: 1;
+      flex-basis: auto;
+      flex-direction: column;
+      min-height: 0;
+    }
+
     .common-table {
       display: flex;
       flex-grow: 1;
@@ -37,6 +46,26 @@
           .t-table--layout-fixed {
             height: 100%;
           }
+        }
+      }
+    }
+  }
+
+  .common-table {
+    @include tableCommonTheme.table-theme;
+
+    .common-table-ellipsis {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+
+      // 开头省略：direction: rtl 将省略号移至开头；::before 注入 LRM 零宽字符（\200e），
+      // 避免纯数字 / 下划线连接的 ID 类文本被 rtl 反向排列
+      &--start {
+        direction: rtl;
+
+        &::before {
+          content: '\200e';
         }
       }
     }
@@ -103,5 +132,13 @@
 
   .t-table .t-table__last-full-row td .t-table__row-full-element {
     padding: 0;
+  }
+
+  /* 排序列的内置灰底（--td-bg-color-secondarycontainer）画在 td 上，会盖住 tr 上的激活 / hover 整行高亮：
+   * 仅在高亮行内让该列单元格透明，透出整行底色，普通行的排序列底色保持不变。
+   * CommonTable 固定 hover={true} 与 showSortColumnBgColor={true}，该冲突在所有消费方都存在，故修在共享层 */
+  .common-table tbody > tr.t-table__row--active > td.t-table__sort-column,
+  .common-table tbody > tr:hover > td.t-table__sort-column {
+    background-color: transparent;
   }
 }

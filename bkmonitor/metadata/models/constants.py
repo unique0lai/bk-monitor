@@ -3146,6 +3146,8 @@ BASEREPORT_RESULT_TABLE_FIELD_MAP = {
     ],
 }
 
+GSE_SYSTEM_EVENT_TABLE_ID = "gse_system_event"
+
 BASE_EVENT_RESULT_TABLE_FIELD_MAP = {
     "base_event": [
         {
@@ -3401,7 +3403,7 @@ SYSTEM_PROC_DATA_LINK_CONFIGS = {
                 "field_name": "cpu_system",
                 "field_type": "double",
                 "description": "进程占用系统态时间",
-                "unit": "s",
+                "unit": "ms",
                 "tag": "metric",
                 "is_config_by_user": True,
                 "default_value": None,
@@ -3412,7 +3414,7 @@ SYSTEM_PROC_DATA_LINK_CONFIGS = {
                 "field_name": "cpu_total_ticks",
                 "field_type": "double",
                 "description": "整体占用时间",
-                "unit": "s",
+                "unit": "ms",
                 "tag": "metric",
                 "is_config_by_user": True,
                 "default_value": None,
@@ -3434,7 +3436,7 @@ SYSTEM_PROC_DATA_LINK_CONFIGS = {
                 "field_name": "cpu_user",
                 "field_type": "double",
                 "description": "进程占用用户态时间",
-                "unit": "s",
+                "unit": "ms",
                 "tag": "metric",
                 "is_config_by_user": True,
                 "default_value": None,

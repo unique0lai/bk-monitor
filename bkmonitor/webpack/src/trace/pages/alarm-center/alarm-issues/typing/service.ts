@@ -27,12 +27,23 @@
 import type { CommonFilterParams, QuickFilterItem } from '../../typings';
 import type { IssueItem } from './table';
 
+/** Issue 日志内容请求参数 */
+export interface IssueLogContentParams {
+  bk_biz_ids: number[];
+  issue_ids: string[];
+}
+
+/** Issue 日志内容响应（key 为 issue_id，value 为日志内容字典） */
+export type IssueLogContentResponse = Record<string, { log_content: string }>;
+
 /** Issue 搜索请求参数 */
 export interface IssueSearchParams extends CommonFilterParams {
   /** 是否展示聚合 */
   show_aggs?: boolean;
   /** 是否展示 DSL */
   show_dsl?: boolean;
+  /** 是否在列表接口同步查询趋势（兼容旧客户端） */
+  show_trend?: boolean;
   /** 告警趋势图结束时间（跟随 end_time） */
   trend_end_time?: number;
   /** 告警趋势图开始时间（trend_end_time 往前推 24 小时） */
@@ -48,3 +59,14 @@ export interface IssueSearchResponse {
   /** 总数 */
   total: number;
 }
+
+/** Issue 趋势请求参数 */
+export interface IssueTrendParams {
+  bk_biz_ids: number[];
+  issue_ids: string[];
+  trend_end_time: number;
+  trend_start_time: number;
+}
+
+/** Issue ID 到趋势序列的映射 */
+export type IssueTrendResponse = Record<string, [number, number][]>;

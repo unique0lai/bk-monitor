@@ -11,8 +11,9 @@ specific language governing permissions and limitations under the License.
 import logging
 import time
 from typing import Any
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
+from django.db.models import Q
 from django.utils.translation import gettext_lazy as _
 
 from bkmonitor.data_source import conditions_to_q, filter_dict_to_conditions
@@ -23,7 +24,9 @@ from monitor_web.data_explorer.event.constants import (
     DIMENSION_PREFIX,
     EVENT_FIELD_ALIAS,
     INNER_FIELD_TYPE_MAPPINGS,
+    CicdEventName,
     EventCategory,
+    EventDomain,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,6 +120,60 @@ def _get_data_labels_map(bk_biz_id: int, tables: tuple[str, ...]) -> dict[str, s
     return api.metadata.get_data_labels_map(bk_biz_id=bk_biz_id, table_or_labels=list(tables))
 
 
+def cicd_cond_handler(cond: dict[str, Any]) -> Q:
+    return Q(
+        **{
+            "pipelineId": cond.get("pipeline_id"),
+            "projectId": cond.get("project_id"),
+            "event_name": CicdEventName.PIPELINE_STATUS_INFO.value,
+        }
+    )
+
+
+def default_cond_handler(cond: dict[str, Any]) -> Q:
+    return Q(**cond)
+
+
+def k8s_cond_handler(cond: dict[str, Any]) -> Q:
+    kind: str | None = cond.get("kind")
+    name: str | None = cond.get("name")
+    namespace: str | None = cond.get("namespace")
+    bcs_cluster_id: str | None = cond.get("bcs_cluster_id")
+    if not (bcs_cluster_id and namespace and kind and name):
+        return default_cond_handler(cond)
+
+    q: Q = Q(**cond)
+    kind_pod_reg_map: dict[str, Any] = {
+        "Job": f"{name}-[a-z0-9]{{5,10}}",
+        "Deployment": f"{name}(-[a-z0-9]{{5,10}}){{1,2}}",
+        "DaemonSet": f"{name}-[a-z0-9]{{5}}",
+        "StatefulSet": f"{name}-[0-9]+",
+    }
+    base_cond: dict[str, str] = {"bcs_cluster_id": bcs_cluster_id, "namespace": namespace}
+    for workload_kind, pod_name_reg in kind_pod_reg_map.items():
+        # 为什么采取模糊匹配？因为有类似 xxxDeployment 的 CRD 存在。
+        if kind not in workload_kind:
+            continue
+
+        # Workload 事件（例如 Deployment 滚服），实际会触发管控对象（ReplicaSet、Pod）的变更，产生对应级别的 k8s 事件，
+        # 即错误事件可能发生在 Workload 所管理的更基础的 k8s 对象，例如 Pod 重启失败、拉取镜像异常等，此处需要一并关联展示。
+        q |= Q(**base_cond, kind="Pod", name__req=pod_name_reg)
+        if kind in "Deployment":
+            q |= Q(**base_cond, kind="HorizontalPodAutoscaler", name=name) | Q(
+                **base_cond, kind="ReplicaSet", name__req=f"{name}-[a-z0-9]{{5,10}}"
+            )
+
+        # 至多匹配一次
+        break
+    return q
+
+
+DOMAIN_CONF_HANDLER_MAP: dict[str, Callable[[dict[str, Any]], Q]] = {
+    EventDomain.CICD.value: cicd_cond_handler,
+    EventDomain.K8S.value: k8s_cond_handler,
+}
+
+
 def create_k8s_info(origin_data, fields: list[str]):
     return create_event_info(origin_data, fields, EventCategory.K8S_EVENT.value)
 
@@ -201,64 +258,3 @@ def generate_time_range(timestamp):
         end_time = 0
 
     return start_time, end_time
-
-
-class DescendingStr:
-    """
-    定义降序字符串类，用于支持字符串降序排序
-    """
-
-    __slots__ = ("value",)
-
-    def __init__(self, value):
-        self.value = value
-
-    def __lt__(self, other):
-        """
-        降序，取反原来的比较顺序
-        """
-        return self.value > other.value
-
-
-def sort_fields(records, fields, extractor=None):
-    """
-    对字典列表按照多个字段进行排序，支持字段名后加"desc"表示降序
-    支持使用自定义提取器获取字段值
-
-    :param records: 要排序的数据列表（字典列表）
-    :param fields: 排序字段列表，如 ["time", "event.count desc"]
-    :param extractor: 字段提取函数，用于从记录中提取基础数据字典
-    :return: 排序后的字典列表
-    """
-
-    def get_sort_key(item):
-        # 提取比较的字典数据
-        base_data = extractor(item) if extractor else item
-        keys = []
-        for field in fields:
-            # 解析字段和排序顺序
-            if len(field.split()) == 1:
-                field, order = field, "asc"
-            else:
-                field, order = field.split(maxsplit=1)
-
-            value = base_data.get(field)
-            # 用元组来控制 None 的排序顺序，None->(1,)，正常值：(0, value)，确保 None 在最后
-            if value is None:
-                keys.append((1,))
-                continue
-
-            # 升序处理
-            if order != "desc":
-                keys.append((0, value))
-                continue
-
-            # 降序处理
-            if isinstance(value, int | float):
-                keys.append((0, -value))
-            else:
-                keys.append((0, DescendingStr(value)))
-
-        return tuple(keys)
-
-    return sorted(records, key=get_sort_key)

@@ -20,6 +20,10 @@ class MetaViewSet(ResourceViewSet):
     renderer_classes = RENDER_CLASSES
 
 
+class QueryResourceStorageViewSet(MetaViewSet):
+    resource_routes = [ResourceRoute("POST", resource.QueryResourceStorageResource)]
+
+
 class CreateDataIDViewSet(MetaViewSet):
     resource_routes = [ResourceRoute("POST", resource.CreateDataIDResource)]
 
@@ -99,6 +103,10 @@ class GetResultTableStorageViewSet(MetaViewSet):
     resource_routes = [ResourceRoute("GET", resource.GetResultTableStorageResult)]
 
 
+class GetResultTableStorageStatusViewSet(MetaViewSet):
+    resource_routes = [ResourceRoute("GET", resource.GetResultTableStorageStatus)]
+
+
 class CreateClusterInfoViewSet(MetaViewSet):
     resource_routes = [ResourceRoute("POST", resource.CreateClusterInfoResource)]
 
@@ -113,6 +121,10 @@ class DeleteClusterInfoViewSet(MetaViewSet):
 
 class GetClusterInfoViewSet(MetaViewSet):
     resource_routes = [ResourceRoute("GET", resource.QueryClusterInfoResource)]
+
+
+class GetClusterStatusViewSet(MetaViewSet):
+    resource_routes = [ResourceRoute("GET", resource.GetClusterStatusResource)]
 
 
 class QueryEventGroupViewSet(MetaViewSet):
@@ -382,6 +394,10 @@ class UpdateSpaceViewSet(MetaViewSet):
     resource_routes = [ResourceRoute("POST", resource.UpdateSpaceResource)]
 
 
+class SetBkmsSpaceStatusViewSet(MetaViewSet):
+    resource_routes = [ResourceRoute("POST", resource.SetBkmsSpaceStatusResource)]
+
+
 class MergeSpaceViewSet(MetaViewSet):
     resource_routes = [ResourceRoute("POST", resource.MergeSpaceResource)]
 
@@ -492,22 +508,6 @@ class ModifyClusterByVmrtsViewSet(MetaViewSet):
 
 class QueryVmRtBySpaceViewSet(MetaViewSet):
     resource_routes = [ResourceRoute("GET", resource.QueryVmRtBySpace)]
-
-
-class CreateEsRouterViewSet(MetaViewSet):
-    resource_routes = [ResourceRoute("POST", resource.CreateEsRouter)]
-
-
-class UpdateEsRouterViewSet(MetaViewSet):
-    resource_routes = [ResourceRoute("POST", resource.UpdateEsRouter)]
-
-
-class CreateDorisRouterViewSet(MetaViewSet):
-    resource_routes = [ResourceRoute("POST", resource.CreateDorisRouter)]
-
-
-class UpdateDorisRouterViewSet(MetaViewSet):
-    resource_routes = [ResourceRoute("POST", resource.UpdateDorisRouter)]
 
 
 class AddBkDataTableIdsViewSet(MetaViewSet):

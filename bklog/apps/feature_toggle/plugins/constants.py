@@ -30,6 +30,8 @@ SCENARIO_BKDATA = "scenario_bkdata"
 BKDATA_SUPER_TOKEN = "bkdata_super_token"
 # AIOPS相关配置
 BKDATA_CLUSTERING_TOGGLE = "bkdata_aiops_toggle"
+# 新类告警切换 NewSeries 灰度开关（未配置时由调用方默认开启）
+NEW_CLASS_ALERT_NEW_SERIES = "new_class_alert_new_series"
 # es相关配置
 BKLOG_ES_CONFIG = "bklog_es_config"
 # 新人指引相关配置
@@ -46,6 +48,9 @@ EXTERNAL_AUTHORIZER_MAP = "external_authorizer_map"
 # 字段分析白名单开关
 FIELD_ANALYSIS_CONFIG = "field_analysis_config"
 
+# IAM 权限中心鉴权模式：v3 / v4 / union
+IAM_PERMISSION_MODE = "iam_permission_mode"
+
 # 直接进行esquery_search查询的开关
 DIRECT_ESQUERY_SEARCH = "direct_esquery_search"
 
@@ -55,13 +60,6 @@ LOG_DESENSITIZE = "log_desensitize"
 # AI 助手
 AI_ASSISTANT = "ai_assistant"
 
-# unify_query_search查询的开关
-UNIFY_QUERY_SEARCH = "unify_query_search"
-UNIFY_QUERY_SEARCH_EXPORT = "unify_query_search_export"
-
-# unify_query_sql 查询的开关
-UNIFY_QUERY_SQL = "unify_query_sql"
-
 # 日志聚类小型化配置
 # {
 #   "predict_cluster": {
@@ -70,4 +68,11 @@ UNIFY_QUERY_SQL = "unify_query_sql"
 # }
 MINI_CLUSTERING_CONFIG = "mini_clustering_config"
 
-UNIFY_QUERY_SEARCH_CLUSTERING = "unify_query_search_clustering"
+# 场景化检索按业务灰度开关
+SCENE_SEARCH = "scene_search"
+
+# NodeMan V3 物理机采集准入开关
+NODEMAN_V3_COLLECTOR = "nodeman_v3_collector"
+
+# __ext_json 动态解析层级按业务灰度开关
+EXT_JSON_EXPAND_DEPTH = "ext_json_expand_depth"

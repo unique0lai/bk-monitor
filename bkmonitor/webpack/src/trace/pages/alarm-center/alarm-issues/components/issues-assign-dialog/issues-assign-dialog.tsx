@@ -31,9 +31,10 @@ import { useI18n } from 'vue-i18n';
 
 import UserSelector from '../../../../../components/user-selector/user-selector';
 import { useAsyncDialog } from '../../hooks/use-async-dialog';
+import { useRecentAssignees } from '../../hooks/use-recent-assignees';
 
 import type { AsyncDialogConfirmEvent } from '../../hooks/use-async-dialog';
-import type { IssueIdentifier } from '../../typing';
+import type { IssueIdentifier, IssuesAssignDialogParams } from '../../typing';
 
 import './issues-assign-dialog.scss';
 
@@ -54,6 +55,11 @@ export default defineComponent({
     title: {
       type: String,
     },
+    /** dialog 私有参数（用于回填当前负责人） */
+    dialogParam: {
+      type: Object as PropType<IssuesAssignDialogParams>,
+      default: () => ({}),
+    },
   },
   emits: {
     confirm: (_event: AsyncDialogConfirmEvent<{ assignee: string[] }>) => _event != null,
@@ -73,6 +79,11 @@ export default defineComponent({
     } = useAsyncDialog({
       isShow: toRef(() => props.isShow),
       onShowChange: (val: boolean) => emit('update:isShow', val),
+    });
+
+    const { recentUserIds } = useRecentAssignees({
+      isShow: toRef(() => props.isShow),
+      issuesData: toRef(() => props.issuesData),
     });
 
     /**
@@ -105,12 +116,12 @@ export default defineComponent({
       emit('cancel');
     };
 
-    // 每次弹窗打开时清空输入值
+    // 每次弹窗打开时回填当前负责人
     watch(
       () => props.isShow,
       val => {
         if (val) {
-          assignInputValue.value = [];
+          assignInputValue.value = props.dialogParam?.assignee?.length ? props.dialogParam.assignee : [];
         }
       }
     );
@@ -118,6 +129,7 @@ export default defineComponent({
     return {
       t,
       assignInputValue,
+      recentUserIds,
       loading,
       getTitle,
       handleConfirm,
@@ -146,6 +158,7 @@ export default defineComponent({
                   disabled={this.loading}
                   modelValue={this.assignInputValue}
                   placeholder={this.t('请输入')}
+                  recentUserIds={this.recentUserIds}
                   onUpdate:modelValue={(val: string[]) => {
                     this.assignInputValue = val;
                   }}

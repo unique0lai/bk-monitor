@@ -34,7 +34,7 @@ import { defineStore } from 'pinia';
 import { EMode } from '../../components/retrieval-filter/typing';
 import { type TimeRangeType, handleTransformToTimestamp } from '../../components/time-range/utils';
 import { getDefaultTimezone } from '../../i18n/dayjs';
-import { AlarmType, getDefaultAlarmCenterBizIds } from '../../pages/alarm-center/typings';
+import { AlarmType, getDefaultAlarmCenterBizIds, MY_ALARM_BIZ_ID } from '../../pages/alarm-center/typings';
 import { AlarmServiceFactory } from '@/pages/alarm-center/services/factory';
 
 import type { AlarmService } from '@/pages/alarm-center/services/base';
@@ -101,7 +101,9 @@ export const useAlarmCenterStore = defineStore('alarmCenter', () => {
     const params = {
       start_time: start,
       end_time: end,
-      [REFRESH_EFFECT_KEY]: refreshId.value,
+      // timezone 本身不入参，但绝对时间的 unix 转换依赖 window.timezone；
+      // 拼进副作用 key，使时区切换与 timeRange / refreshId 一样触发重算。
+      [REFRESH_EFFECT_KEY]: `${refreshId.value}_${timezone.value}`,
     };
     // 用于主动触发 依赖副作用 更新
     delete params[REFRESH_EFFECT_KEY];
@@ -144,7 +146,12 @@ export const useAlarmCenterStore = defineStore('alarmCenter', () => {
       }
     }
     const params = {
-      bk_biz_ids: bizIds.value,
+      // 「我有告警的空间」虚拟哨兵（MY_ALARM_BIZ_ID = -2）归一化为 []，由后端按
+      // 「我参与的全部告警（assignee/appointee/supervisor）」跨业务返回；后端不识别 -2 哨兵，
+      // 直接透传会被当作无权限业务过滤导致查询为空。对齐老事件中心 event.tsx 的同款处理。
+      // 注意：「我有权限的空间」哨兵（MY_AUTH_BIZ_ID = -1）不在此归一化——后端 parse_biz_item
+      // 依赖 -1 展开为全部授权业务，必须原样透传。
+      bk_biz_ids: bizIds.value.includes(MY_ALARM_BIZ_ID) ? [] : bizIds.value,
       conditions: [
         ...(filterMode.value === EMode.ui ? [...conditions.value, ...residentCondition.value] : []),
         ...otherQuickFilter,

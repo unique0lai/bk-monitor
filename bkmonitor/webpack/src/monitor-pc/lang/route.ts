@@ -95,10 +95,10 @@ export default {
   'route-集成': 'Integrations',
   'route-告警分派': 'Alarm Routing',
   'route-空间管理': 'Space Management',
+  'route-Redis 节点管理': 'Redis Node Management',
   'route-平台设置': 'Platform Settings',
   'route-默认仪表盘': 'Dashboard Home',
   'route-发送历史': 'Send History',
-  'route-AI设置': 'AI Settings',
   'route-配置规则': 'Configuration Rules',
   'route-指标管理': 'Metrics Manage',
   'route-配置应用': 'Configuration Application',
@@ -106,6 +106,7 @@ export default {
   'route-轮值': 'Rotation',
   'route-管理': 'Management',
   'route-告警中心': 'Alarm Center',
+  'route-AI设置': 'AI Settings',
   // 面包屑 标题定位
   'route-新建策略': 'New Alert Rules',
   'route-新建拨测任务': 'New Check',
@@ -141,10 +142,13 @@ export default {
   'route-加载中...': 'Loading...',
   'route-数据源管理': 'DataSource Management',
   'route-Profiling 检索': 'Profiling',
+  'route-RUM': 'RUM',
+  'route-RUM 检索': 'RUM Search',
   'route-编辑轮值': 'Edit Rotation',
   'route-新增轮值': 'Add Rotation',
   'route-故障': 'Incident',
   'route-查询模板': 'Query Template',
+  'route-主机监控 New': 'Host Monitor New',
 
   // 功能页面标题
 

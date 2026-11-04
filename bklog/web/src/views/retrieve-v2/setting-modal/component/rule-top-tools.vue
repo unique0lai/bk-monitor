@@ -49,8 +49,8 @@
         <bk-select
           v-if="ruleType === 'template'"
           ref="templateListRef"
-          ext-cls="template-select"
           v-model="templateRule"
+          ext-cls="template-select"
           behavior="simplicity"
           searchable
           :style="'margin-left: 10px'"
@@ -92,8 +92,8 @@
             </bk-button>
           </template>
           <ul
-            class="bk-dropdown-list"
             slot="dropdown-content"
+            class="bk-dropdown-list"
           >
             <li>
               <a
@@ -134,9 +134,9 @@
     </div>
     <!-- 添加规则dialog -->
     <bk-dialog
+      v-model="isShowAddRule"
       width="640"
       ext-cls="add-rule"
-      v-model="isShowAddRule"
       :mask-close="false"
       :title="isEditRules ? $t('编辑规则') : $t('添加规则')"
       header-position="left"
@@ -155,8 +155,8 @@
           required
         >
           <bk-input
-            style="width: 560px"
             v-model="addRulesData.regular"
+            style="width: 560px"
           ></bk-input>
           <span>{{ $t('样例') }}：\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}</span>
         </bk-form-item>
@@ -167,8 +167,8 @@
           required
         >
           <bk-input
-            style="width: 560px"
             v-model="addRulesData.placeholder"
+            style="width: 560px"
           ></bk-input>
           <span>{{ $t('样例') }}：IP</span>
         </bk-form-item>
@@ -211,9 +211,9 @@
     </bk-dialog>
     <!-- 其他索引集导入弹窗 -->
     <bk-dialog
+      v-model="isShowOtherExport"
       width="640"
       ext-cls="add-rule"
-      v-model="isShowOtherExport"
       header-position="left"
       :mask-close="false"
       :title="$t('其他索引集导入')"
@@ -376,6 +376,10 @@
       this.initInputType();
       this.initTemplateList();
     },
+    beforeDestroy() {
+      this.inputDocument.removeEventListener('change', this.inputFileEvent);
+      this.inputDocument = null;
+    },
     methods: {
       /**
        * @desc: 关闭添加规则弹窗重置参数
@@ -401,11 +405,11 @@
           .validate()
           .then(async () => {
             this.confirmLoading = true;
-            const { index_set_id, export_type } = this.indexSetData;
+            const { index_set_id, export_type: exportType } = this.indexSetData;
             const res = await this.getClusterConfig(index_set_id);
             const importRuleArr = this.base64ToRuleArr(res.data.predefined_varibles);
             this.rulesList =
-              export_type === 'replace' ? importRuleArr : this.mergeAndDeduplicate(importRuleArr, this.rulesList);
+              exportType === 'replace' ? importRuleArr : this.mergeAndDeduplicate(importRuleArr, this.rulesList);
             this.isShowOtherExport = false;
             this.$emit('show-table-loading');
           })
@@ -432,7 +436,7 @@
         combinedArray.forEach(item => {
           // 将对象转换为字符串进行比较，忽略 __Index__
           const key = Object.entries(item)
-            .filter(([k, _]) => k !== '__Index__')
+            .filter(([k]) => k !== '__Index__')
             .map(([k, v]) => `${k}:${v}`)
             .sort()
             .join('|');
@@ -458,7 +462,7 @@
           if (res.data) {
             return res.data;
           }
-        } catch (error) {
+        } catch {
           return false;
         }
       },
@@ -483,7 +487,7 @@
             return pre;
           }, []);
           return ruleNewList;
-        } catch (e) {
+        } catch {
           return [];
         }
       },
@@ -503,7 +507,7 @@
               };
             });
             this.rulesList = list;
-          } catch (err) {
+          } catch {
             this.$bkMessage({
               theme: 'error',
               message: this.$t('不是有效的json文件'),
@@ -712,6 +716,7 @@
             break;
           case 'update':
             this.handleUpdateTemplateName(configItem);
+            break;
           case 'edit':
             this.handleEditTemplateName(configItem.index);
             break;
@@ -721,9 +726,11 @@
         }
       },
       handleSelectTemplate(value) {
-        this.templateRule = value;
-        const selectTemplateStr = this.templateList.find(item => item.id === value).predefined_varibles;
-        this.rulesList = this.base64ToRuleArr(selectTemplateStr);
+        const matchedTemplate = this.templateList.find(item => item.id === value);
+        this.templateRule = matchedTemplate?.id || 0;
+        this.rulesList = matchedTemplate?.predefined_varibles
+          ? this.base64ToRuleArr(matchedTemplate.predefined_varibles)
+          : [];
         this.$emit('show-table-loading');
       },
       handleEditTemplateName(index) {
@@ -783,19 +790,19 @@
       },
       handleClickTemplateBtn(val) {
         this.ruleType = val;
-        const btnShowID = this.initTemplateID === 0 ? this.templateList[0].id : this.initTemplateID;
-        this.templateRule = val === 'customize' ? 0 : btnShowID;
-        if (val !== 'customize') this.handleSelectTemplate(btnShowID);
+        if (val === 'customize') {
+          this.templateRule = 0;
+          return;
+        }
+        const matchedTemplate = this.templateList.find(item => item.id === this.initTemplateID);
+        this.templateRule = matchedTemplate?.id || 0;
+        this.handleSelectTemplate(this.templateRule);
       },
       initTemplateSelect(v) {
         this.templateRule = v.regex_template_id;
         this.ruleType = v.regex_rule_type;
         this.initTemplateID = v.regex_template_id;
       },
-    },
-    beforeDestroy() {
-      this.inputDocument.removeEventListener('change', this.inputFileEvent);
-      this.inputDocument = null;
     },
   };
 </script>

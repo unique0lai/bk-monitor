@@ -127,9 +127,12 @@ interface INoticeConfigNewEvent {
 interface INoticeConfigNewProps {
   alarmGroupLoading?: boolean;
   allAction?: IGroupItem[]; // 套餐列表
+  bkBizId?: number | string;
   dataTypeLabel?: string;
   isExecuteDisable?: boolean;
   legalDimensionList?: ICommonItem[];
+  previewItem?: Record<string, unknown>;
+  previewStrategyId?: number | string;
   readonly?: boolean;
   strategyId?: number | string;
   userList?: IAlarmGroupList[]; // 告警组
@@ -145,6 +148,9 @@ export default class NoticeConfigNew extends tsc<INoticeConfigNewProps, INoticeC
   @Prop({ type: Object, default: () => ({}) }) value: INoticeValue;
   @Prop({ type: Array, default: () => [] }) allAction: IGroupItem[];
   @Prop({ type: Array, default: () => [] }) userList: IAlarmGroupList[];
+  @Prop({ type: [Number, String] }) bkBizId: number | string;
+  @Prop({ type: Object }) previewItem: Record<string, unknown>;
+  @Prop({ type: [Number, String], default: 0 }) previewStrategyId: number | string;
   @Prop({ type: Boolean, default: false }) readonly: boolean;
   @Prop({ default: '', type: [Number, String] }) strategyId: number;
   @Prop({ default: false, type: Boolean }) isExecuteDisable: boolean;
@@ -194,7 +200,7 @@ export default class NoticeConfigNew extends tsc<INoticeConfigNewProps, INoticeC
         { signal: 'recovered', message_tmpl: '', title_tmpl: '' },
         { signal: 'closed', message_tmpl: '', title_tmpl: '' },
       ],
-      voice_notice: 'serial',
+      voice_notice: 'parallel',
     },
   };
 
@@ -298,13 +304,9 @@ export default class NoticeConfigNew extends tsc<INoticeConfigNewProps, INoticeC
   handleValue(data: INoticeValue) {
     this.data = data;
 
-    // 语音拨打顺序字段不存在或者为空时，默认串行; 删减告警组只剩1个时页面隐藏该选项，字段值改为串行
-    if (
-      !Object.keys(data.config).includes('voice_notice') ||
-      !data.config.voice_notice ||
-      data.user_groups.length === 1
-    ) {
-      this.data.config.voice_notice = 'serial';
+    // 语音拨打顺序字段不存在或者为空时，默认并行（与后端/ascode 默认一致）;
+    if (!Object.keys(data.config).includes('voice_notice') || !data.config.voice_notice) {
+      this.data.config.voice_notice = 'parallel';
     }
 
     Object.keys(this.assignMode).forEach(key => {
@@ -1132,7 +1134,10 @@ export default class NoticeConfigNew extends tsc<INoticeConfigNewProps, INoticeC
               )}
             </div>
             <StrategyTemplatePreview
+              bkBizId={this.bkBizId}
               dialogShow={this.isShowTemplate}
+              previewItem={this.previewItem}
+              strategyId={this.previewStrategyId}
               template={this.templateData.message_tmpl}
               {...{ on: { 'update:dialogShow': v => (this.isShowTemplate = v) } }}
             />

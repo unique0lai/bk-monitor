@@ -192,7 +192,7 @@ class AlertBuilder(BaseAlertProcessor):
                 "strategy_id": alert.strategy_id,
             }
             for alert in alerts
-            if alert.is_new() and alert.strategy_id
+            if alert.is_new() and alert.strategy_id and not alert.shield_end_close
         ]
         # 利用send_check_task 创建[alert.manager]延时任务
         send_check_task(alerts=alerts_params, run_immediately=False)
@@ -291,7 +291,24 @@ class AlertBuilder(BaseAlertProcessor):
         # 过滤出保存成功的事件
         return [event for event in dedupe_events if event.id not in error_uids]
 
-    def alert_qos_handle(self, alert: Alert):
+    @staticmethod
+    def is_same_new_series_lifecycle(alert: Alert, successor_event: Event | None) -> bool:
+        if successor_event is None or not successor_event.is_abnormal():
+            return False
+
+        from alarm_backends.service.alert.manager.checker.utils import is_same_new_series_lifecycle
+
+        successor_alert = Alert(
+            {
+                "status": successor_event.status,
+                "severity": successor_event.severity,
+                "event": successor_event.to_dict(),
+                "extra_info": successor_event.extra_info,
+            }
+        )
+        return is_same_new_series_lifecycle(alert, successor_alert)
+
+    def alert_qos_handle(self, alert: Alert, successor_event: Event | None = None):
         if not alert.is_blocked:
             # 对于未被流控的告警，只检查熔断规则
             circuit_breaking_blocked = False
@@ -300,6 +317,7 @@ class AlertBuilder(BaseAlertProcessor):
 
             if circuit_breaking_blocked:
                 # 告警触发熔断规则，需要流控, 结束当前告警。
+                # build_alerts 会基于当前事件创建后继告警；仅相同状态分组可以接管旧活跃状态。
                 alert.update_qos_status(True)
                 now_time = int(time.time())
                 alert.set_end_status(
@@ -308,6 +326,7 @@ class AlertBuilder(BaseAlertProcessor):
                     description="告警命中熔断规则，被流控关闭",
                     end_time=now_time,
                     event_id=now_time,
+                    preserve_new_series_lifecycle=self.is_same_new_series_lifecycle(alert, successor_event),
                 )
                 self.logger.info(
                     f"[circuit breaking] [alert.builder] exists alert({alert.id}) strategy({alert.strategy_id}) "
@@ -332,12 +351,14 @@ class AlertBuilder(BaseAlertProcessor):
             return alert
         else:
             # 不满足熔断条件了，关闭当前告警，接下来直接产生一条新的告警
+            # 仅当新告警与当前告警属于同一状态分组时，才由新告警接管活跃状态。
             self.logger.info("[alert.builder qos] alert(%s) will be closed: %s ", alert.id, qos_result["message"])
             alert.set_end_status(
                 status=EventStatus.CLOSED,
                 op_type=AlertLog.OpType.CLOSE,
                 description=_("{message}, 当前告警关闭").format(message=qos_result["message"]),
                 end_time=int(time.time()),
+                preserve_new_series_lifecycle=self.is_same_new_series_lifecycle(alert, successor_event),
             )
             return alert
 
@@ -350,15 +371,24 @@ class AlertBuilder(BaseAlertProcessor):
 
         # 根据这批事件的dedupe_md5，获取已经存在的告警
         current_alerts = self.get_current_alerts(events)
+        from alarm_backends.service.converge.shield.close import CloseShieldMatcher
+
+        close_shields = CloseShieldMatcher()
         new_alerts = {}
         # 对事件进行遍历，逐个更新告警内容
         for event in events:
             alert: Alert = current_alerts.get(event.dedupe_md5)
             if alert and alert.is_abnormal():
+                close_shields.take_over(alert)
+                if alert.shield_end_close:
+                    alert.update(event)
+                    new_alerts[alert.id] = alert
+                    continue
+            if alert and alert.is_abnormal():
                 # 存量告警处理
                 # 当前事件已经关联了告警， 且告警处于未恢复状态
                 # qos判定，如果判定qos解除， 则alert的状态变更为CLOSED
-                alert = self.alert_qos_handle(alert)
+                alert = self.alert_qos_handle(alert, successor_event=event)
                 if alert.status == EventStatus.CLOSED:
                     # qos状态解除，创建新告警
                     new_alerts[alert.id] = alert
@@ -402,6 +432,7 @@ class AlertBuilder(BaseAlertProcessor):
                 )
 
             # 回写到 current_alerts 用于后续遍历继续更新
+            close_shields.take_over(alert)
             current_alerts[event.dedupe_md5] = alert
             new_alerts[alert.id] = alert
 

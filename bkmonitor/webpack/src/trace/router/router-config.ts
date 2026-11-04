@@ -56,9 +56,19 @@ export const allRouteConfig: IRouteConfig[] = [
     route: 'incident-detail',
   },
   {
-    id: 'profiling',
-    name: 'Profiling',
-    route: 'profiling',
+    id: 'profiling-explore',
+    name: 'Profiling 检索',
+    route: 'profiling-explore',
+  },
+  {
+    id: 'rum',
+    name: 'RUM',
+    route: 'rum',
+  },
+  {
+    id: 'rum-explore',
+    name: 'RUM 检索',
+    route: 'rumExplore',
   },
   {
     id: 'report',
@@ -69,6 +79,21 @@ export const allRouteConfig: IRouteConfig[] = [
     id: 'alarm-center',
     name: 'route-告警中心',
     route: 'alarm-center',
+  },
+  {
+    id: 'host',
+    name: 'route-主机监控',
+    route: 'host',
+  },
+  {
+    id: 'rum',
+    name: 'route-RUM',
+    route: 'rum',
+  },
+  {
+    id: 'ai-config',
+    name: 'route-AI设置',
+    route: 'ai-config',
   },
 ];
 

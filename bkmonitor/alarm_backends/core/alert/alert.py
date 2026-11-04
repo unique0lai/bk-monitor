@@ -28,6 +28,7 @@ from alarm_backends.core.cache.key import (
     COMPOSITE_QOS_COUNTER,
 )
 from alarm_backends.core.cluster import get_cluster
+from alarm_backends.core.storage.redis_cluster import PipelineResultMismatch
 from bkmonitor.documents import ActionInstanceDocument, AlertDocument, AlertLog
 from bkmonitor.models import ActionInstance
 from bkmonitor.utils import extended_json
@@ -93,6 +94,10 @@ class Alert:
         self.init_severity()
 
     def init_severity(self):
+        # 告警分派设置的级别优先于算法动态级别，缓存重载时不能被覆盖
+        if self.severity_source == AssignMode.BY_RULE:
+            return
+
         # 智能监控如果有动态告警级别配置，则从extra_info里获取实际事件级别
         try:
             # 尝试取数据中的extra_info
@@ -110,6 +115,10 @@ class Alert:
         根据给出的事件更新告警内容
         """
         self.refresh_update_time()
+        if event.status == EventStatus.ABNORMAL:
+            self.data.setdefault("extra_info", {})["latest_abnormal_event_time"] = max(
+                self.latest_abnormal_event_time, event.time
+            )
         # 收敛日志
         default_log = dict(
             op_type=AlertLog.OpType.CONVERGE,
@@ -158,6 +167,15 @@ class Alert:
 
         # 如果事件时间大于最新的一条事件时间，则更新告警
         self.data["latest_time"] = event.time
+
+        if self.shield_end_close:
+            # A shield-owned alert keeps its deduplication identity until the
+            # dedicated checker closes it, even when recovery events arrive.
+            self.clear_next_status()
+            if event.status == EventStatus.ABNORMAL and event.severity == self.severity:
+                self.data["event"] = event.to_dict()
+            self.add_log(**default_log)
+            return
 
         if event.status == EventStatus.ABNORMAL:
             self.add_log(**default_log)
@@ -252,7 +270,10 @@ class Alert:
         return True
 
     def update_qos_status(self, is_blocked):
+        if self.is_blocked == is_blocked:
+            return
         self.data["is_blocked"] = is_blocked
+        self._refresh_db = True
 
     def is_valid_handle(self, execute_times=0, action_relation_id=None):
         if execute_times == 0 and action_relation_id is None:
@@ -272,6 +293,14 @@ class Alert:
                 handle_record = self.get_latest_interval_record(config_id=config_id, relation_id=action_relation_id)
         if handle_record and handle_record.get("execute_times") <= execute_times + 1:
             # 当此次执行的次数要大于记录次数情况下才进行处理
+            return True
+
+        if (
+            execute_times == 0
+            and str((self.strategy or {}).get("notice", {}).get("id")) == str(action_relation_id)
+            and self.latest_abnormal_event_time > (handle_record or {}).get("latest_anomaly_time", 0)
+        ):
+            # 新异常的通知事实需要推进，不能被上一轮累计次数挡住。
             return True
 
         return False
@@ -310,7 +339,7 @@ class Alert:
             "last_time": int(action.end_time.timestamp()) if action.end_time else int(time.time()),
             "execute_times": action.execute_times,
             "is_shielded": action.inputs.get("is_alert_shielded", False),
-            "latest_anomaly_time": action.inputs.get("alert_latest_time", 0),
+            "latest_anomaly_time": action.inputs.get("shield_source_time") or action.inputs.get("alert_latest_time", 0),
         }
 
     @property
@@ -475,6 +504,30 @@ class Alert:
         return self.data["latest_time"]
 
     @property
+    def latest_abnormal_event_time(self) -> int:
+        return self.get_extra_info("latest_abnormal_event_time", 0)
+
+    def preserve_notification_progress(self, extra_info: dict):
+        """合并旧快照时保留较新的异常时间与通知处理记录。"""
+        source_time = max(self.latest_abnormal_event_time, extra_info.get("latest_abnormal_event_time", 0))
+        if source_time:
+            self.data.setdefault("extra_info", {})["latest_abnormal_event_time"] = source_time
+        relation_id = str((self.strategy or {}).get("notice", {}).get("id", ""))
+        other = extra_info.get("cycle_handle_record", {}).get(relation_id)
+        if not other:
+            return
+        current = self.cycle_handle_record.get(relation_id, {})
+        if (other.get("latest_anomaly_time", 0), other.get("execute_times", 0)) > (
+            current.get("latest_anomaly_time", 0),
+            current.get("execute_times", 0),
+        ):
+            record = dict(other)
+        else:
+            record = dict(current)
+        record["execute_times"] = max(current.get("execute_times", 0), other.get("execute_times", 0))
+        self.extra_info.setdefault("cycle_handle_record", {})[relation_id] = record
+
+    @property
     def first_anomaly_time(self) -> int:
         return self.data["first_anomaly_time"]
 
@@ -597,7 +650,11 @@ class Alert:
         return self._refresh_db
 
     def should_send_signal(self) -> bool:
-        return self._refresh_db and not self.is_blocked
+        return self._refresh_db and not self.is_blocked and not self.shield_end_close
+
+    @property
+    def shield_end_close(self) -> bool:
+        return self.data.get("shield_end_close", False)
 
     def is_status_changed(self) -> bool:
         return self._status_changed
@@ -696,12 +753,26 @@ class Alert:
         alert_doc = AlertDocument(**data)
         return alert_doc
 
-    def set_end_status(self, status, op_type, description="", end_time=None, **kwargs):
+    def set_end_status(
+        self,
+        status,
+        op_type,
+        description="",
+        end_time=None,
+        preserve_new_series_lifecycle=False,
+        **kwargs,
+    ):
         """
         将告警设置为终止状态
         """
         if not self.is_abnormal():
             return
+
+        if not preserve_new_series_lifecycle:
+            # 所有终态统一先收口 NewSeries 生命周期；收口失败时保留异常态，由原任务重试。
+            from alarm_backends.service.alert.manager.checker.utils import terminate_new_series_lifecycle_state
+
+            terminate_new_series_lifecycle_state(self)
 
         end_time = end_time or int(time.time())
         self.data["status"] = status
@@ -782,6 +853,8 @@ class Alert:
         data["extra_info"]["agg_dimensions"] = [key[5:] for key in event.dedupe_keys if key.startswith("tags.")]
 
         alert = cls(data)
+        if event.status == EventStatus.ABNORMAL:
+            alert.data["extra_info"]["latest_abnormal_event_time"] = event.time
         alert.update_data_id_info(event)
 
         # 补全维度信息
@@ -897,6 +970,12 @@ class Alert:
         for alert_key in alert_keys:
             pipeline.get(alert_key.get_snapshot_key())
         alerts_snapshot = pipeline.execute()
+        if len(alerts_snapshot) != len(alert_keys):
+            # 防御：pipeline 结果数与请求键数不一致（连接异常/代理脏状态），
+            # 避免后续按下标 alert_keys[index] 取值越界；按本轮失败处理，由周期任务下轮重试
+            raise PipelineResultMismatch(
+                f"snapshot pipeline result count({len(alerts_snapshot)}) != alert_keys({len(alert_keys)})"
+            )
 
         results = []
 
@@ -964,7 +1043,7 @@ class Alert:
         qos_threshold = settings.QOS_ALERT_THRESHOLD
         if qos_threshold == 0:
             # 如果当前设置阈值为0表示没有QOS，直接返回
-            return {"is_blocked": self.is_blocked, "message": message}
+            return {"is_blocked": False, "message": message}
 
         qos_counter = ALERT_BUILD_QOS_COUNTER
         qos_threshold = {"threshold": qos_threshold, "window": settings.QOS_ALERT_WINDOW}
@@ -1205,6 +1284,8 @@ class AlertCache:
                         # 如果缓存中的告警ID与当前告警ID不一致，跳过更新
                         should_update = False
                         skip_count += 1
+                    else:
+                        alert.preserve_notification_progress(cached_alert_data.extra_info)
                 except (json.JSONDecodeError, KeyError) as e:
                     # 如果解析失败，允许更新
                     logger.warning("load alert failed: invalid json data: %s, origin data: %s", e, cached_data)

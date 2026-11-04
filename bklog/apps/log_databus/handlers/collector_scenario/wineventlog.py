@@ -21,7 +21,7 @@ the project delivered to anyone in the future.
 
 from django.utils.translation import gettext as _
 
-from apps.log_databus.constants import EtlConfig, LogPluginInfo
+from apps.log_databus.constants import EtlConfig, LogPluginInfo, STORAGE_CLUSTER_TYPE
 from apps.log_databus.handlers.collector_scenario import CollectorScenario
 from apps.log_databus.handlers.collector_scenario.utils import build_es_option_type
 from apps.utils.log import logger
@@ -122,7 +122,9 @@ class WinEventLogScenario(CollectorScenario):
             }
 
     @classmethod
-    def get_built_in_config(cls, es_version="5.X", etl_config=EtlConfig.BK_LOG_TEXT, **kwargs):
+    def get_built_in_config(
+        cls, es_version="5.X", etl_config=EtlConfig.BK_LOG_TEXT, storage_cluster_type=STORAGE_CLUSTER_TYPE, **kwargs
+    ):
         """
         获取采集器标准字段
         """
@@ -149,7 +151,7 @@ class WinEventLogScenario(CollectorScenario):
             "fields": [
                 {
                     "field_name": "bk_host_id",
-                    "field_type": "float",
+                    "field_type": "float" if storage_cluster_type == STORAGE_CLUSTER_TYPE else "long",
                     "tag": "dimension",
                     "alias_name": "bk_host_id",
                     "description": _("主机ID"),
@@ -271,8 +273,9 @@ class WinEventLogScenario(CollectorScenario):
                     "field_type": "string",
                     "tag": "dimension",
                     "alias_name": "provider_name",
-                    "description": "来源名称",
+                    "description": _("来源名称"),
                     "option": build_es_option_type("keyword", es_version),
+                    "flat_field": True,
                 },
                 {
                     "field_name": "winEventTask",
@@ -375,7 +378,7 @@ class WinEventLogScenario(CollectorScenario):
                 },
                 {
                     "field_name": "iterationIndex",
-                    "field_type": "float",
+                    "field_type": "float" if storage_cluster_type == STORAGE_CLUSTER_TYPE else "long",
                     "tag": "dimension",
                     "alias_name": "iterationindex",
                     "description": _("迭代ID"),
@@ -384,12 +387,11 @@ class WinEventLogScenario(CollectorScenario):
                 },
                 {
                     "field_name": "cloudId",
-                    "field_type": "float",
+                    "field_type": "float" if storage_cluster_type == STORAGE_CLUSTER_TYPE else "long",
                     "tag": "dimension",
                     "alias_name": "cloudid",
                     "description": _("云区域ID"),
                     "option": build_es_option_type("integer", es_version),
-                    "flat_field": True,
                 },
                 {
                     "field_name": "serverIp",
@@ -398,16 +400,14 @@ class WinEventLogScenario(CollectorScenario):
                     "alias_name": "ip",
                     "description": "ip",
                     "option": build_es_option_type("keyword", es_version),
-                    "flat_field": True,
                 },
                 {
                     "field_name": "gseIndex",
-                    "field_type": "float",
+                    "field_type": "float" if storage_cluster_type == STORAGE_CLUSTER_TYPE else "long",
                     "tag": "dimension",
                     "alias_name": "gseindex",
                     "description": _("gse索引"),
                     "option": build_es_option_type("long", es_version),
-                    "flat_field": True,
                 },
             ],
             "time_field": {

@@ -23,14 +23,21 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { type PropType, computed, defineComponent, onMounted, shallowRef, useTemplateRef, watch } from 'vue';
+import { type PropType, computed, defineComponent, nextTick, onMounted, toRef, useTemplateRef } from 'vue';
 
-import { type BkUiSettings, type TableSort, PrimaryTable } from '@blueking/tdesign-ui';
+import {
+  type BkUiSettings,
+  type FilterValue,
+  type TableSort,
+  type TdBaseTableProps,
+  PrimaryTable,
+} from '@blueking/tdesign-ui';
 import { Exception, Pagination } from 'bkui-vue';
+import { useI18n } from 'vue-i18n';
 
 import TableSkeleton from '../../../../../../components/skeleton/table-skeleton';
+import { useTableEllipsis } from '../../../../../../hooks/use-table-popover';
 import { useTableCell } from '../../../../../trace-explore/components/trace-explore-table/hooks/use-table-cell';
-import { useTableEllipsis } from '../../../../../trace-explore/components/trace-explore-table/hooks/use-table-popover';
 import {
   type ColumnResizeContext,
   type TableEmpty,
@@ -42,6 +49,7 @@ import { DEFAULT_TABLE_CONFIG } from './table-constants';
 
 import type {
   BaseTableColumn,
+  EllipsisPosition,
   TableCellRenderer,
 } from '../../../../../trace-explore/components/trace-explore-table/typing';
 import type { CheckboxGroupValue, SelectOptions, SizeEnum, SlotReturnValue, TdAffixProps } from 'tdesign-vue-next';
@@ -97,6 +105,10 @@ export default defineComponent({
       type: Boolean,
       default: false,
     },
+    /** 按真实列布局渲染首屏骨架；已有数据时保留表格并显示刷新状态。 */
+    loadingCell: {
+      type: Function as PropType<(column: BaseTableColumn, rowIndex: number) => SlotReturnValue>,
+    },
     /** 表格空数据展示 */
     empty: {
       type: [Object, Function] as PropType<TableEmpty>,
@@ -121,10 +133,68 @@ export default defineComponent({
     customCellRenderMap: {
       type: Object as PropType<Record<string, TableCellRenderer>>,
     },
-    /** 表格默认选中高亮的行 */
+    /** 表格单元格默认取值逻辑（列自身配置了 getRenderValue 时，以列配置为准） */
+    customDefaultGetRenderValue: {
+      type: Function as PropType<(row: Record<string, unknown>, column: BaseTableColumn) => unknown>,
+    },
+    /** 表格单元格溢出省略号位置全局默认值（end: 末尾省略；start: 开头省略。优先级低于列配置 ellipsisPosition） */
+    ellipsisPosition: {
+      type: String as PropType<EllipsisPosition>,
+    },
+    /** 行高亮类型：single 高亮一行、multiple 高亮多行，'' 关闭（官方类型未声明，运行时默认值） */
+    activeRowType: {
+      type: String as PropType<'' | null | TdBaseTableProps['activeRowType']>,
+      default: 'single',
+    },
+    /**
+     * 受控高亮行 keys（与 PrimaryTable activeRowKeys 语义一致）：挂载时传入数组即受控，传 undefined 视为未传（非受控），
+     * 行点击 / 键盘高亮只触发 activeChange 事件，由调用方决定是否更新
+     */
+    activeRowKeys: {
+      type: Array as PropType<(number | string)[]>,
+      default: undefined,
+    },
+    /** 非受控高亮行 keys（与 PrimaryTable defaultActiveRowKeys 语义一致）：仅初始化时读取，后续变化不生效 */
     defaultActiveRowKeys: {
       type: Array as PropType<(number | string)[]>,
       default: () => [],
+    },
+    /** 表头筛选受控值（与 PrimaryTable filterValue 一致） */
+    filterValue: {
+      type: Object as PropType<FilterValue>,
+    },
+    /** 行类名，参数为 { row, rowIndex, type } */
+    rowClassName: {
+      type: [String, Function] as PropType<TdBaseTableProps['rowClassName']>,
+    },
+    /** 表格滚动配置，可用于开启虚拟滚动 */
+    scroll: {
+      type: Object as PropType<{
+        bufferSize?: number;
+        isFixedRowHeight?: boolean;
+        rowHeight?: number;
+        threshold?: number;
+        type: 'lazy' | 'virtual';
+      }>,
+    },
+    /** 表格最大高度，超出后出现滚动条 */
+    maxHeight: {
+      type: [String, Number] as PropType<number | string>,
+    },
+    /** 是否显示表格边框 */
+    bordered: {
+      type: Boolean,
+      default: false,
+    },
+    /** 是否允许拖拽调整列宽 */
+    resizable: {
+      type: Boolean,
+      default: true,
+    },
+    /** 刷新 key，值变化时强制重新渲染 PrimaryTable */
+    refreshKey: {
+      type: [Number, String] as PropType<number | string>,
+      default: '',
     },
   },
   emits: {
@@ -139,42 +209,62 @@ export default defineComponent({
     /** 行选择变化回调 */
     selectChange: (selectedRowKeys: (number | string)[], options: SelectOptions<unknown>) =>
       Array.isArray(selectedRowKeys) && options,
+    filterChange: (filterValue: FilterValue) => filterValue != null,
+    /** 高亮行变化回调（透传 PrimaryTable onActiveChange，参数语义一致） */
+    activeChange: (rowKeys: Array<number | string>, _context?: unknown) => Array.isArray(rowKeys),
     /** 列宽拖拽变化回调 */
     columnResizeChange: (context: ColumnResizeContext) => context && typeof context.columnsWidth === 'object',
   },
   setup(props, { emit }) {
-    const tableRef = useTemplateRef<InstanceType<typeof PrimaryTable>>('tableRef');
+    const { t } = useI18n();
+    /**
+     * activeRowKeys 是否受控：挂载时传入数组才算受控。中间封装层（如 AlarmTable）会把未传的 prop 以 undefined 透传，
+     * 若按 vnode.props 是否携带 key 判定，会被 TDesign 当作值为 undefined 的受控模式，行点击时读取 undefined.includes 报错。
+     * 与 TDesign 相同，该判定在挂载时确定，不支持运行期切换受控 / 非受控模式。
+     */
+    const isControlledActiveRowKeys = Array.isArray(props.activeRowKeys);
+    const wrapperRef = useTemplateRef<HTMLElement>('wrapperRef');
     /** 表格单元格渲染逻辑 */
     const { tableCellRender, renderContext } = useTableCell({
-      rowKeyField: props.rowKey,
+      rowKeyField: toRef(props, 'rowKey'),
       customCellRenderMap: props.customCellRenderMap,
+      customDefaultGetRenderValue: props.customDefaultGetRenderValue,
       cellEllipsisClass: COMMON_TABLE_ELLIPSIS_CLASS_NAME,
+      ellipsisPosition: toRef(props, 'ellipsisPosition'),
     });
-    /** 表格功能单元格内容溢出弹出 popover 功能 */
-    const { initListeners: initEllipsisListeners } = useTableEllipsis(tableRef, {
+    /** 表格功能单元格内容溢出弹出 popover 功能（绑定到包裹层，避免表格重建时事件委托丢失） */
+    const { initListeners: initEllipsisListeners } = useTableEllipsis(wrapperRef, {
       trigger: {
         selector: `.${COMMON_TABLE_ELLIPSIS_CLASS_NAME}`,
       },
     });
-    const activeRowKeys = shallowRef([]);
+    const showLoadingRows = computed(() => !!props.loadingCell && props.loading);
+    const displayedData = computed(() =>
+      showLoadingRows.value && !props.data.length
+        ? Array.from({ length: 8 }, (_, index) => ({ [props.rowKey]: `loading-${index}` }))
+        : props.data
+    );
     /** 处理后的表格列配置 */
     const tableColumns = computed(() =>
       props.columns.map(column => ({
-        // @ts-expect-error
+        // @ts-expect-error cellEllipsis 不在 BaseTableColumn 类型中，但 TDesign 运行时支持
         cellEllipsis: column?.ellipsis != null ? column?.ellipsis : true,
         ellipsis: false,
-        // @ts-expect-error
+        // @ts-expect-error ellipsisTitle 不在 BaseTableColumn 类型中，但 TDesign 运行时支持
         ellipsisTitle: column?.ellipsisTitle != null ? column?.ellipsisTitle : true,
         ...column,
+        ...(showLoadingRows.value ? { type: undefined, ellipsis: false } : {}),
         cell: (_, cellParams) =>
-          column?.cellRenderer
-            ? column?.cellRenderer(cellParams.row, column, { ...renderContext, runtime: cellParams })
-            : tableCellRender(cellParams.row, column, { ...renderContext, runtime: cellParams }),
+          showLoadingRows.value
+            ? props.loadingCell(column, cellParams.rowIndex)
+            : column?.cellRenderer
+              ? column?.cellRenderer(cellParams.row, column, { ...renderContext, runtime: cellParams })
+              : tableCellRender(cellParams.row, column, { ...renderContext, runtime: cellParams }),
       }))
     );
     /** 表格骨架屏展示相关配置 */
     const tableSkeletonConfig = computed(() => {
-      if (!props.loading) return null;
+      if (!props.loading || props.loadingCell) return null;
       const config = {
         tableClass: 'common-table-hidden-body',
         skeletonClass: 'common-skeleton-show-body',
@@ -269,11 +359,20 @@ export default defineComponent({
     };
 
     /**
-     * @description 表格高亮行发生变化时的回调
-     * @param {Array<string | number>} activeRowKeys 高亮行
+     * @description 表头筛选变化
+     * @param {FilterValue} value
      */
-    const handleActiveChange = (rowKeys: Array<number | string>) => {
-      activeRowKeys.value = rowKeys;
+    const handleFilterChange = (value: FilterValue) => {
+      emit('filterChange', value);
+    };
+    /**
+     * @description 表格高亮行变化回调：不写内部状态，原样透传 PrimaryTable onActiveChange 的参数，
+     *              受控 / 非受控的状态归集由调用方自行处理
+     * @param {Array<string | number>} rowKeys 高亮行 keys
+     * @param {unknown} context 高亮上下文（activeRowList / currentRowData / type）
+     */
+    const handleActiveChange = (rowKeys: Array<number | string>, context?: unknown) => {
+      emit('activeChange', rowKeys, context);
     };
     /**
      * @description 表格列宽拖拽变化时的回调
@@ -306,32 +405,26 @@ export default defineComponent({
       return (
         <Exception
           class='common-table-empty'
-          description={props.empty?.emptyText || '搜索为空'}
+          description={props.empty?.emptyText || t('搜索为空')}
           scene='part'
           type={props.empty?.type || 'search-empty'}
         />
       ) as unknown as SlotReturnValue;
     };
 
-    watch(
-      () => props.defaultActiveRowKeys,
-      val => {
-        activeRowKeys.value = val;
-      }
-    );
-
+    /** 初始化表格省略号事件监听器（绑定到包裹层，表格重建时无需重新初始化） */
     onMounted(() => {
-      setTimeout(() => {
-        initEllipsisListeners();
-      }, 300);
+      nextTick(() => initEllipsisListeners());
     });
 
     return {
       tableColumns,
+      displayedData,
+      showLoadingRows,
       tableSort,
       showPagination,
       tableSkeletonConfig,
-      activeRowKeys,
+      isControlledActiveRowKeys,
       tableCellRender,
       handleSortChange,
       handleCurrentPageChange,
@@ -341,45 +434,79 @@ export default defineComponent({
       handleColumnResizeChange,
       tableLastFullRowRender,
       tableEmptyRender,
+      handleFilterChange,
       handleActiveChange,
     };
   },
   render() {
     return (
-      <div class={`common-table-wrapper ${this.autoFillSpace ? 'fill-remaining-space' : ''}`}>
-        <PrimaryTable
-          ref='tableRef'
-          class={`common-table ${this.tableSkeletonConfig?.tableClass}`}
-          v-slots={{
-            empty: this.tableEmptyRender,
-          }}
-          activeRowKeys={this.activeRowKeys}
-          activeRowType='single'
-          bkUiSettings={this.tableSettings}
-          columns={this.tableColumns}
-          data={this.data}
-          disableDataPage={true}
-          firstFullRow={this.firstFullRow}
-          headerAffixedTop={this.headerAffixedTop}
-          horizontalScrollAffixedBottom={this.horizontalScrollAffixedBottom}
-          hover={true}
-          lastFullRow={this.data?.length ? this.tableLastFullRowRender : null}
-          needCustomScroll={false}
-          reserveSelectedRowOnPaginate={false}
-          resizable={true}
-          rowKey={this.rowKey}
-          selectedRowKeys={this.selectedRowKeys}
-          showSortColumnBgColor={true}
-          size={this.tableSize}
-          sort={this.tableSort}
-          tableLayout='fixed'
-          onActiveChange={this.handleActiveChange}
-          onColumnResizeChange={this.handleColumnResizeChange}
-          onDisplayColumnsChange={this.handleDisplayColFieldsChange}
-          onSelectChange={this.handleSelectChange}
-          onSortChange={this.handleSortChange}
-        />
-        <TableSkeleton class={`common-table-skeleton ${this.tableSkeletonConfig?.skeletonClass}`} />
+      <div
+        class={[
+          'common-table-wrapper',
+          {
+            'fill-remaining-space': this.autoFillSpace && (!this.showLoadingRows || !!this.data.length),
+            'is-loading-rows': this.showLoadingRows,
+          },
+        ]}
+        aria-busy={this.loading}
+      >
+        {/* 事件委托包裹层：避免 PrimaryTable 销毁重建时事件委托丢失 */}
+        <div
+          ref='wrapperRef'
+          class='common-table-event-root'
+          inert={this.loadingCell && this.loading ? true : undefined}
+        >
+          <PrimaryTable
+            key={this.refreshKey}
+            ref='tableRef'
+            class={`common-table ${this.tableSkeletonConfig?.tableClass}`}
+            v-slots={{
+              empty: this.tableEmptyRender,
+            }}
+            /**
+             * 受控高亮行透传：仅受控（判定见 setup）才把 key 透传给 PrimaryTable；非受控时携带该 key 会被 PrimaryTable
+             * 误判为受控，故用条件展开。受控期间值变为 undefined 时兜底为空数组，避免 TDesign 内部读取 undefined。
+             * 受控时骨架态强制清空（骨架行为假数据 key，真实高亮 key 本就不会命中，此处仅与历史行为保持一致）
+             */
+            {...(this.isControlledActiveRowKeys
+              ? { activeRowKeys: this.showLoadingRows ? [] : (this.activeRowKeys ?? []) }
+              : {})}
+            activeRowType={this.activeRowType || undefined}
+            bkUiSettings={this.tableSettings}
+            bordered={this.bordered}
+            columns={this.tableColumns}
+            data={this.displayedData}
+            defaultActiveRowKeys={this.defaultActiveRowKeys}
+            disableDataPage={true}
+            filterValue={this.filterValue}
+            firstFullRow={this.showLoadingRows ? null : this.firstFullRow}
+            headerAffixedTop={this.headerAffixedTop}
+            horizontalScrollAffixedBottom={this.horizontalScrollAffixedBottom}
+            hover={true}
+            lastFullRow={!this.showLoadingRows && this.data?.length ? this.tableLastFullRowRender : null}
+            maxHeight={this.maxHeight}
+            needCustomScroll={false}
+            reserveSelectedRowOnPaginate={false}
+            resizable={this.resizable}
+            rowClassName={this.showLoadingRows ? 'alarm-loading-row' : this.rowClassName}
+            rowKey={this.rowKey}
+            scroll={this.scroll}
+            selectedRowKeys={this.showLoadingRows ? [] : this.selectedRowKeys}
+            showSortColumnBgColor={true}
+            size={this.tableSize}
+            sort={this.tableSort}
+            tableLayout='fixed'
+            onActiveChange={this.handleActiveChange}
+            onColumnResizeChange={this.handleColumnResizeChange}
+            onDisplayColumnsChange={this.handleDisplayColFieldsChange}
+            onFilterChange={this.handleFilterChange}
+            onSelectChange={this.handleSelectChange}
+            onSortChange={this.handleSortChange}
+          />
+        </div>
+        {!this.loadingCell && (
+          <TableSkeleton class={`common-table-skeleton ${this.tableSkeletonConfig?.skeletonClass}`} />
+        )}
 
         {this.showPagination ? (
           <Pagination

@@ -664,15 +664,35 @@ class AlertDetailResource(Resource):
 
         result = AlertQueryHandler.clean_document(alert)
         result["plugin_display_name"] = PluginTranslator().translate([result["plugin_id"]])[result["plugin_id"]]
-        result["extend_info"] = resource.alert.alert_related_info(ids=[alert_id]).get(alert_id, {})
+        result["extend_info"] = resource.alert.alert_related_info(alerts=[alert]).get(alert_id, {})
         self.clean_graph_panel_where(graph_panel)
         result["graph_panel"] = graph_panel
 
         topo_info = result["extend_info"].get("topo_info", "")
-        result["relation_info"] = f"{topo_info} {relation_info}"
+        result["relation_info"] = self.build_relation_info(topo_info, relation_info)
         self.add_project_name(result)
         self.add_graph_extra_info(alert, result)
         return result
+
+    @staticmethod
+    def build_relation_info(topo_info: str, relation_info: str) -> str:
+        if not relation_info:
+            return topo_info
+
+        if not topo_info:
+            return relation_info
+
+        try:
+            relation_data = json.loads(relation_info)
+        except (TypeError, json.JSONDecodeError):
+            return f"{topo_info} {relation_info}"
+
+        if isinstance(relation_data, dict):
+            # 结构化日志需保持为 JSON，避免破坏前端解析。
+            relation_data["_alert_topo_info"] = topo_info
+            return json.dumps(relation_data, ensure_ascii=False)
+
+        return f"{topo_info} {relation_info}"
 
     @staticmethod
     def clean_graph_panel_where(graph_panel: dict | None) -> None:
@@ -884,8 +904,12 @@ class AlertEventCountResource(Resource):
 
         event_count = {}
         # Step 2: 根据时间范围和MD5去查询告警信息
+        # 事件可能按 create_time 落索引，需保留 all_indices；顶层时间范围取各桶并集，供 ES 跳过无关分片
+        start_time = min(alert.begin_time or 0 for alert in simple_alerts)
+        end_time = max(alert.latest_time or now_time for alert in simple_alerts)
         search = EventDocument.search(all_indices=True)
         search = search.filter("terms", dedupe_md5=[alert["dedupe_md5"] for alert in alert_mapping.values()])
+        search = search.filter("range", time={"gte": start_time, "lte": end_time})
 
         for alert_id, alert in alert_mapping.items():
             # 为每个告警条件设置一个桶
@@ -973,6 +997,13 @@ class AlertRelatedInfoResource(Resource):
         """
         related_infos = defaultdict(dict)
 
+        def normalize_positive_id(value) -> int | None:
+            try:
+                normalized_id = int(value)
+            except (TypeError, ValueError):
+                return None
+            return normalized_id if normalized_id > 0 else None
+
         # 提取事件的主机IP和服务实例ID，按业务分组
         instances_by_biz = defaultdict(lambda: {"ips": {}, "service_instance_ids": {}, "host_ids": {}})
         for alert in alerts:
@@ -982,9 +1013,9 @@ class AlertRelatedInfoResource(Resource):
                 continue
             try:
                 if event.target_type == EventTargetType.HOST:
-                    if hasattr(event, "bk_host_id"):
-                        instances_by_biz[event.bk_biz_id]["host_ids"][alert.id] = int(event.bk_host_id)
-                    else:
+                    if bk_host_id := normalize_positive_id(getattr(event, "bk_host_id", None)):
+                        instances_by_biz[event.bk_biz_id]["host_ids"][alert.id] = bk_host_id
+                    elif event.ip:
                         instances_by_biz[event.bk_biz_id]["ips"][alert.id] = {
                             "ip": event.ip,
                             "bk_cloud_id": int(event.bk_cloud_id),
@@ -992,10 +1023,12 @@ class AlertRelatedInfoResource(Resource):
                     related_infos[alert.id]["ip"] = event.ip
                     related_infos[alert.id]["bk_cloud_id"] = getattr(event, "bk_cloud_id", "")
                     related_infos[alert.id]["type"] = "host"
+                    related_infos[alert.id]["hostname"] = ""
+                    related_infos[alert.id]["topo_info"] = ""
                 elif dimensions_dict.get("ip"):
                     bk_cloud_id = dimensions_dict.get("bk_cloud_id", 0)
-                    if dimensions_dict.get("bk_host_id"):
-                        instances_by_biz[event.bk_biz_id]["host_ids"][alert.id] = int(dimensions_dict["bk_host_id"])
+                    if bk_host_id := normalize_positive_id(dimensions_dict.get("bk_host_id")):
+                        instances_by_biz[event.bk_biz_id]["host_ids"][alert.id] = bk_host_id
                     else:
                         instances_by_biz[event.bk_biz_id]["ips"][alert.id] = {
                             "ip": dimensions_dict["ip"],
@@ -1005,8 +1038,11 @@ class AlertRelatedInfoResource(Resource):
                     related_infos[alert.id]["ip"] = dimensions_dict["ip"]
                     related_infos[alert.id]["bk_cloud_id"] = bk_cloud_id
                     related_infos[alert.id]["type"] = dimensions_dict.get("target_type", "")
+                    related_infos[alert.id]["hostname"] = ""
+                    related_infos[alert.id]["topo_info"] = ""
                 elif event.target_type == EventTargetType.SERVICE:
-                    instances_by_biz[event.bk_biz_id]["service_instance_ids"][alert.id] = event.bk_service_instance_id
+                    if service_instance_id := normalize_positive_id(getattr(event, "bk_service_instance_id", None)):
+                        instances_by_biz[event.bk_biz_id]["service_instance_ids"][alert.id] = service_instance_id
             except AttributeError:
                 continue
 
@@ -1021,32 +1057,84 @@ class AlertRelatedInfoResource(Resource):
             service_instance_ids = instances["service_instance_ids"]
             host_ids = instances["host_ids"]
             # 查询主机和服务实例信息
-            hosts: list[Host] = api.cmdb.get_host_by_ip(bk_biz_id=bk_biz_id, ips=list(ips.values()))
-            hosts.extend(api.cmdb.get_host_by_id(bk_biz_id=bk_biz_id, bk_host_ids=list(host_ids.values())))
-            service_instances: list[ServiceInstance] = api.cmdb.get_service_instance_by_id(
-                bk_biz_id=bk_biz_id, service_instance_ids=list(service_instance_ids.values())
-            )
+            hosts: list[Host] = []
+            if ips:
+                hosts.extend(api.cmdb.get_host_by_ip(bk_biz_id=bk_biz_id, ips=list(ips.values())))
+            if host_ids:
+                hosts.extend(
+                    api.cmdb.get_host_by_id(
+                        bk_biz_id=bk_biz_id,
+                        bk_host_ids=list(host_ids.values()),
+                        fields=[
+                            "bk_host_id",
+                            "bk_host_innerip",
+                            "bk_host_innerip_v6",
+                            "bk_cloud_id",
+                            "bk_host_name",
+                        ],
+                    )
+                )
+
+            service_instances: list[ServiceInstance] = []
+            if service_instance_ids:
+                service_instances.extend(
+                    api.cmdb.get_service_instance_by_id(
+                        bk_biz_id=bk_biz_id, service_instance_ids=list(service_instance_ids.values())
+                    )
+                )
 
             # 将主机和服务实例转为模块ID
-            host_to_module_id = {(host.bk_host_innerip, host.bk_cloud_id): host.bk_module_ids for host in hosts}
+            host_to_module_id = {
+                (host.bk_host_innerip, host.bk_cloud_id): [
+                    bk_module_id for value in host.bk_module_ids if (bk_module_id := normalize_positive_id(value))
+                ]
+                for host in hosts
+            }
             host_to_hostname = {(host.bk_host_innerip, host.bk_cloud_id): host.bk_host_name for host in hosts}
-            host_id_to_module_id = {host.bk_host_id: host.bk_module_ids for host in hosts}
+            host_id_to_module_id = {
+                host.bk_host_id: [
+                    bk_module_id for value in host.bk_module_ids if (bk_module_id := normalize_positive_id(value))
+                ]
+                for host in hosts
+            }
             host_id_to_hostname = {host.bk_host_id: host.bk_host_name for host in hosts}
-            service_to_module_id = {service.service_instance_id: service.bk_module_id for service in service_instances}
+            service_to_module_id = {}
+            for service in service_instances:
+                if bk_module_id := normalize_positive_id(service.bk_module_id):
+                    service_to_module_id[service.service_instance_id] = bk_module_id
 
             all_bk_module_ids = set()
-            for host in hosts:
-                all_bk_module_ids.update(host.bk_module_ids)
-            for service_instance in service_instances:
-                all_bk_module_ids.add(service_instance.bk_module_id)
+            for bk_module_ids in host_to_module_id.values():
+                all_bk_module_ids.update(bk_module_ids)
+            all_bk_module_ids.update(service_to_module_id.values())
 
             # 查询模块和集群信息
-            modules = api.cmdb.get_module(bk_biz_id=bk_biz_id, bk_module_ids=all_bk_module_ids)
-            module_to_set = {module.bk_module_id: module.bk_set_id for module in modules}
-            sets = api.cmdb.get_set(bk_biz_id=bk_biz_id, bk_set_ids=list(module_to_set.values()))
-            module_names = {module.bk_module_id: module.bk_module_name for module in modules}
-            set_names = {s.bk_set_id: s.bk_set_name for s in sets}
-            environment_types = {s.bk_set_id: s.bk_set_env for s in sets}
+            modules = []
+            if all_bk_module_ids:
+                modules = api.cmdb.get_module(bk_biz_id=bk_biz_id, bk_module_ids=all_bk_module_ids)
+            module_to_set = {}
+            module_names = {}
+            for module in modules:
+                bk_module_id = normalize_positive_id(module.bk_module_id)
+                if not bk_module_id:
+                    continue
+                module_names[bk_module_id] = module.bk_module_name
+                if bk_set_id := normalize_positive_id(module.bk_set_id):
+                    module_to_set[bk_module_id] = bk_set_id
+            bk_set_ids = list(module_to_set.values())
+            sets = []
+            if bk_set_ids:
+                sets = api.cmdb.get_set(bk_biz_id=bk_biz_id, bk_set_ids=bk_set_ids)
+            set_names = {
+                bk_set_id: bk_set.bk_set_name
+                for bk_set in sets
+                if (bk_set_id := normalize_positive_id(bk_set.bk_set_id))
+            }
+            environment_types = {
+                bk_set_id: bk_set.bk_set_env
+                for bk_set in sets
+                if (bk_set_id := normalize_positive_id(bk_set.bk_set_id))
+            }
 
             # 事件对应到模块ID
             alert_to_module_ids = {}
@@ -1580,7 +1668,7 @@ class SearchAlertResource(Resource):
             request_data: 请求数据
 
         Returns:
-            tuple: (是否包含 action_id 查询, 处理记录 ID 列表)
+            tuple: (是否包含 action_id 查询, detect_result dict 含 action_ids_in_query / action_ids_in_conditions)
         """
         action_ids_in_query = set()
         action_ids_in_conditions = set()
@@ -1588,9 +1676,20 @@ class SearchAlertResource(Resource):
         has_action_id = False
 
         # 检查 query_string 中的处理记录ID
+        # 兼容两种写法：内部字段名 action_id、中文显示名 "处理记录ID"
+        # 同步维护：fta_web/alert/handlers/alert.py::AlertQueryTransformer._process_action_id 白名单需与本处一致，
+        # 否则会出现 Path A 扩了时间窗但 Path B 未改写 query 的语义冲突（ES 把字面字段当未知字段，0 命中）
+        # 不支持英文 i18n "Handling Record ID"：luqum parser 不接受含空格的 field name
+        # （"Handling Record ID : X" 会被解析成 UnknownOperation(Word('Handling'), Word('Record'), SearchField('ID', Word('X')))，
+        #  此时 Path B 拿到的 search_field_origin_name 是 "ID"，永远不会命中 action_id 白名单 → 无法转换 query），
+        # 强行加白名单只会触发时间窗扩展但下游查询失败，造成"看似支持实际无效"的死代码
+        # action_id 用负向 lookbehind 避免误命中 parent_action_id / alert_action_id 等含 "action_id" 子串的合法字段
         query_string = request_data.get("query_string", "")
         if query_string:
-            action_id_matches = re.findall(r"处理记录ID\s*:\s*(\d+)", query_string)
+            action_id_matches = re.findall(
+                r"(?:(?<![A-Za-z0-9_])action_id|处理记录ID)\s*:\s*(\d+)",
+                query_string,
+            )
             if action_id_matches:
                 action_ids_in_query.update(set(action_id_matches))
 
@@ -2143,7 +2242,9 @@ class AlertTopNResource(Resource):
             return resource.alert.alert_top_n_result(**validated_request_data)
 
         executor = ThreadPool(processes=1)
-        future = executor.apply_async(self.get_bucket_count, [validated_request_data])
+        # 必须传副本：紧随其后要 pop 掉时间范围换成分片区间，与子线程共享同一 dict 时，
+        # 基数聚合覆盖的区间取决于线程调度——多数情况下会退化成"仅当天"，而非请求的完整区间。
+        future = executor.apply_async(self.get_bucket_count, [dict(validated_request_data)])
 
         start_time = validated_request_data.pop("start_time")
         end_time = validated_request_data.pop("end_time")
@@ -2238,7 +2339,7 @@ class AlertTopNResource(Resource):
         search_object = handler.get_search_object()
         search_object = handler.add_conditions(search_object)
         search_object = handler.add_query_string(search_object)
-        search_object = search_object.params(track_total_hits=True).extra(size=0)
+        search_object = search_object.params(track_total_hits=False).extra(size=0)
 
         bucket_count_suffix = handler.bucket_count_suffix
 

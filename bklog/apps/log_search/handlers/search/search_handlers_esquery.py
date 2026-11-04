@@ -32,6 +32,7 @@ import pytz
 import ujson
 from django.conf import settings
 from django.core.cache import cache
+from django.db.models import F
 from django.utils.translation import gettext as _
 
 from apps.api import BcsApi, BkLogApi, MonitorApi
@@ -45,7 +46,15 @@ from apps.log_databus.constants import EtlConfig
 from apps.log_databus.models import CollectorConfig
 from apps.log_desensitize.handlers.desensitize import DesensitizeHandler
 from apps.log_desensitize.models import DesensitizeConfig, DesensitizeFieldConfig
-from apps.log_desensitize.utils import expand_nested_data, merge_nested_data
+from apps.log_desensitize.utils import (
+    _extract_value_by_path,
+    _get_sensitive_top_fields,
+    _is_fail_closed,
+    _MASKED_VALUE,
+    _mask_sensitive_fields,
+    path_aware_expand,
+    restore_by_metadata,
+)
 from apps.log_esquery import metrics
 from apps.log_esquery.esquery.esquery import EsQuery
 from apps.log_esquery.serializers import (
@@ -55,7 +64,6 @@ from apps.log_esquery.serializers import (
 )
 from apps.log_search.constants import (
     ASYNC_DIR,
-    ASYNC_SORTED,
     CHECK_FIELD_LIST,
     CHECK_FIELD_MAX_VALUE_MAPPING,
     CHECK_FIELD_MIN_VALUE_MAPPING,
@@ -113,6 +121,7 @@ from apps.log_search.handlers.es.indices_optimizer_context_tail import (
 from apps.log_search.handlers.search.mapping_handlers import MappingHandlers
 from apps.log_search.handlers.search.pre_search_handlers import PreSearchHandlers
 from apps.log_search.models import (
+    AsyncTask,
     IndexSetFieldsConfig,
     LogIndexSet,
     LogIndexSetData,
@@ -123,7 +132,7 @@ from apps.log_search.models import (
     UserIndexSetSearchHistory,
 )
 from apps.log_search.permission import Permission
-from apps.log_search.utils import sort_func, handle_es_query_error
+from apps.log_search.utils import display_index_set_name, sort_func, handle_es_query_error
 from apps.models import model_to_dict
 from apps.utils.cache import cache_five_minute
 from apps.utils.core.cache.cmdb_host import CmdbHostCache
@@ -164,6 +173,8 @@ def fields_config(name: str, is_active: bool = False):
 
 
 class SearchHandler:
+    mapping_handler_class = MappingHandlers
+
     def __init__(
         self,
         index_set_id: int,
@@ -397,7 +408,7 @@ class SearchHandler:
         index_set_data_obj_list: list = self.index_set.get_indexes(has_applied=True)
         for index_set_data in index_set_data_obj_list:
             _result_table_id = index_set_data["result_table_id"]
-            _mapping_handlers = MappingHandlers(
+            _mapping_handlers = self.mapping_handler_class(
                 _result_table_id,
                 self.index_set_id,
                 index_set_data["scenario_id"] or self.origin_scenario_id,
@@ -1243,7 +1254,7 @@ class SearchHandler:
             result_size += scroll_size
             yield self._deal_query_result(scroll_result)
 
-    def multi_get_slice_data(self, pre_file_name, export_file_type):
+    def multi_get_slice_data(self, pre_file_name, export_file_type, async_task_id=None):
         collector_config = CollectorConfig.objects.filter(index_set_id=self.index_set_id).first()
         if collector_config:
             storage_shards_nums = collector_config.storage_shards_nums
@@ -1260,12 +1271,15 @@ class SearchHandler:
                 "slice_max": slice_max,
                 "file_name": f"{pre_file_name}_slice_{idx}",
                 "export_file_type": export_file_type,
+                "async_task_id": async_task_id,
             }
             multi_execute_func.append(result_key=idx, func=self.get_slice_data, params=body, multi_func_params=True)
         result = multi_execute_func.run(return_exception=True)
         return result
 
-    def get_slice_data(self, slice_id: int, slice_max: int, file_name: str, export_file_type: str):
+    def get_slice_data(
+        self, slice_id: int, slice_max: int, file_name: str, export_file_type: str, async_task_id: int = None
+    ):
         """
         get_slice_data
         @param slice_id:
@@ -1280,15 +1294,22 @@ class SearchHandler:
         # 文件路径
         file_path = f"{ASYNC_DIR}/{file_name}_cluster_{self.storage_cluster_id}.{export_file_type}"
 
-        def content_generator():
-            yield from result.get("hits", {}).get("hits", [])
+        def result_batch_generator():
+            yield result.get("hits", {}).get("hits", [])
             for res in generate_result:
                 origin_result_list = res.get("hits", {}).get("hits", [])
-                yield from origin_result_list
+                yield origin_result_list
 
         with open(file_path, "a+", encoding="utf-8") as f:
-            for content in content_generator():
-                f.write(f"{ujson.dumps(content, ensure_ascii=False)}\n")
+            for result_batch in result_batch_generator():
+                if not result_batch:
+                    continue
+                for content in result_batch:
+                    f.write(f"{ujson.dumps(content, ensure_ascii=False)}\n")
+                if async_task_id:
+                    AsyncTask.objects.filter(id=async_task_id).update(
+                        exported_count=F("exported_count") + len(result_batch)
+                    )
         return file_path
 
     def slice_pre_get_result(self, size: int, slice_id: int, slice_max: int):
@@ -1414,10 +1435,13 @@ class SearchHandler:
         # 获取当前空间关联空间的索引集
         space_uids = IndexSetHandler.get_all_related_space_uids(space_uid)
         index_set_objs = LogIndexSet.objects.filter(index_set_id__in=index_set_id_all, space_uid__in=space_uids).values(
-            "index_set_id", "index_set_name"
+            "index_set_id", "index_set_name", "collector_config_id"
         )
 
-        effect_index_set_mapping = {obj["index_set_id"]: obj["index_set_name"] for obj in index_set_objs}
+        effect_index_set_mapping = {
+            obj["index_set_id"]: display_index_set_name(obj["index_set_name"], obj["collector_config_id"])
+            for obj in index_set_objs
+        }
 
         if not effect_index_set_mapping:
             return []
@@ -1627,7 +1651,7 @@ class SearchHandler:
 
     def verify_sort_list_item(self, sort_list):
         # field_result, _ = self._get_all_fields_by_index_id()
-        mapping_handlers = MappingHandlers(
+        mapping_handlers = self.mapping_handler_class(
             self.origin_indices,
             self.index_set_id,
             self.origin_scenario_id,
@@ -1941,23 +1965,30 @@ class SearchHandler:
 
     @staticmethod
     def init_time_field(index_set_id: int, scenario_id: str = None) -> tuple:
+        log_index_set_obj = LogIndexSet.objects.filter(index_set_id=index_set_id).first()
         if not scenario_id:
-            scenario_id = LogIndexSet.objects.filter(index_set_id=index_set_id).first().scenario_id
+            scenario_id = log_index_set_obj.scenario_id
         # get timestamp field
-        if scenario_id in [Scenario.BKDATA, Scenario.LOG]:
-            return "dtEventTimeStamp", TimeFieldTypeEnum.DATE.value, TimeFieldUnitEnum.SECOND.value
+        if not log_index_set_obj.is_group and scenario_id in [Scenario.BKDATA, Scenario.LOG]:
+            return "dtEventTimeStamp", TimeFieldTypeEnum.DATE.value, TimeFieldUnitEnum.MILLISECOND.value
         else:
-            log_index_set_obj = LogIndexSet.objects.filter(index_set_id=index_set_id).first()
             time_field = log_index_set_obj.time_field
             time_field_type = log_index_set_obj.time_field_type
             time_field_unit = log_index_set_obj.time_field_unit
             if time_field:
                 return time_field, time_field_type, time_field_unit
+            if log_index_set_obj.is_group:
+                child_index_set_ids = log_index_set_obj.get_child_index_set_ids()
+                if not child_index_set_ids:
+                    raise BaseSearchIndexSetException(
+                        BaseSearchIndexSetException.MESSAGE.format(index_set_id=index_set_id)
+                    )
+                return SearchHandler.init_time_field(child_index_set_ids[0])
             index_set_obj: LogIndexSetData = LogIndexSetData.objects.filter(index_set_id=index_set_id).first()
             if not index_set_obj:
                 raise BaseSearchIndexSetException(BaseSearchIndexSetException.MESSAGE.format(index_set_id=index_set_id))
             time_field = index_set_obj.time_field
-            return time_field, TimeFieldTypeEnum.DATE.value, TimeFieldUnitEnum.SECOND.value
+            return time_field, TimeFieldTypeEnum.DATE.value, TimeFieldUnitEnum.MILLISECOND.value
 
     def _init_sort(self) -> list:
         if self.only_for_agg:
@@ -2030,7 +2061,7 @@ class SearchHandler:
     @property
     def mapping_handlers(self) -> MappingHandlers:
         if self._mapping_handlers is None:
-            self._mapping_handlers = MappingHandlers(
+            self._mapping_handlers = self.mapping_handler_class(
                 index_set_id=self.index_set_id,
                 indices=self.origin_indices,
                 scenario_id=self.origin_scenario_id,
@@ -2297,7 +2328,19 @@ class SearchHandler:
             log = hit["_source"]
             # 脱敏处理
             if (self.field_configs or self.text_fields_field_configs) and self.is_desensitize:
-                log = self._log_desensitize(log)
+                try:
+                    log = self._log_desensitize(log)
+                except Exception as e:
+                    # fail-closed：脱敏异常时遮罩配置涉及的敏感字段，保留元数据字段
+                    logger.error(
+                        "[desensitize] failed to desensitize log (index=%s): %s, masking sensitive fields",
+                        hit.get("_index", "unknown"),
+                        e,
+                    )
+                    sensitive_fields = _get_sensitive_top_fields(
+                        self.field_configs, self.text_fields_field_configs, self.text_fields
+                    )
+                    log = _mask_sensitive_fields(log, sensitive_fields)
             else:
                 log = self.convert_keys(log)
             # 联合检索补充索引集信息
@@ -2430,33 +2473,79 @@ class SearchHandler:
         if not log:
             return log
 
-        # 展开object对象
-        log = expand_nested_data(log)
-        # 保存一份未处理之前的log字段 用于脱敏之后的日志原文处理
-        log_content_tmp = copy.deepcopy(log)
+        # 提取已配置字段的 dotted path 列表，用于路径感知展开
+        configured_paths = [c["field_name"] for c in self.field_configs if c.get("field_name")]
+
+        # 先 deepcopy 原始 log，用于后续日志原文替换
+        # 必须在 path_aware_expand 之前执行，否则 log 已被展开为 dotted-key 形式
+        if self.text_fields:
+            try:
+                log_content_tmp = copy.deepcopy(log)
+            except RecursionError:
+                logger.warning(
+                    "[desensitize] deepcopy failed due to deeply nested structure, "
+                    "falling back to shallow copy"
+                )
+                log_content_tmp = copy.copy(log)
+
+        # 路径感知展开（支持 flattened / JSON 字符串子路径）
+        log, restore_metadata = path_aware_expand(log, configured_paths)
+
+        # 在 transform_dict 之前检测 fail-closed 状态
+        # 必须在此处检测：transform_dict 可能修改 _MASKED_VALUE 值导致后续检测失效
+        has_fail_closed = _is_fail_closed(log, restore_metadata)
 
         # 字段脱敏处理
         log = self.desensitize_handler.transform_dict(log)
 
-        # 原文字段应用其他字段的脱敏结果
-        if not self.text_fields:
-            return log
+        if self.text_fields and has_fail_closed:
+            # fail-closed 场景下原文字段整体遮罩
+            for text_field in self.text_fields:
+                text_tuple = (text_field,)
+                if text_tuple in log and isinstance(log[text_tuple], str) and log[text_tuple]:
+                    log[text_tuple] = _MASKED_VALUE
+                elif text_tuple not in log and text_tuple in restore_metadata:
+                    # text_field 被 path_aware_expand 展开为子路径，key 已消失
+                    keys_to_remove = [k for k in log if len(k) > 1 and k[0] == text_field]
+                    for k in keys_to_remove:
+                        del log[k]
+                    log[text_tuple] = _MASKED_VALUE
+                    restore_metadata[text_tuple] = {"type": "scalar"}
+        elif self.text_fields:
+            # 原文字段应用其他字段的脱敏结果（原有逻辑，仅在非 fail-closed 时生效）
+            # 对副本做空路径展开，获得 path-token 形式的原始值
+            log_content_tmp_expanded, _ = path_aware_expand(log_content_tmp, [])
 
-        for text_field in self.text_fields:  # ["log"]
-            # 判断原文字段是否存在log中
-            if text_field not in log.keys():
-                continue
-            # 原始内容替换成脱敏后的内容
-            for field_name in log.keys():
-                if field_name == text_field:
+            for text_field in self.text_fields:  # ["log"]
+                text_tuple = (text_field,)
+                # 判断原文字段是否存在log中
+                if text_tuple not in log:
                     continue
-                log[text_field] = log[text_field].replace(str(log_content_tmp[field_name]), str(log[field_name]))
 
-        # 处理原文字段自身绑定的脱敏逻辑
-        if self.text_fields:
+                for _config in self.field_configs:
+                    field_name = _config["field_name"]
+                    field_tuple = tuple(field_name.split("."))
+                    if field_tuple not in log or field_tuple == text_tuple:
+                        continue
+
+                    # 优先从展开后的副本获取原始值
+                    original_value = log_content_tmp_expanded.get(field_tuple)
+                    if original_value is None:
+                        # 空路径展开时 JSON 字符串子路径不会被展开
+                        # 从原始 log 按 dotted path 导航提取
+                        original_value = _extract_value_by_path(log_content_tmp, field_name)
+                        if original_value is None:
+                            continue
+
+                    log[text_tuple] = log[text_tuple].replace(
+                        str(original_value), str(log[field_tuple])
+                    )
+
+            # 处理原文字段自身绑定的脱敏逻辑
             log = self.text_fields_desensitize_handler.transform_dict(log)
-        # 折叠object对象
-        log = merge_nested_data(log)
+
+        # 按原始容器类型还原（dict 保持 dict，JSON 字符串保持字符串）
+        log = restore_by_metadata(log, restore_metadata)
         return log
 
     def _analyze_field_length(self, log_list: list[dict[str, Any]]):
@@ -2691,19 +2780,6 @@ class SearchHandler:
         else:
             return ERROR_MSG_CHECK_FIELDS_FROM_LOG
 
-    def _get_user_sorted_list(self, sorted_fields):
-        config = UserIndexSetFieldsConfig.get_config(index_set_id=self.index_set_id, username=self.request_username)
-        if not config:
-            return [[sorted_field, ASYNC_SORTED] for sorted_field in sorted_fields]
-        user_sort_list = config.sort_list
-        user_sort_fields = [i[0] for i in user_sort_list]
-        for sorted_field in sorted_fields:
-            if sorted_field in user_sort_fields:
-                continue
-            user_sort_list.append([sorted_field, ASYNC_SORTED])
-
-        return user_sort_list
-
 
 class UnionSearchHandler:
     """
@@ -2773,6 +2849,11 @@ class UnionSearchHandler:
         time_fields_type = set()
         time_fields_unit = set()
         for index_set_obj in index_set_objs:
+            (
+                index_set_obj.time_field,
+                index_set_obj.time_field_type,
+                index_set_obj.time_field_unit,
+            ) = SearchHandler.init_time_field(index_set_obj.index_set_id, index_set_obj.scenario_id)
             if not index_set_obj.time_field or not index_set_obj.time_field_type or not index_set_obj.time_field_unit:
                 raise SearchUnKnowTimeField()
             time_fields.add(index_set_obj.time_field)
@@ -2941,6 +3022,11 @@ class UnionSearchHandler:
         time_fields_type = set()
         time_fields_unit = set()
         for index_set_obj in index_set_objs:
+            (
+                index_set_obj.time_field,
+                index_set_obj.time_field_type,
+                index_set_obj.time_field_unit,
+            ) = SearchHandler.init_time_field(index_set_obj.index_set_id, index_set_obj.scenario_id)
             if not index_set_obj.time_field or not index_set_obj.time_field_type or not index_set_obj.time_field_unit:
                 raise SearchUnKnowTimeField()
             time_fields.add(index_set_obj.time_field)
@@ -3178,6 +3264,11 @@ class UnionSearchHandler:
 
         # 处理时间字段
         for index_set_obj in index_set_objs:
+            (
+                index_set_obj.time_field,
+                index_set_obj.time_field_type,
+                index_set_obj.time_field_unit,
+            ) = SearchHandler.init_time_field(index_set_obj.index_set_id, index_set_obj.scenario_id)
             if not index_set_obj.time_field or not index_set_obj.time_field_type or not index_set_obj.time_field_unit:
                 raise SearchUnKnowTimeField()
             union_time_fields.add(index_set_obj.time_field)
@@ -3330,6 +3421,11 @@ class UnionSearchHandler:
 
         # 处理时间字段
         for index_set_obj in index_set_objs:
+            (
+                index_set_obj.time_field,
+                index_set_obj.time_field_type,
+                index_set_obj.time_field_unit,
+            ) = SearchHandler.init_time_field(index_set_obj.index_set_id, index_set_obj.scenario_id)
             if not index_set_obj.time_field or not index_set_obj.time_field_type or not index_set_obj.time_field_unit:
                 raise SearchUnKnowTimeField()
             union_time_fields.add(index_set_obj.time_field)

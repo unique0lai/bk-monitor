@@ -12,6 +12,7 @@ from django.utils.translation import gettext as _
 from rest_framework import serializers
 
 from bkmonitor.dataflow.constant import VisualType
+from constants.strategy import NewSeriesAlertMode
 from core.errors.alarm_backends.detect import (
     InvalidAdvancedRingRatioConfig,
     InvalidAdvancedYearRoundConfig,
@@ -134,9 +135,24 @@ class NewSeriesSerializer(serializers.Serializer):
     新序列算法serializer
     """
 
-    effective_delay = serializers.IntegerField(label="生效延迟", required=False, default=86400)
+    # 生效延迟(冷启动宽限)恒等于检测窗口(detect_range)：NewSeries 不设独立宽限期。传入值在 validate 里统一覆盖。
+    effective_delay = serializers.IntegerField(label="生效延迟", required=False)
     max_series = serializers.IntegerField(label="最大序列数", required=False, default=100000)
     detect_range = serializers.IntegerField(label="检测范围", required=True)
+    threshold = serializers.IntegerField(label="告警阈值", required=False, default=0)
+    alert_mode = serializers.ChoiceField(
+        label="告警状态模式",
+        choices=NewSeriesAlertMode.CHOICES,
+        required=False,
+        default=NewSeriesAlertMode.ONCE,
+    )
+
+    def validate(self, attrs):
+        # effective_delay 一律归一化为 detect_range：宽限时长 = 检测窗口。
+        # 扩展宽限(eff>detect_range)只是"开局多压一段时间不报",无检测增益(检测逻辑与 seen-set 与短宽限完全相同),
+        # 可用策略延后启用/告警屏蔽替代,故不设独立旋钮；落库值=运行值,避免配置与行为不一致。
+        attrs["effective_delay"] = attrs["detect_range"]
+        return attrs
 
 
 class AIServiceControlMixin(serializers.Serializer):
@@ -159,6 +175,15 @@ class AIServiceControlMixin(serializers.Serializer):
     )
 
 
+class AlertLevelField(serializers.ChoiceField):
+    """告警级别只接受 JSON 整数，不接受 ChoiceField 默认兼容的数字字符串。"""
+
+    def to_internal_value(self, data):
+        if type(data) is not int:
+            self.fail("invalid_choice", input=data)
+        return super().to_internal_value(data)
+
+
 class IntelligentDetectSerializer(AIServiceControlMixin, serializers.Serializer):
     """
     智能异常检测算法serializer
@@ -166,9 +191,28 @@ class IntelligentDetectSerializer(AIServiceControlMixin, serializers.Serializer)
 
     args = serializers.DictField(required=True)
     plan_id = serializers.IntegerField(required=True)
+    alert_level_mode = serializers.ChoiceField(required=False, choices=["manual", "auto"])
+    alert_levels = serializers.ListField(
+        required=False,
+        allow_empty=False,
+        child=AlertLevelField(choices=[1, 2, 3]),
+    )
     visual_type = serializers.ChoiceField(
         default=VisualType.NONE, choices=[VisualType.NONE, VisualType.SCORE, VisualType.BOUNDARY]
     )
+
+    def validate(self, attrs):
+        mode = attrs.get("alert_level_mode")
+        if mode == "auto":
+            alert_levels = attrs.get("alert_levels")
+            if not alert_levels:
+                raise serializers.ValidationError({"alert_levels": _("自动告警等级必须至少选择一个输出级别")})
+            if len(alert_levels) != len(set(alert_levels)):
+                raise serializers.ValidationError({"alert_levels": _("自动告警等级的输出级别不能重复")})
+            attrs["alert_levels"] = sorted(alert_levels)
+        elif "alert_levels" in attrs:
+            raise serializers.ValidationError({"alert_levels": _("仅自动告警等级支持配置输出级别范围")})
+        return attrs
 
 
 class TimeSeriesForecastingSerializer(serializers.Serializer):
@@ -410,6 +454,7 @@ class BkApmTraceSerializer(QueryConfigSerializer):
 class PrometheusTimeSeriesSerializer(QueryConfigSerializer):
     promql = serializers.CharField(label="查询表达式")
     agg_interval = serializers.IntegerField(label="聚合周期", min_value=0)
+    expression_mode = serializers.ChoiceField(choices=("promql",), required=False)
 
 
 class GrafanaTimeSeriesSerializer(QueryConfigSerializer):

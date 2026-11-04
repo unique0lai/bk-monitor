@@ -17,12 +17,14 @@ from datetime import datetime, timezone
 from functools import reduce
 from itertools import chain
 
+from django.conf import settings
 from django.db.models import Q as DQ
 from django.utils.translation import gettext as _
 from django.utils.translation import gettext_lazy as _lazy
 from elasticsearch_dsl import Q
 from elasticsearch_dsl.response.aggs import BucketData
 from luqum.tree import AndOperation, FieldGroup, OrOperation, Phrase, SearchField, Word
+from rest_framework.exceptions import ValidationError
 
 from bkmonitor.documents import ActionInstanceDocument, AlertDocument, AlertLog
 from bkmonitor.models import ActionInstance, ConvergeRelation, MetricListCache, Shield
@@ -54,6 +56,7 @@ from fta_web.alert.handlers.base import (
     BaseQueryTransformer,
     QueryField,
 )
+from fta_web.alert.handlers.fulltext import FulltextFieldKind, FulltextSearchField
 from fta_web.alert.handlers.translator import (
     BizTranslator,
     CategoryTranslator,
@@ -232,6 +235,7 @@ class AlertQueryTransformer(BaseQueryTransformer):
         QueryField("is_handled", _lazy("是否已处理")),
         QueryField("is_blocked", _lazy("是否熔断")),
         QueryField("strategy_id", _lazy("策略ID")),
+        QueryField("issue_id", _lazy("Issue ID")),
         QueryField("create_time", _lazy("创建时间")),
         QueryField("update_time", _lazy("更新时间")),
         QueryField("begin_time", _lazy("开始时间")),
@@ -377,11 +381,22 @@ class AlertQueryTransformer(BaseQueryTransformer):
     def _process_action_id(self, node: Word, context: dict) -> tuple:
         """
         处理动作ID
+
+        同步维护：fta_web/alert/resources.py::SearchAlertResource.detect_action_id_query 的 regex 需与本白名单一致，
+        否则会出现 Path A 扩了时间窗但 Path B 未改写 query 的语义冲突（ES 把字面字段当未知字段，0 命中）。
+
+        FIXME: `_("处理记录ID")` 在 locale=en 下返回 "Handling Record ID"（含空格），但 luqum parser 不接受含空格的
+        field name，"Handling Record ID : X" 会被切碎为 UnknownOperation(Word('Handling'), Word('Record'),
+        SearchField('ID', Word('X')))，本分支拿到的 search_field_origin_name 是 'ID'，不会命中白名单。这意味着
+        en locale 下用户输入英文 i18n 显示名的查询永远失效。这是 v1.0 之前就存在的遗留缺陷，需独立 PR 修复
+        （方案：进 luqum 前规范化字段名 / 改用 ASCII-safe 英文翻译 / 要求前端只发 action_id）。
         """
         search_field_name = context.get("search_field_name")
         if search_field_name == "id" and context.get("search_field_origin_name") in [
             "action_id",
             _("处理记录ID"),
+            # 显式列出 zh 字面，避免 _() 受 locale 切换影响时 zh 用户失效
+            "处理记录ID",
         ]:
             action_alert_map = context.get("action_alert_map", {})
             if action_alert_map:
@@ -594,6 +609,17 @@ class AlertQueryHandler(BaseBizQueryHandler):
     """
 
     query_transformer = AlertQueryTransformer
+    FULLTEXT_BIZ_ID_FIELD = "event.bk_biz_id"
+    # 产品锁定对照故障：ID、名称、内容、标签、负责人、关注人、所属业务
+    FULLTEXT_SEARCH_FIELDS = [
+        FulltextSearchField("id", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("alert_name", FulltextFieldKind.TEXT),
+        FulltextSearchField("event.description", FulltextFieldKind.TEXT),
+        FulltextSearchField("labels", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("appointee", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("follower", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("event.bk_biz_id", FulltextFieldKind.KEYWORD),
+    ]
 
     # 导出时需要排除的无用字段（这些字段会在处理过程中被移除）
     EXCLUDED_EXPORT_FIELDS = {"action_id", "action_name", "module_id", "set_id"}
@@ -605,6 +631,10 @@ class AlertQueryHandler(BaseBizQueryHandler):
     MY_FOLLOW_STATUS_NAME = "MY_FOLLOW"
     SHIELD_ABNORMAL_STATUS_NAME = "SHIELDED_ABNORMAL"
     NOT_SHIELD_ABNORMAL_STATUS_NAME = "NOT_SHIELDED_ABNORMAL"
+    NOTICE_WAY_CANDIDATE_LIMIT = 10000
+    # 每页 composite 桶数，加上兄弟聚合须低于集群 search.max_buckets
+    # （ES 7.9 起默认 65,535，之前为 10,000）
+    NOTICE_WAY_PAIRS_PAGE_SIZE = 9000
 
     def __init__(
         self,
@@ -616,7 +646,7 @@ class AlertQueryHandler(BaseBizQueryHandler):
         need_bucket_count: bool = True,
         **kwargs,
     ):
-        super().__init__(bk_biz_ids, username, **kwargs)
+        super().__init__(bk_biz_ids, username, need_bucket_count=need_bucket_count, **kwargs)
         self.must_exists_fields = kwargs.get("must_exists_fields", [])
         self.status = [status] if isinstance(status, str) else status
         if not self.ordering:
@@ -626,6 +656,12 @@ class AlertQueryHandler(BaseBizQueryHandler):
         self.is_finaly_partition = is_finaly_partition
         self.need_bucket_count = need_bucket_count
         self._notice_ways_cache: dict[str, set] | None = None
+        # 一次请求只读一次开关，避免筛选路径与聚合路径读到不同口径
+        self._notice_way_by_records = bool(settings.ALERT_NOTICE_WAY_BY_RECORDS)
+        # 候选告警的最早 begin_time（秒级时间戳），作为通知历史检索下界
+        self._notice_way_start_time: int | None = None
+        self.allow_partial = kwargs.get("allow_partial", True)
+        self.partial_reasons: list[dict] = []
         self.query_context = kwargs.get("context", {})
         self.query_context.update(
             {
@@ -636,6 +672,73 @@ class AlertQueryHandler(BaseBizQueryHandler):
                 "page_size": self.page_size,
             }
         )
+        # 合并/拆分独立映射层：按 issue_id 过滤告警时把主 Issue 展开为 [main, ...members]
+        self._expand_merged_issue_conditions()
+
+    def _mark_partial(self, code: str, scopes: list[str], **details):
+        reason = {"code": code, "scopes": scopes, **details}
+        if reason not in self.partial_reasons:
+            self.partial_reasons.append(reason)
+
+        if not self.allow_partial:
+            raise ValidationError(_("查询结果不完整，请缩小时间范围或增加过滤条件"))
+
+    def get_partial_metadata(self) -> dict:
+        return {
+            "is_partial": bool(self.partial_reasons),
+            "partial_reasons": self.partial_reasons,
+        }
+
+    def _check_search_response_completeness(self, search_result):
+        if getattr(search_result, "timed_out", False):
+            self._mark_partial(
+                code="alert_search_timeout",
+                scopes=["alerts", "total", "overview", "aggs"],
+            )
+
+        failed_shards = getattr(getattr(search_result, "_shards", None), "failed", 0)
+        if failed_shards:
+            self._mark_partial(
+                code="alert_search_shard_failure",
+                scopes=["alerts", "total", "overview", "aggs"],
+                failed_shards=failed_shards,
+            )
+
+    def _expand_merged_issue_conditions(self):
+        """合并/拆分独立映射层：把 issue_id 过滤条件展开为 [main, ...active members]。
+
+        合并不改写 alert.issue_id（被并入 Issue 的告警物理上仍指向自身），主 Issue
+        要在告警列表 / 趋势 / 维度统计里聚合展示被并入 Issue 的告警，必须在「按
+        issue_id 反查 alert」时把查询值扩展为主 + 全部 active member。语义与
+        IssueQueryHandler.add_alert_trend 一致。
+
+        在 __init__ 内对 self.conditions 原地改写，可一处覆盖所有经 AlertQueryHandler
+        的查询路径（search / date_histogram / TopN）。
+
+        biz 维度用已解析的 self.authorized_bizs 而非原始 self.bk_biz_ids：全业务查询传
+        bk_biz_ids=[-1] 时 BaseBizQueryHandler 已把它解析为用户实际授权的业务集
+        （authorized_bizs），用它查合并关系才命中；直接用 [-1] 查 IssueMergeRelation 无结果，
+        会让全业务列表 / TopN / histogram 的 issue_id 过滤漏掉 active members。
+
+        fail-open：关系层异常或无合并关系时保持原条件，体感等同「无合并」。
+        """
+        conditions = self.conditions or []
+        issue_conditions = [c for c in conditions if c.get("origin_key") == "issue_id" and c.get("value")]
+        biz_ids = self.authorized_bizs
+        if not issue_conditions or not biz_ids:
+            return
+        try:
+            from bkmonitor.issue_merge import IssueMergeResolver, MergeResolverContext
+
+            ctx = MergeResolverContext(biz_ids)
+            ctx.load()
+            if ctx.degraded:
+                return
+            for condition in issue_conditions:
+                values = condition["value"] if isinstance(condition["value"], list) else [condition["value"]]
+                condition["value"] = IssueMergeResolver.expand_to_full_ids(values, ctx)
+        except Exception:
+            logger.warning("[issue-merge] expand issue_id conditions failed (fail-open)", exc_info=True)
 
     def get_search_object(
         self,
@@ -737,6 +840,9 @@ class AlertQueryHandler(BaseBizQueryHandler):
             dsl = None
             exc = e
 
+        if not exc:
+            self._check_search_response_completeness(search_result)
+
         alerts = self.handle_hit_list(search_result)
         self.handle_operator(alerts)
 
@@ -759,6 +865,11 @@ class AlertQueryHandler(BaseBizQueryHandler):
 
         if dsl:
             result["dsl"] = dsl
+
+        total_relation = getattr(search_result.hits.total, "relation", "eq")
+        if any("total" in reason["scopes"] for reason in self.partial_reasons):
+            total_relation = "gte"
+        result.update(total_relation=total_relation, **self.get_partial_metadata())
 
         if exc:
             exc.data = result
@@ -935,6 +1046,8 @@ class AlertQueryHandler(BaseBizQueryHandler):
         elif condition["origin_key"] == "notice_way":
             # 通知类型过滤：查询 ActionInstanceDocument 获取匹配的 alert_id
             alert_ids = self._get_alert_ids_by_notice_way(condition["value"])
+            if condition["method"] == "neq" and any("alerts" in reason["scopes"] for reason in self.partial_reasons):
+                raise ValidationError(_lazy("通知方式排除条件无法返回部分结果，请缩小时间范围或增加过滤条件"))
             if not alert_ids:
                 alert_ids = [0]
             return Q("terms", id=alert_ids)
@@ -1002,26 +1115,13 @@ class AlertQueryHandler(BaseBizQueryHandler):
             condition["value"] = [exploded_ip(v) for v in condition["value"]]
 
         elif condition["key"] == "query_string":
-            con_q = None
-            for query_string in condition["value"]:
-                if query_string.strip():
-                    query_dsl = self.query_transformer.transform_query_string(query_string, self.query_context)
-                    if isinstance(query_dsl, str):
-                        temp_q = Q("query_string", query=query_dsl)
-                    else:
-                        temp_q = Q(query_dsl)
-
-                    if con_q is None:
-                        con_q = temp_q
-                    else:
-                        con_q = con_q | temp_q
-
-            return con_q
+            # UI 全字段：按字面文本走白名单（foo:bar / CPU AND memory 不解析为 Lucene）
+            return self.build_query_string_condition_q(condition.get("value"), context=self.query_context)
         return super().parse_condition_item(condition)
 
     def add_biz_condition(self, search_object):
         queries = []
-        if self.authorized_bizs is not None and self.bk_biz_ids:
+        if self.authorized_bizs is not None and self.bk_biz_ids and not self.is_tenant_wide_authorized():
             # 进行我有权限的告警过滤
             authorized_query = self.build_es_terms_query("event.bk_biz_id", self.authorized_bizs)
             if authorized_query is not None:
@@ -1041,12 +1141,13 @@ class AlertQueryHandler(BaseBizQueryHandler):
             if unauthorized_query is not None:
                 queries.append(unauthorized_query & user_condition)
 
-        if queries:
-            return search_object.filter(reduce(operator.or_, queries))
-        return search_object
+        return self.finalize_biz_condition(search_object, queries)
 
     def add_filter(self, search_object, start_time: int = None, end_time: int = None):
         # 条件过滤
+        # 该方法当前无调用方（保留为历史）。若被复用：此处直接用 self.bk_biz_ids 做 terms 过滤，
+        #    bk_biz_ids 含 -1（"全部授权业务"哨兵）时会查空——改用 self.get_biz_filter_ids()
+        #    （已解析 -1），告警可见性请走 add_biz_condition。勿照此模板复制。
         if self.bk_biz_ids:
             search_object = search_object.filter("terms", **{"event.bk_biz_id": self.bk_biz_ids})
 
@@ -1100,7 +1201,10 @@ class AlertQueryHandler(BaseBizQueryHandler):
         search_object.aggs.bucket("is_blocked", "filter", Q("term", is_blocked=True))
 
         # 收集匹配告警的 id，供通知类型聚合使用
-        search_object.aggs.bucket("alert_ids", "terms", field="id", size=10000)
+        search_object.aggs.bucket("alert_ids", "terms", field="id", size=self.NOTICE_WAY_CANDIDATE_LIMIT)
+        if self._notice_way_by_records:
+            # 仅新口径需要：候选告警的最早开始时间，作为通知历史检索下界（取用时毫秒转秒）
+            search_object.aggs.metric("min_begin_time", "min", field="begin_time")
 
         return search_object
 
@@ -1170,7 +1274,16 @@ class AlertQueryHandler(BaseBizQueryHandler):
         # 从聚合结果中提取所有匹配的 alert_id，供通知类型聚合使用
         alert_ids = []
         if search_result.aggs:
+            # 未走筛选路径时，历史下界只能从这里拿；必须在 handle_aggs_notice_way 之前保存
+            self._save_notice_way_start_time(search_result.aggs)
             alert_ids = set(bucket.key for bucket in search_result.aggs.alert_ids.buckets)
+            if getattr(search_result.aggs.alert_ids, "sum_other_doc_count", 0) > 0:
+                self._mark_partial(
+                    code="notice_way_aggregation_candidate_limit",
+                    scopes=["aggs.notice_way"],
+                    scanned_candidate_count=len(alert_ids),
+                    candidate_limit=self.NOTICE_WAY_CANDIDATE_LIMIT,
+                )
 
         agg_result = [
             self.handle_aggs_severity(search_result),
@@ -1282,9 +1395,16 @@ class AlertQueryHandler(BaseBizQueryHandler):
                 notice_ways.add(way)
         return notice_ways
 
-    def _query_alert_notice_ways(self, alert_ids: set | None = None) -> dict[str, set]:
+    def _query_alert_notice_ways(
+        self,
+        alert_ids: set | None = None,
+        partial_scopes: list[str] | None = None,
+    ) -> dict[str, set]:
         """
         查询通知父任务，返回每个 alert_id 对应的有效通知方式集合
+
+        开关打开时按「非父通知记录的渠道并集」统计（_query_notice_ways_by_records）；
+        开关关闭时保持现有实现，行为完全不变。
 
         参数:
             alert_ids: 限定查询范围的告警 ID 集合，为 None 时不限定
@@ -1292,6 +1412,9 @@ class AlertQueryHandler(BaseBizQueryHandler):
         返回:
             {alert_id: {notice_way1, notice_way2, ...}, ...}
         """
+        if self._notice_way_by_records:
+            return self._query_notice_ways_by_records(alert_ids, partial_scopes)
+
         result = {}
 
         action_search = ActionInstanceDocument.search(start_time=self.start_time, end_time=self.end_time)
@@ -1319,6 +1442,7 @@ class AlertQueryHandler(BaseBizQueryHandler):
         )
 
         search_result = action_search.execute()
+        self._check_action_search_completeness(search_result, partial_scopes)
 
         for bucket in search_result.aggregations.per_alert.buckets:
             if alert_ids is not None and bucket.key not in alert_ids:
@@ -1336,26 +1460,142 @@ class AlertQueryHandler(BaseBizQueryHandler):
 
         return result
 
+    def _save_notice_way_start_time(self, aggs):
+        """保存候选告警的最早开始时间（秒），作为通知历史检索下界"""
+        # ES 对 date 字段的 min 聚合固定返回毫秒；项目锁定的 arrow 0.6.0 会把毫秒当秒解析，年份越界
+        value = getattr(getattr(aggs, "min_begin_time", None), "value", None)
+        if value is not None and self._notice_way_start_time is None:
+            self._notice_way_start_time = int(value // 1000)
+
+    def _query_notice_ways_by_records(
+        self,
+        alert_ids: set | None,
+        partial_scopes: list[str] | None,
+    ) -> dict[str, set]:
+        """候选告警通知历史中产生过的渠道并集：非父通知记录，不限执行状态，按（告警，渠道）去重"""
+        if not alert_ids:
+            return {}
+
+        start_time = self._notice_way_start_time
+        if start_time is None:
+            # 下界缺失时只能查页面时间范围，历史通知可能漏掉，必须让用户看到结果不完整
+            self._mark_partial(
+                code="notice_way_history_start_missing",
+                scopes=partial_scopes or ["alerts", "total", "overview", "aggs"],
+            )
+            start_time = self.start_time
+
+        # 分页之间不变的过滤条件提到循环外：管理员场景 authorized_bizs 可达十万级，
+        # 每页重建会重复构造大量 terms 子句（与主查询保持一致，租户级授权时省略）
+        alert_id_query = Q("terms", alert_id=list(alert_ids))
+        authorized_query = None
+        if self.authorized_bizs is not None and self.bk_biz_ids and not self.is_tenant_wide_authorized():
+            authorized_query = self.build_es_terms_query("bk_biz_id", self.authorized_bizs)
+
+        result: dict[str, set] = defaultdict(set)
+        after_key = None
+        page_no = 0
+        page_count = 0
+        pair_count = 0
+        total_took = 0
+        while True:
+            search = ActionInstanceDocument.search(start_time=start_time)
+            search = search.filter("term", action_plugin_type=ActionPluginType.NOTICE)
+            search = search.exclude("term", is_parent_action=True)
+            search = search.filter(alert_id_query)
+            if authorized_query is not None:
+                search = search.filter(authorized_query)
+
+            composite = {
+                "size": self.NOTICE_WAY_PAIRS_PAGE_SIZE,
+                "sources": [
+                    {"alert_id": {"terms": {"field": "alert_id"}}},
+                    # 字段名与写入侧共用常量，避免两处漂移
+                    {NoticeWay.NOTICE_WAY_FIELD: {"terms": {"field": NoticeWay.NOTICE_WAY_FIELD}}},
+                ],
+            }
+            if after_key:
+                composite["after"] = after_key
+            search.aggs.bucket("pairs", "composite", **composite)
+            if page_no == 0:
+                search.aggs.bucket("unfilled", "filter", ~Q("exists", field=NoticeWay.NOTICE_WAY_FIELD))
+
+            # 只取聚合结果，不需要 total；track_total_hits=False 可免掉一次全量计数
+            search_result = search.extra(size=0, track_total_hits=False).execute()
+            page_count += 1
+            total_took += int(getattr(search_result, "took", 0) or 0)
+            self._check_action_search_completeness(search_result, partial_scopes)
+
+            if page_no == 0 and search_result.aggs.unfilled.doc_count:
+                # 回填未完成：标记结果不完整，不回退到最新父任务，也不静默少算
+                self._mark_partial(
+                    code="notice_way_field_missing",
+                    scopes=partial_scopes or ["alerts", "total", "overview", "aggs"],
+                    missing_count=search_result.aggs.unfilled.doc_count,
+                )
+
+            # 原始桶数用于判断是否还有下一页；pair_count 只统计最终入库的组合
+            raw_page_pairs = len(search_result.aggs.pairs.buckets)
+            for bucket in search_result.aggs.pairs.buckets:
+                alert_id, way = bucket.key.alert_id, bucket.key.notice_way
+                if alert_id not in alert_ids or way == NoticeWay.NOTICE_WAY_NONE:
+                    continue
+                pair_count += 1
+                result[alert_id].add(NoticeWay.ALIASES.get(way, way))
+
+            after_key = getattr(search_result.aggs.pairs, "after_key", None)
+            if not after_key or raw_page_pairs < self.NOTICE_WAY_PAIRS_PAGE_SIZE:
+                # 页数随「候选告警最早开始时间」拉长而增长，留痕便于定位性能退化
+                logger.info(
+                    "notice_way records: candidates=%s pages=%s pairs=%s took_ms=%s start_time=%s",
+                    len(alert_ids),
+                    page_count,
+                    pair_count,
+                    total_took,
+                    start_time,
+                )
+                return dict(result)
+            page_no += 1
+
+    def _check_action_search_completeness(self, search_result, partial_scopes: list[str] | None):
+        """超时 / 分片失败标记（与现有实现一致），动作索引查询共用"""
+        if getattr(search_result, "timed_out", False):
+            self._mark_partial(
+                code="notice_way_action_timeout",
+                scopes=partial_scopes or ["alerts", "total", "overview", "aggs"],
+            )
+
+        failed_shards = getattr(getattr(search_result, "_shards", None), "failed", 0)
+        if failed_shards:
+            self._mark_partial(
+                code="notice_way_action_shard_failure",
+                scopes=partial_scopes or ["alerts", "total", "overview", "aggs"],
+                failed_shards=failed_shards,
+            )
+
     def _get_alert_ids_by_notice_way(self, notice_ways: list) -> list:
         """根据通知类型过滤，返回匹配的 alert_id 列表"""
         target_ways = set(notice_ways)
+        if self._notice_way_by_records:
+            # 新口径按通知记录统计，筛选值同样归一（rtx -> qy_weixin）；
+            # 旧口径返回原始值，关闭开关时归一会让原本能命中的请求变空
+            target_ways = {NoticeWay.ALIASES.get(way, way) for way in target_ways}
         matched_alert_ids = []
 
-        try:
-            # 先获取当前查询条件匹配的 alert_ids，限定查询范围
-            alert_ids = self._collect_current_alert_ids()
-            if not alert_ids:
-                return []
+        # 先获取当前查询条件匹配的 alert_ids，限定查询范围
+        alert_ids = self._collect_current_alert_ids()
+        if not alert_ids:
+            return []
 
-            alert_notice_ways = self._query_alert_notice_ways(alert_ids=alert_ids)
-            self._notice_ways_cache = alert_notice_ways
+        alert_notice_ways = self._query_alert_notice_ways(
+            alert_ids=alert_ids,
+            partial_scopes=["alerts", "total", "overview", "aggs"],
+        )
+        self._notice_ways_cache = alert_notice_ways
 
-            for alert_id, ways in alert_notice_ways.items():
-                if ways & target_ways:
-                    matched_alert_ids.append(alert_id)
-
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"_get_alert_ids_by_notice_way error: {e}")
+        for alert_id, ways in alert_notice_ways.items():
+            if ways & target_ways:
+                matched_alert_ids.append(alert_id)
 
         return matched_alert_ids
 
@@ -1373,18 +1613,42 @@ class AlertQueryHandler(BaseBizQueryHandler):
             self.conditions = original_conditions
         search_object = self.add_query_string(search_object)
         search_object = search_object[:0]
-        search_object.aggs.bucket("alert_ids", "terms", field="id", size=10000)
-        result = search_object.execute()
+        search_object.aggs.bucket("alert_ids", "terms", field="id", size=self.NOTICE_WAY_CANDIDATE_LIMIT)
+        if self._notice_way_by_records:
+            search_object.aggs.metric("min_begin_time", "min", field="begin_time")
+        # 该查询只取聚合结果，不需要 total
+        result = search_object.extra(track_total_hits=False).execute()
+        if getattr(result, "timed_out", False):
+            self._mark_partial(
+                code="notice_way_candidate_timeout",
+                scopes=["alerts", "total", "overview", "aggs"],
+            )
+
+        failed_shards = getattr(getattr(result, "_shards", None), "failed", 0)
+        if failed_shards:
+            self._mark_partial(
+                code="notice_way_candidate_shard_failure",
+                scopes=["alerts", "total", "overview", "aggs"],
+                failed_shards=failed_shards,
+            )
 
         if result.aggs:
+            # 筛选路径先执行，其候选集是最终结果的超集，下界可以直接沿用
+            self._save_notice_way_start_time(result.aggs)
             ids = set(bucket.key for bucket in result.aggs.alert_ids.buckets)
-            if len(ids) >= 10000:
+            if getattr(result.aggs.alert_ids, "sum_other_doc_count", 0) > 0:
                 logger.warning(
-                    "_collect_current_alert_ids: reached 10000 limit, notice_way filter may be incomplete. "
+                    "_collect_current_alert_ids: reached candidate limit, notice_way filter is incomplete. "
                     "bk_biz_ids=%s, start_time=%s, end_time=%s",
                     self.bk_biz_ids,
                     self.start_time,
                     self.end_time,
+                )
+                self._mark_partial(
+                    code="notice_way_candidate_limit",
+                    scopes=["alerts", "total", "overview", "aggs"],
+                    scanned_candidate_count=len(ids),
+                    candidate_limit=self.NOTICE_WAY_CANDIDATE_LIMIT,
                 )
             return ids
         return set()
@@ -1402,6 +1666,9 @@ class AlertQueryHandler(BaseBizQueryHandler):
         ]
         notice_way_count = defaultdict(int)
         alert_notice_ways = {}
+        is_partial = any(
+            "aggs" in reason["scopes"] or "aggs.notice_way" in reason["scopes"] for reason in self.partial_reasons
+        )
 
         try:
             if not alert_ids:
@@ -1417,13 +1684,17 @@ class AlertQueryHandler(BaseBizQueryHandler):
                         }
                         for way_key in notice_ways
                     ],
+                    "is_partial": is_partial,
                 }
 
             # 优先复用 notice_way 过滤阶段已查询的缓存，避免重复查询 action 索引
             if self._notice_ways_cache is not None:
                 alert_notice_ways = {k: v for k, v in self._notice_ways_cache.items() if k in alert_ids}
             else:
-                alert_notice_ways = self._query_alert_notice_ways(alert_ids=alert_ids)
+                alert_notice_ways = self._query_alert_notice_ways(
+                    alert_ids=alert_ids,
+                    partial_scopes=["aggs.notice_way"],
+                )
 
             # 统计每种通知方式的告警数量
             for ways in alert_notice_ways.values():
@@ -1432,8 +1703,12 @@ class AlertQueryHandler(BaseBizQueryHandler):
 
         except Exception as e:  # noqa: BLE001
             logger.error(f"handle_aggs_notice_way error, error: {e}")
+            self._mark_partial(
+                code="notice_way_aggregation_failed",
+                scopes=["aggs.notice_way"],
+            )
 
-        return {
+        result = {
             "id": "notice_way",
             "name": _("通知类型"),
             "count": len(alert_notice_ways),
@@ -1446,6 +1721,10 @@ class AlertQueryHandler(BaseBizQueryHandler):
                 for way_key in notice_ways
             ],
         }
+        result["is_partial"] = any(
+            "aggs" in reason["scopes"] or "aggs.notice_way" in reason["scopes"] for reason in self.partial_reasons
+        )
+        return result
 
     @classmethod
     def handle_overview(cls, search_result):

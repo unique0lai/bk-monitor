@@ -19,7 +19,6 @@ from django.utils.translation import gettext_lazy as _lazy
 from opentelemetry.semconv.resource import ResourceAttributes
 from rest_framework import serializers
 
-from apm.constants import StatisticsProperty
 from apm_web.constants import DEFAULT_DIFF_TRACE_MAX_NUM, CategoryEnum, QueryMode
 from apm_web.handlers.trace_handler.base import (
     StatisticsHandler,
@@ -35,12 +34,13 @@ from apm_web.handlers.trace_handler.query import (
     TraceQueryTransformer,
 )
 from apm_web.handlers.trace_handler.view_config import TraceFieldsHandler
+from apm_web.llm.builders.detail import attach_llm_detail, get_llm_entity_set, prepare_llm_spans
 from apm_web.models import Application
 from apm_web.models.trace import TraceComparison
-from apm_web.trace.constants import EnabledStatisticsDimension, OperatorEnum
 from apm_web.trace.serializers import (
     BaseTraceRequestSerializer,
     GetFieldsOptionValuesRequestSerializer,
+    ListLinkRequestSerializer,
     QuerySerializer,
     SpanIdInputSerializer,
     TraceFieldStatisticsGraphRequestSerializer,
@@ -48,18 +48,22 @@ from apm_web.trace.serializers import (
     TraceFieldsTopkRequestSerializer,
     TraceGenerateQueryStringRequestSerializer,
 )
-from apm_web.utils import flatten_es_dict_data
+from bkmonitor.data_source.format import flatten_dict_data
+from bkmonitor.data_source.utils.apm import LogicSupportOperator
 from bkmonitor.utils.cache import CacheType, using_cache
+from bkmonitor.utils.common_utils import count_md5
 from bkmonitor.utils.elasticsearch.handler import QueryStringGenerator
+from constants.otel_query import OperatorEnum
 from constants.apm import (
+    CallSide,
     OperatorGroupRelation,
     OtlpKey,
     PreCalculateSpecificField,
     SpanStandardField,
     TraceListQueryMode,
     TraceWaterFallDisplayKey,
-    CallSide,
 )
+from constants.otel_query import EnabledStatisticsDimension, StatisticsProperty
 from core.drf_resource import Resource, api, FaultTolerantResource
 from core.drf_resource.exceptions import CustomException
 from core.errors.api import BKAPIError
@@ -315,6 +319,11 @@ class ListSpanResource(Resource):
 class ListTraceResource(Resource):
     RequestSerializer = QuerySerializer
 
+    # error 属于预计算特有字段，但 logic 过滤可在原始表转换为 status.code = 2，不应阻断空结果回退。
+    ORIGIN_COMPATIBLE_PRECALCULATE_FILTERS: set[tuple[str, str]] = {
+        (PreCalculateSpecificField.ERROR, LogicSupportOperator.LOGIC)
+    }
+
     def perform_request(self, data):
         response = self.get_trace_list_api_data(data)
         QueryHandler.handle_trace_list(response["data"])
@@ -351,8 +360,20 @@ class ListTraceResource(Resource):
             fields=SpanStandardField.standard_fields() + PreCalculateSpecificField.search_fields(),
         )
 
+        filters_for_specific_field_check: list[dict[str, Any]] = [
+            trace_filter
+            for trace_filter in data["filters"]
+            if (
+                TraceQueryTransformer.to_common_field(trace_filter["key"]),
+                trace_filter["operator"],
+            )
+            not in self.ORIGIN_COMPATIBLE_PRECALCULATE_FILTERS
+        ]
         is_has_specific_fields = QueryHandler.has_field_not_in_fields(
-            data["query"], data["filters"], fields=PreCalculateSpecificField.specific_fields(), opposite=True
+            data["query"],
+            filters_for_specific_field_check,
+            fields=PreCalculateSpecificField.specific_fields(),
+            opposite=True,
         )
 
         if is_contain_non_standard_fields:
@@ -448,6 +469,9 @@ class TraceDetailResource(Resource):
         )
         query_trace_relation_app = serializers.BooleanField(required=False, default=False)
         enabled_time_alignment = serializers.BooleanField(required=False, default=False, label="是否开启时间对齐")
+        reduce_span_details = serializers.BooleanField(
+            required=False, default=False, label="超过 500 个 Span 时按需加载详情"
+        )
 
     def perform_request(self, validated_request_data):
         data = api.apm_api.query_trace_detail(
@@ -461,13 +485,33 @@ class TraceDetailResource(Resource):
         )
         if not data.get("trace_data"):
             raise CustomException(_lazy(f"trace_id: {validated_request_data['trace_id']} 不存在"))
+        entity_set = get_llm_entity_set(validated_request_data["bk_biz_id"], validated_request_data["app_name"])
+        raw_spans: list[dict[str, Any]] = (
+            prepare_llm_spans(
+                validated_request_data["bk_biz_id"],
+                validated_request_data["app_name"],
+                data["trace_data"],
+                entity_set=entity_set,
+            )
+            if entity_set
+            else data["trace_data"]
+        )
+        data["trace_data"] = raw_spans
+        detail_span_ids: set[str] = TraceHandler.get_deferred_span_ids(
+            raw_spans,
+            validated_request_data["bk_biz_id"],
+            validated_request_data["app_name"],
+            reduce_span_details=validated_request_data["reduce_span_details"],
+        )
         handled_data = TraceHandler.handle_trace(
             validated_request_data["app_name"],
-            data["trace_data"],
+            raw_spans,
             validated_request_data["trace_id"],
             data["relation_mapping"],
             validated_request_data.get("displays"),
             validated_request_data.get("enabled_time_alignment"),
+            compact_groups=validated_request_data["reduce_span_details"],
+            detail_span_ids=detail_span_ids,
         )
         if not handled_data.get("original_data", []):
             raise CustomException(
@@ -480,6 +524,21 @@ class TraceDetailResource(Resource):
         service_topo_data = trace_data_to_service_topo(handled_data["original_data"])
         handled_data.update(service_topo_data)
         handled_data.update(data.get("options"))
+        TraceHandler.sanitize_span_details(
+            handled_data,
+            validated_request_data["bk_biz_id"],
+            validated_request_data["app_name"],
+            detail_span_ids=detail_span_ids,
+        )
+        if entity_set is not None:
+            attach_llm_detail(
+                validated_request_data["bk_biz_id"],
+                validated_request_data["app_name"],
+                handled_data["trace_tree"],
+                handled_data["original_data"],
+                compact=True,
+                entity_set=entity_set,
+            )
         return handled_data
 
 
@@ -491,7 +550,15 @@ class SpanDetailResource(Resource):
 
     def perform_request(self, validated_request_data):
         span = api.apm_api.query_span_detail(**validated_request_data)
-        return TraceHandler.handle_span(validated_request_data["app_name"], span)
+        handled_data = TraceHandler.handle_span(validated_request_data["app_name"], span)
+        if handled_data:
+            attach_llm_detail(
+                validated_request_data["bk_biz_id"],
+                validated_request_data["app_name"],
+                handled_data["trace_tree"],
+                [span],
+            )
+        return handled_data
 
 
 class TraceDiagramResource(Resource):
@@ -565,6 +632,7 @@ class TraceDiagramResource(Resource):
         )
 
         diagrammer = get_diagrammer(validated_request_data["diagram_type"], {})
+        response_handled_data: dict[str, Any] = handled_data
         # 当有对比 trace_id 时，需要对比两个 trace 的差异
         if validated_request_data.get("diff_trace_id"):
             if validated_request_data.get("diff_trace_id") == validated_request_data["trace_id"]:
@@ -588,19 +656,22 @@ class TraceDiagramResource(Resource):
             diagram = diagrammer.diff(
                 handled_data["original_data"], other_handled_data["original_data"], **validated_request_data
             )
-            result = {
-                "diagram_data": diagram,
-                "original_data": other_handled_data["original_data"],
-                "trace_tree": other_handled_data["trace_tree"],
-            }
+            response_handled_data = other_handled_data
         else:
             diagram = diagrammer.draw(handled_data["original_data"])
-            result = {
-                "diagram_data": diagram,
-                "original_data": handled_data["original_data"],
-                "trace_tree": handled_data["trace_tree"],
-                "trace_info": handled_data["trace_info"],
-            }
+
+        TraceHandler.sanitize_span_details(
+            response_handled_data,
+            validated_request_data["bk_biz_id"],
+            validated_request_data["app_name"],
+        )
+        result: dict[str, Any] = {
+            "diagram_data": diagram,
+            "original_data": response_handled_data["original_data"],
+            "trace_tree": response_handled_data["trace_tree"],
+        }
+        if not validated_request_data.get("diff_trace_id"):
+            result["trace_info"] = response_handled_data["trace_info"]
 
         return result
 
@@ -957,11 +1028,7 @@ class TraceFieldStatisticsGraphResource(BaseTraceFaultTolerantResource):
     def perform_request(self, validated_data):
         field_info = validated_data["field"]
         # 边界场景，数值字段最小值，最大值为 None 时，直接返回空数据
-        if field_info["field_type"] in {
-            EnabledStatisticsDimension.INTEGER.value,
-            EnabledStatisticsDimension.LONG.value,
-            EnabledStatisticsDimension.DOUBLE.value,
-        }:
+        if EnabledStatisticsDimension.from_value(field_info["field_type"]).is_numeric():
             min_value, max_value, *_ = field_info["values"][:4]
             if min_value is None or max_value is None:
                 return self.EMPTY_DATA
@@ -976,7 +1043,7 @@ class ListFlattenSpanResource(BaseTraceFaultTolerantResource):
 
     def perform_request(self, data):
         response = ListSpanResource().get_span_list_api_data(data)
-        response["data"] = [flatten_es_dict_data(data_dict) for data_dict in response["data"]]
+        response["data"] = [flatten_dict_data(data_dict) for data_dict in response["data"]]
         return response
 
 
@@ -989,7 +1056,7 @@ class ListFlattenTraceResource(BaseTraceFaultTolerantResource):
         response = ListTraceResource().get_trace_list_api_data(data)
         data_list = []
         for trace_data_dict in response["data"]:
-            data_list.append(flatten_es_dict_data(trace_data_dict))
+            data_list.append(flatten_dict_data(trace_data_dict))
         response["data"] = data_list
         return response
 
@@ -1008,3 +1075,118 @@ class TraceGenerateQueryStringResource(Resource):
                 f.get("options", {}).get("group_relation", OperatorGroupRelation.OR),
             )
         return generator.to_query_string()
+
+
+class ListLinkResource(Resource):
+    """
+    Links 反向关联查询资源
+    支持通过 TraceID 和 SpanID 过滤正向与反向关联，并统一返回 OpenTelemetry Link 列表
+    """
+
+    RequestSerializer = ListLinkRequestSerializer
+
+    @classmethod
+    def build_links(
+        cls,
+        reported_spans: list[dict[str, Any]],
+        reverse_spans: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        统一处理两路查询结果，转换为同构 Link 后合并去重
+
+        :param reported_spans: 正向查询结果，读取 Span 的 links[]，字段缺失时按空列表处理
+        :param reverse_spans: 反向查询结果，Span 数据包含 trace_id 和 span_id，trace_state 可缺失
+        :return: OpenTelemetry Link 列表
+        """
+        links_dict: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+        for span in reported_spans:
+            for link in span.get(OtlpKey.LINKS) or []:
+                cls._add_link(
+                    links_dict,
+                    trace_id=link.get(OtlpKey.TRACE_ID),
+                    span_id=link.get(OtlpKey.SPAN_ID),
+                    trace_state=link.get(OtlpKey.TRACE_STATE),
+                    attributes=link.get(OtlpKey.ATTRIBUTES) or {},
+                )
+
+        for span in reverse_spans:
+            cls._add_link(
+                links_dict,
+                trace_id=span.get(OtlpKey.TRACE_ID),
+                span_id=span.get(OtlpKey.SPAN_ID),
+                trace_state=span.get(OtlpKey.TRACE_STATE),
+                attributes={},
+            )
+
+        return list(links_dict.values())
+
+    @classmethod
+    def _add_link(
+        cls,
+        links_dict: dict[tuple[str, str, str, str], dict[str, Any]],
+        trace_id: Any,
+        span_id: Any,
+        trace_state: Any,
+        attributes: dict[str, Any],
+    ) -> None:
+        """标准化 Link 字段并写入去重集合。"""
+        normalized_trace_id = str(trace_id or "")
+        normalized_span_id = str(span_id or "")
+        normalized_trace_state = "" if trace_state is None else str(trace_state)
+        dedup_key: tuple[str, str, str, str] = (
+            normalized_trace_id,
+            normalized_span_id,
+            normalized_trace_state,
+            count_md5(attributes),
+        )
+        if dedup_key in links_dict:
+            return
+
+        links_dict[dedup_key] = {
+            OtlpKey.TRACE_ID: normalized_trace_id,
+            OtlpKey.SPAN_ID: normalized_span_id,
+            OtlpKey.TRACE_STATE: normalized_trace_state,
+            OtlpKey.ATTRIBUTES: attributes,
+        }
+
+    def perform_request(self, validated_data: dict[str, Any]) -> dict[str, Any]:
+        bk_biz_id: int = validated_data["bk_biz_id"]
+        app_name: str = validated_data["app_name"]
+        trace_id: str | None = validated_data.get("trace_id")
+        span_id: str | None = validated_data.get("span_id")
+
+        reported_filters: list[dict[str, Any]] = []
+        reverse_filters: list[dict[str, Any]] = []
+        for value, reported_key, reverse_key in (
+            (trace_id, OtlpKey.TRACE_ID, f"{OtlpKey.LINKS}.{OtlpKey.TRACE_ID}"),
+            (span_id, OtlpKey.SPAN_ID, f"{OtlpKey.LINKS}.{OtlpKey.SPAN_ID}"),
+        ):
+            if not value:
+                continue
+
+            reported_filters.append({"key": reported_key, "operator": OperatorEnum.EQUAL["operator"], "value": [value]})
+            reverse_filters.append({"key": reverse_key, "operator": OperatorEnum.EQUAL["operator"], "value": [value]})
+
+        common_params: dict[str, Any] = {
+            "bk_biz_id": bk_biz_id,
+            "app_name": app_name,
+            "offset": 0,
+            "limit": 1000,
+            # SpanQuery 缺省会排除 links，Links 查询必须显式保留 links 用于构建正向关联。
+            "exclude_field": [OtlpKey.ATTRIBUTES, OtlpKey.EVENTS],
+        }
+        reported_params: dict[str, Any] = {**common_params, "filters": reported_filters}
+        reverse_params: dict[str, Any] = {**common_params, "filters": reverse_filters}
+
+        reported_response, reverse_response = api.apm_api.query_span_list.bulk_request(
+            [reported_params, reverse_params]
+        )
+        reported_spans: list[dict[str, Any]] = reported_response.get("data") or []
+        reverse_spans: list[dict[str, Any]] = reverse_response.get("data") or []
+
+        return {
+            OtlpKey.TRACE_ID: trace_id,
+            OtlpKey.SPAN_ID: span_id,
+            OtlpKey.LINKS: self.build_links(reported_spans, reverse_spans),
+        }

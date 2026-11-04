@@ -26,6 +26,7 @@
 
 import type { ImpactScopeResourceKeyType, IssuePriorityType, IssueStatusType } from './constants';
 import type { IssueIdentifier } from './dialog';
+import type { MergeStatus } from './issues-merge-split';
 
 /** 聚合配置 */
 export interface AggregateConfig {
@@ -115,6 +116,12 @@ export interface IssueItem extends Record<string, unknown> {
   labels: string[];
   /** 最近关联告警时间（秒级时间戳） */
   last_alert_time: number;
+  /** 关联日志内容；请求完成后才有值，空字符串表示没有可展示的日志 */
+  log_content?: string;
+  /** 关联日志是否已回填。false 表示请求中，此时不先展示 anomaly_message */
+  log_content_loaded?: boolean;
+  /** 合并状态 */
+  merge_status?: MergeStatus;
   /** Issue 名称（回归问题带 [回归] 前缀） */
   name: string;
   /** 优先级 */
@@ -132,7 +139,7 @@ export interface IssueItem extends Record<string, unknown> {
   /** 策略名称 */
   strategy_name: string;
   /** 告警时间分布趋势 [[毫秒时间戳, 数量], ...] */
-  trend: [number, number][];
+  trend?: [number, number][];
   /** 最近更新时间（秒级时间戳） */
   update_time: number;
 }

@@ -221,6 +221,8 @@ export type AlertTableItem = {
   ipv6: null | string;
   is_ack: boolean | null;
   is_blocked: boolean;
+  /** 是否为最新排障记录中新增的告警（故障场景） */
+  is_current_primary?: boolean;
   is_handled: boolean;
   is_shielded: boolean;
   items: AlertContentItem[];
@@ -302,7 +304,10 @@ export type CommonFilterParams = {
 
 export type FilterTableResponse<T> = {
   data: T[];
+  enabled_spaces?: number[];
+  greyed_spaces?: number[];
   total: number;
+  wx_cs_link?: string;
 };
 
 /**
@@ -317,6 +322,12 @@ export type IncidentTableItem = {
   create_time: number;
   duration: string;
   end_time: number;
+  extra_info: {
+    merge_info?: {
+      origin_incident_doc_id: string;
+      target_incident_doc_id: string;
+    };
+  };
   handlers: string[];
   id: string;
   incident_id: number;

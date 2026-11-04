@@ -215,8 +215,11 @@ export default class FieldAnalysis extends Vue {
       this.infoLoading = true;
       this.chartLoading = true;
 
+      const isScene = store.getters.isSceneMode;
+      const urlStr = isScene ? 'retrieve/getSceneFieldStatisticsInfo' : 'retrieve/fieldStatisticsInfo';
+
       const res = await $http.request(
-        'retrieve/fieldStatisticsInfo',
+        urlStr,
         { data: { ...this.queryParams } },
         { cancelToken: new CancelToken(c => (this.getInfoCancelFn = c)) },
       );
@@ -240,8 +243,11 @@ export default class FieldAnalysis extends Vue {
         });
       }
 
+      const isScene = store.getters.isSceneMode;
+      const urlStr = isScene ? 'retrieve/getSceneFieldStatisticsGraph' : 'retrieve/fieldStatisticsGraph';
+
       const res = await $http.request(
-        'retrieve/fieldStatisticsGraph',
+        urlStr,
         { data },
         {
           catchIsShowMessage: false,
@@ -474,7 +480,7 @@ export default class FieldAnalysis extends Vue {
 
   handleSetTimeTooltip(params: any[]) {
     const sortedParams = [...params].sort((a, b) => b.value[1] - a.value[1]);
-    const liHtmls = sortedParams.map((item) => {
+    const liHtmls = sortedParams.map(item => {
       const formattedName = item.seriesName.replace(/(.{85})(?=.{85})/g, '$1\n');
       const formattedValue = formatNumberWithRegex(item.value[1]);
       /** 折线图tooltips不能使用纯CSS来处理换行 会有宽度贴图表边缘变小问题 字符串添加换行倍数为85 */
@@ -681,7 +687,6 @@ export default class FieldAnalysis extends Vue {
     }
   }
 
-  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: reason
   render() {
     const {
       isPillarChart,

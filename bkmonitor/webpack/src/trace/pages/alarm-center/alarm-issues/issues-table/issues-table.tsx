@@ -24,18 +24,22 @@
  * IN THE SOFTWARE.
  */
 
-import { type PropType, computed, defineComponent, useTemplateRef } from 'vue';
+import { type PropType, computed, defineComponent, toRef, useTemplateRef } from 'vue';
 
+import { useTableScrollOptimize } from '../../../../hooks/use-table-scroll-optimize';
+import { AlarmTableSkeletonCell } from '../../components/alarm-skeleton';
 import CommonTable from '../../components/alarm-table/components/common-table/common-table';
 import { usePopover } from '../../components/alarm-table/hooks/use-popover';
 import { useEchartsGroupConnect } from '../../composables/use-echarts-group';
-import { useTableScrollOptimize } from '../../composables/use-table-scroll-optimize';
+import { ENDED_STATUS_SET, TrendRangeEnum } from '../constant';
 import { useIssuesColumnsRenderer } from './hooks/use-issues-columns-renderer';
 import { useIssuesHandlers } from './hooks/use-issues-handlers';
 import ExploreTableEmpty from '@/pages/trace-explore/components/trace-explore-table/components/explore-table-empty';
 
-import type { TableColumnItem, TablePagination } from '../../typings';
-import type { ImpactScopeEvent, IssueItem, IssuePriorityType, IssuesBatchActionType } from '../typing';
+import type { ColumnResizeContext, TableColumnItem, TablePagination } from '../../typings';
+import type { ImpactScopeEvent, IssueItem, IssuePriorityType, IssuesBatchActionType, TrendRangeType } from '../typing';
+import type { AlarmCenterPanelTabType } from '@/pages/alarm-center/utils/constant';
+import type { BkUiSettings } from '@blueking/tdesign-ui';
 import type { SelectOptions, SlotReturnValue } from 'tdesign-vue-next';
 
 import './issues-table.scss';
@@ -76,6 +80,11 @@ export default defineComponent({
       type: String,
       required: true,
     },
+    /** 拆分后需高亮的行 ID 集合 */
+    highlightedRowIds: {
+      type: Set as PropType<Set<string>>,
+      default: () => new Set(),
+    },
     /** 表头吸顶 */
     headerAffixedTop: {
       type: Object as PropType<{ container: string }>,
@@ -86,6 +95,25 @@ export default defineComponent({
     },
     /** 空状态下是否显示"清空筛选项"操作 */
     showEmptyOperation: {
+      type: Boolean,
+      default: false,
+    },
+    /** Issue 名称变更回调（返回 Promise，用于 loading 状态管理） */
+    nameChange: {
+      type: Function as PropType<(id: string, name: string) => Promise<void>>,
+      default: () => () => Promise.resolve(),
+    },
+    /** 表格设置属性类型 */
+    tableSettings: {
+      type: Object as PropType<Omit<BkUiSettings, 'hasCheckAll'>>,
+    },
+    /** 趋势时间范围 */
+    trendRange: {
+      type: String as PropType<TrendRangeType>,
+      default: TrendRangeEnum.HOURS_24,
+    },
+    /** 趋势数据加载中 */
+    trendLoading: {
       type: Boolean,
       default: false,
     },
@@ -101,7 +129,7 @@ export default defineComponent({
     selectionChange: (selectedRowKeys: string[], options: SelectOptions<any>) =>
       Array.isArray(selectedRowKeys) && !!options,
     /** 显示详情 */
-    showDetail: (item: IssueItem) => !!item,
+    showDetail: (item: IssueItem, _defaultTab?: AlarmCenterPanelTabType) => !!item,
     /** 分配负责人点击 */
     assignClick: (id: IssueItem['id'], data: IssueItem) => typeof id === 'string' && !!data,
     /** 状态变更操作（标记已解决/重新打开/归档/恢复归档） */
@@ -110,11 +138,26 @@ export default defineComponent({
     priorityChange: (id: string, priority: IssuePriorityType) => typeof id === 'string' && !!priority,
     /** 影响范围点击 */
     impactScopeClick: (event: ImpactScopeEvent) => !!event,
+    /** 拆分按钮点击 */
+    splitClick: (row: IssueItem) => !!row,
     /** 清除检索过滤 */
     clearFilter: () => true,
+    /** 列宽拖拽变化回调 */
+    columnResizeChange: (context: ColumnResizeContext) => context && typeof context.columnsWidth === 'object',
+    /** 显示列字段变化 */
+    displayColFieldsChange: (displayColFields: string[]) => Array.isArray(displayColFields),
+    /** 趋势时间范围变化 */
+    trendRangeChange: (range: TrendRangeType) => typeof range === 'string',
   },
   setup(props, { emit }) {
     const tableRef = useTemplateRef<InstanceType<typeof CommonTable>>('tableRef');
+
+    /** 表格设置 */
+    const settings = computed(() => ({
+      ...props.tableSettings,
+      hasCheckAll: true,
+      showRowSize: false,
+    }));
 
     /** 图表联动组管理 */
     const { chartGroupId } = useEchartsGroupConnect(() => props.data);
@@ -130,15 +173,22 @@ export default defineComponent({
       },
     });
 
-    const { handleShowDetail, handleAssignClick, handleAction, handlePriorityClick, handleImpactScopeClick } =
-      useIssuesHandlers({
-        clickPopoverTools,
-        showDetailEmit: item => emit('showDetail', item),
-        assignClickEmit: (id, data) => emit('assignClick', id, data),
-        actionEmit: (type, id) => emit('action', type, id),
-        priorityChangeEmit: (id, priority) => emit('priorityChange', id, priority),
-        impactScopeClickEmit: event => emit('impactScopeClick', event),
-      });
+    const {
+      handleShowDetail,
+      handleAssignClick,
+      handleAction,
+      handlePriorityClick,
+      handleImpactScopeClick,
+      handleSplitClick,
+    } = useIssuesHandlers({
+      clickPopoverTools,
+      showDetailEmit: (item, defaultTab) => emit('showDetail', item, defaultTab),
+      assignClickEmit: (id, data) => emit('assignClick', id, data),
+      actionEmit: (type, id) => emit('action', type, id),
+      priorityChangeEmit: (id, priority) => emit('priorityChange', id, priority),
+      impactScopeClickEmit: event => emit('impactScopeClick', event),
+      splitClickEmit: row => emit('splitClick', row),
+    });
 
     /** Issues 列渲染器 */
     const { transformColumns } = useIssuesColumnsRenderer({
@@ -150,6 +200,11 @@ export default defineComponent({
       handleAction,
       handlePriorityClick,
       handleImpactScopeClick,
+      handleSplitClick,
+      handleNameChange: (row, name) => props.nameChange(row.id, name),
+      trendRange: toRef(props, 'trendRange'),
+      trendLoading: toRef(props, 'trendLoading'),
+      onTrendRangeChange: (range: TrendRangeType) => emit('trendRangeChange', range),
     });
 
     /** 转换后的列配置 */
@@ -158,7 +213,7 @@ export default defineComponent({
     /** 表格滚动优化：滚动时禁用 pointerEvents 并隐藏 popover */
     useTableScrollOptimize({
       targetElement: tableRef,
-      scrollContainerSelector: props.scrollContainerSelector,
+      scrollContainerElement: props.scrollContainerSelector,
       onScroll: () => {
         clickPopoverTools.hidePopover();
       },
@@ -166,6 +221,7 @@ export default defineComponent({
 
     return {
       transformedColumns,
+      settings,
     };
   },
   render() {
@@ -182,6 +238,22 @@ export default defineComponent({
               />
             ) as unknown as SlotReturnValue
           }
+          loadingCell={(column, rowIndex) =>
+            (
+              <AlarmTableSkeletonCell
+                columnKey={column.colKey}
+                rowIndex={rowIndex}
+                variant='issues'
+              />
+            ) as unknown as SlotReturnValue
+          }
+          rowClassName={({ row }) => {
+            const item = row as IssueItem;
+            const classes: string[] = [];
+            if (ENDED_STATUS_SET.has(item.status)) classes.push('is-ended');
+            if (this.highlightedRowIds.has(item.id)) classes.push('is-split-highlighted');
+            return classes.join(' ');
+          }}
           autoFillSpace={!this.data?.length}
           columns={this.transformedColumns}
           data={this.data}
@@ -191,7 +263,10 @@ export default defineComponent({
           pagination={this.pagination}
           selectedRowKeys={this.selectedRowKeys}
           sort={this.sort}
+          tableSettings={this.settings}
+          onColumnResizeChange={context => this.$emit('columnResizeChange', context)}
           onCurrentPageChange={page => this.$emit('currentPageChange', page)}
+          onDisplayColFieldsChange={displayColFields => this.$emit('displayColFieldsChange', displayColFields)}
           onPageSizeChange={pageSize => this.$emit('pageSizeChange', pageSize)}
           onSelectChange={(keys, options) => this.$emit('selectionChange', (keys ?? []) as string[], options)}
           onSortChange={sort => this.$emit('sortChange', sort)}

@@ -27,11 +27,17 @@
 import type { MaybeRef } from 'vue';
 
 import { get } from '@vueuse/core';
+import { Radio } from 'bkui-vue';
 import dayjs from 'dayjs';
 import { useI18n } from 'vue-i18n';
 
 import { formatTraceTableDate } from '../../../../../components/trace-view/utils/date';
-import { ExploreTableColumnTypeEnum } from '../../../../trace-explore/components/trace-explore-table/typing';
+import {
+  type BaseTableColumn,
+  type TableCellRenderContext,
+  ExploreTableColumnTypeEnum,
+} from '../../../../trace-explore/components/trace-explore-table/typing';
+import { AlarmTrendSkeleton } from '../../../components/alarm-skeleton';
 import MiniBarChart from '../../components/mini-bar-chart/mini-bar-chart';
 import {
   IMPACT_SCOPE_SORT_ORDER_MAP,
@@ -39,15 +45,16 @@ import {
   ISSUES_REGRESSION_MAP,
   ISSUES_STATUS_MAP,
   IssueStatusEnum,
+  TrendRangeEnum,
 } from '../../constant';
+import { showIssueExceptionPopover } from '../../utils/issue-exception-popover';
+import { getIssueExceptionText } from '../../utils/issue-log-content';
+import IssueNameCell from '../components/issue-name-cell/issue-name-cell';
+import { ALARM_CENTER_PANEL_TAB_MAP } from '@/pages/alarm-center/utils/constant';
 
-import type {
-  BaseTableColumn,
-  TableCellRenderContext,
-} from '../../../../trace-explore/components/trace-explore-table/typing';
 import type { IUsePopoverTools } from '../../../components/alarm-table/hooks/use-popover';
 import type { TableColumnItem } from '../../../typings';
-import type { ImpactScopeResource, ImpactScopeResourceKeyType, IssueItem } from '../../typing';
+import type { ImpactScopeResource, ImpactScopeResourceKeyType, IssueItem, TrendRangeType } from '../../typing';
 import type { UseIssuesHandlersReturnType } from './use-issues-handlers';
 import type { SlotReturnValue } from 'tdesign-vue-next';
 
@@ -57,8 +64,16 @@ export type IssuesColumnsRendererCtx = {
   chartGroupId?: MaybeRef<string>;
   /** click popover 工具（基础设施依赖） */
   clickPopoverTools: IUsePopoverTools;
+  /** 提交 Issue 名称变更（返回 Promise，用于 loading 状态管理） */
+  handleNameChange: (row: IssueItem, name: string) => Promise<void>;
   /** hover popover 工具（基础设施依赖） */
   hoverPopoverTools: IUsePopoverTools;
+  /** 趋势时间范围切换回调 */
+  onTrendRangeChange?: (range: TrendRangeType) => void;
+  /** 趋势数据是否加载中 */
+  trendLoading?: MaybeRef<boolean>;
+  /** 当前趋势时间范围 */
+  trendRange?: MaybeRef<TrendRangeType>;
 } & UseIssuesHandlersReturnType;
 
 /**
@@ -82,20 +97,11 @@ export const useIssuesColumnsRenderer = (rendererCtx: IssuesColumnsRendererCtx) 
     renderCtx: TableCellRenderContext
   ): SlotReturnValue => {
     const regressionConfig = ISSUES_REGRESSION_MAP[String(row.is_regression)];
+    const exceptionText = getIssueExceptionText(row);
+
     return (
       <div class='issues-name-col'>
-        <div class={`issues-name-title ${renderCtx.isEnabledCellEllipsis(column)}`}>
-          <span
-            class='issues-name-title-text'
-            onClick={() => rendererCtx.handleShowDetail(row)}
-          >
-            {row.name || '--'}
-          </span>
-        </div>
-        <div class={`issues-name-exception ${renderCtx.isEnabledCellEllipsis(column)}`}>
-          <span class='issues-name-exception-text'>{row.anomaly_message}</span>
-        </div>
-        <div class='issues-name-meta'>
+        <div class='issues-name-title'>
           <span
             style={{
               '--issues-type-bg': regressionConfig?.bgColor || '#E1F5F0',
@@ -111,6 +117,31 @@ export const useIssuesColumnsRenderer = (rendererCtx: IssuesColumnsRendererCtx) 
           >
             <i class={regressionConfig?.icon} />
           </span>
+          {row.merge_status?.role === 'main' && row.merge_status.active_members?.length && (
+            <span
+              class='issues-merge-badge'
+              onClick={() => rendererCtx.handleSplitClick(row)}
+              onMouseenter={e =>
+                rendererCtx.hoverPopoverTools.showPopover(
+                  e,
+                  t('合并了 {n} 个 Issue，点击查看合并明细', { n: row.merge_status?.active_members?.length ?? 0 }),
+                  { theme: 'alarm-center-popover max-width-50vw text-wrap' }
+                )
+              }
+              onMouseleave={() => rendererCtx.hoverPopoverTools.clearPopoverTimer()}
+            >
+              <i class='icon-monitor icon-a-ziIssue' />
+              <span class='issues-merge-badge-count'>{row.merge_status?.active_members?.length ?? 0}</span>
+            </span>
+          )}
+          <IssueNameCell
+            ellipsisClass={renderCtx.isEnabledCellEllipsis(column)}
+            name={row.name || ''}
+            onShowDetail={() => rendererCtx.handleShowDetail(row)}
+            onSubmit={(newName: string) => rendererCtx.handleNameChange(row, newName)}
+          />
+        </div>
+        <div class='issues-name-description'>
           <span
             class='issues-alert-count'
             onMouseenter={e =>
@@ -120,9 +151,26 @@ export const useIssuesColumnsRenderer = (rendererCtx: IssuesColumnsRendererCtx) 
             }
             onMouseleave={() => rendererCtx.hoverPopoverTools.clearPopoverTimer()}
           >
-            <i class='icon-monitor icon-shijianjiansuo' />
-            {row.alert_count}
+            <i class='icon-monitor icon-alert-line' />
+            <span class='issues-alert-count-number'>{row.alert_count}</span>
           </span>
+          {row.log_content_loaded === false ? (
+            <span class='skeleton-element issues-log-skeleton' />
+          ) : (
+            <span
+              class='issues-name-exception-text'
+              onMouseenter={e =>
+                showIssueExceptionPopover(e, rendererCtx.hoverPopoverTools, {
+                  onViewMore: () => rendererCtx.handleShowDetail(row, ALARM_CENTER_PANEL_TAB_MAP.LOG),
+                  source: row,
+                  t,
+                })
+              }
+              onMouseleave={() => rendererCtx.hoverPopoverTools.clearPopoverTimer()}
+            >
+              {exceptionText}
+            </span>
+          )}
         </div>
       </div>
     ) as unknown as SlotReturnValue;
@@ -152,28 +200,43 @@ export const useIssuesColumnsRenderer = (rendererCtx: IssuesColumnsRendererCtx) 
   };
 
   /**
-   * @description 趋势列渲染（MiniBarChart 柱状迷你图 + 告警总数，支持通过 chartGroupId 进行图表联动）
+   * @description 趋势列渲染（MiniBarChart 柱状迷你图，支持通过 chartGroupId 进行图表联动）
    * @param {IssueItem} row - 当前行 Issue 数据
    * @returns {SlotReturnValue} 趋势列 JSX
    */
   const renderTrendCell = (row: IssueItem): SlotReturnValue => {
+    if (get(rendererCtx.trendLoading) && !row.trend?.length) {
+      return (
+        <div class='issues-trend-col is-loading'>
+          <AlarmTrendSkeleton compact />
+        </div>
+      ) as unknown as SlotReturnValue;
+    }
     const trend = row.trend || [];
-    const seriesList = trend.length
-      ? [
-          {
-            datapoints: trend.map(([ts, count]) => [count, ts] as [number, number]),
-            name: t('告警事件数'),
-            type: 'bar',
-            unit: 'none',
-          },
-        ]
-      : [];
+    const effectiveTrend = trend.filter(([, count]) => count > 0);
+    if (!effectiveTrend.length) {
+      return (
+        <div class='issues-trend-col is-empty'>
+          <span class='empty-text'>{t('暂无数据')}</span>
+        </div>
+      ) as unknown as SlotReturnValue;
+    }
+    const seriesList = [
+      {
+        datapoints: trend.map(([ts, count]) => [count, ts] as [number, number]),
+        name: t('告警事件数'),
+        type: 'bar',
+        unit: 'none',
+      },
+    ];
     return (
-      <div class='issues-trend-col'>
+      <div
+        class={['issues-trend-col', { 'is-refreshing': get(rendererCtx.trendLoading) }]}
+        aria-busy={get(rendererCtx.trendLoading)}
+      >
         <MiniBarChart
           group={get(rendererCtx.chartGroupId)}
           seriesList={seriesList}
-          total={row.alert_count}
         />
       </div>
     ) as unknown as SlotReturnValue;
@@ -285,24 +348,25 @@ export const useIssuesColumnsRenderer = (rendererCtx: IssuesColumnsRendererCtx) 
     column: BaseTableColumn,
     renderCtx: TableCellRenderContext
   ): SlotReturnValue => {
-    if (!row.assignee?.length) {
-      return (
-        <div
-          class='issues-assignee-unassigned-col'
-          onClick={() => rendererCtx.handleAssignClick(row)}
-        >
+    return (
+      <div
+        class='issues-assignee-col'
+        onClick={() => rendererCtx.handleAssignClick(row)}
+      >
+        {row.assignee?.length ? (
+          (renderCtx.cellRenderHandleMap[ExploreTableColumnTypeEnum.USER_TAGS]?.(
+            row,
+            column,
+            renderCtx
+          ) as SlotReturnValue)
+        ) : (
           <div class='assignee-tag-wrapper'>
             <span class='assignee-unassigned'>{t('未指派')}</span>
             <i class='icon-monitor icon-mc-arrow-down' />
           </div>
-        </div>
-      ) as unknown as SlotReturnValue;
-    }
-    return renderCtx.cellRenderHandleMap[ExploreTableColumnTypeEnum.USER_TAGS]?.(
-      row,
-      column,
-      renderCtx
-    ) as SlotReturnValue;
+        )}
+      </div>
+    ) as unknown as SlotReturnValue;
   };
 
   /**
@@ -313,6 +377,7 @@ export const useIssuesColumnsRenderer = (rendererCtx: IssuesColumnsRendererCtx) 
   const renderOperationCell = (row: IssueItem): SlotReturnValue => {
     const isResolved = row.status === IssueStatusEnum.RESOLVED;
     const isArchived = row.status === IssueStatusEnum.ARCHIVED;
+    const canSplit = row.merge_status?.role === 'main' && row.merge_status.active_members?.length;
     return (
       <div class='issues-operation-col'>
         {row.status !== IssueStatusEnum.ARCHIVED && (
@@ -331,17 +396,43 @@ export const useIssuesColumnsRenderer = (rendererCtx: IssuesColumnsRendererCtx) 
             {isArchived ? t('恢复') : t('归档')}
           </span>
         )}
+        {canSplit && (
+          <span
+            class='operation-btn'
+            onClick={() => rendererCtx.handleSplitClick(row)}
+          >
+            {t('拆分')}
+          </span>
+        )}
+      </div>
+    ) as unknown as SlotReturnValue;
+  };
+
+  /** 趋势列头渲染（24h / 7d 胶囊切换） */
+  const renderTrendTitle = (): SlotReturnValue => {
+    return (
+      <div class='issues-trend-header'>
+        <Radio.Group
+          modelValue={get(rendererCtx.trendRange)}
+          size='small'
+          type='capsule'
+          onUpdate:modelValue={(val: TrendRangeType) => rendererCtx.onTrendRangeChange?.(val)}
+        >
+          <Radio.Button label={TrendRangeEnum.HOURS_24}>24h</Radio.Button>
+          <Radio.Button label={TrendRangeEnum.DAYS_7}>7d</Radio.Button>
+        </Radio.Group>
+        <span class='issues-trend-header-text'>{t('趋势')}</span>
       </div>
     ) as unknown as SlotReturnValue;
   };
 
   /** 列渲染配置映射表：按 colKey 定义各列的 cellRenderer / renderType / 布局等配置 */
   const columnsRendererMap: Record<string, Partial<BaseTableColumn>> = {
-    name: { cellRenderer: renderIssueName },
+    name: { cellRenderer: renderIssueName, resize: { minWidth: 80, maxWidth: 1000 } },
     labels: { renderType: ExploreTableColumnTypeEnum.TAGS },
     last_alert_time: { cellRenderer: renderTimeCell },
     first_alert_time: { cellRenderer: renderTimeCell },
-    trend: { cellRenderer: renderTrendCell },
+    trend: { cellRenderer: renderTrendCell, title: renderTrendTitle },
     impact_scope: { cellRenderer: renderImpactCell },
     priority: { cellRenderer: renderPriorityCell },
     status: { cellRenderer: renderStatusCell },

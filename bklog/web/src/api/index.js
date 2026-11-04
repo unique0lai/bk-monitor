@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-misused-promises */
 /*
  * Tencent is pleased to support the open source community by making
  * 蓝鲸智云PaaS平台 (BlueKing PaaS) available.
@@ -32,11 +31,13 @@
 
 import Vue from 'vue';
 
-import { messageError } from '@/common/bkmagic';
+import { messageWarn } from '@/common/bkmagic';
 import { bus } from '@/common/bus';
+import { showCaughtApiError } from '@/common/collector-api-error';
 import { makeMessage, readBlobRespToJson } from '@/common/util';
 import i18n from '@/language/i18n';
 import serviceList from '@/services/index.js';
+import { resolveTenantMismatchPayload } from '@/views/un-authorized/tenant-mismatch';
 import { showLoginModal } from '@blueking/login-modal';
 import axios from 'axios';
 
@@ -47,6 +48,9 @@ import RequestQueue from './request-queue';
 import store from '@/store';
 
 const baseURL = window.AJAX_URL_PREFIX || '/api/v1';
+
+// 用于防止 租户不一致(3641001) 错误弹窗重复显示
+let hasShownTenantMismatchWarning = false;
 // axios 实例
 export const axiosInstance = axios.create({
   headers: { 'X-Requested-With': 'XMLHttpRequest' },
@@ -60,13 +64,13 @@ export const axiosInstance = axios.create({
  * request interceptor
  */
 axiosInstance.interceptors.request.use(
-  (config) => {
+  config => {
     if (!/^(https|http)?:\/\//.test(config.url)) {
       // const prefix = config.url.indexOf('?') === -1 ? '?' : '&';
-      config.url = config.url;
+      // config.url = config.url;
     }
-    // 外部版后端需要读取header里的 spaceUid
-    if (window.IS_EXTERNAL && JSON.parse(window.IS_EXTERNAL) && store.state.spaceUid) {
+    // 平台级索引集的所有检索子接口都需要请求空间，统一通过 header 传递
+    if (store.state.spaceUid) {
       config.headers['X-Bk-Space-Uid'] = store.state.spaceUid;
     }
     // if (window.__IS_MONITOR_COMPONENT__) {
@@ -74,9 +78,11 @@ axiosInstance.interceptors.request.use(
     const traceparent = `00-${random(32, 'abcdef0123456789')}-${random(16, 'abcdef0123456789')}-01`;
     config.headers.Traceparent = traceparent;
     // }
-    // 添加时区信息
-    if (store.state.indexItem?.timezone) {
-      config.headers['X-BKLOG-TIMEZONE'] = store.state.indexItem.timezone;
+    // 检索模块使用时间选择器设置的时区，其它模块使用用户个人设置的时区
+    const isRetrievePage = /^#\/retrieve(?:\/|\?|$)/.test(window.location.hash);
+    const timezone = isRetrievePage ? store.state.indexItem?.timezone : store.state.userMeta?.time_zone;
+    if (timezone) {
+      config.headers['X-BKLOG-TIMEZONE'] = timezone;
     }
     return config;
   },
@@ -89,10 +95,10 @@ axiosInstance.interceptors.request.use(
  * @returns {Object|Promise} - 如果数据是 Blob 类型，则直接返回响应对象；否则返回处理后的响应数据。
  */
 axiosInstance.interceptors.response.use(
-  async (response) => {
+  async response => {
     const responsePromise = (respData = undefined, cfg = undefined) => {
       const config = response.config;
-      return new Promise(async (resolve, reject) => {
+      return new Promise((resolve, reject) => {
         try {
           handleResponse({
             config: { ...config, ...(cfg ?? {}) },
@@ -108,7 +114,7 @@ axiosInstance.interceptors.response.use(
     };
     if (response.data instanceof Blob) {
       if (response.status !== 200) {
-        return readBlobRespToJson(response.data).then((resp) => {
+        return readBlobRespToJson(response.data).then(resp => {
           return responsePromise(resp, { globalError: true });
         });
       }
@@ -118,8 +124,8 @@ axiosInstance.interceptors.response.use(
 
     return responsePromise();
   },
-  (error) => {
-    const reject = (e) => {
+  error => {
+    const reject = e => {
       if (typeof e === 'object' && e !== null) {
         return Promise.reject(e);
       }
@@ -127,7 +133,7 @@ axiosInstance.interceptors.response.use(
       return Promise.reject(new Error(`${e}`));
     };
     if (error?.response?.data instanceof Blob) {
-      return readBlobRespToJson(error.response.data).then((resp) => {
+      return readBlobRespToJson(error.response.data).then(resp => {
         return handleReject(
           {
             ...(error ?? {}),
@@ -196,15 +202,22 @@ async function getPromise(method, url, data, userConfig = {}) {
     return promise;
   }
 
-  promise = new Promise(async (resolve, reject) => {
-    try {
-      const axiosRequest = http.$request.request(url, data, config);
-      const response = await axiosRequest;
-      Object.assign(config, response.config || {});
-      handleResponse({ config, response, resolve, reject });
-    } catch (error) {
+  promise = new Promise((resolve, reject) => {
+    const handleRequestError = error => {
       Object.assign(config, error.config);
       reject(error);
+    };
+
+    try {
+      http.$request
+        .request(url, data, config)
+        .then(response => {
+          Object.assign(config, response.config || {});
+          handleResponse({ config, response, resolve, reject });
+        })
+        .catch(handleRequestError);
+    } catch (error) {
+      handleRequestError(error);
     }
   });
 
@@ -271,7 +284,11 @@ function handleReject(error, config, reject) {
   if (config.globalError && error.response) {
     // status 是 httpStatus
     const { status, data } = error.response;
-    const nextError = { message: (data.message ?? error.message) ?? '401 Authorization Required', response: error.response, status };
+    const nextError = {
+      message: data.message ?? error.message ?? '401 Authorization Required',
+      response: error.response,
+      status,
+    };
     // 弹出登录框不需要出 bkMessage 提示
     if (status === 401) {
       // 窗口登录，页面跳转交给平台返回302
@@ -298,9 +315,9 @@ function handleReject(error, config, reject) {
       nextError.message = data.message;
     }
 
-    const resMessage = makeMessage(nextError.message, traceparent);
-    config.catchIsShowMessage && messageError(resMessage);
-    console.error(nextError.message);
+    showCaughtApiError(nextError.message, traceparent, {
+      catchIsShowMessage: config.catchIsShowMessage,
+    });
   }
 
   // 捕获业务 code 错误
@@ -318,17 +335,44 @@ function handleReject(error, config, reject) {
         bus.$emit('show-apply-perm-modal', error.data);
       } else if (code === '3621602') {
         return 1;
+      } else if (code === 3641001) {
+        const tenantMismatch = resolveTenantMismatchPayload({
+          message,
+          data: error.data,
+          userTenantId: store.state.userMeta?.bk_tenant_id,
+        });
+        store.commit('updateState', { tenantMismatch });
+        const displayMessage =
+          tenantMismatch.current_tenant_id && tenantMismatch.target_tenant_id
+            ? i18n.t(
+                '您当前登录的企业空间是【{current}】，无法访问【{target}】企业空间的资源。请返回登录页或切换企业空间后重试。',
+                {
+                  current: tenantMismatch.current_tenant_id,
+                  target: tenantMismatch.target_tenant_id,
+                },
+              )
+            : message;
+        const resMessage = makeMessage(displayMessage, traceparent);
+        if (config.catchIsShowMessage && !hasShownTenantMismatchWarning) {
+          hasShownTenantMismatchWarning = true;
+          messageWarn(resMessage);
+          // 3秒后重置标志位，允许下次再显示
+          setTimeout(() => {
+            hasShownTenantMismatchWarning = false;
+          }, 3000);
+        }
       } else {
-        const resMessage = makeMessage(message, traceparent);
-        config.catchIsShowMessage && messageError(resMessage);
+        showCaughtApiError(message, traceparent, {
+          catchIsShowMessage: config.catchIsShowMessage,
+        });
       }
     }
     return reject(message);
   }
 
-  const resMessage = makeMessage(error.response?.data?.message || error.message, traceparent);
-  config.catchIsShowMessage && messageError(resMessage);
-  console.error(error.message);
+  showCaughtApiError(error.response?.data?.message || error.message, traceparent, {
+    catchIsShowMessage: config.catchIsShowMessage,
+  });
   return reject(error);
 }
 
@@ -377,7 +421,7 @@ function initConfig(method, url, userConfig) {
  */
 function getCancelToken() {
   let cancelExcutor;
-  const cancelToken = new axios.CancelToken((excutor) => {
+  const cancelToken = new axios.CancelToken(excutor => {
     cancelExcutor = excutor;
   });
   return {

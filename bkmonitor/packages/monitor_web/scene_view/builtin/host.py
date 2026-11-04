@@ -9,9 +9,13 @@ specific language governing permissions and limitations under the License.
 """
 
 import json
+from copy import deepcopy
 
 from django.utils.translation import gettext as _
+from rest_framework.exceptions import NotFound
 
+from bkm_space.errors import NoRelatedResourceError
+from bkm_space.validate import validate_bk_biz_id
 from bkmonitor.commons.tools import is_ipv6_biz
 from bkmonitor.models import MetricListCache
 from bkmonitor.utils.tenant import bk_biz_id_to_bk_tenant_id
@@ -106,10 +110,18 @@ DEFAULT_PROCESS_ORDER = [
 
 # 聚合方法
 DEFAULT_METHOD = "MAX"
+# 进程指标聚合方法使用变量占位符拼接：前端工具栏选择 MAX/AVG/SUM/MIN 后，
+# 由前端变量解析为 MAX_WITHOUT_TIME 等大写变体（后缀统一大写，与前端选项风格一致），
+# 查询侧 normalize_metric_method 归一为 max_without_time（保留 without_time 语义：不做时间桶内聚合，仅跨 series 聚合）。
+# 注意：多实例分线（实例维度在 group_by）场景下，组内单 series，切换聚合方法数值无明显差异，
+# 切换主要服务于按维度聚合（收敛实例维度）的场景。
 METRIC_METHOD = {
-    "bk_monitor.time_series.system.proc.mem_res": "sum_without_time",
-    "bk_monitor.time_series.system.proc.mem_virt": "sum_without_time",
-    "bk_monitor.time_series.system.proc.fd_num": "sum_without_time",
+    "bk_monitor.time_series.system.proc.cpu_usage_pct": "${method}_WITHOUT_TIME",
+    "bk_monitor.time_series.system.proc.mem_usage_pct": "${method}_WITHOUT_TIME",
+    "bk_monitor.time_series.system.proc.mem_res": "${method}_WITHOUT_TIME",
+    "bk_monitor.time_series.system.proc.mem_virt": "${method}_WITHOUT_TIME",
+    "bk_monitor.time_series.system.proc.fd_num": "${method}_WITHOUT_TIME",
+    "bk_monitor.time_series.system.proc.uptime": "MAX",
 }
 METRIC_OS_TYPE = {"bk_monitor.time_series.system.load.load5": "linux"}
 
@@ -156,8 +168,9 @@ def get_default_order(view: SceneViewModel):
     获取默认配置
     """
     if view.id == "process":
-        return DEFAULT_PROCESS_ORDER
+        return deepcopy(DEFAULT_PROCESS_ORDER)
     else:
+        default_host_order = deepcopy(DEFAULT_HOST_ORDER)
         # sql查询表名
         row_result_table_ids = [
             ["system.load", "system.cpu_summary", "system.cpu_detail"],  # cpu
@@ -168,7 +181,7 @@ def get_default_order(view: SceneViewModel):
 
         for index, result_table_ids in enumerate(row_result_table_ids):
             exists_metric_id = set()
-            for panel in DEFAULT_HOST_ORDER[index]["panels"]:
+            for panel in default_host_order[index]["panels"]:
                 exists_metric_id.add(panel["id"])
             # 获得已经上报的指标名
             for metric in MetricListCache.objects.filter(
@@ -181,8 +194,8 @@ def get_default_order(view: SceneViewModel):
                 if metric_id in exists_metric_id:
                     continue
                 # 添加非默认的指标
-                DEFAULT_HOST_ORDER[index]["panels"].append({"id": metric_id, "hidden": True})
-        return DEFAULT_HOST_ORDER
+                default_host_order[index]["panels"].append({"id": metric_id, "hidden": True})
+        return default_host_order
 
 
 def get_order_config(view: SceneViewModel):
@@ -193,29 +206,38 @@ def get_order_config(view: SceneViewModel):
         return view.order
     else:
         # 获得需要展示的指标
-        default_order = get_default_order(view).copy()
+        default_order = get_default_order(view)
         for row in default_order:
             row["title"] = str(row["title"])
         return default_order
+
+
+def get_host_metric_bk_biz_id(bk_biz_id: int) -> int:
+    """解析主机指标所属业务，视图配置仍使用请求空间。"""
+    try:
+        return validate_bk_biz_id(bk_biz_id)
+    except NoRelatedResourceError as err:
+        raise NotFound(_("当前空间未关联业务，无法获取主机视图")) from err
 
 
 def get_panels(view: SceneViewModel) -> list[dict]:
     """
     获取指标信息，包含指标信息及该指标需要使用的聚合方法、聚合维度、聚合周期等
     """
+    bk_biz_id = get_host_metric_bk_biz_id(view.bk_biz_id)
     metrics = MetricListCache.objects.filter(
-        bk_tenant_id=bk_biz_id_to_bk_tenant_id(view.bk_biz_id),
-        bk_biz_id__in=[0, view.bk_biz_id],
+        bk_tenant_id=bk_biz_id_to_bk_tenant_id(bk_biz_id),
+        bk_biz_id__in=[0, bk_biz_id],
         result_table_label="host_process" if view.id == "process" else "os",
         data_source_label="bk_monitor",
         data_type_label="time_series",
     )
     if view.id == "process":
-        metrics.filter(result_table_id__startswith="system")
+        metrics = metrics.filter(result_table_id__startswith="system")
 
     panels = []
     for metric in metrics:
-        panel = get_metric_panel(bk_biz_id=view.bk_biz_id, metric=metric, view_id=view.id)
+        panel = get_metric_panel(bk_biz_id=bk_biz_id, metric=metric, view_id=view.id)
         panels.append(panel)
     return panels
 

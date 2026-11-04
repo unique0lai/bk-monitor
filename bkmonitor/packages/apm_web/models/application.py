@@ -9,10 +9,10 @@ specific language governing permissions and limitations under the License.
 """
 
 import json
+from typing import cast
 
 from celery import shared_task
 from django.conf import settings
-from django.core.cache import cache
 from django.db import models
 from django.db.models import Q
 from django.db.transaction import atomic
@@ -31,7 +31,6 @@ from apm_web.constants import (
     DEFAULT_DB_CONFIG_PREDICATE_KEY,
     DEFAULT_NO_DATA_PERIOD,
     ApdexConfigEnum,
-    ApmCacheKey,
     CustomServiceMatchType,
     CustomServiceType,
     DataStatus,
@@ -43,8 +42,8 @@ from apm_web.constants import (
 )
 from apm_web.meta.plugin.log_trace_plugin_config import LogTracePluginConfig
 from apm_web.meta.plugin.plugin import LOG_TRACE
-from apm_web.metric_handler import RequestCountInstance
 from bkm_space.api import SpaceApi
+from bkmonitor.data_source.utils.apm import TraceDatasourceTarget
 from bkmonitor.iam import Permission, ResourceEnum
 from bkmonitor.middlewares.source import get_source_app_code
 from bkmonitor.utils import group_by
@@ -199,6 +198,9 @@ class Application(AbstractRecordModel):
     log_data_status = models.CharField("Log 数据状态", default=DataStatus.DISABLED, max_length=50)
     # ↓ 1 个数据字段 (由定时任务刷新)
     service_count = models.IntegerField("服务个数", default=0)
+    # 负责人列表：应用创建/编辑时可主动指定负责人，创建/更新后会给这些用户授权
+    # APM_APPLICATION 权限，并同步授权所属业务的 VIEW_BUSINESS（创建者动作）以便能进入业务页面
+    owners = models.JSONField("负责人列表", default=list, blank=True)
     # 租户id
     bk_tenant_id = models.CharField("租户ID", max_length=64, default=DEFAULT_TENANT_ID)
 
@@ -317,15 +319,8 @@ class Application(AbstractRecordModel):
             return no_data_config.config_value[self.NoDataConfig.no_data_period]
         return DEFAULT_NO_DATA_PERIOD
 
-    @cached_property
-    def doc_count(self):
-        """应用过期时间内的文档数量"""
-        start_time, end_time = get_datetime_range("day", self.es_retention)
-        start_time, end_time = int(start_time.timestamp()), int(end_time.timestamp())
-        return RequestCountInstance(self, start_time, end_time).query_instance()
-
-    def set_service_count_and_data_status(self):
-        """刷新应用的服务数量和各个数据源的状态"""
+    def set_service_count_and_data_status(self) -> None:
+        """刷新应用的服务数量。"""
         from apm_web.handlers.service_handler import ServiceHandler
 
         # 刷新服务数量
@@ -333,13 +328,6 @@ class Application(AbstractRecordModel):
 
         # 这里通过update方式，指定字段更新，是为了不自动变更 update_user， update_time 字段
         Application.objects.filter(bk_biz_id=self.bk_biz_id, app_name=self.app_name).update(service_count=len(services))
-
-        # 刷新数据状态
-        start_time, end_time = get_datetime_range("minute", self.no_data_period)
-        start_time, end_time = int(start_time.timestamp()), int(end_time.timestamp())
-        service_status_mapping = ServiceHandler.get_service_data_status_mapping(self, start_time, end_time, services)
-        key = ApmCacheKey.APP_SERVICE_STATUS_KEY.format(application_id=self.application_id)
-        cache.set(key, json.dumps(service_status_mapping))
 
     def set_data_status(self):
         from apm_web.handlers.backend_data_handler import telemetry_handler_registry
@@ -465,6 +453,7 @@ class Application(AbstractRecordModel):
         enabled_log,
         storage_options=None,
         plugin_config=None,
+        owners=None,
     ):
         create_params = {
             "bk_tenant_id": bk_tenant_id,
@@ -477,9 +466,13 @@ class Application(AbstractRecordModel):
             "enabled_metric": enabled_metric,
             "enabled_log": enabled_log,
             "es_storage_config": storage_options,
+            "owners": cls._normalize_owners(owners),
         }
 
         application_info = api.apm_api.create_application(create_params)
+
+        # 负责人列表去重、保序、去空
+        normalized_owners = cls._normalize_owners(owners)
 
         application = cls.objects.create(
             bk_tenant_id=bk_tenant_id,
@@ -488,6 +481,7 @@ class Application(AbstractRecordModel):
             app_name=app_name,
             app_alias=app_alias,
             description=description,
+            owners=normalized_owners,
         )
 
         # 初始化应用配置信息: 插件、环境、语言、数据源配置
@@ -643,6 +637,18 @@ class Application(AbstractRecordModel):
             TelemetryDataType.LOG.value: self.is_enabled_log,
         }
 
+    def build_data_sources(self) -> list[TraceDatasourceTarget]:
+        """构造当前应用的 Trace 数据源查询目标。"""
+
+        return [
+            TraceDatasourceTarget.build(
+                bk_biz_id=cast(int, self.bk_biz_id),
+                app_name=cast(str, self.app_name),
+                table_id=cast(str, self.trace_result_table_id),
+                retention=cast(int, self.es_retention),
+            )
+        ]
+
     def set_init_dimensions_config(self):
         dimensions_value = {self.DimensionConfig.DIMENSIONS: DefaultDimensionConfig.DEFAULT_DIMENSIONS}
         ApmMetaConfig.application_config_setup(self.application_id, self.DIMENSION_CONFIG_KEY, dimensions_value)
@@ -689,6 +695,99 @@ class Application(AbstractRecordModel):
             Application.authorization_to_maintainers.delay(self.update_user, self.application_id)
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(f"application->({self.application_id}) grant creator action failed, reason: {e}")
+
+        # 给应用负责人授权（创建阶段的 owners 就是全量新增，等价于 grant_owners）
+        # 日志采集授权已在创建数据源时通过 create_custom_report(owners) 完成，这里不再重复
+        if self.owners:
+            self.grant_owners(self.owners, previous_owners=[], grant_log=False)
+
+    @staticmethod
+    def _normalize_owners(owners):
+        """负责人列表标准化：去空、去重、保序，返回 list[str]"""
+        if not owners:
+            return []
+        seen = set()
+        result = []
+        for user in owners:
+            if not user:
+                continue
+            user = str(user).strip()
+            if not user or user in seen:
+                continue
+            seen.add(user)
+            result.append(user)
+        return result
+
+    def grant_owners(self, new_owners, previous_owners=None, grant_log=True):
+        """
+        给新增的负责人授权 APM_APPLICATION 权限，并同步授权所属业务查看权限。
+
+        策略：
+        - 仅对 new_owners 相对于 previous_owners 新增的用户调用 IAM `grant_creator_action`；
+        - 先授 APM 应用实例权限，再授所属业务（space）创建者权限，保证负责人能进入业务页面；
+        - 被移除的用户不做 IAM 权限回收（bk-monitor 侧无回收能力，IAM 侧默认 6 个月有效期到期后自然失效）。
+        - 更新应用且已开启日志时，再给新增负责人授日志采集项/索引集权限；创建场景由 create_custom_report 负责，不再走这里。
+
+        :param new_owners: 目标负责人列表（数据库将被更新为该列表）
+        :param previous_owners: 更新前的负责人列表；不传则默认取 self.owners
+        :param grant_log: 是否同步给日志采集授权；创建应用传 False，避免与创建数据源重复授权
+        """
+        normalized_new = self._normalize_owners(new_owners)
+        if previous_owners is None:
+            previous_owners = self.owners or []
+        normalized_old = self._normalize_owners(previous_owners)
+
+        to_grant = [user for user in normalized_new if user not in set(normalized_old)]
+        if not to_grant:
+            return normalized_new
+
+        app_resource = ResourceEnum.APM_APPLICATION.create_simple_instance(
+            self.application_id, {"bk_biz_id": self.bk_biz_id}
+        )
+        biz_resource = ResourceEnum.BUSINESS.create_simple_instance(self.bk_biz_id)
+        try:
+            # API/后台无 request 时 Permission() 会因缺少 username 直接失败；
+            # 授权对象是 creator，这里用应用创建者初始化即可。
+            permission = Permission(username=self.create_user, bk_tenant_id=self.bk_tenant_id)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f"application->({self.application_id}) init permission failed, reason: {e}")
+            return normalized_new
+
+        for user in to_grant:
+            try:
+                permission.grant_creator_action(app_resource, creator=user)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f"application->({self.application_id}) grant owner({user}) action failed, reason: {e}")
+            try:
+                # 前端 APM 页面入口校验 view_business，仅有应用权限无法进入业务
+                permission.grant_creator_action(biz_resource, creator=user)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f"application->({self.application_id}) grant owner({user}) "
+                    f"view_business(bk_biz_id={self.bk_biz_id}) failed, reason: {e}"
+                )
+
+        if grant_log and self.is_enabled_log:
+            self._grant_log_owners(to_grant)
+        return normalized_new
+
+    def _grant_log_owners(self, owners):
+        """应用已有日志数据源时，把新增负责人传给日志平台做采集项/索引集授权。"""
+        if not owners:
+            return
+        try:
+            detail = api.apm_api.detail_application(bk_biz_id=self.bk_biz_id, app_name=self.app_name)
+            collector_config_id = (detail.get("log_config") or {}).get("collector_config_id")
+            if not collector_config_id:
+                return
+            api.log_search.update_custom_report(
+                bk_tenant_id=self.bk_tenant_id,
+                collector_config_id=collector_config_id,
+                collector_config_name=self.app_name,
+                owners=owners,
+            )
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f"application->({self.application_id}) grant log owners({owners}) failed, reason: {e}")
 
     @property
     def is_create_finished(self):
@@ -1031,13 +1130,11 @@ class ApmMetaConfig(models.Model):
 
     @classmethod
     def _setup(cls, config_level, level_key, config_key, config_value):
-        qs = cls.objects.filter(config_level=config_level, level_key=level_key, config_key=config_key)
-        if qs.exists():
-            qs.update(config_value=config_value)
-            return
-
-        cls.objects.create(
-            config_level=config_level, level_key=level_key, config_key=config_key, config_value=config_value
+        cls.objects.update_or_create(
+            config_level=config_level,
+            level_key=level_key,
+            config_key=config_key,
+            defaults={"config_value": config_value},
         )
 
 

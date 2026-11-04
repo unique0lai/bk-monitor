@@ -3,6 +3,7 @@ import logging
 import operator
 import re
 import time
+import traceback
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ from bkmonitor.action.utils import get_strategy_user_group_dict
 from bkmonitor.aiops.utils import AiSetting
 from bkmonitor.commons.tools import is_ipv6_biz
 from bkmonitor.data_source import Functions, UnifyQuery, load_data_source
+from bkmonitor.data_source.unify_query.functions import add_expression_functions
 from bkmonitor.dataflow.constant import (
     AI_SETTING_ALGORITHMS,
     AccessStatus,
@@ -51,13 +53,16 @@ from bkmonitor.models.strategy import AlgorithmChoiceConfig, NoticeSubscribe
 from bkmonitor.strategy.new_strategy import (
     ActionRelation,
     Algorithm,
+    Item,
     NoticeRelation,
     QueryConfig,
     Strategy,
     get_metric_id,
     parse_metric_id,
 )
+from bkmonitor.strategy.partial_update import StrategyConfigPatch, StrategyConfigPatchSerializer, StrategyConfigUpdater
 from bkmonitor.utils.cache import CacheType
+from bkmonitor.utils.metric_id import build_metric_id_filter_queries
 from bkmonitor.utils.request import get_request_tenant_id, get_request_username, get_source_app
 from bkmonitor.utils.tenant import bk_biz_id_to_bk_tenant_id
 from bkmonitor.utils.time_format import duration_string, parse_duration
@@ -73,7 +78,7 @@ from core.drf_resource import api, resource
 from core.drf_resource.base import Resource
 from core.drf_resource.contrib.cache import CacheResource
 from core.errors.bkmonitor.data_source import CmdbLevelValidateError
-from core.errors.strategy import StrategyNameExist
+from core.errors.strategy import CreateStrategyError, StrategyNameExist
 from monitor.models import ApplicationConfig
 from monitor_web.models import (
     CollectorPluginMeta,
@@ -86,6 +91,7 @@ from monitor_web.strategies.constant import (
     DEFAULT_TRIGGER_CONFIG_MAP,
     GLOBAL_TRIGGER_CONFIG,
 )
+from monitor_web.strategies.metric_cache.process_dimensions import get_process_extra_dimensions
 from monitor_web.strategies.serializers import handle_target
 from monitor_web.tasks import update_metric_list_by_biz
 from common.decorators import db_safe_wrapper
@@ -98,6 +104,11 @@ class GetStrategyListV2Resource(Resource):
     获取策略列表
     """
 
+    # ponytail: 经验阈值，未经线上压测。ES 耗时主要由全索引扇出决定，候选策略超过阈值时按业务聚合后在内存求交，
+    # 避免超大 terms 请求；需对比阈值两侧的 ES took 后调整
+    ALERT_SUMMARY_TERMS_LIMIT = 1000
+    ALERT_SUMMARY_PAGE_SIZE = 10000
+
     class RequestSerializer(serializers.Serializer):
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
         scenario = serializers.CharField(required=False, label="监控场景")
@@ -107,6 +118,7 @@ class GetStrategyListV2Resource(Resource):
         with_user_group = serializers.BooleanField(default=False, label="是否补充告警组信息")
         with_user_group_detail = serializers.BooleanField(required=False, default=False, label="补充告警组详细信息")
         convert_dashboard = serializers.BooleanField(required=False, default=True, label="是否转换仪表盘格式")
+        with_alert_summary = serializers.BooleanField(required=False, default=True, label="是否统计策略告警数量")
 
     @classmethod
     def filter_by_ip(cls, ips: list[dict], strategies: QuerySet, bk_biz_id: int = None) -> QuerySet:
@@ -265,17 +277,20 @@ class GetStrategyListV2Resource(Resource):
 
     @classmethod
     def filter_strategy_ids_by_status(
-        cls, filter_dict: dict, filter_strategy_ids_set: set, bk_biz_id: str | None = None
+        cls, filter_dict: dict, filter_strategy_ids_set: set, bk_biz_id: str | None = None, context: dict | None = None
     ):
-        """策略状态过滤"""
+        """策略状态过滤，告警中、屏蔽中共用一次告警统计，并写入 context 供调用方复用"""
         if filter_dict["strategy_status"]:
+            alert_summary = None
+            if {"ALERT", "SHIELDED"} & set(filter_dict["strategy_status"]):
+                alert_summary = cls.get_alert_summary(bk_biz_id, filter_strategy_ids_set)
+                if context is not None:
+                    context["alert_summary"] = alert_summary
             strategy_status_ids = []
             for status in filter_dict["strategy_status"]:
-                filter_status_params = {"status": status}
-                if bk_biz_id is not None:
-                    filter_status_params["bk_biz_id"] = bk_biz_id
-
-                strategy_status_ids.extend(cls.filter_by_status(**filter_status_params))
+                strategy_status_ids.extend(
+                    cls.filter_by_status(status, filter_strategy_ids_set, bk_biz_id, alert_summary)
+                )
             filter_strategy_ids_set.intersection_update(set(strategy_status_ids))
 
     @classmethod
@@ -463,9 +478,11 @@ class GetStrategyListV2Resource(Resource):
         filter_strategy_ids_set.intersection_update(set(source_strategy_ids.values_list("id", flat=True).distinct()))
 
     @classmethod
-    def filter_by_conditions(cls, conditions: list[dict], strategies: QuerySet, bk_biz_id: int = None) -> QuerySet:
+    def filter_by_conditions(
+        cls, conditions: list[dict], strategies: QuerySet, bk_biz_id: int = None, context: dict | None = None
+    ) -> QuerySet:
         """
-        按条件进行过滤
+        按条件进行过滤，按告警中、屏蔽中过滤时，候选策略的告警统计写入 context["alert_summary"]
         - id: 策略ID
         - name: 策略名称
         - user_group_id: 通知组ID
@@ -519,7 +536,7 @@ class GetStrategyListV2Resource(Resource):
             (cls.filter_strategy_ids_by_label, (filter_dict, filter_strategy_ids_set, bk_biz_id)),
             (cls.filter_strategy_ids_by_data_source, (filter_dict, filter_strategy_ids_set)),
             (cls.filter_strategy_ids_by_result_table, (filter_dict, filter_strategy_ids_set)),
-            (cls.filter_strategy_ids_by_status, (filter_dict, filter_strategy_ids_set, bk_biz_id)),
+            (cls.filter_strategy_ids_by_status, (filter_dict, filter_strategy_ids_set, bk_biz_id, context)),
             (cls.filter_strategy_ids_by_algo_type, (filter_dict, filter_strategy_ids_set)),
             (cls.filter_strategy_ids_by_invalid_type, (filter_dict, filter_strategy_ids_set)),
             (cls.filter_by_user_groups, (filter_dict, filter_strategy_ids_set, bk_biz_id)),
@@ -652,13 +669,17 @@ class GetStrategyListV2Resource(Resource):
             filter_strategy_ids_set.intersection_update(set())
             return
 
-        or_condition = reduce(
-            operator.or_, (Q(**{"user_groups__contains": group_id}) for group_id in set(filter_user_group_ids))
-        )
-
-        user_group_strategy_ids = set(
-            StrategyActionConfigRelation.objects.filter(or_condition).values_list("strategy_id", flat=True).distinct()
-        )
+        # user_groups 是 JSON 数组，MySQL 5.7 既没有 JSON_OVERLAPS 也不支持多值索引，
+        # 把每个告警组拼成 JSON_CONTAINS 下推会得到上千个无法走索引的谓词，退化成准全表扫描。
+        # 这里改为按候选策略取回 user_groups，在内存里做集合交集。
+        target_group_ids = set(filter_user_group_ids)
+        user_group_strategy_ids = {
+            strategy_id
+            for strategy_id, user_groups in StrategyActionConfigRelation.objects.filter(
+                strategy_id__in=filter_strategy_ids_set
+            ).values_list("strategy_id", "user_groups")
+            if target_group_ids.intersection(user_groups or [])
+        }
         filter_strategy_ids_set.intersection_update(user_group_strategy_ids)
 
     @staticmethod
@@ -719,11 +740,16 @@ class GetStrategyListV2Resource(Resource):
         )
 
     @classmethod
-    def filter_by_status(cls, status: str, filter_strategy_ids: list = None, bk_biz_id: int = None):
+    def filter_by_status(
+        cls, status: str, filter_strategy_ids: list = None, bk_biz_id: int = None, alert_summary: dict = None
+    ):
+        if status in ("ALERT", "SHIELDED") and alert_summary is None:
+            alert_summary = cls.get_alert_summary(bk_biz_id, filter_strategy_ids)
+
         strategy_ids = set()
         if status == "ALERT":
             # 告警中的策略
-            strategy_ids.update(cls.get_strategies_by_shield_status(bk_biz_id))
+            strategy_ids.update(strategy_id for strategy_id, counts in alert_summary.items() if counts["alert_count"])
 
         elif status == "INVALID":
             invalid_qs = StrategyModel.objects.filter(is_invalid=True)
@@ -738,7 +764,9 @@ class GetStrategyListV2Resource(Resource):
                 if shield_manager.is_shielded(shield_obj, match_info):
                     strategy_ids.update(shield_obj.dimension_config["strategy_id"])
             # 屏蔽中的策略
-            strategy_ids.update(cls.get_strategies_by_shield_status(bk_biz_id, is_shielded=True))
+            strategy_ids.update(
+                strategy_id for strategy_id, counts in alert_summary.items() if counts["shield_alert_count"]
+            )
         else:
             enabled_qs = StrategyModel.objects.filter(is_enabled=status == "ON")
             if bk_biz_id is not None:
@@ -749,27 +777,47 @@ class GetStrategyListV2Resource(Resource):
             return list(set(filter_strategy_ids) & strategy_ids)
         return list(strategy_ids)
 
-    @staticmethod
-    def get_strategies_by_shield_status(bk_biz_id, is_shielded=False):
-        # 告警中的策略
-        alert_qs = AlertDocument.search(all_indices=True).filter("term", status=EventStatus.ABNORMAL)
-        if is_shielded:
-            alert_qs = alert_qs.filter("term", is_shielded=True)
-        else:
-            # 屏蔽状态告警生成时未写入值，可能为null，用排除法比较好
-            alert_qs = alert_qs.exclude("term", is_shielded=True)
-
+    @classmethod
+    def get_alert_summary(cls, bk_biz_id: int | None, strategy_ids: list[int] | set[int] | None = None) -> dict:
+        """
+        按策略统计未恢复告警数量，屏蔽状态告警生成时未写入值，可能为null，按未屏蔽统计
+        :return: {strategy_id: {"alert_count": 未屏蔽告警数, "shield_alert_count": 已屏蔽告警数}}
+        """
+        search = AlertDocument.search(all_indices=True).filter("term", status=EventStatus.ABNORMAL)
         if bk_biz_id is not None:
-            alert_qs = alert_qs.filter("term", **{"event.bk_biz_id": bk_biz_id})
+            search = search.filter("term", **{"event.bk_biz_id": bk_biz_id})
+        if strategy_ids is not None:
+            strategy_ids = set(strategy_ids)
+            if not strategy_ids:
+                return {}
+            if len(strategy_ids) <= cls.ALERT_SUMMARY_TERMS_LIMIT:
+                search = search.filter("terms", strategy_id=list(strategy_ids))
 
-        search_object = alert_qs[:0]
-        search_object.aggs.bucket("strategy_id", "terms", field="strategy_id", size=10000)
-        search_result = search_object.execute()
-        strategy_ids = []
-        if search_result.aggs:
-            for bucket in search_result.aggs.strategy_id.buckets:
-                strategy_ids.append(int(bucket.key))
-        return strategy_ids
+        search = search.params(track_total_hits=False).extra(size=0)
+        composite = search.aggs.bucket(
+            "strategy_id",
+            "composite",
+            size=cls.ALERT_SUMMARY_PAGE_SIZE,
+            sources=[{"strategy_id": {"terms": {"field": "strategy_id"}}}],
+        )
+        composite.bucket("shielded", "filter", term={"is_shielded": True})
+
+        alert_summary = {}
+        while True:
+            result = search.execute(ignore_cache=True).to_dict().get("aggregations", {}).get("strategy_id", {})
+            buckets = result.get("buckets", [])
+            for bucket in buckets:
+                strategy_id = int(bucket["key"]["strategy_id"])
+                if strategy_ids is not None and strategy_id not in strategy_ids:
+                    continue
+                shield_alert_count = bucket["shielded"]["doc_count"]
+                alert_summary[strategy_id] = {
+                    "alert_count": bucket["doc_count"] - shield_alert_count,
+                    "shield_alert_count": shield_alert_count,
+                }
+            if len(buckets) < cls.ALERT_SUMMARY_PAGE_SIZE or "after_key" not in result:
+                return alert_summary
+            composite.after = result["after_key"]
 
     @staticmethod
     def get_shield_info(filter_strategy_ids: list = None, bk_biz_id: int = None):
@@ -800,23 +848,6 @@ class GetStrategyListV2Resource(Resource):
                 }
             )
         return user_group_list
-
-    @staticmethod
-    def get_alert_search_result(bk_biz_id, strategy_ids):
-        search_object = (
-            AlertDocument.search(all_indices=True)
-            .filter("term", **{"event.bk_biz_id": bk_biz_id})
-            .filter("term", status=EventStatus.ABNORMAL)
-            .filter("terms", strategy_id=strategy_ids)[:0]
-        )
-        # 构建ES聚合查询
-        # 按strategy_id分桶,size=10000表示最多返回10000个桶
-        # 每个strategy_id桶下再按is_shielded字段分桶,统计屏蔽和未屏蔽的告警数量
-        search_object.aggs.bucket("strategy_id", "terms", field="strategy_id", size=10000).bucket(
-            "shield_status", "terms", field="is_shielded", size=10000
-        )
-        search_result = search_object.execute()
-        return search_result
 
     @staticmethod
     def get_action_config_list(strategy_ids: list[int], bk_biz_id: int):
@@ -890,15 +921,18 @@ class GetStrategyListV2Resource(Resource):
         按策略标签统计策略数量
         """
 
-        # 按策略标签进行聚合统计
-        count_records = (
-            StrategyLabel.objects.filter(strategy_id__in=strategy_ids)
-            .values("label_name")
-            .annotate(total=Count("strategy_id", distinct=True))
-            .order_by("label_name")
-        )
+        # 按策略标签统计去重策略数。
+        # 不在 SQL 侧 GROUP BY/ORDER BY label_name：该写法会让优化器选 label_name 打头的索引
+        # 全扫整表（成本与表大小相关、与 strategy_ids 数解耦），strategy_id 的覆盖索引被弃用。
+        # 改为按 strategy_id 走覆盖索引 seek 取 (strategy_id, label_name) 对，在内存按 label
+        # 去重统计（命中行数与 strategy_ids 规模相关、量级可忽略），与原 COUNT(DISTINCT) 等价。
+        label_to_strategies: dict[str, set[int]] = defaultdict(set)
+        for strategy_id, label_name in StrategyLabel.objects.filter(strategy_id__in=strategy_ids).values_list(
+            "strategy_id", "label_name"
+        ):
+            label_to_strategies[label_name].add(strategy_id)
 
-        label_counts = {record["label_name"]: record["total"] for record in count_records}
+        label_counts = {label_name: len(strategy_set) for label_name, strategy_set in label_to_strategies.items()}
 
         # 查询业务下所有的策略标签
         labels = (
@@ -932,9 +966,9 @@ class GetStrategyListV2Resource(Resource):
                 )
         return scenario_list
 
-    def get_strategy_status_list(self, strategy_ids: list[int], bk_biz_id: int):
+    def get_strategy_status_list(self, strategy_ids: list[int], bk_biz_id: int, alert_summary: dict | None = None):
         """
-        按策略状态统计策略数量
+        按策略状态统计策略数量，未提供告警统计时，告警中和屏蔽中的数量为 None
         """
         status_list = [
             {
@@ -952,7 +986,10 @@ class GetStrategyListV2Resource(Resource):
             {"id": "SHIELDED", "name": _("屏蔽中"), "count": 0},
         ]
         for status in status_list:
-            data = self.filter_by_status(status["id"], strategy_ids, bk_biz_id)
+            if alert_summary is None and status["id"] in ("ALERT", "SHIELDED"):
+                status["count"] = None
+                continue
+            data = self.filter_by_status(status["id"], strategy_ids, bk_biz_id, alert_summary)
             status["count"] = len(data)
         return status_list
 
@@ -1181,18 +1218,11 @@ class GetStrategyListV2Resource(Resource):
 
         return target_strategy_mapping
 
-    def perform_request(self, params):
-        bk_biz_id = params["bk_biz_id"]
-        strategies = StrategyModel.objects.filter(bk_biz_id=bk_biz_id)
-
-        # 按条件过滤策略
-        if params["conditions"]:
-            strategies = self.filter_by_conditions(params["conditions"], strategies, bk_biz_id)
-
-        # 在过滤监控对象前统计数量
-        scenario_list = self.get_scenario_list(strategies)
-
-        # 按当前选择的监控对象过滤
+    @staticmethod
+    def filter_by_scenario(strategies: QuerySet, params: dict) -> QuerySet:
+        """
+        按当前选择的监控对象过滤
+        """
         scenarios = set(params.get("scenario", []))
         for condition in params["conditions"]:
             if condition["key"] != "scenario":
@@ -1205,6 +1235,21 @@ class GetStrategyListV2Resource(Resource):
 
         if scenarios:
             strategies = strategies.filter(scenario__in=scenarios)
+        return strategies
+
+    def perform_request(self, params):
+        bk_biz_id = params["bk_biz_id"]
+        strategies = StrategyModel.objects.filter(bk_biz_id=bk_biz_id)
+
+        # 按条件过滤策略
+        context = {}
+        if params["conditions"]:
+            strategies = self.filter_by_conditions(params["conditions"], strategies, bk_biz_id, context)
+
+        # 在过滤监控对象前统计数量
+        scenario_list = self.get_scenario_list(strategies)
+
+        strategies = self.filter_by_scenario(strategies, params)
 
         # 统计其他分类数量
         strategy_ids = list(strategies.values_list("id", flat=True).distinct())
@@ -1218,9 +1263,11 @@ class GetStrategyListV2Resource(Resource):
         strategy_label_list_future = executor.submit(
             db_safe_wrapper(self.get_strategy_label_list), strategy_ids, bk_biz_id
         )
-        strategy_status_list_future = executor.submit(
-            db_safe_wrapper(self.get_strategy_status_list), strategy_ids, bk_biz_id
-        )
+        # 查询ES，统计策略告警数量，状态统计与当前页告警数量共用；按告警状态过滤时已统计过，直接复用
+        alert_summary = context.get("alert_summary")
+        alert_summary_future = None
+        if alert_summary is None and params["with_alert_summary"]:
+            alert_summary_future = executor.submit(db_safe_wrapper(self.get_alert_summary), bk_biz_id, strategy_ids)
         alert_level_list_future = executor.submit(db_safe_wrapper(self.get_alert_level_list), strategy_ids)
         invalid_type_list_future = executor.submit(db_safe_wrapper(self.get_invalid_type_list), strategy_ids)
         algorithm_type_list_future = executor.submit(db_safe_wrapper(self.get_algorithm_type_list), strategy_ids)
@@ -1252,24 +1299,19 @@ class GetStrategyListV2Resource(Resource):
             else:
                 strategy_config["config_source"] = "UI"
 
-        strategy_ids = [strategy_config["id"] for strategy_config in strategy_configs]
+        page_strategy_ids = [strategy_config["id"] for strategy_config in strategy_configs]
 
-        # 查询ES，统计策略告警数量
-        search_result_future = executor.submit(db_safe_wrapper(self.get_alert_search_result), bk_biz_id, strategy_ids)
         metric_info_future = executor.submit(db_safe_wrapper(self.get_metric_info), bk_biz_id, strategy_configs)
         target_strategy_mapping_future = executor.submit(
             db_safe_wrapper(self.get_target_strategy_mapping), strategy_configs
         )
-        strategy_shield_info_future = executor.submit(db_safe_wrapper(self.get_shield_info), strategy_ids, bk_biz_id)
+        strategy_shield_info_future = executor.submit(
+            db_safe_wrapper(self.get_shield_info), page_strategy_ids, bk_biz_id
+        )
 
-        # 获取到ES查询结果
-        search_result = search_result_future.result()
-        strategy_alert_counts = defaultdict(dict)
-        if search_result.aggs:
-            for strategy_bucket in search_result.aggs.strategy_id.buckets:
-                strategy_alert_counts[strategy_bucket.key]["alert_count"] = strategy_bucket.doc_count
-                for shield_bucket in strategy_bucket.shield_status:
-                    strategy_alert_counts[strategy_bucket.key][shield_bucket.key_as_string] = shield_bucket.doc_count
+        if alert_summary_future:
+            alert_summary = alert_summary_future.result()
+        strategy_status_list = self.get_strategy_status_list(strategy_ids, bk_biz_id, alert_summary)
         data_source_names = {
             (category["data_source_label"], category["data_type_label"]): category["name"] for category in DATA_CATEGORY
         }
@@ -1279,12 +1321,11 @@ class GetStrategyListV2Resource(Resource):
         strategy_shield_info = strategy_shield_info_future.result()
 
         for strategy_config in strategy_configs:
-            # 补充告警数量
-            strategy_config["alert_count"] = strategy_alert_counts.get(str(strategy_config["id"]), {}).get("false", 0)
-            # 补充屏蔽告警数量
-            strategy_config["shield_alert_count"] = strategy_alert_counts.get(str(strategy_config["id"]), {}).get(
-                "true", 0
-            )
+            # 补充告警数量及屏蔽告警数量
+            if alert_summary is not None:
+                strategy_config.update(
+                    alert_summary.get(strategy_config["id"], {"alert_count": 0, "shield_alert_count": 0})
+                )
             # 补充策略屏蔽状态
             strategy_config["shield_info"] = strategy_shield_info.get(strategy_config["id"])
             self.fill_metric_info(strategy_config, metric_info)
@@ -1295,7 +1336,6 @@ class GetStrategyListV2Resource(Resource):
         action_config_list = action_config_list_future.result()
         data_source_list = data_source_list_future.result()
         strategy_label_list = strategy_label_list_future.result()
-        strategy_status_list = strategy_status_list_future.result()
         alert_level_list = alert_level_list_future.result()
         invalid_type_list = invalid_type_list_future.result()
         algorithm_type_list = algorithm_type_list_future.result()
@@ -1314,6 +1354,40 @@ class GetStrategyListV2Resource(Resource):
             "invalid_type_list": invalid_type_list,
             "algorithm_type_list": algorithm_type_list,
             "total": total,
+        }
+
+
+class GetStrategyAlertSummaryV2Resource(GetStrategyListV2Resource):
+    """
+    获取策略告警统计，与策略列表使用相同的过滤条件
+    """
+
+    class RequestSerializer(serializers.Serializer):
+        bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
+        scenario = serializers.CharField(required=False, label="监控场景")
+        conditions = serializers.ListField(required=False, child=serializers.DictField(), default=[], label="条件")
+        strategy_ids = serializers.ListField(
+            required=False, child=serializers.IntegerField(), default=[], label="需要返回告警数量的策略ID"
+        )
+
+    def perform_request(self, params):
+        bk_biz_id = params["bk_biz_id"]
+        strategies = StrategyModel.objects.filter(bk_biz_id=bk_biz_id)
+        context = {}
+        if params["conditions"]:
+            strategies = self.filter_by_conditions(params["conditions"], strategies, bk_biz_id, context)
+        strategy_ids = list(self.filter_by_scenario(strategies, params).values_list("id", flat=True).distinct())
+
+        # 按告警状态过滤时已统计过候选策略，结果覆盖最终策略，直接复用
+        alert_summary = context.get("alert_summary")
+        if alert_summary is None:
+            alert_summary = self.get_alert_summary(bk_biz_id, strategy_ids)
+        return {
+            "strategy_status_list": self.get_strategy_status_list(strategy_ids, bk_biz_id, alert_summary),
+            "strategy_alert_counts": {
+                strategy_id: alert_summary.get(strategy_id, {"alert_count": 0, "shield_alert_count": 0})
+                for strategy_id in set(params["strategy_ids"]).intersection(strategy_ids)
+            },
         }
 
 
@@ -1514,12 +1588,7 @@ class GetMetricListV2Resource(Resource):
             queries: list[Q] = []
             for metric_id in filter_dict["metric_id"]:
                 metric: dict = parse_metric_id(metric_id)
-
-                if "index_set_id" in metric:
-                    metric["related_id"] = metric["index_set_id"]
-                    del metric["index_set_id"]
-                if metric:
-                    queries.append(Q(**metric))
+                queries.extend(build_metric_id_filter_queries(metric))
 
             found_metric = False
             if queries:
@@ -1837,6 +1906,11 @@ class GetMetricListV2Resource(Resource):
         指标数据
         """
         metric_list: list[dict] = []
+        metrics = list(metrics)
+        # 进程采集：静态指标缓存不含用户「维度提取」(extract_pattern) 出的维度（如 process），按业务真实上报补全
+        process_extra_dimensions = get_process_extra_dimensions(
+            bk_biz_id_to_bk_tenant_id(bk_biz_id), bk_biz_id, {metric.result_table_id for metric in metrics}
+        )
         for metric in metrics:
             metric: MetricListCache
 
@@ -1856,13 +1930,20 @@ class GetMetricListV2Resource(Resource):
                         d for d in default_dimensions if d not in ["bk_target_ip", "bk_target_cloud_id"]
                     ]
 
+            # 进程采集等场景：合并真实上报但不在静态指标缓存里的维度（按 id 去重）
+            dimensions = list(metric.dimensions)
+            extra_dims = process_extra_dimensions.get(metric.result_table_id)
+            if extra_dims:
+                existing_ids = {d["id"] for d in dimensions}
+                dimensions += [d for d in extra_dims if d["id"] not in existing_ids]
+
             data = {
                 "id": metric.id,
                 "name": metric.metric_field_name,
                 "bk_biz_id": metric.bk_biz_id,
                 "data_source_label": metric.data_source_label,
                 "data_type_label": metric.data_type_label,
-                "dimensions": sorted(metric.dimensions, key=lambda x: x["name"]),
+                "dimensions": sorted(dimensions, key=lambda x: x["name"]),
                 "collect_interval": metric.collect_interval,
                 "unit": metric.unit,
                 "metric_field": metric.metric_field,
@@ -2135,7 +2216,7 @@ class SaveStrategyV2Resource(Resource):
         if set(upgrade_config["user_groups"]) & set(notice_info.user_groups):
             raise ValidationError(detail=_("通知升级的用户组不能包含第一次接收告警的用户组"))
 
-    def perform_request(self, params):
+    def perform_request(self, params, *, audit_operator=None):
         strategy = Strategy(**params)
         strategy.convert()
         self.validate_realtime_kafka(strategy)
@@ -2146,16 +2227,156 @@ class SaveStrategyV2Resource(Resource):
         # - Strategy.__init__ 通过 ISSUE_CONFIG_EMPTY sentinel 区分"字段未传"与"显式 null"，
         #   自动设置 _issue_config_in_request 与 self.issue_config
         # - strategy.save() → save_issue_config() 在落库前调用 IssueConfig.validate(self)
-        strategy.save()
+        strategy.save(audit_operator=audit_operator)
 
         # 编辑后需要重置AsCode相关配置
         StrategyModel.objects.filter(id=strategy.id).update(hash="", snippet="")
         return strategy.to_dict()
 
 
+class SaveStrategyForPageResource(SaveStrategyV2Resource):
+    """Page-only defaults for named outputs of a multi-PromQL item."""
+
+    @staticmethod
+    def is_multi_promql(item: dict) -> bool:
+        queries = item.get("query_configs") or []
+        return len(queries) >= 2 and all(
+            (query.get("data_source_label"), query.get("data_type_label"), query.get("expression_mode"))
+            == (DataSourceLabel.PROMETHEUS, DataTypeLabel.TIME_SERIES, "promql")
+            for query in queries
+        )
+
+    @staticmethod
+    def default_output_config(item: dict, *, enforce_capacity: bool = True) -> dict:
+        aliases = [query["alias"] for query in item["query_configs"]]
+        references = [alias.upper() for alias in aliases]
+        if len(references) != len(set(references)):
+            raise ValidationError(detail="PromQL 查询别名忽略大小写后存在重复，无法生成默认命名输出")
+        if "RESULT" in references:
+            raise ValidationError(detail="PromQL 查询别名 RESULT 为默认命名输出保留名")
+        config = {
+            "response_contract": "named_outputs/v1",
+            "legacy_output_ref": "RESULT",
+            "output_list": [
+                {"reference_name": reference, "expression": alias} for reference, alias in zip(references, aliases)
+            ]
+            + [
+                {
+                    "reference_name": "RESULT",
+                    "expression": add_expression_functions(item["expression"], item.get("functions") or []),
+                }
+            ],
+        }
+        return Item.normalize_query_output_config(config) if enforce_capacity else config
+
+    @staticmethod
+    def same_output_config(left: dict | None, right: dict | None) -> bool:
+        """Compare output identities, not presentation order of query configs."""
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        if (left.get("response_contract"), left.get("legacy_output_ref")) != (
+            right.get("response_contract"),
+            right.get("legacy_output_ref"),
+        ):
+            return False
+        left_outputs = left.get("output_list")
+        right_outputs = right.get("output_list")
+        if not isinstance(left_outputs, list) or not isinstance(right_outputs, list):
+            return False
+        if len(left_outputs) != len(right_outputs) or not all(
+            isinstance(output, dict) and isinstance(output.get("reference_name"), str)
+            for output in left_outputs + right_outputs
+        ):
+            return False
+        left_by_name = {output.get("reference_name"): output.get("expression") for output in left_outputs}
+        right_by_name = {output.get("reference_name"): output.get("expression") for output in right_outputs}
+        return len(left_by_name) == len(left_outputs) and left_by_name == right_by_name
+
+    @staticmethod
+    def match_old_items(items: list[dict], old_items: list[ItemModel]) -> list[ItemModel | None]:
+        """Use the same explicit-ID reservation and positional fallback as Strategy.save()."""
+        old_by_id = {item.id: item for item in old_items}
+        reserved_ids = {item.get("id") for item in items} & set(old_by_id)
+        available_ids = iter(item.id for item in old_items if item.id not in reserved_ids)
+        used_ids = set()
+        matched = []
+        for item in items:
+            old_id = item.get("id")
+            if old_id not in reserved_ids or old_id in used_ids:
+                old_id = next(available_ids, 0)
+            used_ids.add(old_id)
+            matched.append(old_by_id.get(old_id))
+        return matched
+
+    @classmethod
+    def add_page_defaults(cls, params: dict) -> dict:
+        prepared = deepcopy(params)
+        items = prepared.get("items") or []
+        strategy_id = prepared.get("id")
+        old_items: list[ItemModel] = []
+        old_queries: dict[int, list[dict]] = defaultdict(list)
+        if strategy_id and StrategyModel.objects.filter(id=strategy_id, bk_biz_id=prepared["bk_biz_id"]).exists():
+            # Keep the ItemModel query order aligned with Strategy.save()'s record reuse.
+            old_items = list(
+                ItemModel.objects.filter(strategy_id=strategy_id).only("id", "expression", "functions", "meta")
+            )
+            for query in QueryConfigModel.objects.filter(
+                strategy_id=strategy_id, item_id__in=[item.id for item in old_items]
+            ).order_by("id"):
+                old_queries[query.item_id].append(
+                    {
+                        "alias": query.alias,
+                        "data_source_label": query.data_source_label,
+                        "data_type_label": query.data_type_label,
+                        **query.config,
+                    }
+                )
+
+        for item, old_item in zip(items, cls.match_old_items(items, old_items)):
+            incoming = item.get("query_output_config", serializers.empty)
+            old_config = (
+                old_item.meta.get("query_output_config") if old_item and isinstance(old_item.meta, dict) else None
+            )
+            old_is_multi = bool(old_item) and cls.is_multi_promql({"query_configs": old_queries[old_item.id]})
+            old_default = None
+            if isinstance(old_config, dict) and old_is_multi:
+                old_data = {
+                    "query_configs": old_queries[old_item.id],
+                    "expression": old_item.expression,
+                    "functions": old_item.functions,
+                }
+                # Recognition of an old default must not apply today's capacity limit to custom/disabled items.
+                old_output_list = old_config.get("output_list")
+                if isinstance(old_output_list, list) and len(old_data["query_configs"]) + 1 == len(old_output_list):
+                    try:
+                        old_default = cls.default_output_config(old_data, enforce_capacity=False)
+                    except ValidationError:
+                        pass
+            is_old_default = cls.same_output_config(old_config, old_default)
+            supplied_old_default = incoming is serializers.empty or cls.same_output_config(incoming, old_config)
+
+            if cls.is_multi_promql(item):
+                if incoming is None:
+                    continue
+                if is_old_default and supplied_old_default:
+                    item["query_output_config"] = cls.default_output_config(item)
+                elif incoming is serializers.empty and old_config is None and (old_item is None or not old_is_multi):
+                    item["query_output_config"] = cls.default_output_config(item)
+            elif is_old_default and supplied_old_default:
+                item["query_output_config"] = None
+        return prepared
+
+    def perform_request(self, params, *, audit_operator=None):
+        return super().perform_request(self.add_page_defaults(params), audit_operator=audit_operator)
+
+
 class UpdatePartialStrategyV2Resource(Resource):
     """
     批量更新策略局部配置
+
+    公共入口接收各业务构造的 patch，负责请求校验、事务、行锁和操作历史。
+    strategy_config 的合并与组件保存交给 bkmonitor.strategy，APM 标签等业务规则留在调用方。
+    复合字段与旧字段互斥，分别执行各自的保存流程，保留旧接口的通知和套餐联动行为。
     """
 
     class RequestSerializer(serializers.Serializer):
@@ -2175,11 +2396,23 @@ class UpdatePartialStrategyV2Resource(Resource):
             )
             actions = serializers.ListField(required=False, child=serializers.DictField(), allow_empty=True)
             algorithms = Algorithm.Serializer(many=True, required=False)
+            strategy_config = StrategyConfigPatchSerializer(required=False)
 
             def validate_target(self, target):
                 if target and target[0]:
                     handle_target(target)
                 return target
+
+            def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+                if "strategy_config" not in attrs:
+                    return attrs
+
+                overlap_fields: set[str] = set(attrs) - {"strategy_config"}
+                if overlap_fields:
+                    raise ValidationError(
+                        detail=_("strategy_config 不能与以下字段同时更新: {}").format(", ".join(sorted(overlap_fields)))
+                    )
+                return attrs
 
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
         ids = serializers.ListField(required=True, label="批量修改的策略ID列表")
@@ -2328,6 +2561,11 @@ class UpdatePartialStrategyV2Resource(Resource):
         """更新检测算法。"""
         for item in strategy.items:
             item.algorithms = [Algorithm(strategy.id, item.id, **data) for data in algorithms]
+        strategy.inherit_dynamic_alert_level_mode()
+        # 保存层硬校验(防 partial_update 旁路绕过 Strategy.Serializer.validate)：落库前校验合并结果
+        Strategy.Serializer.validate_new_series(strategy.to_dict())
+        Strategy.Serializer.validate_dynamic_alert_level(strategy.to_dict())
+        for item in strategy.items:
             item.save_algorithms()
 
         return None, [], []
@@ -2482,9 +2720,122 @@ class UpdatePartialStrategyV2Resource(Resource):
                 create_datas[f"extra_{key}_relation"]["cls"] = data["cls"]
                 create_datas[f"extra_{key}_relation"]["objs"].extend(data["objs"])
 
-    def perform_request(self, params):
+    @classmethod
+    def _validate_strategy_config_patch(cls, patch: StrategyConfigPatch) -> None:
+        SaveStrategyV2Resource.validate_realtime_kafka(patch.candidate)
+        SaveStrategyV2Resource.validate_cmdb_level(patch.candidate)
+        SaveStrategyV2Resource.validate_upgrade_user_groups(patch.candidate)
+
+    @staticmethod
+    def update_strategy_config(strategy: Strategy, patch: dict[str, Any]) -> StrategyConfigPatch:
+        """为复合字段生成公共策略组件保存计划。"""
+        # 延续 update_<field> 的入口命名；此处只生成计划，由 Resource 完成校验后执行。
+        return StrategyConfigUpdater.prepare(strategy, patch)
+
+    @staticmethod
+    def _validate_strategy_config_name(bk_biz_id: int, strategy_id: int, name: str) -> None:
+        if StrategyModel.objects.filter(bk_biz_id=bk_biz_id, name=name).exclude(id=strategy_id).exists():
+            raise CreateStrategyError(msg=_("策略名称({})不能重复").format(name))
+
+    @staticmethod
+    def _validate_strategy_config_notice(strategy_id: int, patch: dict[str, Any]) -> None:
+        if not patch.get("notice"):
+            return
+
+        notice_count: int = StrategyActionConfigRelation.objects.filter(
+            strategy_id=strategy_id,
+            relate_type=StrategyActionConfigRelation.RelateType.NOTICE,
+        ).count()
+        if notice_count != 1:
+            raise ValidationError(detail=_("策略配置局部更新要求策略存在唯一通知关系"))
+
+    @staticmethod
+    def _record_strategy_config_failed_history(
+        bk_biz_id: int,
+        strategy_id: int,
+        username: str,
+        message: str,
+    ) -> None:
+        """事务回滚后记录失败历史，不覆盖原始异常。"""
+
+        try:
+            persisted_strategy: Strategy = Strategy.from_models(
+                [StrategyModel.objects.get(id=strategy_id, bk_biz_id=bk_biz_id)]
+            )[0]
+            StrategyHistoryModel.objects.create(
+                create_user=username,
+                strategy_id=strategy_id,
+                operate="update",
+                status=False,
+                content=persisted_strategy.get_history_content(generate_priority_group_key=False),
+                message=message,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "记录策略配置局部更新失败历史失败: bk_biz_id=%s, strategy_id=%s",
+                bk_biz_id,
+                strategy_id,
+            )
+
+    def _perform_strategy_config_request(self, params: dict[str, Any]) -> list[int]:
+        bk_biz_id: int = params["bk_biz_id"]
+        patch_data: dict[str, Any] = params["edit_data"]["strategy_config"]
+        username: str = Strategy._get_username()
+        update_time = datetime.datetime.now(tz=pytz.timezone(settings.TIME_ZONE))
+
+        for strategy_id in params["ids"]:
+            # 每条策略使用独立事务，失败时只回滚当前策略，之前成功的策略已经提交。
+            # 前置结构和通知校验失败不重复留痕，实际更新失败在回滚后记录历史。
+            should_record_failure: bool = False
+            try:
+                with transaction.atomic(settings.BACKEND_DATABASE_NAME):
+                    strategy_model: StrategyModel = StrategyModel.objects.select_for_update().get(
+                        bk_biz_id=bk_biz_id,
+                        id=strategy_id,
+                    )
+                    StrategyConfigUpdater.lock_related(strategy_id, patch_data)
+                    self._validate_strategy_config_notice(strategy_id, patch_data)
+                    patch: StrategyConfigPatch = self.update_strategy_config(
+                        Strategy.from_models([strategy_model])[0], patch_data
+                    )
+                    if not patch.changed:
+                        continue
+                    self._validate_strategy_config_patch(patch)
+
+                    should_record_failure = True
+                    self._validate_strategy_config_name(bk_biz_id, strategy_id, patch.candidate.name)
+                    patch.save()
+                    StrategyModel.objects.filter(id=strategy_id, bk_biz_id=bk_biz_id).update(
+                        update_time=update_time, update_user=username, hash="", snippet=""
+                    )
+                    persisted_strategy: Strategy = Strategy.from_models(
+                        [StrategyModel.objects.get(id=strategy_id, bk_biz_id=bk_biz_id)]
+                    )[0]
+                    StrategyHistoryModel.objects.create(
+                        create_user=username,
+                        strategy_id=strategy_id,
+                        operate="update",
+                        status=True,
+                        content=persisted_strategy.get_history_content(generate_priority_group_key=False),
+                    )
+            except Exception:  # pylint: disable=broad-except
+                if should_record_failure:
+                    self._record_strategy_config_failed_history(
+                        bk_biz_id,
+                        strategy_id,
+                        username,
+                        traceback.format_exc(),
+                    )
+                raise
+
+        return params["ids"]
+
+    def perform_request(self, params: dict[str, Any]) -> list[int]:
         bk_biz_id = params["bk_biz_id"]
         config: dict = params["edit_data"]
+        if set(config) == {"strategy_config"}:
+            return self._perform_strategy_config_request(params)
+
         username = get_global_user()
         strategy_ids = params["ids"]
         strategies = StrategyModel.objects.filter(bk_biz_id=bk_biz_id, id__in=strategy_ids)
@@ -2636,6 +2987,30 @@ class GetTargetDetailWithCache(CacheResource):
     backend_cache_type = CacheType.CC_CACHE_ALWAYS
     cache_user_related = False
 
+    # 目标字段 -> 节点类型/实例类型 映射（类级常量，供逐策略与批量两条路径共用）
+    TARGET_TYPE_MAP = {
+        TargetFieldType.host_target_ip: TargetNodeType.INSTANCE,
+        TargetFieldType.host_ip: TargetNodeType.INSTANCE,
+        TargetFieldType.host_topo: TargetNodeType.TOPO,
+        TargetFieldType.service_topo: TargetNodeType.TOPO,
+        TargetFieldType.service_service_template: TargetNodeType.SERVICE_TEMPLATE,
+        TargetFieldType.service_set_template: TargetNodeType.SET_TEMPLATE,
+        TargetFieldType.host_service_template: TargetNodeType.SERVICE_TEMPLATE,
+        TargetFieldType.host_set_template: TargetNodeType.SET_TEMPLATE,
+        TargetFieldType.dynamic_group: TargetNodeType.DYNAMIC_GROUP,
+    }
+    OBJ_TYPE_MAP = {
+        TargetFieldType.host_target_ip: TargetObjectType.HOST,
+        TargetFieldType.host_ip: TargetObjectType.HOST,
+        TargetFieldType.host_topo: TargetObjectType.HOST,
+        TargetFieldType.service_topo: TargetObjectType.SERVICE,
+        TargetFieldType.service_service_template: TargetObjectType.SERVICE,
+        TargetFieldType.service_set_template: TargetObjectType.SERVICE,
+        TargetFieldType.host_service_template: TargetObjectType.HOST,
+        TargetFieldType.host_set_template: TargetObjectType.HOST,
+        TargetFieldType.dynamic_group: TargetObjectType.HOST,
+    }
+
     class RequestSerializer(serializers.Serializer):
         strategy_id = serializers.IntegerField(required=True, label="策略ID")
 
@@ -2695,28 +3070,8 @@ class GetTargetDetailWithCache(CacheResource):
         target理论上支持多个列表以或关系存在，列表内部亦存在多个对象以且关系存在，
         由于目前产品形态只支持单对象的展示，因此若存在多对象，只取第一个对象返回给前端
         """
-        target_type_map = {
-            TargetFieldType.host_target_ip: TargetNodeType.INSTANCE,
-            TargetFieldType.host_ip: TargetNodeType.INSTANCE,
-            TargetFieldType.host_topo: TargetNodeType.TOPO,
-            TargetFieldType.service_topo: TargetNodeType.TOPO,
-            TargetFieldType.service_service_template: TargetNodeType.SERVICE_TEMPLATE,
-            TargetFieldType.service_set_template: TargetNodeType.SET_TEMPLATE,
-            TargetFieldType.host_service_template: TargetNodeType.SERVICE_TEMPLATE,
-            TargetFieldType.host_set_template: TargetNodeType.SET_TEMPLATE,
-            TargetFieldType.dynamic_group: TargetNodeType.DYNAMIC_GROUP,
-        }
-        obj_type_map = {
-            TargetFieldType.host_target_ip: TargetObjectType.HOST,
-            TargetFieldType.host_ip: TargetObjectType.HOST,
-            TargetFieldType.host_topo: TargetObjectType.HOST,
-            TargetFieldType.service_topo: TargetObjectType.SERVICE,
-            TargetFieldType.service_service_template: TargetObjectType.SERVICE,
-            TargetFieldType.service_set_template: TargetObjectType.SERVICE,
-            TargetFieldType.host_service_template: TargetObjectType.HOST,
-            TargetFieldType.host_set_template: TargetObjectType.HOST,
-            TargetFieldType.dynamic_group: TargetObjectType.HOST,
-        }
+        target_type_map = cls.TARGET_TYPE_MAP
+        obj_type_map = cls.OBJ_TYPE_MAP
         info_func_map = {
             TargetFieldType.host_target_ip: resource.commons.get_host_instance_by_ip,
             TargetFieldType.host_ip: resource.commons.get_host_instance_by_ip,
@@ -2836,10 +3191,79 @@ class GetTargetDetail(Resource):
     获取监控目标详情
     """
 
+    # 支持跨策略批量解析的目标字段：这两类目标的 resolver（get_host_instance_by_node /
+    # get_service_instance_by_node）每次调用都会拉取整业务的主机/Agent状态/拓扑树，
+    # 与 node_list 长度基本无关，逐策略调用会把业务级取数重复 N 遍
+    BATCH_NODE_FIELDS = (TargetFieldType.host_topo, TargetFieldType.service_topo)
+
     class RequestSerializer(serializers.Serializer):
         bk_biz_id = serializers.IntegerField(required=True, label="业务ID")
         strategy_ids = serializers.ListField(required=True, label="策略ID列表", child=serializers.IntegerField())
         refresh = serializers.BooleanField(required=False, default=False, label="是否刷新缓存")
+
+    @classmethod
+    def batch_get_node_target_details(cls, bk_biz_id: int, items) -> dict:
+        """
+        node 类目标（host_topo/service_topo）跨策略合并为一次 resolver 调用。
+
+        把同类型目标的 node_list 直接拼接（不去重）成一次调用：resolver 按节点逐个处理
+        且保持顺序，结果按偏移切回各策略，因此与逐策略调用结果一致；
+        业务级取数（整业务主机/Agent状态/拓扑树）则由每策略一次降为每类型一次。
+
+        :return: {strategy_id: 与 GetTargetDetailWithCache.get_target_detail 同构的结果}
+        """
+        # 目标字段 -> (strategy_id, 节点列表) 分组
+        node_groups = {field: [] for field in cls.BATCH_NODE_FIELDS}
+        for item in items:
+            target = item.target
+            # 与 get_target_detail 相同的目标格式预检，不符合的留给逐策略路径
+            if not target or not target[0]:
+                continue
+            target = target[0][0]
+            field = target.get("field")
+            if field not in cls.BATCH_NODE_FIELDS or not target.get("value"):
+                continue
+
+            # resolver 会原地修改节点字典（补 node_path/all_host 等并 pop module_ids），
+            # 深拷贝以隔离各策略结果、避免污染 ORM 对象上的原始 target
+            nodes = deepcopy(target["value"])
+            for node in nodes:
+                if "bk_biz_id" not in node:
+                    node.update(bk_biz_id=bk_biz_id)
+            node_groups[field].append((item.strategy_id, nodes))
+
+        info_func_map = {
+            TargetFieldType.host_topo: resource.commons.get_host_instance_by_node,
+            TargetFieldType.service_topo: resource.commons.get_service_instance_by_node,
+        }
+
+        results = {}
+        for field, entries in node_groups.items():
+            if not entries:
+                continue
+
+            merged_nodes = [node for _, nodes in entries for node in nodes]
+            target_details = info_func_map[field]({"bk_biz_id": bk_biz_id, "node_list": merged_nodes})
+
+            # resolver 逐节点处理且保持顺序，按偏移切回各策略
+            offset = 0
+            for strategy_id, nodes in entries:
+                target_detail = target_details[offset : offset + len(nodes)]
+                offset += len(nodes)
+
+                # 与 get_target_detail 相同的实例数统计口径
+                instances = set()
+                for node in target_detail:
+                    instances.update(node.get("all_host", []))
+
+                results[strategy_id] = {
+                    "node_type": GetTargetDetailWithCache.TARGET_TYPE_MAP[field],
+                    "node_count": len(nodes),
+                    "instance_type": GetTargetDetailWithCache.OBJ_TYPE_MAP[field],
+                    "instance_count": len(instances),
+                    "target_detail": target_detail,
+                }
+        return results
 
     def perform_request(self, params):
         bk_biz_id = params["bk_biz_id"]
@@ -2847,18 +3271,36 @@ class GetTargetDetail(Resource):
             "id", "scenario"
         )
         strategy_ids = [strategy.id for strategy in strategies]
-        items = ItemModel.objects.filter(strategy_id__in=strategy_ids)
+        items = list(ItemModel.objects.filter(strategy_id__in=strategy_ids))
 
         get_target_detail_with_cache = GetTargetDetailWithCache()
         # 提前设置策略与监控目标映射，避免频繁查询数据库
         get_target_detail_with_cache.set_mapping({item.strategy_id: (bk_biz_id, item.target) for item in items})
 
-        empty_strategy_ids = []
         result = {}
+
+        # 先探策略级缓存：命中直接用；refresh 时全部视为未命中（之后批量重算并回写）
+        miss_items = []
         for item in items:
-            # 使用instance.request()方式调用，而非instance()方式。
-            # instance()方式执行时会重新实例化，导致先前执行的set_mapping失效
-            if params["refresh"]:
+            info = None
+            if not params["refresh"]:
+                info = get_target_detail_with_cache.get_cached({"strategy_id": item.strategy_id})
+            if info:
+                result[item.strategy_id] = info
+            else:
+                miss_items.append(item)
+
+        # node 类目标的未命中跨策略合并为一次 resolver 调用，结果按 request() 的缓存语义回写
+        batched_infos = self.batch_get_node_target_details(bk_biz_id, miss_items)
+
+        empty_strategy_ids = []
+        for item in miss_items:
+            if item.strategy_id in batched_infos:
+                info = batched_infos[item.strategy_id]
+                get_target_detail_with_cache.set_cached(info, {"strategy_id": item.strategy_id})
+            elif params["refresh"]:
+                # 使用instance.request()方式调用，而非instance()方式。
+                # instance()方式执行时会重新实例化，导致先前执行的set_mapping失效
                 info = get_target_detail_with_cache.request.refresh({"strategy_id": item.strategy_id})
             else:
                 info = get_target_detail_with_cache.request({"strategy_id": item.strategy_id})

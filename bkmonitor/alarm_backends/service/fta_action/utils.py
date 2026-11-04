@@ -73,6 +73,8 @@ class PushActionProcessor:
         else:
             # 如果没有屏蔽，才创建子任务
             for action_instance in ActionInstance.objects.filter(generate_uuid=generate_uuid, is_parent_action=True):
+                if action_instance.inputs.get("historical_shield_ids"):
+                    continue
                 # 有父任务的事件，先需要创建对应的子任务
                 sub_actions = action_instance.create_sub_actions()
                 logger.info(
@@ -240,6 +242,13 @@ def to_document(action_instance: ActionInstance, current_time, alerts=None):
 
     if action_info["action_plugin_type"] == ActionPluginType.NOTICE:
         target_info["operate_target_string"] = notice_way_display
+        # 非父通知记录（子任务、汇总记录）落原始渠道，供告警列表「通知类型」按通知记录统计；
+        # 原始值缺失时写哨兵，保证「字段不存在」只表示尚未回填
+        if not action_instance.is_parent_action:
+            raw_notice_way = action_instance.inputs.get("notice_way")
+            if not isinstance(raw_notice_way, list):
+                raw_notice_way = [raw_notice_way] if raw_notice_way else []
+            action_info[NoticeWay.NOTICE_WAY_FIELD] = raw_notice_way or [NoticeWay.NOTICE_WAY_NONE]
     action_info.update(target_info)
     converge_info = getattr(action_instance, "converge_info", {})
     action_info.update(converge_info)
@@ -373,7 +382,14 @@ class AlertAssignee:
         """
         group_notify_items = defaultdict(dict)
         user_groups = self.user_groups if user_type == UserGroupType.MAIN else self.follow_groups
-        for user_group in UserGroup.objects.filter(id__in=user_groups):
+        # 严格按 user_groups 配置顺序构建：UserGroup 默认排序为 -update_time，直接遍历 queryset
+        # 会让跨用户组的通知顺序受“最近更新时间”影响（典型如串行电话的拨打顺序），
+        # 这里按配置列表顺序重排，保证顺序确定且可由用户控制。
+        group_objects = {user_group.id: user_group for user_group in UserGroup.objects.filter(id__in=user_groups)}
+        for group_id in user_groups:
+            user_group = group_objects.get(group_id)
+            if not user_group:
+                continue
             group_notify_items[user_group.id] = {
                 "notice_way": self.get_notify_item(getattr(user_group, notice_type, []), self.alert.event.bk_biz_id),
                 "mention_users": self.get_group_mention_users(user_group),

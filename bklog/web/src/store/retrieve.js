@@ -24,32 +24,52 @@
  * IN THE SOFTWARE.
  */
 
-import { random } from '@/components/monitor-echarts/utils';
-
 import http from '@/api';
+import { transformSceneConfigs } from '@/store/scene-filter-config';
+
+const random = (length = 10) => {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return result;
+};
+
+const LIGHTEN_NAME_LIMIT = 3;
+
+const buildLightenName = (indices = []) => {
+  const tableIds = (indices ?? []).map(entry => entry.result_table_id).filter(Boolean);
+  if (!tableIds.length) return ' ()';
+  if (tableIds.length <= LIGHTEN_NAME_LIMIT) {
+    return ` (${tableIds.join(';')})`;
+  }
+  return ` (${tableIds.slice(0, LIGHTEN_NAME_LIMIT).join(';')}+${tableIds.length - LIGHTEN_NAME_LIMIT})`;
+};
 
 /**
  * 索引集列表初始化
  * @param {*} indexSetList 索引集列表
- * @param {*} pid 父节点id
+ * @param {*} parentId 父节点 index_set_id，根节点为 '#'
  */
-const resolveIndexItemAttr = (indexSetList = [], parent_node = null) => {
+const resolveIndexItemAttr = (indexSetList = [], parentId = '#') => {
   const s1 = [];
   const s2 = [];
   indexSetList?.forEach(item => {
-    const copyItem = structuredClone(item);
-    Object.assign(copyItem, {
-      index_set_id: `${item.index_set_id}`,
+    const indexSetId = `${item.index_set_id}`;
+    const copyItem = Object.assign({}, item, {
+      index_set_id: indexSetId,
       indexName: item.index_set_name,
-      lightenName: ` (${item.indices.map(item => item.result_table_id).join(';')})`,
-      unique_id: `${parent_node?.index_set_id ?? '#'}_${item.index_set_id}`,
-      is_child_node: parent_node !== null,
-      parent_node,
+      lightenName: buildLightenName(item.indices),
+      unique_id: `${parentId}_${indexSetId}`,
+      is_child_node: parentId !== '#',
+      parent_id: parentId === '#' ? '' : parentId,
     });
+    delete copyItem.parent_node;
 
     // 这里只有两层，数据结构固定为 parent_id#child_id
-    // 如果是跟节点 数据结构为 #_child_id
-    copyItem.children = resolveIndexItemAttr(item.children ?? [], copyItem);
+    // 如果是根节点 数据结构为 #_child_id
+    copyItem.children = resolveIndexItemAttr(item.children ?? [], indexSetId);
 
     if (copyItem.auth_wieght === 1) {
       s1.push(copyItem);
@@ -83,6 +103,15 @@ export default {
       sortList: [],
     },
     activeVersion: 'v2',
+    /** 场景化检索配置列表 */
+    sceneConfigs: {
+      is_loading: false,
+      data: [],
+    },
+  },
+  getters: {
+    /** 转换后的场景配置列表 */
+    sceneConfigList: state => transformSceneConfigs(state.sceneConfigs?.data ?? []),
   },
   mutations: {
     updateActiveVersion(state, version) {
@@ -143,8 +172,66 @@ export default {
         state.catchFieldCustomConfig.filterAddition.push(...addition);
       }
     },
+    /** 更新场景化检索配置列表 */
+    updateSceneConfigs(state, payload) {
+      if (payload.is_loading !== undefined) {
+        state.sceneConfigs.is_loading = payload.is_loading;
+      }
+      if (payload.data !== undefined) {
+        state.sceneConfigs.data = payload.data ?? [];
+      }
+    },
+    /**
+     * 清理检索页运行态大对象。
+     * 检索页切到管理页后不再需要索引集树、场景配置和字段配置缓存，
+     * 若继续常驻 Vuex，会保留大量响应式对象，导致多次路由切换后 heap 无法及时回落。
+     */
+    resetRuntimeState(state) {
+      state.indexSetList = [];
+      state.flatIndexSetList = [];
+      state.isIndexSetLoading = false;
+      state.isTrendDataLoading = false;
+      state.isTotalCountLoaded = false;
+      state.trendDataCount = 0;
+      state.catchFieldCustomConfig = {
+        fieldsWidth: {},
+        displayFields: [],
+        filterSetting: [],
+        filterAddition: [],
+        fixedFilterAddition: false,
+        sortList: [],
+        contextDisplayFields: [],
+      };
+      state.sceneConfigs = {
+        is_loading: false,
+        data: [],
+      };
+    },
   },
   actions: {
+    /** 请求场景化检索配置列表 */
+    requestSceneConfigs({ commit, rootState }) {
+      commit('updateSceneConfigs', { is_loading: true });
+      return http
+        .request('retrieve/getSceneConfigs', {
+          query: {
+            bk_biz_id: rootState?.bkBizId,
+          },
+        })
+        .then(resp => {
+          const data = resp.data ?? resp ?? [];
+          commit('updateSceneConfigs', { data });
+          return data;
+        })
+        .catch(err => {
+          console.error('requestSceneConfigs error:', err);
+          commit('updateSceneConfigs', { data: [] });
+          return [];
+        })
+        .finally(() => {
+          commit('updateSceneConfigs', { is_loading: false });
+        });
+    },
     getIndexSetList(ctx, payload) {
       const { spaceUid, isLoading = true, is_group } = payload;
       if (isLoading) ctx.commit('updateIndexSetLoading', true);

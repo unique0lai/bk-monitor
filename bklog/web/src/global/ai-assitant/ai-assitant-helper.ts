@@ -1,11 +1,5 @@
 import { Ref, ref } from 'vue';
-import {
-  IAssitantInstance,
-  IAssitantOptions,
-  IAssitantOptionsType,
-  IQueryStringSendData,
-  IRowSendData,
-} from '.';
+import { IAssitantInstance, IAssitantOptions, IAssitantOptionsType, IQueryStringSendData, IRowSendData } from '.';
 import { requestAIResult } from './ai-request';
 import { TextToQueryResponse } from './interface';
 
@@ -15,6 +9,7 @@ import { TextToQueryResponse } from './interface';
 class AiAssitantHelper {
   aiAssitantRef: Ref<IAssitantInstance | null>;
   activePosition: 'search-bar' | 'row-box' | 'text-selection';
+
   constructor() {
     this.aiAssitantRef = ref<IAssitantInstance>(null);
     this.activePosition = 'search-bar';
@@ -41,10 +36,7 @@ class AiAssitantHelper {
    * 搜索栏显示 AI 助手
    * @param options
    */
-  showAiAssitant(
-    options: Partial<IAssitantOptions> = {},
-    args: IQueryStringSendData,
-  ) {
+  showAiAssitant(options: Partial<IAssitantOptions> = {}, args: IQueryStringSendData) {
     this.updateAiAssitantOptions(options, 'query_string_generate').then(() => {
       this.activePosition = 'search-bar';
       this.aiAssitantRef.value?.queryStringShowAiAssistant(args);
@@ -55,11 +47,8 @@ class AiAssitantHelper {
    * 更新 AI 助手实例的选项
    * @param options
    */
-  updateAiAssitantOptions(
-    options: Partial<IAssitantOptions> = {},
-    type: IAssitantOptionsType = 'log_analysis',
-  ) {
-    return this.aiAssitantRef.value?.updateOptions(options, type);
+  updateAiAssitantOptions(options: Partial<IAssitantOptions> = {}, type: IAssitantOptionsType = 'log_analysis') {
+    return Promise.resolve(this.aiAssitantRef.value?.updateOptions(options, type));
   }
 
   /**
@@ -95,11 +84,11 @@ class AiAssitantHelper {
     const selector = '.ai-blueking-wrapper > .ai-blueking-container-wrapper > .ai-blueking-container';
     const aiBlueKineElement = document.querySelector(selector);
     return (
-      aiBlueKineElement?.contains(target)
-      || target?.classList?.contains('ai-blueking-button-text')
-      || target?.closest('.ai-blueking-container-wrapper')
-      || target?.closest('.ai-blueking-form')
-      || target?.parentElement?.querySelector('.bkai-icon') !== null
+      aiBlueKineElement?.contains(target) ||
+      target?.classList?.contains('ai-blueking-button-text') ||
+      target?.closest('.ai-blueking-container-wrapper') ||
+      target?.closest('.ai-blueking-form') ||
+      target?.parentElement?.querySelector('.bkai-icon') !== null
     );
   }
 
@@ -108,11 +97,7 @@ class AiAssitantHelper {
    * @param e
    */
   closeAiAssitantWithSearchBar(e: MouseEvent) {
-    if (
-      this.aiAssitantRef.value?.isShown()
-      && this.activePosition === 'search-bar'
-      && !this.isClickAiAssitant(e)
-    ) {
+    if (this.aiAssitantRef.value?.isShown() && this.activePosition === 'search-bar' && !this.isClickAiAssitant(e)) {
       this.aiAssitantRef.value?.close();
     }
   }
@@ -139,7 +124,7 @@ class AiAssitantHelper {
   /**
    * @description 请求自然语言转查询语句
    * @param args {IQueryStringSendData & { keyword: string }}
-   * @returns {Promise<string>}
+   * @returns {Promise<TextToQueryResponse>}
    */
   requestTextToQueryString(args: IQueryStringSendData & { keyword: string }): Promise<TextToQueryResponse> {
     return requestAIResult(args);

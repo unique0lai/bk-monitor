@@ -55,6 +55,8 @@ const buildRequestConfig = (
   method: 'POST' | 'GET' | 'PUT' = 'POST',
   appendHeaders?: Record<string, string>,
   signal?: AbortSignal,
+  skipTraceparent?: boolean,
+  skipSpaceUid?: boolean,
 ) => {
   // URL 处理（对应 axios 拦截器中的 URL 检查）
   // 如果URL是外部API（如 /api/bk-user-web），直接使用，不拼接 baseURL
@@ -87,21 +89,23 @@ const buildRequestConfig = (
     headers[xsrfHeaderName] = csrfToken;
   }
 
-  // 外部版后端需要读取header里的 spaceUid（对应 axios 拦截器）
-  if (window.IS_EXTERNAL && JSON.parse(window.IS_EXTERNAL as string) && store.state.spaceUid) {
+  // 平台级索引集的所有检索子接口都需要请求空间，统一通过 header 传递
+  if (store.state.spaceUid && !skipSpaceUid) {
     headers['X-Bk-Space-Uid'] = store.state.spaceUid;
   }
 
   // 监控上层并没有使用 OT 这里直接自己生成traceparent id（对应 axios 拦截器）
-  const traceparent = `00-${random(32, 'abcdef0123456789')}-${random(16, 'abcdef0123456789')}-01`;
-  headers.Traceparent = traceparent;
+  if (!skipTraceparent) {
+    const traceparent = `00-${random(32, 'abcdef0123456789')}-${random(16, 'abcdef0123456789')}-01`;
+    headers.Traceparent = traceparent;
+  }
 
   // 构建 fetch 配置（对应 axios withCredentials: true）
   const fetchConfig: RequestInit = {
     method,
     headers: { ...headers, ...appendHeaders },
     credentials: 'include', // 对应 axios withCredentials: true
-    body: params ? JSON.stringify(params) : undefined,
+    body: ['GET', 'HEAD'].includes(method) ? undefined : params ? JSON.stringify(params) : undefined,
     signal, // 支持 AbortController
   };
 
@@ -116,6 +120,7 @@ const buildRequestConfig = (
  * @param args.method 请求方法
  * @param args.headers 请求头
  * @param args.signal AbortSignal 用于取消请求
+ * @param args.skipSpaceUid 是否跳过自动注入空间id
  * @returns {Promise<Response>}
  */
 export const request = (args: {
@@ -124,9 +129,19 @@ export const request = (args: {
   method?: 'POST' | 'GET' | 'PUT';
   headers?: Record<string, string>;
   signal?: AbortSignal;
+  skipTraceparent?: boolean;
+  skipSpaceUid?: boolean;
 }) => {
-  const { url, params = {}, method = 'POST', headers = {}, signal } = args;
-  const { url: fullUrl, config } = buildRequestConfig(url, params, method, headers, signal);
+  const { url, params = {}, method = 'POST', headers = {}, signal, skipTraceparent, skipSpaceUid = false } = args;
+  const { url: fullUrl, config } = buildRequestConfig(
+    url,
+    params,
+    method,
+    headers,
+    signal,
+    skipTraceparent,
+    skipSpaceUid,
+  );
   return fetch(fullUrl, config);
 };
 

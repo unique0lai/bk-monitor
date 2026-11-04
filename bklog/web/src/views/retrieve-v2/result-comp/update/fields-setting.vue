@@ -26,8 +26,8 @@
 
 <template>
   <div
-    class="update-fields-setting"
     v-bkloading="{ isLoading: isLoading }"
+    class="update-fields-setting"
   >
     <!-- 设置列表字段 -->
     <div class="fields-container">
@@ -37,8 +37,8 @@
       >
         <div class="config-container-header">
           <div
-            class="header-config-operation"
             v-show="!isShowAddInput"
+            class="header-config-operation"
           >
             <bk-button
               class="config-btn"
@@ -57,8 +57,8 @@
             </log-export>
           </div>
           <div
-            class="header-config-new-input"
             v-show="isShowAddInput"
+            class="header-config-new-input"
           >
             <bk-input
               v-model="newConfigStr"
@@ -159,7 +159,6 @@
 </template>
 
 <script>
-  import { formatHierarchy } from '@/common/field-resolver';
   import { random, downJsonFile } from '@/common/util';
   import VueDraggable from 'vuedraggable';
   import { mapGetters } from 'vuex';
@@ -169,8 +168,6 @@
   import fieldSetting from './field-setting';
   import fieldsSettingOperate from './fields-setting-operate';
   import tableSort from './table-sort';
-  import { BK_LOG_STORAGE } from '@/store/store.type';
-
 
   /** 导出配置字段文件名前缀 */
   const FIELD_CONFIG_FILENAME_PREFIX = 'log-field-';
@@ -254,25 +251,17 @@
         return this.$store.state.indexFieldInfo?.user_custom_config?.sortList ?? [];
       },
       shadowTotal() {
-        return formatHierarchy(this.$store.state.indexFieldInfo.fields);
+        return this.$store.getters.filteredFieldList;
       },
       filterShadowTotal() {
-        const fields = this.$store.state.indexFieldInfo.fields;
-        return fields.filter(item => {
+        return this.$store.getters.filteredFieldList.filter(item => {
           const matchesKeyword = item.field_name?.includes(this.keyword) || item.query_alias?.includes(this.keyword);
           const isInShadowVisible = this.shadowVisible.some(shadowItem => shadowItem === item.field_name);
           return matchesKeyword && !isInShadowVisible;
         });
       },
-      showFieldAlias() {
-        return this.$store.state.storage[BK_LOG_STORAGE.SHOW_FIELD_ALIAS];
-      },
       fieldAliasMap() {
-        let fieldAliasMap = {};
-        this.$store.state.indexFieldInfo.fields.forEach(item => {
-          fieldAliasMap[item.field_name] = item.field_alias || item.field_name;
-        });
-        return fieldAliasMap;
+        return this.$store.getters.fieldAliasMap;
       },
       toSelectLength() {
         if (this.keyword) {
@@ -293,6 +282,9 @@
       filedSettingConfigID() {
         // 当前索引集的显示字段ID
         return this.$store.state.retrieve.filedSettingConfigID;
+      },
+      isSceneMode() {
+        return this.$store.getters.isSceneMode;
       },
       currentClickConfigData() {
         // 当前选中的配置
@@ -354,7 +346,7 @@
         // 在数据初始化后缓存，使用深拷贝
         this.cachedVisibleFields = structuredClone(this.shadowVisible);
         this.cachedSortFields = structuredClone(this.shadowSort);
-     },
+      },
       /** 保存或应用 */
       async confirmModifyFields() {
         const currentVisibleList = this.$refs.fieldSettingRef.shadowVisible.map(item => item.field_name);
@@ -396,7 +388,6 @@
           // 更新本地显示字段状态
           this.$store.commit('resetVisibleFields', currentVisibleList);
           this.$store.commit('updateIsSetDefaultTableColumn');
-
         } catch (error) {
           console.warn(error);
         } finally {
@@ -405,20 +396,20 @@
       },
       /** 更新config */
       async submitFieldsSet(configID) {
-        await this.$http
-          .request('retrieve/postFieldsConfig', {
-            data: {
+        const requestName = this.isSceneMode ? 'retrieve/sceneApplyFieldsConfig' : 'retrieve/postFieldsConfig';
+        const data = this.isSceneMode
+          ? { config_id: configID }
+          : {
               index_set_id: window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId,
               index_set_ids: this.unionIndexList,
               index_set_type: this.isUnionSearch ? 'union' : 'single',
               display_fields: this.shadowVisible,
               sort_list: this.cachedSortFields,
               config_id: configID,
-            },
-          })
-          .catch(e => {
-            console.warn(e);
-          });
+            };
+        await this.$http.request(requestName, { data }).catch(e => {
+          console.warn(e);
+        });
       },
       cancelModifyFields() {
         this.$emit('cancel');
@@ -471,7 +462,7 @@
           const fieldConfig = JSON.parse(fieldContent);
           fieldConfig.editStr = `导入模板-${random(3)}`;
           this.handleUpdateConfig(fieldConfig, true, this.$t('导入成功'));
-        } catch (error) {
+        } catch {
           this.messageWarn(this.$t('请导入正确的JSON格式文件~'));
           return;
         }
@@ -482,7 +473,7 @@
        *
        */
       handleFieldConfigExport(updateItem) {
-        let fieldName = `${updateItem.name}`;
+        const fieldName = `${updateItem.name}`;
         const fieldConfigParam = {
           name: fieldName,
           sort_list: updateItem.sort_list,
@@ -529,21 +520,29 @@
       },
       /** 更新配置 */
       async handleUpdateConfig(updateItem, isCreate = false, successMsg) {
-        const requestStr = isCreate ? 'create' : 'update';
-        const data = {
+        const requestName = this.isSceneMode
+          ? `retrieve/scene${isCreate ? 'Create' : 'Update'}Config`
+          : `retrieve/${isCreate ? 'create' : 'update'}FieldsConfig`;
+        const baseData = {
           name: updateItem.editStr,
           sort_list: updateItem.sort_list,
           display_fields: updateItem.display_fields,
-          config_id: undefined,
-          index_set_id: window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId,
-          index_set_ids: this.unionIndexList,
-          index_set_type: this.isUnionSearch ? 'union' : 'single',
+          ...(!isCreate && { config_id: updateItem.id }),
         };
-        if (!isCreate) data.config_id = updateItem.id;
+        const data = this.isSceneMode
+          ? {
+              ...baseData,
+              bk_biz_id: this.$store.state.bkBizId,
+              scene_id: this.$store.state.indexItem.scene_active,
+            }
+          : {
+              ...baseData,
+              index_set_id: window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId,
+              index_set_ids: this.unionIndexList,
+              index_set_type: this.isUnionSearch ? 'union' : 'single',
+            };
         try {
-          await this.$http.request(`retrieve/${requestStr}FieldsConfig`, {
-            data,
-          });
+          await this.$http.request(requestName, { data });
           if (this.activeFieldTab === 'sort') {
             if (this.isSortFieldChanged) {
               this.$store.dispatch('requestIndexSetQuery', { formChartChange: false }).then(() => {
@@ -555,7 +554,8 @@
           if (successMsg) {
             isCreate ? this.messageSuccess(successMsg) : this.messageInfo(successMsg);
           }
-        } catch (error) {
+        } catch {
+          // 配置保存失败时不执行成功态处理，错误由请求层统一处理
         } finally {
           if (!this.isConfirmSubmit) this.initRequestConfigListShow();
           this.newConfigStr = '';
@@ -565,15 +565,18 @@
       /** 删除配置 */
       async handleDeleteConfig(configID) {
         try {
-          await this.$http.request('retrieve/deleteFieldsConfig', {
-            data: {
-              config_id: configID,
-              index_set_id: window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId,
-              index_set_ids: this.unionIndexList,
-              index_set_type: this.isUnionSearch ? 'union' : 'single',
-            },
-          });
-        } catch (error) {
+          const requestName = this.isSceneMode ? 'retrieve/sceneDeleteConfig' : 'retrieve/deleteFieldsConfig';
+          const data = this.isSceneMode
+            ? { config_id: configID }
+            : {
+                config_id: configID,
+                index_set_id: window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId,
+                index_set_ids: this.unionIndexList,
+                index_set_type: this.isUnionSearch ? 'union' : 'single',
+              };
+          await this.$http.request(requestName, { data });
+        } catch {
+          // 删除失败时保留当前配置，错误由请求层统一处理
         } finally {
           this.initRequestConfigListShow();
           this.newConfigStr = '';
@@ -626,25 +629,32 @@
       async getFiledConfigList() {
         this.isLoading = true;
         try {
-          const res = await this.$http.request('retrieve/getFieldsListConfig', {
-            data: {
-              ...(this.isUnionSearch
-                ? { index_set_ids: this.unionIndexList }
-                : {
-                    index_set_id: window.__IS_MONITOR_COMPONENT__
-                      ? this.$route.query.indexId
-                      : this.$route.params.indexId,
-                  }),
-              scope: 'default',
-              index_set_type: this.isUnionSearch ? 'union' : 'single',
-            },
-          });
+          const requestName = this.isSceneMode ? 'retrieve/sceneListConfig' : 'retrieve/getFieldsListConfig';
+          const data = this.isSceneMode
+            ? {
+                bk_biz_id: this.$store.state.bkBizId,
+                scene_id: this.$store.state.indexItem.scene_active,
+                scope: 'default',
+              }
+            : {
+                ...(this.isUnionSearch
+                  ? { index_set_ids: this.unionIndexList }
+                  : {
+                      index_set_id: window.__IS_MONITOR_COMPONENT__
+                        ? this.$route.query.indexId
+                        : this.$route.params.indexId,
+                    }),
+                scope: 'default',
+                index_set_type: this.isUnionSearch ? 'union' : 'single',
+              };
+          const res = await this.$http.request(requestName, { data });
           this.configTabPanels = res.data.map(item => ({
             ...item,
             isShowEdit: false,
             editStr: item.name,
           }));
-        } catch (error) {
+        } catch {
+          // 配置列表加载失败时保留当前列表，错误由请求层统一处理
         } finally {
           this.isLoading = false;
         }
@@ -654,7 +664,7 @@
       },
       /** gseIndex和iterationIndex排序顺序同步dtEventTimeStamp */
       syncSort(currentSortList) {
-        const fields = this.$store.state.indexFieldInfo.fields.map(item => item.field_name);
+        const fields = this.$store.getters.rawFieldList.map(item => item.field_name);
         const existingKeys = new Set(currentSortList.map(item => item[0]));
         const requiredFields = ['gseIndex', 'iterationIndex'];
 
@@ -678,7 +688,7 @@
         });
 
         return currentSortList;
-      }
+      },
     },
   };
 </script>

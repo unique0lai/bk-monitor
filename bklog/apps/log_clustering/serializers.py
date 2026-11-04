@@ -50,6 +50,7 @@ class PatternSearchSerlaizer(serializers.Serializer):
     year_on_year_hour = serializers.IntegerField(required=False, default=0, min_value=0)
     group_by = serializers.ListField(required=False, default=[])
     filter_not_clustering = serializers.BooleanField(required=False, default=True)
+    include_origin_log = serializers.BooleanField(required=False, default=False)
 
     remark_config = serializers.ChoiceField(choices=RemarkConfigEnum.get_choices(), default=RemarkConfigEnum.ALL.value)
     owner_config = serializers.ChoiceField(choices=OwnerConfigEnum.get_choices(), default=OwnerConfigEnum.ALL.value)
@@ -218,7 +219,7 @@ class StrategySerializer(serializers.Serializer):
 
 class NewClsStrategySerializer(StrategySerializer):
     interval = serializers.IntegerField(label=_("告警间隔"))
-    threshold = serializers.IntegerField(label=_("告警阈值"))
+    threshold = serializers.IntegerField(label=_("告警阈值"), min_value=1)
 
 
 class StrategyTypeSerializer(serializers.Serializer):

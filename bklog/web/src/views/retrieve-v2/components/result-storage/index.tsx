@@ -24,7 +24,7 @@
  * IN THE SOFTWARE.
  */
 
-import { computed, defineComponent, ref } from 'vue';
+import { computed, defineComponent, ref, watch } from 'vue';
 
 import useLocale from '@/hooks/use-locale';
 import useStore from '@/hooks/use-store';
@@ -51,10 +51,21 @@ export default defineComponent({
     const showRowIndex = computed(() => store.state.storage[BK_LOG_STORAGE.TABLE_SHOW_ROW_INDEX]);
     const expandTextView = computed(() => store.state.storage[BK_LOG_STORAGE.IS_LIMIT_EXPAND_VIEW]);
     const isShowSourceField = computed(() => store.state.storage[BK_LOG_STORAGE.TABLE_SHOW_SOURCE_FIELD]);
+    const isShowCollectorField = computed(() => store.state.storage[BK_LOG_STORAGE.TABLE_SHOW_COLLECTOR_FIELD]);
     const isUnionSearch = computed(() => store.getters.isUnionSearch);
+    const isSceneMode = computed(() => store.getters.isSceneMode);
     const isFormatDate = computed(() => store.state.isFormatDate);
 
     const sortStatus = ref<undefined | 'asc' | 'desc'>(undefined);
+
+    // 切换检索模式时，重置排序状态
+    watch(
+      () => store.state.indexItem?.retrieve_type,
+      () => {
+        sortStatus.value = undefined;
+        store.commit('updateState', { dateTimeSort: false, dateTimeSortList: [] });
+      },
+    );
 
     const userSortFields = computed(() => store.state.indexFieldInfo?.user_custom_config?.sortList ?? []);
     const defaultSortFields = computed(() =>
@@ -117,7 +128,7 @@ export default defineComponent({
       fieldsSettingPopperRef.value?.hide();
     };
 
-    const handleBeforeHide = (e) => {
+    const handleBeforeHide = e => {
       if (e.target?.closest?.('.bklog-v3-popover-tag')) {
         return false;
       }
@@ -128,13 +139,13 @@ export default defineComponent({
       store.commit('updateStorage', { [key]: val });
     };
 
-    const handleJsonFormatDeepChange = (val) => {
+    const handleJsonFormatDeepChange = val => {
       const value = Number(val);
       const target = value > 15 ? 15 : value < 1 ? 1 : value;
       store.commit('updateStorage', { [BK_LOG_STORAGE.TABLE_JSON_FORMAT_DEPTH]: target });
     };
 
-    const handleFormatDate = (val) => {
+    const handleFormatDate = val => {
       store.commit('updateState', { isFormatDate: val });
     };
     const handleShowLogTimeChange = async (target?: 'asc' | 'desc') => {
@@ -154,7 +165,10 @@ export default defineComponent({
         sortList = localSortFields.value.map(item => [item[0], sortStatus.value]);
       }
       displaySortFields.value = sortList;
-      store.commit('updateState', { dateTimeSort: ['asc', 'desc'].includes(sortStatus.value), dateTimeSortList: sortList });
+      store.commit('updateState', {
+        dateTimeSort: ['asc', 'desc'].includes(sortStatus.value),
+        dateTimeSortList: sortList,
+      });
       await store.dispatch('requestIndexSetFieldInfo');
       await store.dispatch('requestIndexSetQuery', { defaultSortList: sortList });
       RetrieveHelper.fire(RetrieveEvent.SORT_LIST_CHANGED, sortList);
@@ -167,11 +181,17 @@ export default defineComponent({
             <div
               class='sort-time'
               on-click={() => handleShowLogTimeChange()}
-              v-bk-tooltips={{ content: sortStatus.value === 'desc' ? $t('当前降序(点击切换)') : (sortStatus.value === 'asc' ? $t('当前升序(点击切换)') : $t('点击切换排序')), placement: 'top' }}
+              v-bk-tooltips={{
+                content:
+                  sortStatus.value === 'desc'
+                    ? $t('当前降序(点击切换)')
+                    : sortStatus.value === 'asc'
+                      ? $t('当前升序(点击切换)')
+                      : $t('点击切换排序'),
+                placement: 'top',
+              }}
             >
-              <span class='bklog-option-item'>
-                {$t('日志排序')}
-              </span>
+              <span class='bklog-option-item'>{$t('日志排序')}</span>
               <span class='bk-table-caret-wrapper'>
                 <i
                   class={['bk-table-sort-caret', 'ascending', { active: sortStatus.value === 'asc' }]}
@@ -197,22 +217,37 @@ export default defineComponent({
               beforeHide={handleBeforeHide}
               content-class='bklog-sort-setting-popover-content'
               content={() => (
-                <div class="sort-setting-content">
-                  <div class="sort-setting-title">{$t('排序字段设置')}</div>
+                <div class='sort-setting-content'>
+                  <div class='sort-setting-title'>{$t('排序字段设置')}</div>
                   <TableSort
                     ref={tableSortRef}
-                    class="sort-setting-list"
+                    class='sort-setting-list'
                     initData={displaySortFields.value}
                     shouldRefresh={showSortSetting.value}
                   />
-                  <div class="sort-setting-actions">
-                    <bk-button theme="primary" size="small" class="mr8" onClick={handleConfirm}>{$t('确定')}</bk-button>
-                    <bk-button size="small" onClick={handleCancel}>{$t('取消')}</bk-button>
+                  <div class='sort-setting-actions'>
+                    <bk-button
+                      theme='primary'
+                      size='small'
+                      class='mr8'
+                      onClick={handleConfirm}
+                    >
+                      {$t('确定')}
+                    </bk-button>
+                    <bk-button
+                      size='small'
+                      onClick={handleCancel}
+                    >
+                      {$t('取消')}
+                    </bk-button>
                   </div>
                 </div>
               )}
             >
-              <div class='sort-setting' v-bk-tooltips={{ content: `${$t('设置排序字段')}`, placement: 'top' }}>
+              <div
+                class='sort-setting'
+                v-bk-tooltips={{ content: `${$t('设置排序字段')}`, placement: 'top' }}
+              >
                 <span class='icon bklog-icon bklog-shezhi sort-setting-icon' />
               </div>
             </BkLogPopover>
@@ -238,7 +273,7 @@ export default defineComponent({
           <span class='switch-label'>{$t('换行')}</span>
         </bk-checkbox>
 
-        {isUnionSearch.value && (
+        {isUnionSearch.value && !isSceneMode.value && (
           <bk-checkbox
             style='margin: 0 12px 0 0'
             class='bklog-option-item'
@@ -315,6 +350,17 @@ export default defineComponent({
             >
               <span class='switch-label'>{$t('时间格式化')}</span>
             </bk-checkbox>
+            {isSceneMode.value && (
+              <bk-checkbox
+                style='margin: 8px 12px 0 0'
+                class='bklog-option-item'
+                theme='primary'
+                value={isShowCollectorField.value}
+                on-change={val => handleStorageChange(val, BK_LOG_STORAGE.TABLE_SHOW_COLLECTOR_FIELD)}
+              >
+                <span class='switch-label'>{$t('来源采集项')}</span>
+              </bk-checkbox>
+            )}
           </div>
         </bk-popover>
       </div>

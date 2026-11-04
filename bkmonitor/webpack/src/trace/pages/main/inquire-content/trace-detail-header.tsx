@@ -31,6 +31,7 @@ import { AI_BLUEKING_SHORTCUTS_ID, getAIBluekingShortcutTips } from 'monitor-pc/
 // import { AI_BLUEKING_SHORTCUTS_ID } from 'monitor-pc/components/ai-whale/types';
 import { useI18n } from 'vue-i18n';
 
+import { getEmbedContext } from '@/common/embed-context';
 import AiBluekingIcon from '@/components/ai-blueking-icon/ai-blueking-icon';
 
 import './trace-detail-header.scss';
@@ -43,6 +44,11 @@ const traceHeaderProps = {
   appName: {
     type: String,
     default: true,
+  },
+  /** 跨业务打开时的目标业务 ID */
+  bizId: {
+    type: [Number, String],
+    default: undefined,
   },
   traceId: {
     type: String,
@@ -71,10 +77,17 @@ export default defineComponent({
       if (content === 'text') {
         text = traceId;
       } else {
-        const hash = `#${window.__BK_WEWEB_DATA__?.parentRoute || '/'}home/?app_name=${
+        /** 嵌入宿主时链接固定指向监控的 trace 路由；主站下由 weweb 提供父级路由 */
+        const parentRoute = getEmbedContext() ? '/trace/' : window.__BK_WEWEB_DATA__?.parentRoute || '/';
+        const hash = `#${parentRoute}home/?app_name=${
           props.appName
         }&search_type=accurate&sceneMode=trace&trace_id=${traceId}`;
         text = location.href.replace(location.hash, hash);
+        if (props.bizId != null && props.bizId !== '') {
+          const url = new URL(text);
+          url.searchParams.set('bizId', String(props.bizId));
+          text = url.toString();
+        }
       }
       copyText(text, (msg: string) => {
         Message({
@@ -131,7 +144,7 @@ export default defineComponent({
             fillBackFieldMap={{
               trace_id: this.traceId,
               app_name: this.appName,
-              bk_biz_id: (window.bk_biz_id || window.cc_biz_id) as string,
+              bk_biz_id: String(this.bizId ?? window.bk_biz_id ?? window.cc_biz_id),
             }}
             tips={{
               content: getAIBluekingShortcutTips(AI_BLUEKING_SHORTCUTS_ID.TRACING_ANALYSIS),

@@ -44,6 +44,9 @@ class AlertManager(BaseAlertProcessor):
         super().__init__()
         self.logger = logging.getLogger("alert.manager")
         self.alert_keys = alert_keys
+        # 本批告警状态是否已落库(save_alerts 完成)。用于区分 broker 异常发生在 finalize 前后:
+        # finalize 后(send_signal)再抛 broker 异常会丢 signal、终态不会被下周期重发,不应计 deferred。
+        self.alerts_finalized = False
 
     def fetch_alerts(self) -> list[Alert]:
         # 1. 根据告警ID，从ES拉出数据
@@ -61,6 +64,7 @@ class AlertManager(BaseAlertProcessor):
             "appointee",
             "supervisor",
             "extra_info",
+            "shield_end_close",
         ]
         alert_docs = {
             alert_doc.id: alert_doc
@@ -76,7 +80,9 @@ class AlertManager(BaseAlertProcessor):
                         # 以DB为主，同时合并check阶段新增内容
                         extra_info = getattr(alert_docs[alert.id], field, None)
                         alert.data[field] = alert.data.get(field) or {}
+                        progress = alert.data[field].copy()
                         alert.data[field].update(extra_info.to_dict() if extra_info else {})
+                        alert.preserve_notification_progress(progress)
                     else:
                         alert.data[field] = getattr(alert_docs[alert.id], field, None)
         return alerts
@@ -110,13 +116,23 @@ class AlertManager(BaseAlertProcessor):
             # 构造mapping，方便后续过滤
             current_alerts_mapping[current_alert.dedupe_md5] = current_alert
         new_alerts = []
+        # Reuse the existing lock-protected cache read. Only missing cache entries
+        # need a snapshot/ES fallback, rather than reloading every ordinary alert.
+        missing_keys = [alert.key for alert in alerts if alert.dedupe_md5 not in current_alerts_mapping]
+        latest_missing = {alert.id: alert for alert in Alert.mget(missing_keys)} if missing_keys else {}
         for alert in alerts:
+            if alert.shield_end_close:
+                continue
+            if alert.id in latest_missing and latest_missing[alert.id].shield_end_close:
+                continue
             if alert.dedupe_md5 in current_alerts_mapping:
                 # 如果缓存中存在当前告警，则使用缓存中的告警状态进行判断
                 cache_alert = current_alerts_mapping.get(alert.dedupe_md5)
-                if cache_alert and not cache_alert.is_abnormal():
+                if cache_alert and (not cache_alert.is_abnormal() or cache_alert.shield_end_close):
                     # 如果缓存二次确认状态不为异常则过滤掉，拉取的都是异常告警，若不一致说明此时告警可能已经被关闭或者恢复
                     continue
+                if cache_alert and cache_alert.id == alert.id:
+                    alert.preserve_notification_progress(cache_alert.extra_info)
             # 其他情况正常进行处理
             new_alerts.append(alert)
         # 打印过滤日志(包含过滤的告警id)
@@ -168,6 +184,9 @@ class AlertManager(BaseAlertProcessor):
 
             # 4. 保存告警到ES
             saved_alerts = self.save_alerts(alerts_to_check, action=BulkActionType.UPSERT, force_save=True)
+            # 状态已落库: 此后(save_alert_logs / send_signal)再抛异常属 finalize 后,
+            # recovered/closed 等终态不会被下周期 check_abnormal_alert 重新捞起重发 signal。
+            self.alerts_finalized = True
 
         # 5. 保存流水日志
         self.save_alert_logs(saved_alerts)
@@ -200,12 +219,17 @@ class AlertManager(BaseAlertProcessor):
         active_alerts = self.list_alerts_content_from_cache(
             [Event(data=alert.top_event, do_clean=False) for alert in alerts]
         )
-        active_alerts_mapping = {alert.dedupe_md5: alert.id for alert in active_alerts}
+        active_alerts_mapping = {alert.dedupe_md5: alert for alert in active_alerts}
+        for alert in alerts:
+            current = active_alerts_mapping.get(alert.dedupe_md5)
+            if current and current.id == alert.id:
+                alert.preserve_notification_progress(current.extra_info)
         update_count, finished_count = self.update_alert_cache(
             [
                 alert
                 for alert in alerts
-                if alert.dedupe_md5 not in active_alerts_mapping or active_alerts_mapping[alert.dedupe_md5] == alert.id
+                if alert.dedupe_md5 not in active_alerts_mapping
+                or active_alerts_mapping[alert.dedupe_md5].id == alert.id
             ]
         )
         self.logger.info("[alert.manager update alert cache]: updated(%s), finished(%s)", update_count, finished_count)

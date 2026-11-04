@@ -14,8 +14,9 @@ import sys
 
 from jinja2 import DebugUndefined
 
+from config import kms
 from config.tools.consul import get_consul_settings
-from config.tools.rabbitmq import get_rabbitmq_settings
+from config.tools.rabbitmq import get_rabbitmq_management_host, get_rabbitmq_settings
 from config.tools.redis import get_cache_redis_settings, get_redis_settings
 
 from ..tools.environment import (
@@ -56,6 +57,8 @@ INSTALLED_APPS += (  # noqa: F405,F821
     "alarm_backends",
     "apm",
     "apm_ebpf",
+    "rum",
+    "rum_web",
     "core.drf_resource",
     "ai_whale",
 )
@@ -135,9 +138,9 @@ DEFAULT_CRONTAB = [
     # 策略增量更新
     ("alarm_backends.core.cache.strategy.smart_refresh", "* * * * *", "global"),
     ("alarm_backends.core.cache.models.collect_config", "* * * * *", "global"),
+    ("alarm_backends.core.cache.models.custom_ts_group", "*/10 * * * *", "global"),
     ("alarm_backends.core.cache.models.uptimecheck", "* * * * *", "global"),
     ("alarm_backends.core.cache.action_config.refresh_total", "*/60 * * * *", "global"),
-    ("alarm_backends.core.cache.action_config.refresh_latest_5_minutes", "* * * * *", "global"),
     ("alarm_backends.core.cache.assign", "* * * * *", "global"),
     # alarm_backends.core.cache.issue (StrategyIssueConfigCache) 已废弃，issue_config 合并进策略缓存
     ("alarm_backends.core.cache.calendar", "* * * * *", "global"),
@@ -151,6 +154,8 @@ DEFAULT_CRONTAB = [
     # clean detect result cache
     ("alarm_backends.core.detect_result.tasks.clean_expired_detect_result", "0 */2 * * *", "global"),
     ("alarm_backends.core.detect_result.tasks.clean_md5_to_dimension_cache", "0 23 * * *", "global"),
+    # clean new series(新维度值检测) seen cache: 按 max_series 收口
+    ("alarm_backends.core.detect_result.tasks.clean_new_series_seen_cache", "0 */2 * * *", "global"),
     # 定期清理超时未执行任务
     ("alarm_backends.service.fta_action.tasks.check_timeout_actions", "* * * * *", "global"),
     # 定期清理mysql内半个月前的数据
@@ -170,6 +175,12 @@ DEFAULT_CRONTAB = [
     ("apm.task.tasks.check_pre_calculate_fields_update", "0 */1 * * *", "global"),
     # apm 检查consul配置是否有更新 1小时执行检测一次
     ("apm.task.tasks.check_apm_consul_config", "0 */1 * * *", "global"),
+    # apm 主动 Profiling 事件分组 DataID 的 consul 配置对账 1小时执行一次
+    ("apm.task.tasks.check_active_profiling_consul_config", "0 */1 * * *", "global"),
+    # apm 主动 Profiling 过期计划停用先不调度，测试环境手动验证后再打开（每天凌晨2点半执行）
+    # ("apm.task.tasks.stop_expired_active_profiling_tasks", "30 2 * * *", "global"),
+    # apm Trace 数据源域索引集兜底同步 每 3 小时触发
+    ("apm.task.tasks.sync_trace_scope_index_sets", "0 */3 * * *", "global"),
     # apm_ebpf 定时检查业务集群是否安装DeepFlow 每15分钟触发
     ("apm_ebpf.task.tasks.ebpf_discover_cron", "*/15 * * * *", "global"),
     # apm_ebpf 定时检查集群和业务绑定关系 每十分钟触发
@@ -184,19 +195,23 @@ DEFAULT_CRONTAB = [
     ("metadata.task.sync_space.refresh_bkcc_space_name", "*/6 * * * *", "global"),
     # metadata 全量刷新 ResourceDefinition/RelationDefinition 到 Redis 兜底任务，每10分钟一次
     ("metadata.task.entity_relation.refresh_entity_definition_to_redis", "*/10 * * * *", "global"),
+    # rum k8s 批量配置下发: 每5分钟触发，获取全部数据进行批量调度
+    ("rum.task.tasks.refresh_rum_config_to_k8s", "*/10 * * * *", "global"),
 ]
 
 if BCS_API_GATEWAY_HOST:  # noqa: F821
     DEFAULT_CRONTAB += [
         # bcs资源同步
         ("api.bcs.tasks.sync_bcs_cluster_to_db", "*/15 * * * *", "global"),
-        ("api.bcs.tasks.sync_bcs_service_to_db", "*/25 * * * *", "global"),
-        ("api.bcs.tasks.sync_bcs_workload_to_db", "*/25 * * * *", "global"),
-        ("api.bcs.tasks.sync_bcs_pod_to_db", "*/25 * * * *", "global"),
-        ("api.bcs.tasks.sync_bcs_node_to_db", "*/25 * * * *", "global"),
-        ("api.bcs.tasks.sync_bcs_service_monitor_to_db", "*/25 * * * *", "global"),
-        ("api.bcs.tasks.sync_bcs_pod_monitor_to_db", "*/25 * * * *", "global"),
-        ("api.bcs.tasks.sync_bcs_ingress_to_db", "*/25 * * * *", "global"),
+        # 下列 7 个 to_db 均按集群 apply_async 到 celery_cron；同分钟触发会把队列瞬时堆到上万条。
+        # 错开约 4 分钟、每小时 2 次（间隔 30min，原 */25 约 25min），避开 :00/:15/:30/:45。
+        ("api.bcs.tasks.sync_bcs_service_to_db", "2,32 * * * *", "global"),
+        ("api.bcs.tasks.sync_bcs_workload_to_db", "6,36 * * * *", "global"),
+        ("api.bcs.tasks.sync_bcs_pod_to_db", "10,40 * * * *", "global"),
+        ("api.bcs.tasks.sync_bcs_node_to_db", "14,44 * * * *", "global"),
+        ("api.bcs.tasks.sync_bcs_service_monitor_to_db", "18,48 * * * *", "global"),
+        ("api.bcs.tasks.sync_bcs_pod_monitor_to_db", "22,52 * * * *", "global"),
+        ("api.bcs.tasks.sync_bcs_ingress_to_db", "26,56 * * * *", "global"),
         # bcs资源数据状态同步
         ("api.bcs.tasks.sync_bcs_cluster_resource", "*/260 * * * *", "global"),
         ("api.bcs.tasks.sync_bcs_workload_resource", "*/260 * * * *", "global"),
@@ -216,6 +231,7 @@ ACTION_TASK_CRONTAB = [
     ("alarm_backends.service.alert.manager.tasks.check_abnormal_alert", "* * * * *", "cluster"),
     # 定期关闭流控告警，避免与整点之类的任务并发，设置每小时执行一次
     ("alarm_backends.service.alert.manager.tasks.check_blocked_alert", "40 */1 * * *", "cluster"),
+    ("alarm_backends.service.alert.manager.shield_tasks.check_shield_end_close_alert", "* * * * *", "cluster"),
     # 定期检测屏蔽策略，进行告警的屏蔽
     ("alarm_backends.service.converge.shield.tasks.check_and_send_shield_notice", "* * * * *", "cluster"),
     # 全局任务
@@ -229,6 +245,8 @@ ACTION_TASK_CRONTAB = [
     ("bkmonitor.documents.tasks.rollover_indices", "*/24 * * * *", "global"),
     # 定期同步活跃 Issue 的告警统计（含漏关联补偿和 orphan issue 检测）
     ("alarm_backends.service.fta_action.tasks.sync_issue_alert_stats", "*/5 * * * *", "cluster"),
+    # 定期预计算 Issue LLM 标题 few-shot 示例缓存（用户改名采样）
+    ("alarm_backends.service.fta_action.tasks.refresh_issue_llm_title_examples", "0 * * * *", "cluster"),
     # 定期清理停用的ai 策略对应的flow任务(每天2点半)
     ("bkmonitor.management.commands.clean_aiflow.run_clean", "30 2 * * *", "global"),
     # aiops sdk策略历史依赖管理
@@ -252,8 +270,9 @@ DEFAULT_CRONTAB += [
     ("metadata.task.config_refresh.refresh_kafka_storage", "*/10 * * * *", "global"),
     ("metadata.task.config_refresh.refresh_consul_es_info", "*/10 * * * *", "global"),
     ("metadata.task.config_refresh.refresh_consul_storage", "*/10 * * * *", "global"),
+    ("metadata.task.config_refresh.refresh_redis_storage", "*/10 * * * *", "global"),
     # 检查V4数据源是否存在对应的Consul配置，若存在则删除
-    ("metadata.task.config_refresh.check_and_delete_ds_consul_config", "*/5 * * * *", "global"),
+    ("metadata.task.config_refresh.check_and_delete_ds_consul_config", "0 1 * * *", "global"),
     ("metadata.task.config_refresh.refresh_bcs_info", "*/10 * * * *", "global"),
     # 刷新回溯配置
     ("metadata.task.config_refresh.refresh_es_restore", "* * * * *", "global"),
@@ -311,12 +330,10 @@ LONG_TASK_CRONTAB = [
     ("metadata.task.bkbase.sync_bkbase_metadata_all", "0 */2 * * *", "global"),
     # BkBase RT 路由同步任务，6h一次
     ("metadata.task.bkbase.sync_bkbase_rt_meta_info_all", "0 */6 * * *", "global"),
-    # BkBase V4 链路组件与关系同步任务，30min
-    # ("metadata.task.bkbase.sync_bkbase_v4_datalink_components", "*/30 * * * *", "global"),
     # 禁用采集项索引清理任务，30min
     ("metadata.task.config_refresh.manage_disable_es_storage", "*/30 * * * *", "global"),
-    # 新版链路状态自动兜底刷新,15min 一次
-    ("metadata.task.refresh_data_link.refresh_data_link_status", "*/15 * * * *", "global"),
+    # BkBase V4 链路组件同步与状态自动兜底刷新，30min 一次
+    ("metadata.task.refresh_data_link.refresh_data_link_status", "*/30 * * * *", "global"),
 ]
 
 # 排除特定的定时任务
@@ -325,7 +342,6 @@ EXCLUDE_WORKER_TASKS = []
 AES_X_KEY_FIELD = "SAAS_SECRET_KEY"
 
 # gse alarm dataid
-GSE_BASE_ALARM_DATAID = 1000
 GSE_CUSTOM_EVENT_DATAID = 1100000
 
 BKMONITOR_WORKER_INET_DEV = ""
@@ -469,6 +485,7 @@ RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_VHOST, RABBITMQ_USER, RABBITMQ_PASS, _ = 
     app_code=APP_CODE,  # noqa: F821
     backend=True,
 )
+RABBITMQ_MANAGEMENT_HOST = get_rabbitmq_management_host(RABBITMQ_HOST, backend=True)
 
 # esb组件地址
 COMMON_USERNAME = os.environ.get("BK_ESB_SUPER_USER", "admin")
@@ -506,7 +523,9 @@ CACHES = {
 # BkBase Redis
 BKBASE_REDIS_HOST = os.environ.get("BKBASE_REDIS_HOST")
 BKBASE_REDIS_PORT = os.environ.get("BKBASE_REDIS_PORT")
-BKBASE_REDIS_PASSWORD = os.environ.get("BKBASE_REDIS_PASSWORD")
+BKBASE_REDIS_PASSWORD = (
+    kms.value("redis", "bkbase", "password") if kms.enabled() else os.environ.get("BKBASE_REDIS_PASSWORD")
+)
 
 # django cache backend using redis
 DJANGO_REDIS_PASSWORD = os.environ.get("DJANGO_REDIS_PASSWORD")
@@ -548,6 +567,24 @@ QOS_ALERT_WINDOW = 60
 # （metric 由 ISSUE_ACTIVE_COUNT_KEY 5min Redis cache 驱动，存在 ≤5min 滞后）。
 ISSUE_MAX_ACTIVE_PER_STRATEGY = 500
 
+# Issue 单个合并组的成员总数上限（**超限拒绝合并**，不是 warn-only）
+# 0 = 关闭该门禁；>0 = 合并后组成员数超过此值时 MergeResource 抛 MergeGroupTooLargeError(3337110)。
+# 把已成组的主并入另一主时，被并入主的成员会一起改挂过来，组规模可成倍增长；
+# IssueMergeResolver.hydrate_aggregations 与 IssueDocument.bulk_follow_status 的 ES 查询是
+# size=len(member_ids)，无界组会退化成慢查询。
+# 与上面 ISSUE_MAX_ACTIVE_PER_STRATEGY 的 warn-only 取向刻意不同：那边放行是因为阻塞会让告警
+# 永久失联（数据代价），这里超限只是用户一次交互失败（先拆分再合并即可），无数据代价。
+ISSUE_MAX_MERGE_GROUP_SIZE = 500
+
+# Issue LLM 标题生成动态配置的静态占位（值与 bkmonitor/define/global_config.py 的 serializer default 对齐）。
+# 必须保留：DynamicSettings.__getattr__ 读 DB 前先 getattr 静态 settings（dynamic_settings.py L74），
+# 缺占位会抛 AttributeError 短路掉 DB 查询，导致 GlobalConfig 页面改的值被静默忽略、功能无法开启。
+ISSUE_LLM_TITLE_BIZ_WHITE_LIST = []
+ISSUE_LLM_TITLE_BIZ_TEMPLATES = {}
+ISSUE_LLM_TITLE_SHADOW = False
+ISSUE_LLM_TITLE_MODEL = "hy3-preview"
+ISSUE_LLM_TITLE_RATE_LIMIT_PER_MINUTE = 100
+
 # 第三方事件接入白名单
 BIZ_WHITE_LIST_FOR_3RD_EVENT = []
 
@@ -579,3 +616,4 @@ AIOPS_INCIDENT_SYNC_QUEUE = os.environ.get("AIOPS_INCIDENT_SYNC_QUEUE", "")
 # AIOPS SDK批量预测并行度
 AIOPS_SDK_PREDICT_CONCURRENCY = int(os.environ.get("AIOPS_SDK_PREDICT_CONCURRENCY", 20))
 AIOPS_SDK_INIT_CONCURRENCY = int(os.environ.get("AIOPS_SDK_INIT_CONCURRENCY", 20))
+AIOPS_SAS_PREDICT_CONCURRENCY = max(1, int(os.environ.get("AIOPS_SAS_PREDICT_CONCURRENCY", 20)))

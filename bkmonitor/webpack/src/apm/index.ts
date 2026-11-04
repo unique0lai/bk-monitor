@@ -37,9 +37,10 @@ import 'monitor-ui/directive/index';
 import Api from 'monitor-api/api';
 import { type VueInstance, setVue } from 'monitor-api/utils/index';
 import { immediateRegister } from 'monitor-common/service-worker/service-worker';
-import { getUrlParam, mergeSpaceList, setGlobalBizId } from 'monitor-common/utils';
+import { getUrlParam, mergeSpaceList, parseBizId, setGlobalBizId } from 'monitor-common/utils';
 import { assignWindowField } from 'monitor-common/utils/assign-window';
 import { userDisplayNameConfigure } from 'monitor-pc/common/user-display-name';
+import { dispatchApmK8sCacheFlush } from 'monitor-pc/pages/monitor-k8s/monitor-k8s-apm';
 
 import App from './pages/app';
 import router from './router/router';
@@ -54,7 +55,7 @@ import 'monitor-static/icons/monitor-icons.css';
 Vue.config.devtools = process.env.NODE_ENV === 'development';
 window.source_app = 'apm';
 const spaceUid = getUrlParam('space_uid');
-const bizId = getUrlParam('bizId')?.replace(/\//gim, '');
+const bizId = parseBizId(getUrlParam('bizId'));
 
 setVue(Vue as VueInstance);
 if (process.env.NODE_ENV === 'development') {
@@ -63,16 +64,17 @@ if (process.env.NODE_ENV === 'development') {
 if (window.__POWERED_BY_BK_WEWEB__) {
   window.bk_biz_id = window.rawWindow.bk_biz_id;
   window.cc_biz_id = window.rawWindow.bk_biz_id;
+  const bizList = window.__BK_WEWEB_DATA__?.$baseStore?.getters.bizList || window.space_list || [];
   store.commit('app/SET_APP_STATE', {
     userName: window.user_name,
     bizId: window.cc_biz_id,
-    bizList: window.space_list,
+    bizList,
     csrfCookieName: window.csrf_cookie_name || '',
     siteUrl: window.site_url,
     bkUrl: window.bk_url,
   });
 
-  new Vue({
+  const app = new Vue({
     el: '#app',
     router,
     store,
@@ -82,6 +84,9 @@ if (window.__POWERED_BY_BK_WEWEB__) {
   Vue.prototype.$bus = new Vue();
   Vue.prototype.$api = Api;
   Vue.prototype.$authorityStore = Authority;
+  window.__BK_WEWEB_DATA__?.setUnmountCallback?.(() => app.$destroy());
+  /** 在 APM 作为微应用嵌入 monitor-pc 时，向父页面注册一个「离开前回调 */
+  window.__BK_WEWEB_DATA__?.registerApmLeaveHandler?.(dispatchApmK8sCacheFlush);
 } else {
   Api.model
     .enhancedContext({
@@ -94,7 +99,7 @@ if (window.__POWERED_BY_BK_WEWEB__) {
       mergeSpaceList(window.space_list);
       window.username = window.uin;
       window.user_name = window.uin;
-      window.cc_biz_id = +window.bk_biz_id;
+      window.cc_biz_id = parseBizId(window.bk_biz_id);
       window.bk_log_search_url = data.BKLOGSEARCH_HOST;
       const bizId = setGlobalBizId();
       if (bizId === false) return;

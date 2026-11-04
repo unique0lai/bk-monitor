@@ -24,8 +24,11 @@
  * IN THE SOFTWARE.
  */
 
-import { type PropType, computed, defineComponent } from 'vue';
+import { type PropType, computed, defineComponent, nextTick, onScopeDispose, shallowRef, useTemplateRef } from 'vue';
 
+import { Button, Input, Loading, Popover } from 'bkui-vue';
+import { EditLine } from 'bkui-vue/lib/icon';
+import { renameIssue } from 'monitor-api/modules/issue';
 import { useI18n } from 'vue-i18n';
 
 import TemporaryShareNew from '../../../../../components/temporary-share/temporary-share-new';
@@ -63,20 +66,74 @@ export default defineComponent({
     toggleFullscreen: val => typeof val === 'boolean',
     previous: () => true,
     next: () => true,
+    nameChange: (_val: string) => true,
+    createTapdSliderShowChange: () => true,
   },
   setup(props, { emit }) {
     const { t } = useI18n();
+    let disposed = false;
+    onScopeDispose(() => { disposed = true; });
 
+    /** 问题回归状态图标映射配置 */
     const iconMap = computed(() => {
       const isRegression = props.detail?.is_regression;
       const config = ISSUES_REGRESSION_MAP[String(isRegression)];
       return {
         ...config,
-        alias: isRegression ? t('回归') : t('新'),
+        alias: isRegression ? t('回归') : t('新类'),
       };
     });
 
-    /** 右侧操作按钮 */
+    /** 编辑名称输入框引用 */
+    const editNameInputRef = useTemplateRef<InstanceType<typeof Input>>('editNameInput');
+    /** 当前编辑的名称 */
+    const editName = shallowRef('');
+    /** 是否处于编辑状态 */
+    const isEdit = shallowRef(false);
+    /** 编辑名称的加载状态 */
+    const editNameLoading = shallowRef(false);
+    /** 创建单据Popover */
+    const createTapdPopover = useTemplateRef<InstanceType<typeof Popover>>('createTapdPopover');
+
+    /**
+     * 处理编辑名称
+     * 进入编辑模式，设置当前名称为问题名称，并聚焦输入框
+     */
+    const handleEditName = () => {
+      isEdit.value = true;
+      editName.value = props.detail.name;
+      nextTick(() => {
+        editNameInputRef.value?.focus();
+      });
+    };
+
+    /**
+     * 处理名称输入框失焦
+     * 如果名称有变化则调用API重命名，否则取消编辑
+     */
+    const handleNameBlur = () => {
+      if (editNameLoading.value) return;
+      if (editName.value === props.detail.name || !editName.value.trim()) {
+        isEdit.value = false;
+        return;
+      }
+      editNameLoading.value = true;
+      renameIssue({
+        bk_biz_id: props.detail.bk_biz_id,
+        issue_id: props.detail.id,
+        new_name: editName.value,
+      })
+        .then(data => {
+          if (disposed) return;
+          isEdit.value = false;
+          emit('nameChange', data.name);
+        })
+        .finally(() => {
+          editNameLoading.value = false;
+        });
+    };
+
+    /** 右侧操作按钮配置列表 */
     const btnGroupObject = computed(() => {
       return [
         {
@@ -100,6 +157,10 @@ export default defineComponent({
       ];
     });
 
+    /**
+     * 处理按钮点击
+     * @param id 按钮ID
+     */
     const handleBtnClick = (id: string) => {
       switch (id) {
         case 'fullscreen':
@@ -114,10 +175,21 @@ export default defineComponent({
       }
     };
 
+    const handleCreateTapdSliderShowChange = () => {
+      emit('createTapdSliderShowChange');
+      createTapdPopover.value.hide();
+    };
+
     return {
+      editName,
+      isEdit,
+      editNameLoading,
       iconMap,
       btnGroupObject,
       handleBtnClick,
+      handleEditName,
+      handleNameBlur,
+      handleCreateTapdSliderShowChange,
     };
   },
   render() {
@@ -129,9 +201,11 @@ export default defineComponent({
           <div class='issues-detail-head-btn-group'>
             <div class='btn-item skeleton-element' />
             <div class='btn-item skeleton-element' />
+            <div class='btn-item skeleton-element' />
           </div>
         </div>
       );
+    if (!this.detail?.id) return <div class='issues-detail-head-main'>{this.$t('问题详情')}</div>;
     return (
       <div class='issues-detail-head-main'>
         <div
@@ -141,18 +215,40 @@ export default defineComponent({
           <i class={['icon-monitor', 'sign-icon', this.iconMap.icon]} />
           <span class='level-tag-text'>{this.iconMap.alias}</span>
         </div>
-        <div class='issues-detail-head-content'>
+        <div class={['issues-detail-head-content', { 'edit-name': this.isEdit }]}>
+          <div class='issues-detail-title'>
+            {this.isEdit ? (
+              <Loading
+                loading={this.editNameLoading}
+                size='small'
+              >
+                <Input
+                  ref='editNameInput'
+                  class='edit-name-input'
+                  v-model={this.editName}
+                  behavior='simplicity'
+                  onBlur={this.handleNameBlur}
+                  onEnter={this.handleNameBlur}
+                />
+              </Loading>
+            ) : (
+              <span
+                class='basic-title-name'
+                v-overflow-tips
+              >
+                {this.detail.name}
+              </span>
+            )}
+            {!this.isEdit && (
+              <EditLine
+                class='edit-icon'
+                onClick={this.handleEditName}
+              />
+            )}
+          </div>
           <div class='issues-id'>
             {this.detail.anomaly_message}
             <TemporaryShareNew type='issues' />
-          </div>
-          <div class='issues-detail-title'>
-            <span
-              class='basic-title-name'
-              v-overflow-tips
-            >
-              {this.detail.name}
-            </span>
           </div>
         </div>
         <div class='issues-detail-head-btn-group'>
@@ -169,6 +265,35 @@ export default defineComponent({
                 <span class='btn-text'>{item.title}</span>
               </div>
             ))}
+          <div class='btn-group-item create-tapd'>
+            <Popover
+              ref='createTapdPopover'
+              v-slots={{
+                content: () => (
+                  <div class='create-tapd-menu-popover-content'>
+                    <div
+                      class='create-tapd-menu-item'
+                      onClick={this.handleCreateTapdSliderShowChange}
+                    >
+                      {this.$t('TAPD 单据')}
+                    </div>
+                    {/* <div class='create-tapd-menu-item disabled'>Github Issue</div> */}
+                  </div>
+                ),
+              }}
+              arrow={false}
+              theme='light create-tapd-menu-popover'
+              trigger='click'
+            >
+              <Button
+                class='create-tapd-btn'
+                theme='primary'
+              >
+                <span>{this.$t('创建单据')}</span>
+                <i class='icon-monitor icon-arrow-down' />
+              </Button>
+            </Popover>
+          </div>
         </div>
       </div>
     );

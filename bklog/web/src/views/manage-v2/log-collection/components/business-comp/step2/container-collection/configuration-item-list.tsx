@@ -24,10 +24,11 @@
  * IN THE SOFTWARE.
  */
 
-import { defineComponent, computed, type PropType, ref, type ComponentPublicInstance } from 'vue';
+import { defineComponent, computed, type PropType, ref, type ComponentPublicInstance, watch } from 'vue';
 
 import useLocale from '@/hooks/use-locale';
 import useStore from '@/hooks/use-store';
+import $http from '@/api';
 
 import LineRuleConfig from '../line-rule-config';
 import LogFilter from '../log-filter';
@@ -37,6 +38,14 @@ import ConfigClusterBox from './config-cluster-box';
 import type { IContainerConfigItem, IClusterItem, IConditions } from '../../../../type';
 
 import './configuration-item-list.scss';
+
+/**
+ * 选择项类型定义
+ */
+type ISelectItem = {
+  id: string;
+  name: string;
+};
 
 /**
  * 子组件实例类型定义
@@ -69,6 +78,8 @@ interface IConfigurationItemListProps {
   logType: 'row' | 'section';
   /** 采集器类型 */
   collectorType: string;
+  /** 是否为编辑态 */
+  isEdit?: boolean;
 }
 
 /**
@@ -120,6 +131,12 @@ export default defineComponent({
       required: false,
       default: '',
     },
+    /** 是否为编辑态 */
+    isEdit: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
   },
 
   emits: ['change'],
@@ -141,6 +158,66 @@ export default defineComponent({
     /** 获取全局数据（字符集选项等） */
     const globalsData = computed(() => store.getters['globals/globalsData']);
 
+    /** 业务 ID */
+    const bkBizId = computed(() => store.getters.bkBizId);
+
+    /** 是否正在请求命名空间接口 */
+    const nameSpaceRequest = ref(false);
+
+    /** 命名空间选择列表 */
+    const nameSpacesSelectList = ref<ISelectItem[]>([]);
+
+    /**
+     * 判断当前所选集群是否为共享集群
+     * @returns 是否为共享集群
+     */
+    const getIsSharedCluster = (): boolean => {
+      return props.clusterList?.find(cluster => cluster.id === props.bcsClusterId)?.is_shared ?? false;
+    };
+
+    /**
+     * 获取命名空间列表
+     * @param clusterID - 集群 ID
+     * @param isFirstUpdateSelect - 是否为首次更新选择（用于详情页数据回显）
+     */
+    const getNameSpaceList = async (clusterID: string, isFirstUpdateSelect = false): Promise<void> => {
+      // 参数校验和防重复请求
+      if (!clusterID || nameSpaceRequest.value) {
+        return;
+      }
+
+      const query = { bcs_cluster_id: clusterID, bk_biz_id: bkBizId.value };
+      nameSpaceRequest.value = true;
+
+      try {
+        const res = (await $http.request('container/getNameSpace', { query })) as { code: number; data: ISelectItem[] };
+
+        if (isFirstUpdateSelect) {
+          // 首次切换集群时，合并现有命名空间和接口返回的命名空间，用于详情页数据回显
+          const firstConfig = props.data[0] as IContainerConfigItem;
+          const namespaceList: string[] = [...(firstConfig?.namespaces || [])];
+          const resIDList = (res.data || []).map((item: ISelectItem) => item.id);
+          const setList = new Set([...namespaceList, ...resIDList]);
+          setList.delete('*'); // 移除通配符，后续会重新添加
+
+          const allList = [...setList].map(item => ({ id: item, name: item }));
+          nameSpacesSelectList.value = [...allList];
+        } else {
+          nameSpacesSelectList.value = res.data || [];
+        }
+
+        // 如果不是共享集群，添加"所有"选项
+        if (!getIsSharedCluster()) {
+          nameSpacesSelectList.value.unshift({ name: t('所有'), id: '*' });
+        }
+      } catch (err) {
+        console.log('获取命名空间列表失败:', err);
+        nameSpacesSelectList.value = [];
+      } finally {
+        nameSpaceRequest.value = false;
+      }
+    };
+
     /**
      * 将索引转换为字母标识（A, B, C, ...）
      * @param index - 配置项的索引（从0开始）
@@ -153,6 +230,16 @@ export default defineComponent({
     };
 
     const isFileType = computed(() => props.scenarioId === 'container_file');
+
+    // 监听集群 ID 变化时获取命名空间列表
+    watch(
+      () => props.bcsClusterId,
+      newVal => {
+        if (newVal) {
+          getNameSpaceList(newVal);
+        }
+      },
+    );
 
     /**
      * 处理配置项数据变更
@@ -176,7 +263,7 @@ export default defineComponent({
       const collectorType = props.data[0]?.collector_type || 'container_log_config';
       return {
         collector_type: collectorType,
-        namespaces: [],
+        namespaces: ['*'],
         // noQuestParams 和 containerNameList 不在类型定义中，但实际业务中需要使用
         noQuestParams: {
           letterIndex: 0,
@@ -218,6 +305,8 @@ export default defineComponent({
           multiline_pattern: '',
           multiline_max_lines: '50',
           multiline_timeout: '2',
+          // 采集范围：true-仅采集下发后的日志，false-采集全量日志
+          tail_files: true,
           // winlog 相关字段在 IContainerCollectionParams 中，但 IContainerConfigItem.params 类型是 IHostCollectionParams
           // 这里使用类型断言来兼容实际使用场景
           winlog_name: [],
@@ -338,6 +427,8 @@ export default defineComponent({
                 clusterList={props.clusterList}
                 config={item}
                 isNode={props.collectorType === 'node_log_config'}
+                nameSpaceRequest={nameSpaceRequest.value}
+                nameSpacesSelectList={nameSpacesSelectList.value}
                 scenarioId={props.scenarioId}
                 on-change={(data: IContainerConfigItem) => {
                   handleDataChange(data, ind);
@@ -418,6 +509,46 @@ export default defineComponent({
                 </bk-select>
               </div>
             )}
+            {/* 采集范围 */}
+            <div class='item-content-child small-width'>
+              <div class='item-content-title'>{t('采集范围')}</div>
+              <span
+                class='tail-files-radio-wrap'
+                v-bk-tooltips={{
+                  content: t('仅新创建采集项支持选择采集范围'),
+                  placement: 'top',
+                  disabled: !props.isEdit,
+                }}
+              >
+                <bk-radio-group
+                  value={item.params?.tail_files ?? true}
+                  on-change={(val: boolean) => {
+                    const updatedItem = {
+                      ...item,
+                      params: {
+                        ...item.params,
+                        tail_files: val,
+                      },
+                    };
+                    handleDataChange(updatedItem, ind);
+                  }}
+                >
+                  <bk-radio
+                    class='mr-24'
+                    value={true}
+                    disabled={props.isEdit}
+                  >
+                    {t('仅采集下发后的日志')}
+                  </bk-radio>
+                  <bk-radio
+                    value={false}
+                    disabled={props.isEdit}
+                  >
+                    {t('采集全量日志')}
+                  </bk-radio>
+                </bk-radio-group>
+              </span>
+            </div>
             {/* 日志过滤配置 */}
             <div class='item-content-child'>
               <div class='item-content-title'>{t('日志过滤')}</div>

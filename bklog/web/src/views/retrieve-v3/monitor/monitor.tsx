@@ -24,11 +24,11 @@
  * IN THE SOFTWARE.
  */
 
-import { computed, defineComponent, provide, watch } from 'vue';
+import { computed, defineComponent, provide, watch, onBeforeUnmount } from 'vue';
 
 import useStore from '@/hooks/use-store';
 
-import { TimeRangeType } from '../../../components/time-range/time-range';
+import type { TimeRangeType } from '../../../components/time-range/time-range';
 import { handleTransformToTimestamp } from '../../../components/time-range/utils';
 import { updateTimezone } from '../../../language/dayjs';
 import { BK_LOG_STORAGE } from '../../../store/store.type';
@@ -61,7 +61,19 @@ export default defineComponent({
       type: String,
       default: '',
     },
+    appName: {
+      type: String,
+      default: '',
+    },
+    serviceName: {
+      type: String,
+      default: '',
+    },
     handleChartDataZoom: {
+      type: Function,
+      default: null,
+    },
+    handleRelatedTraceClick: {
       type: Function,
       default: null,
     },
@@ -69,6 +81,7 @@ export default defineComponent({
   setup(props) {
     const store = useStore();
     provide('handleChartDataZoom', props.handleChartDataZoom);
+    provide('handleRelatedTraceClick', props.handleRelatedTraceClick);
     const {
       isSearchContextStickyTop,
       isSearchResultStickyTop,
@@ -79,6 +92,10 @@ export default defineComponent({
     } = useMonitorAppInit(props.indexSetApi);
     const isStartTextEllipsis = computed(() => store.state.storage[BK_LOG_STORAGE.TEXT_ELLIPSIS_DIR] === 'start');
     const init = () => {
+      if (props.appName && props.serviceName) {
+        window.MONITOR_APM_APP_NAME = props.appName;
+        window.MONITOR_APM_SERVICE_NAME = props.serviceName;
+      }
       const result = handleTransformToTimestamp(props.timeRange as TimeRangeType, store.getters.retrieveParams.format);
       store.commit('updateIndexItem', {
         start_time: result[0],
@@ -97,10 +114,14 @@ export default defineComponent({
         if (!val) return;
         getIndexSetList();
         store.commit('updateIsSetDefaultTableColumn', false);
+        store.commit('resetIndexSetQueryResult', {
+          is_loading: true,
+          search_count: store.state.indexSetQueryResult.search_count + 1,
+        });
         const result = handleTransformToTimestamp(val as TimeRangeType, store.getters.retrieveParams.format);
         store.commit('updateIndexItemParams', { start_time: result[0], end_time: result[1], datePickerValue: val });
         await store.dispatch('requestIndexSetFieldInfo');
-        store.dispatch('requestIndexSetQuery');
+        store.dispatch('requestIndexSetQuery', { searchCount: store.state.indexSetQueryResult.search_count });
       },
     );
 
@@ -144,6 +165,11 @@ export default defineComponent({
 
       return <div style={{ minHeight: '50vh', width: '100%' }}></div>;
     };
+
+    onBeforeUnmount(() => {
+      window.MONITOR_APM_APP_NAME = '';
+      window.MONITOR_APM_SERVICE_NAME = '';
+    });
 
     return () => (
       <div

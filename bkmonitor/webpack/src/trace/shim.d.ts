@@ -38,14 +38,22 @@ declare global {
   interface Window {
     __BK_WEWEB_DATA__?: Vue3WewebData;
     __POWERED_BY_BK_WEWEB__?: boolean;
+    /*
+     * 灰度开启 Profiling 检索主动采集Tab
+     */
+    active_profiling_biz_list?: number[];
     AJAX_URL_PREFIX: string;
     apm_ebpf_enabled: boolean;
+    // APM 监控相关
+    APM_QUERY_STRING?: string;
     bk_biz_id: number | string;
     bk_biz_list: IBizItem[];
     BK_DOC_URL?: string;
     bk_doc_version: string;
     bk_docs_site_url: string;
+    bk_incident_saas_host: string;
     bk_log_search_url: string;
+    bk_nodeman_host: string;
     bk_url: string;
     bkchat_manage_url: string;
     bklogsearch_host: string;
@@ -53,9 +61,8 @@ declare global {
     csrf_cookie_name: string;
     dayjs?: Dayjs;
     enable_apm_profiling: boolean;
+    enable_cmdb_level?: boolean;
     enable_create_chat_group?: boolean;
-    // APM 监控相关
-    APM_QUERY_STRING?: string;
     // 多租户用户中心是否开启
     enable_multi_tenant_mode?: boolean;
     FEATURE_TOGGLE?: Record<string, 'off' | 'on'>;
@@ -63,12 +70,12 @@ declare global {
     i18n: typeof i18n.global;
     // 以下为日志全局变量配置
     mainComponent: any;
-
     rawWindow?: Window;
     site_url: string;
     source_app: string;
     space_list: ISpaceItem[];
     static_url: string;
+    tapd_oauth_base_url?: string;
     timezone: string;
     traceLogComponent: any;
     uin: string;

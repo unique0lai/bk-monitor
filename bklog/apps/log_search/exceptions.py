@@ -278,6 +278,11 @@ class ChildIndexSetNotExistException(BaseIndexSetException):
     MESSAGE = _("子索引集 [ID:{child_index_set_id}] 不存在")
 
 
+class PlatformIndexRouterSyncException(BaseIndexSetException):
+    ERROR_CODE = "335"
+    MESSAGE = _("平台级索引集 [ID:{index_set_ids}] 路由下发失败，请重试")
+
+
 # =================================================
 # 管理-检索
 # =================================================
@@ -573,11 +578,6 @@ class GetAllFieldsException(BaseSearchException):
 # =================================================
 
 
-class MissAsyncExportException(BaseException):
-    ERROR_CODE = "501"
-    MESSAGE = _("对应索引集缺少异步导出必备fields{}")
-
-
 class OverAsyncExportMaxCount(BaseException):
     ERROR_CODE = "502"
     MESSAGE = _("超过异步导出最大条数限制{max_async_export_count}")
@@ -606,6 +606,46 @@ class DuplicateUnifyQueryExportException(BaseException):
 class PreCheckSortFieldException(BaseSearchException):
     ERROR_CODE = "507"
     MESSAGE = _("导出失败，字段({fields})不支持排序")
+
+
+class AsyncExportTaskNotFoundException(BaseException):
+    ERROR_CODE = "508"
+    MESSAGE = _("异步导出任务不存在或无权限下载")
+
+
+class AsyncExportTaskNotDownloadableException(BaseException):
+    ERROR_CODE = "509"
+    MESSAGE = _("异步导出任务暂不可下载")
+
+
+class ConcurrentExportLimitException(BaseException):
+    ERROR_CODE = "511"
+    MESSAGE = _("当前有多个导出任务正在下载中，同时可进行的任务数不得超过 {limit_count} 个，请稍后重试")
+
+
+class AsyncExportRequestBusyException(BaseException):
+    ERROR_CODE = "512"
+    MESSAGE = _("当前有导出任务正在创建中，请稍后重试")
+
+
+# =================================================
+# Scene Search Fields Config
+# =================================================
+
+
+class SceneFieldsConfigNotExistException(BaseException):
+    ERROR_CODE = "508"
+    MESSAGE = _("场景字段配置不存在")
+
+
+class SceneFieldsConfigAlreadyExistException(BaseException):
+    ERROR_CODE = "509"
+    MESSAGE = _("场景字段配置名称已存在")
+
+
+class SceneDefaultConfigNotAllowedDelete(BaseException):
+    ERROR_CODE = "510"
+    MESSAGE = _("默认场景字段配置不允许删除")
 
 
 # =================================================

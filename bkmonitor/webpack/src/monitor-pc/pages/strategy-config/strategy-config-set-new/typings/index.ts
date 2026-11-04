@@ -137,6 +137,8 @@ export enum DetectionRuleTypeEnum {
   AdvancedYearRound = 'AdvancedYearRound',
   /** 单指标异常检测 */
   IntelligentDetect = 'IntelligentDetect',
+  /** 新维度值检测 */
+  NewSeries = 'NewSeries',
   /** 部分节点数 */
   PartialNodes = 'PartialNodes',
   /** 环比策略(大类) */
@@ -235,13 +237,7 @@ export interface ISceneConfig {
   scene_name?: string;
 }
 /* source模式下 sourceData */
-export interface ISourceData {
-  errorMsg?: string;
-  promqlError?: boolean;
-  sourceCode: string;
-  sourceCodeCache?: string;
-  step: number | string;
-}
+export type ISourceData = import('../../strategy-config-common/promql-query/model').PromqlSourceData;
 
 /** 条件类型 */
 export interface IWhereItem {
@@ -257,7 +253,7 @@ export type strategyType = 'fta' | 'monitor';
 export class MetricDetail {
   _agg_condition = [];
   agg_dimension: string[] = [];
-  agg_interval: any = 60;
+  agg_interval: number | string = undefined;
   agg_interval_list = INTERVAL_LIST;
   agg_method = 'AVG';
   alias?: string = '';
@@ -345,7 +341,7 @@ export class MetricDetail {
         : metricDetail.id;
     this.name = metricDetail.name || metricDetail.metric_field_name;
     if (this.agg_interval === 'auto' || !this.agg_interval) {
-      this.agg_interval = 60;
+      this.agg_interval = metricDetail.collect_interval > 60 ? this.collect_interval : 60;
     } else if (typeof this.agg_interval === 'string') {
       this.agg_interval = this.agg_interval.includes('m')
         ? +this.agg_interval.replace(/m/gi, '')

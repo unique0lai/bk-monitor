@@ -28,11 +28,14 @@ from rest_framework.fields import BooleanField
 from rest_framework.response import Response
 
 from apps.constants import (
+    ACTIONS_IMPLYING_LOG_SEARCH,
+    INDEX_SET_SCOPED_EXTERNAL_ACTIONS,
     ExternalPermissionActionEnum,
     ViewSetAction,
     ViewSetActionEnum,
 )
 from apps.iam import ActionEnum
+from apps.log_audit.external import ExternalAuditRecorder, resolve_exception_status_code
 from apps.log_commons.models import (
     AuthorizerSettings,
     ExternalPermission,
@@ -126,7 +129,7 @@ class RequestProcessor:
     @classmethod
     def get_resource(cls, action_id: str, kwargs: dict[str, Any], json_data_str: str):
         """获取请求中的资源"""
-        if action_id == ExternalPermissionActionEnum.LOG_SEARCH.value:
+        if action_id in INDEX_SET_SCOPED_EXTERNAL_ACTIONS:
             if "index_set_id" in kwargs:
                 return int(kwargs.get("index_set_id", ""))
             try:
@@ -173,14 +176,41 @@ class RequestProcessor:
     def filter_log_search_response_resource(
         cls, response: Response, action_id: str, view_set: str, view_action: str, allow_resources_result: dict[str, Any]
     ):
-        allow_resources = allow_resources_result["resources"]
+        allow_resources = set(allow_resources_result["resources"])
         view_set_class: ViewSetAction = ViewSetAction(action_id=action_id, view_set=view_set, view_action=view_action)
         if view_set_class.is_one_of(
             [ViewSetActionEnum.SEARCH_VIEWSET_LIST.value, ViewSetActionEnum.FAVORITE_VIEWSET_LIST.value]
         ):
             data = response.data
             if isinstance(data, dict) and "data" in data:
-                data["data"] = [d for d in data["data"] if d["index_set_id"] in allow_resources]
+                # 先收集所有已授权父索引组中的子项，避免依赖列表顺序：同一个子项
+                # 即使先在未授权组中出现，也不应在随后可见的已授权组之外再上提一次。
+                visible_child_ids = {
+                    child["index_set_id"]
+                    for index_set in data["data"]
+                    if index_set["index_set_id"] in allow_resources
+                    for child in index_set.get("children", [])
+                }
+                filtered_index_sets = []
+                promoted_ids = set()
+                for index_set in data["data"]:
+                    if index_set["index_set_id"] in allow_resources:
+                        filtered_index_sets.append(index_set)
+                        continue
+
+                    # 分组展示时，未授权的父索引集会将已授权子索引一并过滤掉。
+                    # 子索引上提为顶层项，避免为展示而授权整个索引组导致越权。
+                    for child in index_set.get("children", []):
+                        child_index_set_id = child["index_set_id"]
+                        if (
+                            child_index_set_id not in allow_resources
+                            or child_index_set_id in visible_child_ids
+                            or child_index_set_id in promoted_ids
+                        ):
+                            continue
+                        promoted_ids.add(child_index_set_id)
+                        filtered_index_sets.append(child)
+                data["data"] = filtered_index_sets
                 response.data = data
                 return response
         if view_set_class.eq(ViewSetActionEnum.FAVORITE_VIEWSET_LIST_BY_GROUP.value):
@@ -207,6 +237,20 @@ class RequestProcessor:
                 if _d.action_id == ExternalPermissionActionEnum.LOG_COMMON.value or _d.default_permission:
                     return True
         return False
+
+    @classmethod
+    def get_action_id(cls, view_set: str, view_action: str) -> str:
+        """
+        获取接口声明的action_id
+
+        默认允许的接口不走权限校验，拿不到授权命中的action_id，审计需要以此兜底
+        """
+        for _d in ViewSetActionEnum.get_keys():
+            if _d.view_set != view_set:
+                continue
+            if not _d.view_action or _d.view_action == view_action:
+                return _d.action_id
+        return ExternalPermissionActionEnum.LOG_COMMON.value
 
 
 @login_exempt
@@ -320,6 +364,9 @@ def dispatch_external_proxy(request):
     # 这里是字符串
     json_data_str: str = params.get("data", "")
     authorizer = AuthorizerSettings.get_authorizer(space_uid=space_uid)
+    audit_recorder = ExternalAuditRecorder(request)
+    audit_recorder.space_uid = space_uid
+    audit_recorder.authorizer = authorizer or ""
     try:
         parsed = urlsplit(url)
         if method.lower() == "get":
@@ -346,6 +393,10 @@ def dispatch_external_proxy(request):
         action_id = ""
         external_user_info = RequestProcessor.get_request_user_info(request)
         external_user = external_user_info.get("username", "")
+        audit_recorder.external_user = external_user
+        audit_recorder.view_set = view_set
+        audit_recorder.view_action = view_action
+        audit_recorder.action_id = RequestProcessor.get_action_id(view_set=view_set, view_action=view_action)
         allow_resources_result = {"allowed": False, "resources": []}
         # 判断是否是默认允许的接口, 默认允许的接口不需要进行权限校验
         if not RequestProcessor.is_default_allowed(view_set=view_set, view_action=view_action):
@@ -353,26 +404,28 @@ def dispatch_external_proxy(request):
             external_user_allowed_action_id_list = ExternalPermission.get_authorizer_permission(
                 space_uid=space_uid, authorizer=external_user
             ).get(space_uid, [])
+            # 仅 client_log 这类特例会隐式放通 log_search；log_clustering 不合成检索权限
+            if ExternalPermissionActionEnum.LOG_SEARCH.value not in external_user_allowed_action_id_list and any(
+                implying_action_id in external_user_allowed_action_id_list
+                for implying_action_id in ACTIONS_IMPLYING_LOG_SEARCH
+            ):
+                external_user_allowed_action_id_list.append(ExternalPermissionActionEnum.LOG_SEARCH.value)
             # 判断接口是否在管理范围内
             if not external_user_allowed_action_id_list:
-                return JsonResponse(
-                    {
-                        "result": False,
-                        "message": f"dispatch_plugin_query: external_user:{external_user} has no permission.",
-                    },
-                    status=403,
-                )
+                message = f"dispatch_plugin_query: external_user:{external_user} has no permission."
+                audit_recorder.set_result(403, message)
+                return JsonResponse({"result": False, "message": message}, status=403)
             is_allowed = False
             for _action_id in external_user_allowed_action_id_list:
                 if ExternalPermission.is_action_valid(view_set=view_set, view_action=view_action, action_id=_action_id):
                     is_allowed = True
                     action_id = _action_id
+                    audit_recorder.action_id = action_id
                     break
             if not is_allowed:
-                return JsonResponse(
-                    {"result": False, "message": f"external_user:{external_user} has not enough permission."},
-                    status=403,
-                )
+                message = f"external_user:{external_user} has not enough permission."
+                audit_recorder.set_result(403, message)
+                return JsonResponse({"result": False, "message": message}, status=403)
             allow_resources_result = ExternalPermission.get_resources(
                 space_uid=space_uid, action_id=action_id, authorized_user=external_user
             )
@@ -381,14 +434,25 @@ def dispatch_external_proxy(request):
                 resource = RequestProcessor.get_resource(
                     action_id=action_id, kwargs=kwargs, json_data_str=json_data_str
                 )
+                audit_recorder.resource = resource
                 if resource and resource not in allow_resources:
-                    return JsonResponse(
-                        {
-                            "result": False,
-                            "message": f"external_user:{external_user} cannot access resource(ID:{resource}).",
-                        },
-                        status=403,
+                    message = f"external_user:{external_user} cannot access resource(ID:{resource})."
+                    audit_recorder.set_result(403, message)
+                    return JsonResponse({"result": False, "message": message}, status=403)
+                # 聚类设置写入链路必须同时具备该索引集的日志检索权限，避免只授聚类配置即可改配置
+                if (
+                    action_id == ExternalPermissionActionEnum.LOG_CLUSTERING.value
+                    and resource
+                    and not ExternalPermission.can_access_clustering_settings(
+                        space_uid=space_uid, authorized_user=external_user, index_set_id=resource
                     )
+                ):
+                    message = (
+                        f"external_user:{external_user} cannot access clustering settings "
+                        f"without log_search on resource(ID:{resource})."
+                    )
+                    audit_recorder.set_result(403, message)
+                    return JsonResponse({"result": False, "message": message}, status=403)
         setattr(fake_request, "space_uid", space_uid)
         setattr(request, "space_uid", space_uid)
         if authorizer:
@@ -413,6 +477,10 @@ def dispatch_external_proxy(request):
 
         # call view_func
         response = view_func(fake_request, **kwargs)
+        # 视图内部的鉴权失败不会命中上面的分支，按响应码补记审计结果
+        status_code = getattr(response, "status_code", 0)
+        if status_code >= 400:
+            audit_recorder.set_result(status_code, f"view_func response status: {status_code}")
         return RequestProcessor.filter_response_resource(
             external_user=external_user,
             response=response,
@@ -429,8 +497,13 @@ def dispatch_external_proxy(request):
         )
 
     except Exception as e:
+        audit_recorder.set_result(resolve_exception_status_code(e), str(e))
         logger.exception(f"dispatch_plugin_query: exception for {e}")
         raise e
+
+    finally:
+        # 转发入口有多个鉴权提前返回分支，统一在这里上报，避免漏埋拒绝事件
+        audit_recorder.push()
 
 
 @login_exempt

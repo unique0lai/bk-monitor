@@ -1,0 +1,199 @@
+/*
+ * Tencent is pleased to support the open source community by making
+ * 蓝鲸智云PaaS平台 (BlueKing PaaS) available.
+ *
+ * Copyright (C) 2017-2025 Tencent.  All rights reserved.
+ *
+ * 蓝鲸智云PaaS平台 (BlueKing PaaS) is licensed under the MIT License.
+ *
+ * License for 蓝鲸智云PaaS平台 (BlueKing PaaS):
+ *
+ * ---------------------------------------------------
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+ * to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+ * the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+ * THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+import { type PropType, computed, defineComponent, nextTick, onMounted, shallowRef, useTemplateRef } from 'vue';
+
+import { type TableSort, PrimaryTable } from '@blueking/tdesign-ui';
+import { useResizeObserver } from '@vueuse/core';
+import { useI18n } from 'vue-i18n';
+
+import { HostLoadingCell, HostRefreshStatus } from '../host-loading/host-loading';
+import { useTableEllipsis } from '../../../../hooks/use-table-popover';
+import { PROCESS_LIST_COLUMNS, PROCESS_LIST_ELLIPSIS_CELL_CLASS } from '../../constants/process';
+import { useProcessColumnsRenderer } from './hooks/use-process-columns-renderer';
+import EmptyStatus from '@/components/empty-status/empty-status';
+import ExploreTableEmpty from '@/pages/trace-explore/components/trace-explore-table/components/explore-table-empty';
+
+import type { ProcessItem } from '../../types/process';
+
+import './process-table.scss';
+
+export default defineComponent({
+  name: 'ProcessTable',
+  props: {
+    /** 进程数据 */
+    data: {
+      type: Array as PropType<ProcessItem[]>,
+      default: () => [],
+    },
+    /** 展示列 id 列表 */
+    visibleColumns: {
+      type: Array as PropType<string[]>,
+      default: () => [],
+    },
+    /** 列宽缓存（key -> 像素宽度），覆盖列配置默认宽度 */
+    columnWidths: {
+      type: Object as PropType<Record<string, number>>,
+      default: () => ({}),
+    },
+    /** 排序（`-key` 倒序 / `key` 正序） */
+    sort: {
+      type: String,
+      default: '',
+    },
+    /** 表格加载状态（展示骨架屏） */
+    loading: {
+      type: Boolean,
+      default: false,
+    },
+    refreshing: Boolean,
+    refreshError: Boolean,
+    /** 表格空数据类型 */
+    emptyType: {
+      type: String as PropType<'500' | 'empty' | 'search-empty'>,
+      default: 'empty',
+    },
+  },
+  emits: {
+    sortChange: (_v: string) => true,
+    columnsChange: (_cols: string[]) => true,
+    columnResize: (_widths: Record<string, number>) => true,
+    rowClick: (_row: ProcessItem) => true,
+    clearFilter: () => true,
+    retry: () => true,
+  },
+  setup(props, { emit }) {
+    const { t } = useI18n();
+    const bodyRef = useTemplateRef<HTMLElement>('body');
+    /** 表格体最大高度（自适应屏幕，表内滚动） */
+    const bodyHeight = shallowRef(400);
+    /** 监听容器高度变化，动态调整表格最大高度 */
+    useResizeObserver(bodyRef, entries => {
+      const height = entries[0]?.contentRect?.height;
+      if (height) {
+        bodyHeight.value = height;
+      }
+    });
+
+    /** 表格文本溢出 tooltip 事件委托（配合 PROCESS_LIST_ELLIPSIS_CELL_CLASS） */
+    const { initListeners: initEllipsisListeners } = useTableEllipsis(bodyRef, {
+      trigger: { selector: `.${PROCESS_LIST_ELLIPSIS_CELL_CLASS}` },
+    });
+
+    /** 排序转换为 tdesign 数组形式 */
+    const tableSort = computed<TableSort>(() => {
+      if (!props.sort) return [];
+      const descending = props.sort.startsWith('-');
+      return [{ sortBy: descending ? props.sort.slice(1) : props.sort, descending }];
+    });
+
+    /** 列渲染器 hook（含各列单元格自定义渲染逻辑） */
+    const { buildColumn } = useProcessColumnsRenderer({
+      onRowClick: row => emit('rowClick', row),
+      getColumnWidth: colKey => props.columnWidths[colKey],
+    });
+
+    /**
+     * @description tdesign 排序变化回调，转换为 `-key` / `key` 字符串格式发出
+     * @param {TableSort} sortEvent - 排序事件对象
+     */
+    const handleSortChange = (sortEvent: TableSort) => {
+      const target = Array.isArray(sortEvent) ? sortEvent[0] : sortEvent;
+      emit('sortChange', target?.sortBy ? `${target.descending ? '-' : ''}${target.sortBy}` : '');
+    };
+
+    onMounted(async () => {
+      await nextTick();
+      initEllipsisListeners();
+    });
+
+    return {
+      t,
+      bodyHeight,
+      buildColumn,
+      tableSort,
+      handleSortChange,
+    };
+  },
+  render() {
+    return (
+      <div
+        ref='body'
+        class='process-table'
+        aria-busy={this.loading || this.refreshing}
+      >
+        <HostRefreshStatus loading={this.refreshing} error={this.refreshError} onRetry={() => this.$emit('retry')} />
+        <PrimaryTable
+          class={`process-table-body ${!this.loading && this.data.length === 0 ? 'process-table-body--empty' : ''}`}
+          v-slots={{
+            empty: () =>
+              this.emptyType === '500' ? (
+                <EmptyStatus
+                  type='500'
+                  onOperation={() => this.$emit('retry')}
+                />
+              ) : (
+                <ExploreTableEmpty
+                  showOperation={this.emptyType === 'search-empty'}
+                  type={this.emptyType}
+                  onClearFilter={() => this.$emit('clearFilter')}
+                />
+              ),
+          }}
+          bkUiSettings={{
+            fields: PROCESS_LIST_COLUMNS.map(column => ({
+              label: this.t(column.name),
+              field: column.id,
+              disabled: column.disabled,
+            })),
+            checked: this.visibleColumns,
+          }}
+          columns={PROCESS_LIST_COLUMNS.map(column => ({
+            ...this.buildColumn(column),
+            ...(this.loading ? { cell: (_: unknown, { rowIndex }: { rowIndex: number }) => <HostLoadingCell index={rowIndex} kind={['cpu', 'memory', 'fileHandle'].includes(column.type) ? 'metric' : column.type} /> } : {}),
+          }))}
+          data={this.loading ? Array.from({ length: Math.max(3, Math.floor((this.bodyHeight - 42) / 56)) }, (_, index) => ({ id: `loading-${index}` })) : this.data}
+          disableDataPage={true}
+          hover={true}
+          maxHeight={this.bodyHeight}
+          needCustomScroll={false}
+          resizable={true}
+          rowKey='id'
+          showSortColumnBgColor={true}
+          size='small'
+          sort={this.tableSort}
+          tableLayout='fixed'
+          onColumnResizeChange={(ctx: { columnsWidth: Record<string, number> }) =>
+            this.$emit('columnResize', ctx.columnsWidth)
+          }
+          // @ts-expect-error
+          onDisplayColumnsChange={(cols: string[]) => this.$emit('columnsChange', cols)}
+          onSortChange={this.handleSortChange}
+        />
+      </div>
+    );
+  },
+});

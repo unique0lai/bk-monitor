@@ -57,17 +57,17 @@
       </section>
       <section
         v-if="operateType"
-        class="access-step-container"
         v-bkloading="{ isLoading: containerLoading, zIndex: 10 }"
+        class="access-step-container"
       >
         <component
+          :is="getCurrentComponent"
           ref="currentRef"
           :apply-data="applyData"
           :container-loading.sync="containerLoading"
           :cur-step="curStep"
           :force-show-component.sync="forceShowComponent"
           :index-set-id="indexSetId"
-          :is="getCurrentComponent"
           :is-container-step="isContainerStep"
           :is-finish-create-step="isFinishCreateStep"
           :is-physics.sync="isPhysics"
@@ -99,6 +99,7 @@
 <script>
   import advanceCleanLand from '@/components/collection-access/advance-clean-land';
   import AuthContainerPage from '@/components/common/auth-container-page';
+  import { isFeatureToggleOn } from '@/hooks/use-feature-toggle';
   import { mapState, mapGetters } from 'vuex';
 
   import * as authorityMap from '../../common/authority-map';
@@ -131,7 +132,10 @@
         isCleaning: false,
         isSubmit: false,
         isUpdate: false, // 判断第一步是否是处于编辑状态
-        isItsm: window.FEATURE_TOGGLE.collect_itsm === 'on',
+        isItsm: isFeatureToggleOn('collect_itsm', [
+          String(this.$store.state.bkBizId),
+          String(this.$store.state.spaceUid),
+        ]),
         operateType: '',
         curStep: 1, // 组件步骤
         isPhysics: true, // 采集配置是否是物理环境

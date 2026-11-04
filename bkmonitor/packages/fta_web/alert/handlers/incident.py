@@ -8,6 +8,7 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+import logging
 import operator
 import time
 from collections import defaultdict
@@ -32,8 +33,15 @@ from fta_web.alert.handlers.base import (
     BaseQueryTransformer,
     QueryField,
 )
+from fta_web.alert.handlers.fulltext import (
+    FulltextFieldKind,
+    FulltextSearchField,
+    is_bare_fulltext_query,
+)
 from fta_web.alert.handlers.translator import BizTranslator
 from fta_web.alert.utils import search_time_init
+
+logger = logging.getLogger("bkmonitor")
 
 
 class IncidentQueryTransformer(BaseQueryTransformer):
@@ -71,8 +79,8 @@ class IncidentQueryTransformer(BaseQueryTransformer):
     query_fields = [
         QueryField("id", _lazy("故障ID")),
         QueryField("incident_id", _lazy("故障主键")),
-        QueryField("incident_name", _lazy("故障名称")),
-        QueryField("incident_reason", _lazy("故障原因")),
+        QueryField("incident_name", _lazy("故障名称"), agg_field="incident_name.raw", is_char=True),
+        QueryField("incident_reason", _lazy("故障原因"), agg_field="incident_reason.raw", is_char=True),
         QueryField("bk_biz_id", _lazy("业务ID")),
         QueryField("status", _lazy("故障状态")),
         QueryField("status_order", _lazy("故障状态排序字段")),
@@ -86,6 +94,7 @@ class IncidentQueryTransformer(BaseQueryTransformer):
         QueryField("end_time", _lazy("故障结束时间")),
         QueryField("snapshot", _lazy("故障图谱快照")),
         QueryField("alert_count", _lazy("故障告警数")),
+        QueryField("extra_info", _lazy("故障额外信息"),searchable=False),
     ]
     doc_cls = IncidentDocument
 
@@ -96,6 +105,35 @@ class IncidentQueryHandler(BaseBizQueryHandler):
     """
 
     query_transformer = IncidentQueryTransformer
+    FULLTEXT_BIZ_ID_FIELD = "bk_biz_id"
+    TEXT_CONDITION_FIELDS = {"incident_name", "incident_reason"}
+    TOP_N_ALLOWED_FIELDS = frozenset(
+        {
+            "id",
+            "incident_id",
+            "incident_name",
+            "incident_reason",
+            "bk_biz_id",
+            "status",
+            "status_order",
+            "level",
+            "assignees",
+            "handlers",
+            "labels",
+            "alert_count",
+        }
+    )
+    # 产品锁定：ID、名称、原因、标签、负责人、处理人、所属业务
+    FULLTEXT_SEARCH_FIELDS = [
+        FulltextSearchField("id", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("incident_id", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("incident_name", FulltextFieldKind.TEXT),
+        FulltextSearchField("incident_reason", FulltextFieldKind.TEXT),
+        FulltextSearchField("labels", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("assignees", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("handlers", FulltextFieldKind.KEYWORD),
+        FulltextSearchField("bk_biz_id", FulltextFieldKind.KEYWORD),
+    ]
 
     # “我的故障” 状态名称
     MINE_STATUS_NAME = "MY_INCIDENT"
@@ -129,18 +167,21 @@ class IncidentQueryHandler(BaseBizQueryHandler):
 
         if self.status:
             queries = []
+            user_queries = []
             for status in self.status:
                 if status == self.MINE_STATUS_NAME:
-                    queries.append(
+                    user_queries.append(
                         Q("term", assignees=self.request_username) | Q("term", appointee=self.request_username)
                     )
                 if status == self.MY_ASSIGNEE_STATUS_NAME:
-                    queries.append(Q("term", assignees=self.request_username))
+                    user_queries.append(Q("term", assignees=self.request_username))
                 if status == self.MY_HANDLER_STATUS_NAME:
-                    queries.append(Q("term", handlers=self.request_username))
+                    user_queries.append(Q("term", handlers=self.request_username))
                 else:
                     queries.append(Q("term", status=status))
-
+            # 先查询用户所有数据，然后在查询状态数据；避免直接查询导致用户和状态使用or导致数据透出
+            if user_queries:
+                search_object = search_object.filter(reduce(operator.or_, user_queries))
             if queries:
                 search_object = search_object.filter(reduce(operator.or_, queries))
 
@@ -190,29 +231,73 @@ class IncidentQueryHandler(BaseBizQueryHandler):
                 query_dsl = query_dsl.replace(f"({display} OR {field}:{value})", f'("{display}" OR {field}:{value})')
         return query_dsl
 
+    def build_query_string_q(self, query_string: str, context=None, *, literal_fulltext: bool = False):
+        """故障侧：UI 字面/裸词走全字段；结构化语法走 transform + 枚举中文 quoting。"""
+        if not query_string or not str(query_string).strip():
+            return None
+
+        original_query_string = query_string
+        use_fulltext = self.FULLTEXT_SEARCH_FIELDS and (
+            literal_fulltext or is_bare_fulltext_query(original_query_string)
+        )
+        if use_fulltext:
+            bare_q = self.build_bare_fulltext_query_q([original_query_string])
+            if bare_q is not None:
+                return bare_q
+            return Q("match_none")
+
+        query_dsl = self.query_transformer.transform_query_string(query_string, context)
+        query_dsl = self._quote_translated_query_string(query_dsl)
+        if isinstance(query_dsl, str):
+            return Q("query_string", query=query_dsl)
+        return Q(query_dsl)
+
+
+    @classmethod
+    def _build_fuzzy_query(cls, query_string: str, fields: list[str] | None = None):
+        """单字段 Text 条件的前缀模糊；全字段检索请走 FULLTEXT_SEARCH_FIELDS。"""
+        query_string = query_string.strip().strip('"').strip("'")
+        if not query_string or not fields:
+            return None
+        return Q("multi_match", query=query_string, fields=fields, type="phrase_prefix", lenient=True)
+
+    @classmethod
+    def _build_text_condition_query(cls, condition: dict):
+        """为 Text 字段构造基于分词和前缀短语的包含/排除查询。"""
+        value = condition.get("value")
+        values = value if isinstance(value, list) else [value]
+        queries = []
+        for item in values:
+            if item is None:
+                continue
+            item = str(item).strip()
+            if not item:
+                continue
+            match_query = Q("match", **{condition["key"]: {"query": item, "operator": "and"}})
+            fuzzy_query = cls._build_fuzzy_query(item, fields=[condition["key"]])
+            queries.append(match_query | fuzzy_query if fuzzy_query is not None else match_query)
+
+        if not queries:
+            return None
+
+        query = queries[0] if len(queries) == 1 else Q("bool", should=queries, minimum_should_match=1)
+
+        if condition["method"] == "exclude":
+            return ~query
+        return query
+
     def parse_condition_item(self, condition: dict) -> Q:
         if condition["key"] == "query_string":
-            con_q = None
-            for query_string in condition["value"]:
-                if query_string.strip():
-                    query_string = query_string.replace(":",r"\:")
-                    query_dsl = self.query_transformer.transform_query_string(query_string)
-                    query_dsl = self._quote_translated_query_string(query_dsl)
-                    if isinstance(query_dsl, str):
-                        temp_q = Q("query_string", query=query_dsl)
-                    else:
-                        temp_q = Q(query_dsl)
+            # UI 全字段：按字面文本走白名单（foo:bar / CPU AND memory 不解析为 Lucene）
+            return self.build_query_string_condition_q(condition.get("value"))
+        if condition["key"] in self.TEXT_CONDITION_FIELDS and condition["method"] in ["include", "exclude"]:
+            return self._build_text_condition_query(condition)
 
-                    if con_q is None:
-                        con_q = temp_q
-                    else:
-                        con_q = con_q | temp_q
-            return con_q
         return super().parse_condition_item(condition)
 
     def add_biz_condition(self, search_object: Search) -> Search:
         queries = []
-        if self.authorized_bizs is not None and self.bk_biz_ids:
+        if self.authorized_bizs is not None and self.bk_biz_ids and not self.is_tenant_wide_authorized():
             # 进行我有权限的告警过滤
             authorized_query = self.build_es_terms_query("bk_biz_id", self.authorized_bizs)
             if authorized_query is not None:
@@ -232,9 +317,7 @@ class IncidentQueryHandler(BaseBizQueryHandler):
             if unauthorized_query is not None:
                 queries.append(unauthorized_query & user_condition)
 
-        if queries:
-            return search_object.filter(reduce(operator.or_, queries))
-        return search_object
+        return self.finalize_biz_condition(search_object, queries)
 
     @classmethod
     def handle_hit_list(cls, hits: AttrList = None) -> list[dict]:
@@ -455,8 +538,22 @@ class IncidentQueryHandler(BaseBizQueryHandler):
         }
         return result
 
+    def filter_top_n_fields(self, fields: list) -> list:
+        """过滤不可聚合或未登记的字段。"""
+        allowed = []
+        dropped = []
+        for field in fields or []:
+            actual_field = field.lstrip("+-")
+            if actual_field in self.TOP_N_ALLOWED_FIELDS:
+                allowed.append(field)
+            else:
+                dropped.append(actual_field)
+        if dropped:
+            logger.warning("incident top_n drop unsupported fields: %s", ",".join(sorted(set(dropped))))
+        return allowed
+
     def top_n(self, fields: list, size=10, translators: dict = None) -> dict:
-        return super().top_n(fields, size, translators)
+        return super().top_n(self.filter_top_n_fields(fields), size, translators)
 
 
 class IncidentAlertQueryHandler(AlertQueryHandler):

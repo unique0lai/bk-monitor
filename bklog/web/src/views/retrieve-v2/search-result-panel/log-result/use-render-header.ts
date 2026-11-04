@@ -25,8 +25,10 @@
  */
 import { h, computed } from 'vue';
 
+import { getFieldNameByField } from '@/hooks/use-field-name';
 import useLocale from '@/hooks/use-locale';
 import useStore from '@/hooks/use-store';
+import RetrieveHelper, { RetrieveEvent } from '@/views/retrieve-helper';
 
 export default () => {
   const store = useStore();
@@ -34,6 +36,7 @@ export default () => {
 
   const fieldTypeMap = computed(() => store.state.globals.fieldTypeMap);
   const isUnionSearch = computed(() => store.getters.isUnionSearch);
+  const isSceneMode = computed(() => store.getters.isSceneMode);
   const unionIndexItemList = computed(() => store.getters.unionIndexItemList);
   const visibleFields = computed(() => store.getters.visibleFields);
   const isNotVisibleFieldsShow = computed(() => store.state.isNotVisibleFieldsShow);
@@ -54,6 +57,7 @@ export default () => {
 
     if (field) {
       const fieldName = field.field_name;
+      const displayName = getFieldNameByField(field, store);
       const fieldType = field.field_type;
       const isUnionSource = field?.tag === 'union-source';
       const fieldIcon = fieldTypeMap.value?.[fieldType]?.icon ?? 'bklog-icon bklog-unkown';
@@ -62,7 +66,7 @@ export default () => {
       const content = fieldTypeMap.value[fieldType]?.name;
       let unionContent = '';
       // 联合查询判断字段来源 若indexSetIDs缺少已检索的索引集内容 则增加字段来源判断
-      if (isUnionSearch.value) {
+      if (isUnionSearch.value && !isSceneMode.value) {
         const indexSetIDs = field.index_set_ids?.map(item => String(item)) || [];
         const isDifferentFields = indexSetIDs.length !== unionIndexItemList.value.length;
         if (isDifferentFields && !isUnionSource) {
@@ -73,10 +77,11 @@ export default () => {
         }
       }
       const isLackIndexFields = !!unionContent && isUnionSearch.value;
-      const sortable =        !['dtEventTimeStamp'].includes(field.field_name)
-        && field.es_doc_values
-        && field.tag !== 'union-source'
-        && field.field_type !== 'flattened';
+      const sortable =
+        !['dtEventTimeStamp'].includes(field.field_name) &&
+        field.es_doc_values &&
+        field.tag !== 'union-source' &&
+        field.field_type !== 'flattened';
 
       return h(
         'div',
@@ -121,7 +126,7 @@ export default () => {
             directives: [
               {
                 name: 'bk-tooltips',
-                value: content,
+                value: { content, interactive: false },
               },
             ],
           }),
@@ -131,34 +136,38 @@ export default () => {
               directives: [
                 {
                   name: 'bk-tooltips',
-                  value: { allowHTML: false, content: isLackIndexFields ? unionContent : fieldName },
+                  value: {
+                    allowHTML: false,
+                    content: isLackIndexFields ? unionContent : displayName,
+                    interactive: false,
+                  },
                 },
               ],
               class: { 'lack-index-filed': isLackIndexFields },
             },
-            [fieldName],
+            [displayName],
           ),
 
           sortable
             ? h('span', { class: 'bk-table-caret-wrapper' }, [
-              h('i', {
-                class: `bk-table-sort-caret ascending ${isSortShow && isAsc ? 'active' : ''}`,
-              }),
-              h('i', {
-                class: `bk-table-sort-caret descending ${isSortShow && isDesc ? 'active' : ''}`,
-              }),
-            ])
+                h('i', {
+                  class: `bk-table-sort-caret ascending ${isSortShow && isAsc ? 'active' : ''}`,
+                }),
+                h('i', {
+                  class: `bk-table-sort-caret descending ${isSortShow && isDesc ? 'active' : ''}`,
+                }),
+              ])
             : '',
           h('i', {
             class: `bk-icon icon-minus-circle-shape toggle-display ${isNotVisibleFieldsShow.value ? 'is-hidden' : ''}`,
             directives: [
               {
                 name: 'bk-tooltips',
-                value: $t('将字段从表格中移除'),
+                value: { content: $t('将字段从表格中移除'), interactive: false },
               },
             ],
             on: {
-              click: (e) => {
+              click: e => {
                 e.stopPropagation();
                 const displayFieldNames: string[] = [];
                 for (const newField of visibleFields.value) {
@@ -171,6 +180,7 @@ export default () => {
                 });
                 store.commit('resetVisibleFields', displayFieldNames);
                 store.commit('updateIsSetDefaultTableColumn');
+                RetrieveHelper.fire(RetrieveEvent.VISIBLE_FIELD_COLUMN_LAYOUT_CHANGE);
               },
             },
           }),

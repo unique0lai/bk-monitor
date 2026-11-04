@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -8,9 +7,12 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
 """
+
 import copy
 
 import pytest
+
+from django.db.utils import DataError
 
 from bkmonitor.models import (
     Action as ActionModel,
@@ -19,6 +21,7 @@ from bkmonitor.models import (
     DetectModel,
     ItemModel,
     QueryConfigModel,
+    StrategyHistoryModel,
     StrategyModel,
     NoticeTemplate,
 )
@@ -190,6 +193,84 @@ class TestAlgorithm:
         assert obj.unit_prefix == "%"
         assert obj.level == 3
 
+    def test_save_merge_args_with_db_config(self, clean_model):
+        algorithm_model = AlgorithmModel.objects.create(
+            strategy_id=1,
+            item_id=1,
+            level=2,
+            type="IntelligentDetect",
+            unit_prefix="",
+            config={
+                "args": {"sensitivity": 5, "hidden_arg": "backend"},
+                "plan_id": 100,
+                "visual_type": "score",
+                "service_name": "bkfara",
+                "grey_to_bkfara": True,
+                "enable_week_compare": True,
+            },
+        )
+        algorithm = Algorithm(
+            id=algorithm_model.id,
+            strategy_id=1,
+            item_id=1,
+            level=2,
+            type="IntelligentDetect",
+            config={
+                "args": {"sensitivity": 3, "request_arg": "frontend"},
+                "plan_id": 101,
+                "visual_type": "none",
+                "service_name": "default",
+                "grey_to_bkfara": False,
+                "enable_week_compare": False,
+            },
+        )
+
+        algorithm.save()
+
+        algorithm_model.refresh_from_db()
+        assert algorithm_model.config == {
+            "args": {"sensitivity": 3, "hidden_arg": "backend", "request_arg": "frontend"},
+            "plan_id": 101,
+            "visual_type": "score",
+            "service_name": "bkfara",
+            "grey_to_bkfara": True,
+            "enable_week_compare": True,
+        }
+
+    def test_save_replace_config_when_algorithm_type_changed(self, clean_model):
+        algorithm_model = AlgorithmModel.objects.create(
+            strategy_id=1,
+            item_id=1,
+            level=2,
+            type="IntelligentDetect",
+            unit_prefix="",
+            config={"args": {"hidden_arg": "backend"}, "plan_id": 100},
+        )
+        algorithm = Algorithm(
+            id=algorithm_model.id,
+            strategy_id=1,
+            item_id=1,
+            level=2,
+            type="TimeSeriesForecasting",
+            config={
+                "args": {"predict": 1},
+                "plan_id": 101,
+                "thresholds": [[{"method": "gt", "threshold": 1}]],
+                "duration": 60,
+            },
+        )
+
+        algorithm.save()
+
+        algorithm_model.refresh_from_db()
+        assert algorithm_model.type == "TimeSeriesForecasting"
+        assert algorithm_model.config == {
+            "args": {"predict": 1},
+            "plan_id": 101,
+            "thresholds": [[{"method": "gt", "threshold": 1}]],
+            "duration": 60,
+        }
+
 
 class TestDetect:
     def test_to_dict(self):
@@ -331,7 +412,7 @@ class TestItem:
                     "agg_condition": [],
                     "agg_dimension": [],
                     "agg_interval": 60,
-                }
+                },
             )
         ]
         item.algorithms[0].level = 2
@@ -350,6 +431,45 @@ class TestItem:
         query_config_obj = QueryConfigModel.objects.get(strategy_id=1, id=item.query_configs[0].id)
         assert query_config_obj.config["unit"] == "xxx"
 
+    def test_save_truncates_overlong_name(self, clean_model):
+        config = {
+            "id": 0,
+            "name": "name",
+            "expression": "a",
+            "origin_sql": "test",
+            "no_data_config": {},
+            "target": [[]],
+            "algorithms": [
+                {"id": 0, "type": "operate", "level": 1, "config": {"floor": 1, "ceil": 1}, "unit_prefix": "%"}
+            ],
+            "query_configs": [
+                {
+                    "data_source_label": "bk_monitor",
+                    "data_type_label": "time_series",
+                    "alias": "A",
+                    "id": 0,
+                    "result_table_id": "xxxx",
+                    "metric_field": "aaa",
+                    "unit": "xxx",
+                    "agg_method": "avg",
+                    "agg_condition": [],
+                    "agg_dimension": [],
+                    "agg_interval": 60,
+                }
+            ],
+        }
+        item = Item(strategy_id=1, **config)
+        item.save()
+
+        max_length = ItemModel._meta.get_field("name").max_length
+        item.name = "n" * (max_length + 21)
+        item.save()
+
+        item_obj = ItemModel.objects.get(id=item.id)
+        assert len(item_obj.name) == max_length
+        assert item_obj.name == "n" * max_length
+        assert item.name == item_obj.name
+
 
 class TestStrategy:
     Config = {
@@ -359,7 +479,6 @@ class TestStrategy:
         "type": "monitor",
         "source": "bk_monitor",
         "scenario": "os",
-        "type": "monitor",
         "is_enabled": True,
         "create_time": "2021-05-07T09:22:27.113718+00:00",
         "create_user": "system",
@@ -490,3 +609,39 @@ class TestStrategy:
         assert s1.to_dict() == strategies[0].to_dict()
         assert s2.to_dict() == strategies[1].to_dict()
         assert s3.to_dict() == strategies[2].to_dict()
+
+    def test_save_data_error_keeps_history_and_rolls_back(self, clean_model, monkeypatch):
+        strategy = Strategy(**copy.deepcopy(self.Config))
+        strategy.save()
+        strategy_id = strategy.id
+        original_name = StrategyModel.objects.get(id=strategy_id).name
+
+        def boom(self, *args, **kwargs):
+            raise DataError("Data too long for column 'name' at row 1")
+
+        monkeypatch.setattr(Item, "save", boom)
+        strategy.name = "updated-name"
+        with pytest.raises(DataError, match="Data too long"):
+            strategy.save()
+
+        assert StrategyModel.objects.get(id=strategy_id).name == original_name
+        failed = StrategyHistoryModel.objects.filter(strategy_id=strategy_id, status=False).order_by("-id").first()
+        assert failed is not None
+        assert "Data too long" in failed.message
+        assert "TransactionManagementError" not in failed.message
+
+    def test_save_create_failure_leaves_no_strategy(self, clean_model, monkeypatch):
+        def boom(self, *args, **kwargs):
+            raise DataError("Data too long for column 'name' at row 1")
+
+        monkeypatch.setattr(Item, "save", boom)
+        strategy = Strategy(**copy.deepcopy(self.Config))
+        with pytest.raises(DataError, match="Data too long"):
+            strategy.save()
+
+        assert StrategyModel.objects.count() == 0
+        history = StrategyHistoryModel.objects.filter(status=False).order_by("-id").first()
+        assert history is not None
+        assert history.strategy_id == 0
+        assert "Data too long" in history.message
+        assert "TransactionManagementError" not in history.message

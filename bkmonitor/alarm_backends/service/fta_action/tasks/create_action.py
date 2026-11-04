@@ -40,6 +40,7 @@ from constants.action import (
     ActionPluginType,
     ActionSignal,
     IntervalNotifyMode,
+    NoticeWay,
     UserGroupType,
     VoiceNoticeMode,
 )
@@ -254,11 +255,12 @@ class CreateIntervalActionProcessor:
             # 当上一次任务结束时间已经满足了轮转，则需要创建任务
             alert = polled_alert_docs.get(action_instance.alerts[0], None)
             alert_latest_time = alert.latest_time if alert else 0
+            previous_time = action_instance.inputs.get("alert_latest_time", 0)
+            if alert and action_instance.is_parent_action and action_instance.inputs.get("shield_source_time"):
+                alert_latest_time = getattr(alert.extra_info, "latest_abnormal_event_time", 0) or alert_latest_time
+                previous_time = action_instance.inputs["shield_source_time"]
 
-            if (
-                action_instance.inputs.get("alert_latest_time", 0) < alert_latest_time
-                and alert.status_detail == EventStatus.ABNORMAL
-            ):
+            if previous_time < alert_latest_time and alert.status_detail == EventStatus.ABNORMAL:
                 # 当前周期通知的最近异常点一定要大于历史异常点
                 # 当前告警的具体状态一定， 存在恢复中状态的周期通知不需要发送
                 create_interval_actions.delay(
@@ -356,12 +358,13 @@ class CreateActionProcessor:
         self.alerts = [
             AlertDocument(**alert.data)
             for alert in self.alert_objs.values()
-            if alert.is_valid_handle(execute_times, relation_id)
+            if not alert.shield_end_close and alert.is_valid_handle(execute_times, relation_id)
         ]
         self.is_alert_shielded = False
+        self.historical_shield_ids = {}
         self.shield_detail = ""
-        self.alert_ids = alert_ids
-        self.severity = severity or self.alerts[0].severity
+        self.alert_ids = [alert.id for alert in self.alerts]
+        self.severity = severity or (self.alerts[0].severity if self.alerts else None)
         self.dimensions = dimensions
         self.dimension_hash = dimension_hash
         self.relation_id = relation_id
@@ -370,6 +373,7 @@ class CreateActionProcessor:
         self.strategy = Strategy(strategy_id).config or (self.alerts[0].strategy if self.alerts else {})
         self.generate_uuid = self.get_generate_uuid()
         self.noise_reduce_result = False
+        self._notice_noise_reduce_processed = False
         self.notice = {}
         self.notice_type = notice_type
 
@@ -396,6 +400,55 @@ class CreateActionProcessor:
                 if user not in target_notify_info[notice_way]:
                     target_notify_info[notice_way].append(user)
 
+    def _get_merged_notice_details(self, assignee_manager):
+        """合并默认、分派和订阅接收人，并保证主通知优先于关注通知。"""
+        notify_info = assignee_manager.get_notify_info()
+        follow_notify_info = assignee_manager.get_notify_info(user_type=UserGroupType.FOLLOWER)
+        if not notify_info and self.notice_type != ActionNoticeType.UPGRADE:
+            notify_configs = {notice_way: [] for notice_way in follow_notify_info.keys()}
+            notify_info = assignee_manager.get_appointee_notify_info(notify_configs)
+
+        subscription_notify_info, subscription_follow_notify_info = assignee_manager.get_subscription_notify_info()
+        self._merge_notify_info(notify_info, subscription_notify_info)
+        self._merge_notify_info(follow_notify_info, subscription_follow_notify_info)
+
+        for notice_way, receivers in follow_notify_info.items():
+            follow_notify_info[notice_way] = [
+                receiver for receiver in receivers if receiver not in notify_info.get(notice_way, [])
+            ]
+        return (notify_info, follow_notify_info), subscription_follow_notify_info
+
+    def get_merged_notice_info(self, assignee_manager):
+        merged_notice_info, _ = self._get_merged_notice_details(assignee_manager)
+        return merged_notice_info
+
+    @staticmethod
+    def has_notice_receivers(notice_info):
+        """判断通知信息中是否至少包含一个实际接收人。"""
+        for notice_way, receivers in notice_info.items():
+            if notice_way == "wxbot_mention_users":
+                continue
+            for receiver in receivers:
+                if isinstance(receiver, list):
+                    if any(receiver):
+                        return True
+                elif receiver:
+                    return True
+        return False
+
+    def process_notice_noise_reduce(self, alert):
+        """在首个实际创建的普通通知动作前执行一次降噪。"""
+        if self.notice_type == ActionNoticeType.UPGRADE or self._notice_noise_reduce_processed:
+            return
+        self._notice_noise_reduce_processed = True
+        self.noise_reduce_result = NoiseReduceRecordProcessor(
+            self.notice,
+            self.signal,
+            self.strategy_id,
+            alert,
+            self.generate_uuid,
+        ).process()
+
     def get_action_relations(self):
         # 获取对应signal的 处理套餐/告警通知配置
         if self.strategy:
@@ -407,30 +460,8 @@ class CreateActionProcessor:
             actions = []
 
         if self.notice.get("config_id"):
-            # 检查通知组是否为空，如果为空则跳过创建 notice action
-            # 但如果 assign_mode 包含 BY_RULE，先添加到 actions 列表
-            # 后续在 do_create_actions() 中会根据分派结果决定是否实际创建（如果分派未命中则跳过）
-            user_groups = self.notice.get("user_groups", [])
-            assign_mode = self.notice.get("options", {}).get("assign_mode", [])
-            has_by_rule = AssignMode.BY_RULE in assign_mode if assign_mode else False
-
-            if not user_groups and not has_by_rule:
-                # 通知组为空且未配置分派模式时，不创建 notice action，仅保留 message_queue action
-                logger.info(
-                    "[create actions]skip notice action for strategy(%s) signal(%s) because user_groups is empty and assign_mode is not BY_RULE",
-                    self.strategy_id,
-                    self.signal,
-                )
-            else:
-                # 增加通知操作，并进行降噪处理
-                # 如果配置了 BY_RULE，先添加到 actions 列表，后续在 do_create_actions() 中会检查分派是否命中
-                # 如果分派未命中，则跳过创建 notice action
-                actions.append(self.notice)
-                if self.notice_type != ActionNoticeType.UPGRADE:
-                    # 升级的通知不做降噪处理
-                    self.noise_reduce_result = NoiseReduceRecordProcessor(
-                        self.notice, self.signal, self.strategy_id, self.alerts[0], self.generate_uuid
-                    ).process()
+            # 订阅只能在具体告警上判断是否命中，因此通知关系不能在策略级提前丢弃。
+            actions.append(self.notice)
 
         if self.relation_id:
             # 指定了关联关系，默认用指定的关联关系
@@ -546,29 +577,90 @@ class CreateActionProcessor:
         return assignee_manager
 
     @classmethod
-    def is_action_config_valid(cls, alert, action_config, config_id):
+    def is_action_config_valid(cls, alert, action_config, config_id, suspected_pending=False):
         """
         当前处理套餐是否有效
         :param alert:
         :param action_config:
         :param config_id:
+        :param suspected_pending: 缓存未命中且未经 DB 确认删除时为 True(疑似配置尚未生效, 将自动重试)
         :return:
         """
-        if action_config and action_config["is_enabled"]:
+        if action_config and action_config.get("is_enabled"):
             return True
         current_timestamp = int(time.time())
+        if suspected_pending:
+            # 缓存未命中但未经 DB 确认删除(兜底关闭/兜底异常等): 疑似配置尚未生效, 不写"已删除"误导文案
+            description = _("处理套餐【{}】配置尚未生效，已跳过本次处理（将自动重试）").format(config_id)
+        else:
+            description = _("处理套餐【{}】已经被删除或禁用，系统自动忽略该处理").format(
+                (action_config or {}).get("name") or config_id
+            )
         action_log = dict(
             op_type=AlertLog.OpType.ACTION,
             alert_id=[alert.id],
-            description=_("处理套餐【{}】已经被删除或禁用，系统自动忽略该处理").format(
-                action_config.get("name") or config_id
-            ),
+            description=description,
             time=current_timestamp,
             create_time=current_timestamp,
             event_id=current_timestamp,
         )
         AlertLog.bulk_create([AlertLog(**action_log)])
         return False
+
+    def resolve_missing_action_config(self, config_id):
+        """
+        缓存未命中时的处理套餐兜底解析。
+
+        仅当所属策略近期变更(GATE_WINDOW 内)时才回查 DB: 这种缺失大概率是新建/克隆策略的套餐
+        尚未刷入 action_config 缓存(传播延迟), 而非真的删除/停用; 命中则写回缓存供后续复用,
+        DB 也无则写短 TTL 负缓存避免反复回查(防穿透)。稳定老策略的缓存缺失维持原行为(判无效、
+        不查 DB), 从而不会被穿透。
+
+        :return: (action_config, suspected_pending)
+            action_config 为解析到的配置 dict(命中)或 {}(未命中);
+            suspected_pending 为 True 表示无法确认是否真删(疑似尚未生效, 文案提示自动重试)。
+        """
+        if not getattr(settings, "ACTION_CONFIG_CACHE_DB_FALLBACK_ENABLED", True):
+            return {}, False
+        strategy_update_time = (self.strategy or {}).get("update_time")
+        if not strategy_update_time:
+            return {}, False
+        gate_window = int(getattr(settings, "ACTION_CONFIG_CACHE_FALLBACK_GATE_WINDOW", 600))
+        delta = int(time.time()) - int(strategy_update_time)
+        if delta > gate_window:
+            # 稳定老策略 + 缓存缺失 = 真删/真禁, 不回查 DB, 防止缓存穿透
+            return {}, False
+        try:
+            db_config = ActionConfigCacheManager.get_action_config_from_db(config_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "[create actions] action_config(%s) db fallback error, strategy(%s)",
+                config_id,
+                self.strategy_id,
+            )
+            # 回查异常: 无法确认是否真删, 标记疑似尚未生效(将自动重试), 不写负缓存
+            return {}, True
+        if db_config:
+            ActionConfigCacheManager.set_action_config_cache(config_id, db_config)
+            logger.info(
+                "[create actions] action_config(%s) cache-miss; strategy(%s) updated %ss ago; "
+                "db fallback HIT, cache repopulated",
+                config_id,
+                self.strategy_id,
+                delta,
+            )
+            return db_config, False
+        negative_ttl = int(getattr(settings, "ACTION_CONFIG_NEGATIVE_CACHE_TTL", 60))
+        ActionConfigCacheManager.set_negative_cache(config_id, negative_ttl)
+        logger.info(
+            "[create actions] action_config(%s) cache-miss; strategy(%s) updated %ss ago; "
+            "db fallback MISS; negative-cached for %ss",
+            config_id,
+            self.strategy_id,
+            delta,
+            negative_ttl,
+        )
+        return {}, False
 
     def do_create_actions(self):
         if not self.alerts:
@@ -591,6 +683,13 @@ class CreateActionProcessor:
             self.relation_id,
         )
         actions = self.get_action_relations()
+        assign_mode = self.notice.get("options", {}).get("assign_mode") or []
+        is_subscription_only_notice = (
+            len(actions) == 1
+            and actions[0].get("id") == self.notice.get("id")
+            and not self.notice.get("user_groups")
+            and AssignMode.BY_RULE not in assign_mode
+        )
         new_actions = []
         self.is_alert_shielded, shield_ids = self.get_alert_shield_result()
         # 创建推送队列的人员信息
@@ -638,6 +737,9 @@ class CreateActionProcessor:
         alert_logs = []
         qos_alerts = []
         current_qos_count = 0
+        # 单批兜底解析备忘: 每个缺失 config_id 在本批内只解析一次(含 DB-miss/异常/门控关闭等结果),
+        # 避免同批多条告警引用同一缺失套餐时反复回查 DB(批内穿透)
+        resolved_missing_configs: dict = {}
         for alert in self.alerts:
             alert_dict = alert.to_dict()
             alerts_assignee[alert.id] = alert_dict.get("assignee") or []
@@ -692,33 +794,24 @@ class CreateActionProcessor:
             # 告警关注人
             alerts_follower[alert.id] = self.get_alert_related_users(followers, alerts_follower[alert.id])
 
-            # 获取订阅的 follower 用户并合并到 alerts_follower
-            if assignee_manager and assignee_manager.match_manager:
-                subscription_notify_info, subscription_follow_notify_info = (
-                    assignee_manager.get_subscription_notify_info()
-                )
-                # 从订阅的 follower 通知信息中提取所有用户（格式: {notice_way: [user_list]}）
-                subscription_follower_users = []
-                for notice_way, users in subscription_follow_notify_info.items():
-                    # 排除特殊字段（如 wxbot_mention_users）
-                    if notice_way != "wxbot_mention_users" and users:
-                        subscription_follower_users.extend(users)
-                # 去重并合并到 alerts_follower
-                if subscription_follower_users:
-                    # 使用集合去重，保持顺序
-                    unique_subscription_followers = list(dict.fromkeys(subscription_follower_users))
-                    alerts_follower[alert.id] = self.get_alert_related_users(
-                        unique_subscription_followers, alerts_follower[alert.id]
-                    )
-                    logger.info(
-                        "[alert_subscription] alert(%s) added subscription followers: %s",
-                        alert.id,
-                        unique_subscription_followers,
-                    )
+            merged_notice_info = None
 
             for action in actions + itsm_actions:
-                action_config = action_configs.get(str(action["config_id"]))
-                if not self.is_action_config_valid(alert, action_config, action["config_id"]):
+                cid = str(action["config_id"])
+                action_config = action_configs.get(cid)
+                suspected_pending = False
+                if not action_config:
+                    # 缓存未命中: 若策略近期变更, 大概率是新建/克隆套餐尚未刷入缓存, 回查 DB 兜底。
+                    # 本批已解析过的(含未命中)直接复用备忘, 保证每个缺失套餐每批最多回查一次 DB。
+                    if cid in resolved_missing_configs:
+                        action_config, suspected_pending = resolved_missing_configs[cid]
+                    else:
+                        action_config, suspected_pending = self.resolve_missing_action_config(action["config_id"])
+                        resolved_missing_configs[cid] = (action_config, suspected_pending)
+                        if action_config:
+                            # 兜底命中的配置回填, 供同批后续告警复用, 避免重复回查
+                            action_configs[cid] = action_config
+                if not self.is_action_config_valid(alert, action_config, action["config_id"], suspected_pending):
                     continue
                 action_plugin = action_plugins.get(str(action_config["plugin_id"]))
                 skip_delay = int(action["options"].get("skip_delay", 0))
@@ -756,22 +849,49 @@ class CreateActionProcessor:
 
                     continue
 
-                # 如果是 notice action，且 user_groups 为空，则检查是否需要跳过创建
-                # assignee_manager.is_matched 只有在配置了 BY_RULE 且分派命中时才为 True
-                # 如果未配置 BY_RULE，is_matched 为 False；如果配置了 BY_RULE 但未命中，is_matched 也为 False
-                # 因此只需要检查 is_matched 即可
                 if action_plugin["plugin_type"] == ActionPluginType.NOTICE:
-                    user_groups = self.notice.get("user_groups", [])
-                    if not user_groups and not assignee_manager.is_matched:
-                        # 通知组为空且分派未命中（包括未配置 BY_RULE 或配置了但未命中），跳过创建 notice action
+                    if merged_notice_info is None:
+                        merged_notice_info, subscription_follow_notify_info = self._get_merged_notice_details(
+                            assignee_manager
+                        )
+                        notice_follower_users = []
+                        for notice_way, users in subscription_follow_notify_info.items():
+                            if notice_way == "wxbot_mention_users" or not users:
+                                continue
+                            if notice_way == NoticeWay.VOICE:
+                                for user_list in users:
+                                    notice_follower_users.extend(
+                                        user_list if isinstance(user_list, list) else [user_list]
+                                    )
+                            else:
+                                notice_follower_users.extend(users)
+                        if notice_follower_users:
+                            unique_notice_followers = list(dict.fromkeys(notice_follower_users))
+                            alerts_follower[alert.id] = self.get_alert_related_users(
+                                unique_notice_followers,
+                                alerts_follower[alert.id],
+                            )
+                            logger.info(
+                                "[alert_subscription] alert(%s) subscription followers: %s",
+                                alert.id,
+                                unique_notice_followers,
+                            )
+                    notify_info, follow_notify_info = merged_notice_info
+                    # 当前通知时段没有接收人时，已有告警组或已命中分派仍需保留父动作，供周期任务后续补发。
+                    has_existing_notice_lifecycle = bool(self.notice.get("user_groups")) or assignee_manager.is_matched
+                    has_current_receivers = self.has_notice_receivers(notify_info) or self.has_notice_receivers(
+                        follow_notify_info
+                    )
+                    if not has_existing_notice_lifecycle and not has_current_receivers:
                         logger.info(
                             "[create actions]skip notice action for alert(%s) strategy(%s) signal(%s) "
-                            "because user_groups is empty and assign rule not matched",
+                            "because no receiver matched",
                             alert.id,
                             self.strategy_id,
                             self.signal,
                         )
                         continue
+                    self.process_notice_noise_reduce(alert)
 
                 action_instances.append(
                     self.do_create_action(
@@ -781,6 +901,7 @@ class CreateActionProcessor:
                         action_relation=action,
                         assignee_manager=assignee_manager,
                         shield_ids=shield_ids,
+                        notice_info=merged_notice_info,
                     )
                 )
             if assignee_manager.match_manager:
@@ -790,6 +911,13 @@ class CreateActionProcessor:
         AssignCacheManager.clear()
         # 清理订阅缓存
         SubscribeCacheManager.clear()
+        if is_subscription_only_notice and not action_instances:
+            # 该通知关系仅为匹配订阅而保留；没有订阅命中时恢复原有早退语义，避免把告警误标为已通知。
+            logger.info(
+                "[create actions]skip alert document update for subscription-only alerts(%s) because no action created",
+                self.alert_ids,
+            )
+            return new_actions
         if action_instances:
             ActionInstance.objects.bulk_create(action_instances)
             new_actions.extend(
@@ -897,6 +1025,8 @@ class CreateActionProcessor:
         cached_alerts = [Alert(data=alert.to_dict()) for alert in self.alerts]
         AlertCache.update_alert_to_cache(cached_alerts)
         AlertCache.save_alert_snapshot(cached_alerts)
+        for alert_doc, cached_alert in zip(update_alerts, cached_alerts):
+            alert_doc.extra_info = cached_alert.extra_info
         retry_times = 0
         while retry_times < 3:
             # 更新alert 的时候，可能会有版本冲突，所以需要做重试处理，最多3次
@@ -1028,6 +1158,7 @@ class CreateActionProcessor:
         action_relation=None,
         assignee_manager=None,
         shield_ids=None,
+        notice_info=None,
     ):
         """
         根据套餐配置创建处理记录
@@ -1042,6 +1173,7 @@ class CreateActionProcessor:
         action_relation = action_relation or {}
         inputs = {
             "alert_latest_time": alert.latest_time,
+            "alert_end_time": alert.end_time,
             "is_alert_shielded": self.is_alert_shielded,
             "shield_ids": shield_ids,
             "shield_detail": self.shield_detail,
@@ -1064,24 +1196,20 @@ class CreateActionProcessor:
         if action_plugin["plugin_type"] == ActionPluginType.NOTICE:
             # 通知套餐，父 action_instance 创建
             is_parent_action = True
-            notify_info = assignee_manager.get_notify_info()
-            follow_notify_info = assignee_manager.get_notify_info(user_type=UserGroupType.FOLLOWER)
-            if not notify_info and self.notice_type != ActionNoticeType.UPGRADE:
-                # 如果没有负责人的通知信息，需要将负责人通知信息带上，默认以当前适配到的通知方式为准
-                notify_configs = {notice_way: [] for notice_way in follow_notify_info.keys()}
-                notify_info = assignee_manager.get_appointee_notify_info(notify_configs)
-
-            # 获取并合并订阅用户信息
-            subscription_notify_info, subscription_follow_notify_info = assignee_manager.get_subscription_notify_info()
-            self._merge_notify_info(notify_info, subscription_notify_info)
-            self._merge_notify_info(follow_notify_info, subscription_follow_notify_info)
-
-            # 如果当前用户即是负责人，又是通知人, 需要进行去重, 以通知人为准
-            for notice_way, receivers in follow_notify_info.items():
-                valid_receivers = [
-                    receiver for receiver in receivers if receiver not in notify_info.get(notice_way, [])
-                ]
-                follow_notify_info[notice_way] = valid_receivers
+            if self.signal in ActionSignal.ABNORMAL_SIGNAL:
+                if not self.is_alert_shielded and alert.id not in self.historical_shield_ids:
+                    self.historical_shield_ids[alert.id] = AlertShieldConfigShielder.match_historical(
+                        alert, getattr(alert.extra_info, "latest_abnormal_event_time", 0)
+                    )
+                historical_ids = self.historical_shield_ids.get(alert.id)
+                inputs["shield_source_time"] = getattr(alert.extra_info, "latest_abnormal_event_time", 0)
+                # None 表示未检查/不可用，[] 表示可用规则均未命中，便于回放对账。
+                inputs["historical_shield_ids"] = historical_ids
+                if historical_ids:
+                    inputs["is_alert_shielded"] = True
+                    inputs["shield_ids"] = historical_ids
+                    inputs["shield_detail"] = _("异常事件发生时命中屏蔽配置({})").format(",".join(historical_ids))
+            notify_info, follow_notify_info = notice_info or self.get_merged_notice_info(assignee_manager)
             inputs["notify_info"] = notify_info
             inputs["follow_notify_info"] = follow_notify_info
             # 设置语音通知模式
@@ -1103,13 +1231,19 @@ class CreateActionProcessor:
             # 如果处理的时候，记录第一次一次通知时间和通知次数，用来作为记录当前告警是否已经产生通知
             handle_record = {
                 "last_time": int(time.time()),
-                "is_shielded": self.is_alert_shielded,
-                "latest_anomaly_time": alert.latest_time,
+                "is_shielded": inputs["is_alert_shielded"],
+                "latest_anomaly_time": inputs.get("shield_source_time") or alert.latest_time,
                 "execute_times": self.execute_times + 1,
             }
             if alert.cycle_handle_record:
                 history_record = alert.cycle_handle_record.get(str(relation_id))
-                if not history_record or (
+                if is_parent_action and history_record:
+                    if handle_record["latest_anomaly_time"] >= history_record.get("latest_anomaly_time", 0):
+                        handle_record["execute_times"] = max(
+                            handle_record["execute_times"], history_record["execute_times"]
+                        )
+                        alert.extra_info["cycle_handle_record"][str(relation_id)] = handle_record
+                elif not history_record or (
                     history_record and history_record["execute_times"] < handle_record["execute_times"]
                 ):
                     # 如果曾经没有对应的周期记录，则直接赋值

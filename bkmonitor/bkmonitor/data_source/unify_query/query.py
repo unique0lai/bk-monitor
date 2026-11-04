@@ -8,10 +8,12 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+import copy
 import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from itertools import chain
 from typing import Any
 
@@ -22,7 +24,9 @@ from django.utils.functional import cached_property
 from opentelemetry import trace
 
 from bkm_space.utils import bk_biz_id_to_space_uid
-from bkmonitor.data_source.data_source import DataSource, TimeSeriesDataSource
+from bkmonitor.data_source.data_source import DataSource, PrometheusTimeSeriesDataSource, TimeSeriesDataSource
+from bkmonitor.data_source.promql_expression import compile_promql_expression
+from bkmonitor.data_source.unify_query.constants import REF_VALUES_RESERVED_FIELD
 from bkmonitor.data_source.unify_query.functions import (
     AggMethods,
     CpAggMethods,
@@ -59,12 +63,56 @@ class UnifyQuery:
         expression: str,
         functions: list | None = None,
         bk_tenant_id: str | None = None,
+        query_output_config: dict | None = None,
+        promql_multi_expression: bool = False,
     ):
         self.is_partial = False
         self.functions = [] if functions is None else functions
+        self.query_output_config = query_output_config
         # 不传业务指标时传 0，为 None 时查询所有业务
         self.bk_biz_id = bk_biz_id
+        # alias -> 原始 promql 映射，用于把命名输出的 expression（alias）翻译成完整 PromQL。
+        # 单条与多条 PromQL 场景均构建（单条时仅一个 alias），供查询时透传给 UQ。
+        self.promql_output_map: dict[str, str] = {
+            source.alias: source.promql
+            for source in data_sources
+            if isinstance(source, PrometheusTimeSeriesDataSource) and source.alias
+        }
+        if promql_multi_expression:
+            if len(data_sources) < 2 or not all(
+                isinstance(source, PrometheusTimeSeriesDataSource) for source in data_sources
+            ):
+                raise ValueError("multiple Prometheus time-series queries are required")
+            filter_dict = data_sources[0].filter_dict
+            if any(source.filter_dict != filter_dict for source in data_sources[1:]):
+                raise ValueError("PromQL queries must use the same filters")
+            promql = compile_promql_expression(
+                [
+                    {
+                        "data_source_label": source.data_source_label,
+                        "data_type_label": source.data_type_label,
+                        "alias": source.alias,
+                        "promql": source.promql,
+                        "interval": source.interval,
+                    }
+                    for source in data_sources
+                ],
+                expression,
+            )
+            data_sources = [
+                PrometheusTimeSeriesDataSource(
+                    bk_biz_id=data_sources[0].bk_biz_id,
+                    promql=promql,
+                    interval=int(data_sources[0].interval),
+                    filter_dict=filter_dict,
+                )
+            ]
         self.data_sources = data_sources
+
+        # Prometheus 命名输出：把 output_list 的 expression（alias）翻译成完整 PromQL，
+        # 设置到 data_source 上，由 PrometheusTimeSeriesDataSource.query_data 透传并解析。
+        if self.query_output_config and self.promql_output_map:
+            self.data_sources[0].query_output_config = self._translate_promql_named_output_config()
 
         # 如果未传入租户ID，则根据业务ID获取租户ID
         if not bk_tenant_id and bk_biz_id:
@@ -147,6 +195,28 @@ class UnifyQuery:
     def process_unify_query_data(cls, params: dict, data: dict, end_time: int = None) -> list[dict[str, Any]]:
         """
         处理统一查询模块返回值
+
+        示例（基于 data 入参）:
+            data = {
+                "series": [{
+                    "name": "_result0",
+                    "metric_name": "system.cpu_summary.usage",
+                    "columns": ["_time", "_value", "bk_target_ip"],
+                    "types": ["time", "double", "string"],
+                    "group_keys": ["bk_target_ip"],
+                    "group_values": ["127.0.1.10"],
+                    "values": [
+                        [1657848000, 12.5, "127.0.1.11"],
+                        [1657848060, 13.1, "127.0.1.12"]
+                    ]
+                }]
+            }
+
+            # 返回：
+            [
+                {"bk_target_ip": "127.0.1.10", "_time_": 1657848000000, "_result_": 12.5},
+                {"bk_target_ip": "127.0.1.11", "_time_": 1657848060000, "_result_": 13.1}
+            ]
         """
         records = []
 
@@ -180,6 +250,20 @@ class UnifyQuery:
 
     @classmethod
     def extract_unify_query_series_dimensions(cls, row: dict[str, Any]) -> dict[str, Any]:
+        """
+        从 series 的 group_keys/group_values 中提取维度字典。
+
+        逻辑：
+            - group_keys 与 group_values 一一对应（按索引对齐），组成 {维度名: 维度值}
+            - 维度名可能带多表关联后缀 "_tableN"（RE_DIMENSION_SUFFIX = r"_table\\d+$"），
+              如 "bk_target_ip_table0"，此处将其剥离还原为原始维度名 "bk_target_ip"
+            - 若 group_values 长度不足（index 越界），维度值记为 None
+
+        入参 row 示例：
+            {"group_keys": ["bk_target_ip"], "group_values": ["127.0.1.12"]}
+        返回示例：
+            {"bk_target_ip": "127.0.1.10"}
+        """
         dimensions = {}
         group_values = row.get("group_values") or []
         for index, group_key in enumerate(row.get("group_keys") or []):
@@ -197,6 +281,21 @@ class UnifyQuery:
 
     @classmethod
     def get_unify_query_series_metric_field(cls, row: dict[str, Any], params: dict[str, Any]) -> str:
+        """
+        解析 series 对应的指标字段名（用于 series_stat 的 key 与 records 的 _result_ 对齐）。
+
+        逻辑：
+            - reference_names：汇总 params["query_list"] 中所有 reference_name（如 a0/a1/a2/a3）
+            - columns：取 series 的列名，排除时间列 "_time"
+            - 取首列 column 判定：
+                * 若为 "_result"/"_value" 或命中 reference_names → 归一化为 "_result_"
+                  （多指标查询时各指标列名即 reference_name，统一回退为 _result_ 便于聚合）
+                * 否则（如普通维度指标列）直接返回该列名
+            - 无列时：回退取 query_list[0].reference_name；仍无则兜底 "_result_"
+
+        返回示例：
+            "_result_" 或 "bk_target_ip"
+        """
         reference_names = {
             query["reference_name"] for query in params.get("query_list") or [] if query.get("reference_name")
         }
@@ -214,6 +313,16 @@ class UnifyQuery:
 
     @classmethod
     def process_unify_query_series_stat(cls, params: dict[str, Any], data: dict[str, Any]) -> dict:
+        """
+        聚合各 series 的统计数据（avg/max/min/count 等），以 (维度, 指标) 为 key 归并。
+
+        返回示例：
+            {
+                (("bk_target_ip", "127.0.1.11"), "_result_"): {
+                    "avg": 12.8, "max": 13.1, "min": 12.5, "count": 2
+                }
+            }
+        """
         series_stat = {}
         for row in data.get("series") or []:
             stat = row.get("stat") or {}
@@ -234,6 +343,7 @@ class UnifyQuery:
         first_ds: DataSource = self.data_sources[0]
         if (first_ds.data_source_label, first_ds.data_type_label) in [
             (DataSourceLabel.BK_APM, DataTypeLabel.LOG),
+            (DataSourceLabel.BK_RUM, DataTypeLabel.LOG),
             (DataSourceLabel.CUSTOM, DataTypeLabel.EVENT),
             (DataSourceLabel.BK_MONITOR_COLLECTOR, DataTypeLabel.LOG),
             (DataSourceLabel.BK_LOG_SEARCH, DataTypeLabel.LOG),
@@ -288,7 +398,10 @@ class UnifyQuery:
 
         # 如果是多指标，必然会走统一查询模块
         # APM 的灰度仅通过 switch_unify_query 判断
-        if len(self.data_sources) > 1 and self.data_sources[0].id != (DataSourceLabel.BK_APM, DataTypeLabel.LOG):
+        if len(self.data_sources) > 1 and self.data_sources[0].id not in (
+            (DataSourceLabel.BK_APM, DataTypeLabel.LOG),
+            (DataSourceLabel.BK_RUM, DataTypeLabel.LOG),
+        ):
             return True
 
         # 如果使用表达式，走统一查询模块
@@ -367,12 +480,17 @@ class UnifyQuery:
         params = {
             "query_list": query_list,
             "metric_merge": add_expression_functions(expression, self.functions),
-            "order_by": order_by or ["-time"],
+            # 使用 unify-query 虚拟时间字段 "_time"，会按 query_list 中的 time_field 替换为真实时间字段。
+            # 背景：但在 bkdata / bklog 等以 dtEventTimeStamp 为时间字段的索引上，
+            # 硬编码为 time 要么被 uq 静默丢弃（降级为不排序），要么命中 keyword 导致查询报错。
+            "order_by": order_by or ["-_time"],
             "step": f"{step}s",
             "space_uid": self.space_uid,
             "bk_tenant_id": self.bk_tenant_id,
             "not_time_align": not_time_align,
         }
+        if self.query_output_config:
+            params.update(self.query_output_config)
 
         if start_time and end_time:
             if time_alignment and not not_time_align:
@@ -383,6 +501,74 @@ class UnifyQuery:
                 params["end_time"] = str(end_time // 1000)
 
         return params
+
+    @classmethod
+    def _index_named_output_records(
+        cls, params: dict[str, Any], output: dict[str, Any]
+    ) -> dict[tuple[int, tuple[tuple[str, Any], ...]], dict[str, Any]]:
+        output_params = {**params, "query_list": [{"reference_name": output.get("reference_name")}]}
+        records = cls.process_unify_query_data(output_params, {"series": output.get("series") or []})
+        indexed = {}
+        for record in records:
+            record.pop(output.get("reference_name"), None)
+            # PromQL arithmetic drops the metric name; match snapshots by business labels instead.
+            dimensions = tuple(
+                sorted((key, value) for key, value in record.items() if key not in {"_time_", "_result_", "__name__"})
+            )
+            key = (record["_time_"], dimensions)
+            if key in indexed:
+                raise ValueError(f"duplicate named output point: {output.get('reference_name')}")
+            indexed[key] = record
+        return indexed
+
+    @classmethod
+    def process_named_outputs_data(
+        cls, params: dict[str, Any], data: dict[str, Any], end_time: int | None = None
+    ) -> tuple[list[dict[str, Any]], bool, dict]:
+        contract_version = data.get("contract_version")
+        if contract_version != "named_outputs/v1":
+            raise ValueError(f"unsupported named outputs response contract: {contract_version}")
+
+        legacy_output_ref = params["legacy_output_ref"]
+        outputs = data.get("outputs") or []
+        outputs_by_ref = {}
+        for output in outputs:
+            reference_name = output.get("reference_name")
+            if not reference_name or reference_name in outputs_by_ref:
+                raise ValueError(f"duplicate or empty named output reference: {reference_name}")
+            outputs_by_ref[reference_name] = output
+        if legacy_output_ref not in outputs_by_ref:
+            raise ValueError(f"legacy output is missing: {legacy_output_ref}")
+
+        indexed_outputs = {
+            reference_name: cls._index_named_output_records(params, output)
+            for reference_name, output in outputs_by_ref.items()
+        }
+        condition_output = outputs_by_ref[legacy_output_ref]
+        condition_records = indexed_outputs[legacy_output_ref]
+        records = []
+        for key, condition_record in condition_records.items():
+            record = dict(condition_record)
+            ref_values = {}
+            for reference_name, output in outputs_by_ref.items():
+                state = output.get("state") or ("PARTIAL" if output.get("is_partial") else "SUCCESS")
+                referenced_record = indexed_outputs[reference_name].get(key)
+                if referenced_record is None:
+                    ref_values[reference_name] = {"state": state if state in {"ERROR", "UNSUPPORTED"} else "MISSING"}
+                else:
+                    ref_values[reference_name] = {"value": referenced_record.get("_result_"), "state": state}
+            record[REF_VALUES_RESERVED_FIELD] = ref_values
+            if not params.get("instant") and end_time and record.get("_time_") == end_time:
+                continue
+            records.append(record)
+
+        condition_state = condition_output.get("state")
+        is_partial = bool(condition_output.get("is_partial")) or condition_state in {"PARTIAL", "ERROR"}
+        condition_params = {**params, "query_list": [{"reference_name": legacy_output_ref}]}
+        series_stat = cls.process_unify_query_series_stat(
+            condition_params, {"series": condition_output.get("series") or []}
+        )
+        return records, is_partial, series_stat
 
     def _query_unify_query(
         self,
@@ -398,6 +584,34 @@ class UnifyQuery:
     ) -> tuple[list[dict], bool, dict]:
         """
         使用统一查询模块进行查询
+
+        :param start_time: 查询起始时间（秒级时间戳）
+        :param end_time: 查询结束时间（秒级时间戳）
+        :param limit: 单序列最大点数
+        :param slimit: 最大序列数
+        :param offset: 分页偏移
+        :param down_sample_range: 降采样区间
+        :param time_alignment: 是否时间对齐
+        :param instant: 是否瞬时查询
+        :param not_time_align: 是否关闭时间对齐
+        :return: (records, is_partial, series_stat) 三元组
+                 - records: 处理后的记录列表（同 process_unify_query_data 返回）
+                 - is_partial: 是否仅返回了部分数据
+                 - series_stat: 按 (维度, 指标) 聚合的统计，无统计时为 {}
+
+        返回示例：
+            (
+                [
+                    {"bk_target_ip": "127.0.1.12", "_time_": 1657848000000, "_result_": 12.5},
+                    {"bk_target_ip": "127.0.1.10", "_time_": 1657848060000, "_result_": 13.1}
+                ],
+                False,
+                {
+                    ({"bk_target_ip": "127.0.1.11"}, "_result_"): {
+                        "avg": 12.8, "max": 13.1, "min": 12.5, "count": 2
+                    }
+                }
+            )
         """
         is_partial = False
         params = self.get_unify_query_params(start_time, end_time, time_alignment, not_time_align=not_time_align)
@@ -417,9 +631,24 @@ class UnifyQuery:
             span.set_attribute("bk.system", "unify_query")
             span.set_attribute("bk.unify_query.statement", json.dumps(params))
             data = api.unify_query.query_data(**params)
-            is_partial = data.get("is_partial", False)
-            series_stat = self.process_unify_query_series_stat(params, data)
-            records: list[dict[str, Any]] = self.process_unify_query_data(params, data, end_time=end_time)
+            if self.query_output_config and "contract_version" in data:
+                records, is_partial, series_stat = self.process_named_outputs_data(params, data, end_time=end_time)
+            else:
+                if self.query_output_config and "series" not in data:
+                    raise ValueError("legacy named outputs response is missing series")
+                is_partial = data.get("is_partial", False)
+                series_stat = self.process_unify_query_series_stat(params, data)
+                records = self.process_unify_query_data(params, data, end_time=end_time)
+                if self.query_output_config:
+                    legacy_output_ref = self.query_output_config["legacy_output_ref"]
+                    state = "PARTIAL" if is_partial else "SUCCESS"
+                    for record in records:
+                        ref_values = {
+                            output["reference_name"]: {"state": "UNSUPPORTED"}
+                            for output in self.query_output_config["output_list"]
+                        }
+                        ref_values[legacy_output_ref] = {"value": record.get("_result_"), "state": state}
+                        record[REF_VALUES_RESERVED_FIELD] = ref_values
             records = self.process_data_by_datasource(records)
         return records, is_partial, series_stat
 
@@ -469,6 +698,7 @@ class UnifyQuery:
         offset: int | None = None,
         order_by: list[str] | None = None,
         time_alignment: bool = True,
+        is_es_batch: bool = False,
     ) -> list[dict]:
         params: dict[str, Any] = self.get_unify_query_params(start_time, end_time, time_alignment, order_by)
         if not params["query_list"]:
@@ -481,6 +711,8 @@ class UnifyQuery:
         params["limit"] = limit or 1
         params["_from"] = offset or 0
         params["timezone"] = timezone.get_current_timezone_name()
+        if is_es_batch:
+            params["is_es_batch"] = True
 
         params_json: str = json.dumps(params)
         logger.info("UNIFY_QUERY: %s", params_json)
@@ -492,6 +724,29 @@ class UnifyQuery:
             records: list[dict[str, Any]] = self.process_unify_query_log(params, data)
             records = self.process_log_by_datasource(records)
         return records
+
+    def _translate_promql_named_output_config(self) -> dict:
+        """把 query_output_config 的 output_list expression 从 alias 翻译成完整 PromQL。
+
+        平台侧保存的 output_list 里 expression 是 query alias（如 "a"），而 UQ 的
+        /query/ts/promql 要求 expression 是完整 PromQL，因此查询前需要翻译：
+        - legacy 输出（reference_name == legacy_output_ref）-> 编译后的 promql（检测值）
+        - 非 legacy 输出 -> 对应 alias 的原始 promql
+        """
+        legacy_output_ref = self.query_output_config["legacy_output_ref"]
+        translated = []
+        for output in self.query_output_config["output_list"]:
+            reference_name = output["reference_name"]
+            if reference_name == legacy_output_ref:
+                translated_expression = self.data_sources[0].promql
+            else:
+                translated_expression = self.promql_output_map[output["expression"].strip()]
+            translated.append({"reference_name": reference_name, "expression": translated_expression})
+        return {
+            "response_contract": self.query_output_config["response_contract"],
+            "legacy_output_ref": legacy_output_ref,
+            "output_list": translated,
+        }
 
     def _query_data_using_datasource(
         self,
@@ -527,6 +782,9 @@ class UnifyQuery:
                         continue
                     metric_field = datasource.metrics[0].get("alias") or datasource.metrics[0]["field"]
                     record["_result_"] = record[metric_field]
+            # 汇总 data_source 的 partial 状态（PromQL 命名输出会在 query_data 里设置）
+            if getattr(datasource, "is_partial", False):
+                self.is_partial = True
             all_data.extend(data)
 
         return all_data, all_series_stat
@@ -569,6 +827,46 @@ class UnifyQuery:
         with_series_stat: bool = False,
         **kwargs,
     ) -> tuple[list[dict], dict]:
+        """
+        内部统一查询入口：根据配置选择统一查询模块或原始数据源拉取时序数据，
+        返回处理后的记录列表与（可选的）序列统计信息。
+
+        :param start_time: 查询起始时间（秒级时间戳）
+        :param end_time: 查询结束时间（秒级时间戳）
+        :param limit: 单序列最大点数
+        :param slimit: 最大序列数
+        :param offset: 分页偏移
+        :param down_sample_range: 降采样区间
+        :param not_time_align: 是否关闭时间对齐
+        :param args: 透传位置参数
+        :param with_series_stat: 是否返回序列统计（avg/max/min/count 等）
+        :param kwargs: 透传关键字参数（如 instant、time_alignment）
+        :return: (records, series_stat) 二元组
+                 - records: 处理后的记录列表（同 process_unify_query_data 返回）
+                 - series_stat: with_series_stat=True 时的序列统计，否则为 {}
+
+        返回示例（with_series_stat=False）:
+            (
+                [
+                    {"bk_target_ip": "127.0.1.12", "_time_": 1657848000000, "_result_": 12.5},
+                    {"bk_target_ip": "127.0.1.10", "_time_": 1657848060000, "_result_": 13.1}
+                ],
+                {}
+            )
+
+        返回示例（with_series_stat=True）:
+            (
+                [
+                    {"bk_target_ip": "127.0.1.11", "_time_": 1657848000000, "_result_": 12.5},
+                    {"bk_target_ip": "127.0.1.12", "_time_": 1657848060000, "_result_": 13.1}
+                ],
+                {
+                    ({"bk_target_ip": "127.0.1.10"}, "_result_"): {
+                        "avg": 12.8, "max": 13.1, "min": 12.5, "count": 2
+                    }
+                }
+            )
+        """
         self.is_partial = False
         if not self.data_sources:
             return [], {}
@@ -735,6 +1033,7 @@ class UnifyQuery:
         limit: int = None,
         offset: int = None,
         order_by: list[str] | None = None,
+        is_es_batch: bool = False,
         *args,
         **kwargs,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -757,6 +1056,7 @@ class UnifyQuery:
                         offset=offset,
                         order_by=order_by,
                         time_alignment=kwargs.get("time_alignment", True),
+                        is_es_batch=is_es_batch,
                     )
             except Exception as e:
                 exc = e
@@ -778,15 +1078,85 @@ class UnifyQuery:
 
         return data, total
 
-    def query_dimensions(self, dimension_field: list | str, limit, start_time, end_time, *args, **kwargs):
+    def _query_dimensions_using_unify_query(
+        self,
+        dimension_field: list[str] | str,
+        limit: int,
+        start_time: int | None,
+        end_time: int | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> list[Any]:
+        data_source: DataSource = copy.copy(self.data_sources[0])
+        data_source.group_by = [dimension_field] if isinstance(dimension_field, str) else dimension_field[:]
+        config: dict[str, Any] = data_source.to_unify_query_config()[0]
+        keys: list[str] = config["dimensions"][:1]
+        if not keys:
+            return self._query_dimensions_using_datasource(
+                dimension_field=dimension_field,
+                limit=limit,
+                start_time=start_time,
+                end_time=end_time,
+                *args,
+                **kwargs,
+            )
+
+        start_time, end_time = self.process_time_range(start_time, end_time)
+        space_uid: str | None = kwargs["space_uid"] if "space_uid" in kwargs else self.space_uid
+        params: dict[str, Any] = {
+            "info_type": "tag_values",
+            "data_source": config["data_source"],
+            "table_id": config["table_id"],
+            "keys": keys,
+            "space_uid": space_uid,
+            "bk_tenant_id": self.bk_tenant_id,
+            "start_time": str(start_time // 1000),
+            "end_time": str(end_time // 1000),
+            "limit": limit,
+        }
+        if config.get("field_name"):
+            params["metric_name"] = config["field_name"]
+        if config.get("conditions"):
+            params["conditions"] = config["conditions"]
+
+        response: dict[str, Any] = api.unify_query.get_dimension_data(**params)
+        return response["values"].get(keys[0], [])
+
+    def _query_dimensions_using_datasource(
+        self,
+        dimension_field: list[str] | str,
+        limit: int,
+        start_time: int | None,
+        end_time: int | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> list[Any] | dict[str, Any]:
+        data_source: DataSource = self.data_sources[0]
+        return data_source.query_dimensions(
+            dimension_field=dimension_field,
+            limit=limit,
+            start_time=start_time,
+            end_time=end_time,
+            *args,
+            **kwargs,
+        )
+
+    def query_dimensions(
+        self,
+        dimension_field: list[str] | str,
+        limit: int,
+        start_time: int | None,
+        end_time: int | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> list[Any] | dict[str, Any]:
         """
         查询维度
         """
-        if len(self.data_sources) == 1:
-            return self.data_sources[0].query_dimensions(
-                dimension_field=dimension_field, limit=limit, start_time=start_time, end_time=end_time, *args, **kwargs
-            )
-        else:
+        if not self.data_sources:
+            return []
+
+        if len(self.data_sources) > 1:
             if isinstance(dimension_field, list):
                 dimension_field = dimension_field[0]
             points = self.query_data(start_time, end_time)
@@ -797,3 +1167,36 @@ class UnifyQuery:
                     continue
                 dimensions.add(dimension)
             return list(dimensions)
+
+        exc: Exception | None = None
+        data: list[Any] | dict[str, Any] = []
+        labels: dict[str, str] = self.get_observe_labels()
+        data_source: DataSource = self.data_sources[0]
+        query_dimension: Callable[..., list[Any] | dict[str, Any]]
+        if data_source.supports_unify_query_dimensions and self.use_unify_query():
+            labels["api"] = "unify_query"
+            query_dimension = self._query_dimensions_using_unify_query
+        else:
+            labels["api"] = "query_api"
+            query_dimension = self._query_dimensions_using_datasource
+
+        try:
+            with metrics.DATASOURCE_QUERY_TIME.labels(**labels).time():
+                data = query_dimension(
+                    dimension_field=dimension_field,
+                    limit=limit,
+                    start_time=start_time,
+                    end_time=end_time,
+                    *args,
+                    **kwargs,
+                )
+        except Exception as error:
+            exc = error
+
+        metrics.DATASOURCE_QUERY_COUNT.labels(**labels, status=metrics.StatusEnum.from_exc(exc), exception=exc).inc()
+        metrics.report_all()
+
+        if exc:
+            raise exc
+
+        return data

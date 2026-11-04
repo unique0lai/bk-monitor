@@ -35,10 +35,11 @@ import {
   watch,
 } from 'vue';
 
-import { ResizeLayout } from 'bkui-vue';
+import { Loading, ResizeLayout } from 'bkui-vue';
 import dayjs from 'dayjs';
 import { alertTopN, listAlertTags } from 'monitor-api/modules/alert';
 import {
+  getIncidentDocId,
   incidentDetail,
   incidentOperations,
   incidentOperationTypes,
@@ -103,9 +104,33 @@ export default defineComponent({
     },
   },
   setup(props) {
-    useIncidentProvider(computed(() => props.id));
     const route = useRoute();
     const router = useRouter();
+
+    // 解析真实的 incident ID（当 id 长度 < 16 时，说明是短 id，需通过接口换取真实 id）
+    const resolvedId = deepRef(props.id);
+    const idResolving = deepRef(false);
+    let idResolvePromise: null | Promise<void> = null;
+    if (props.id && String(props.id).length < 11) {
+      idResolving.value = true;
+      idResolvePromise = getIncidentDocId({ incident_id: props.id })
+        .then(async res => {
+          resolvedId.value = res.id;
+          await router.replace({
+            name: route.name as string,
+            params: { ...route.params, id: res.id },
+            query: { ...route.query },
+          });
+        })
+        .catch(err => {
+          console.error('Failed to resolve incident_id:', err);
+        })
+        .finally(() => {
+          idResolving.value = false;
+        });
+    }
+
+    useIncidentProvider(computed(() => resolvedId.value));
     const operations = deepRef([]);
     const operationsFailDetail = deepRef('');
     const bkzIds = deepRef([]);
@@ -124,6 +149,7 @@ export default defineComponent({
     const operationTypes = deepRef([]);
     const refContent = deepRef<InstanceType<typeof FailureContent>>();
     const failureNavRef = deepRef<InstanceType<typeof FailureNav>>();
+    const failureHeaderRef = deepRef<InstanceType<typeof FailureHeader>>();
     const topoNodeId = deepRef<string>();
     const incidentResultList = deepRef({});
     const incidentResultStatus = deepRef('');
@@ -131,6 +157,22 @@ export default defineComponent({
     const isShowDiagnosis = shallowRef(false);
     const currentAlertList = deepRef({});
     const isCollapsed = deepRef(false);
+
+    // 短 ID 解析期间内容组件尚未挂载，待其可用后再消费外部指定的页签。
+    watch(
+      [refContent, () => route.query.activeTab],
+      ([content, queryTab]) => {
+        const activeTab = Array.isArray(queryTab) ? queryTab[0] : queryTab;
+        if (!content || !activeTab) return;
+        if (activeTab === 'FailureTopo' || activeTab === 'FailureView') {
+          content.handleChangeActive(activeTab);
+        }
+        const restQuery = { ...route.query };
+        delete restQuery.activeTab;
+        router.replace({ query: restQuery });
+      },
+      { flush: 'post' }
+    );
 
     const { updateAlarmDetailShow, alarmDetailShow, alarmDetailData } = useIncidentAlarmDetail();
 
@@ -144,6 +186,17 @@ export default defineComponent({
     provide('operationTypeMap', operationTypeMap);
     provide('incidentResults', incidentResultList);
     provide('isShowDiagnosis', isShowDiagnosis);
+    /**
+     * 本页是否已一键开启故障分析（对齐告警中心：开启后立即视为已接入，隐藏按钮）
+     * 后台 incident_results.reason 可能仍短暂为 feature_disabled
+     */
+    const featureEnabledLocally = shallowRef(false);
+    provide('featureEnabledLocally', featureEnabledLocally);
+    /** 刷新故障分析 panels（拓扑一键开启成功后调用，与告警中心 onEnabled 刷新列表一致） */
+    provide('refreshIncidentResults', () => {
+      featureEnabledLocally.value = true;
+      getIncidentResults();
+    });
     /**
      * @description: 获取告警分析TopN数据
      * @param {*}
@@ -310,7 +363,7 @@ export default defineComponent({
     /** 获取故障详情 */
     const getIncidentDetail = () => {
       incidentDetail({
-        id: props.id,
+        id: resolvedId.value,
       })
         .then(res => {
           incidentDetailData.value = res;
@@ -318,13 +371,6 @@ export default defineComponent({
           getIncidentOperations();
           getIncidentOperationTypes();
           handleGetSearchTopNList();
-          /** 判断路由里是否带了activeTab，需要调整到指定tab，由于其他tab的接口请求依赖详情数据，所以要在跳转前确保已经正确获取到详情数据 */
-          if (route.query?.activeTab) {
-            changeTab();
-            nextTick(() => {
-              router.replace({ query: {} });
-            });
-          }
         })
         .catch(err => {
           console.log(err);
@@ -343,14 +389,17 @@ export default defineComponent({
 
     /** 故障分析状态获取接口 */
     const getIncidentResults = (isInit = false) => {
-      incidentResults({ id: props.id }).then(res => {
+      incidentResults({ id: resolvedId.value }).then(res => {
         incidentResultStatus.value = res.status || 'finished';
         incidentResultList.value = res.panels || {};
-        /** 第一次请求这个接口的时候去判断是否要切换到故障诊断的Tab */
+        // 第一次请求这个接口的时候去判断是否要切换到故障诊断的Tab
         const len = Object.keys(incidentResultList.value).length;
         if (isInit && len) {
           const panel = incidentResultList.value.incident_diagnosis.sub_panels || {};
-          isShowDiagnosis.value = Object.values(panel).findIndex(item => item.status === 'finished') > -1;
+          const isDiagnosisEnabled = incidentResultList.value.incident_diagnosis.enabled || false;
+          // 如果故障诊断是开启的且存在子面板且子面板中有完成状态，则显示故障诊断Tab
+          isShowDiagnosis.value =
+            isDiagnosisEnabled && Object.values(panel).findIndex(item => item.status === 'finished') > -1;
         }
       });
     };
@@ -367,7 +416,10 @@ export default defineComponent({
       }
     );
 
-    onMounted(() => {
+    onMounted(async () => {
+      if (idResolvePromise) {
+        await idResolvePromise;
+      }
       getIncidentResults(true);
       getIncidentDetail();
     });
@@ -413,6 +465,12 @@ export default defineComponent({
     const handleCollapseChange = val => {
       isCollapsed.value = val;
     };
+    const handleOpenEdit = () => {
+      if (failureHeaderRef.value) {
+        failureHeaderRef.value.autoFocusReason = true;
+        failureHeaderRef.value.isShow = true;
+      }
+    };
     return {
       incidentDetailData,
       getIncidentDetail,
@@ -444,18 +502,32 @@ export default defineComponent({
       updateAlarmDetailShow,
       alarmDetailShow,
       alarmDetailData,
+      idResolving,
+      handleOpenEdit,
+      failureHeaderRef,
     };
   },
   render() {
+    if (this.idResolving) {
+      return (
+        <div class='failure-wrapper failure-id-resolving'>
+          <Loading />
+        </div>
+      );
+    }
     return (
       <div
         class='failure-wrapper'
         tabindex='0'
       >
-        <FailureHeader onEditSuccess={this.getIncidentDetail} />
+        <FailureHeader
+          ref='failureHeaderRef'
+          onEditSuccess={this.getIncidentDetail}
+        />
         <FailureTags
           onChooseNode={this.nodeClick}
           onChooseTag={this.handleChooseTag}
+          onOpenEdit={this.handleOpenEdit}
           onToSpan={this.handleToSpan}
         />
         <ResizeLayout

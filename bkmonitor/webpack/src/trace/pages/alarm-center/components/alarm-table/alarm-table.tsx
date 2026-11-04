@@ -25,10 +25,11 @@
  */
 import { type PropType, computed, defineComponent, toRef, toValue, useTemplateRef } from 'vue';
 
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 
-import { useTableScrollOptimize } from '../../composables/use-table-scroll-optimize';
+import { useTableScrollOptimize } from '../../../../hooks/use-table-scroll-optimize';
 import { ALERT_STORAGE_KEY } from '../../services/alert-services';
+import { AlarmTableSkeletonCell } from '../alarm-skeleton';
 import AlertSelectionToolbar from './components/alert-selection-toolbar/alert-selection-toolbar';
 import CommonTable from './components/common-table/common-table';
 import { useActionHandlers } from './hooks/use-action-handlers';
@@ -45,6 +46,7 @@ import type {
   TableColumnItem,
   TablePagination,
 } from '../../typings';
+import type { AlarmCenterPanelTabType } from '../../utils/constant';
 import type { AlertSavePromiseEvent } from './components/alert-content-detail/alert-content-detail';
 import type { ActionScenario } from './scenarios/action-scenario';
 import type { AlertScenario } from './scenarios/alert-scenario';
@@ -95,10 +97,10 @@ export default defineComponent({
       type: Boolean,
       default: false,
     },
-    /** 表格默认选中高亮的行 */
-    defaultActiveRowKeys: {
+    /** 受控高亮行 keys（透传 CommonTable activeRowKeys）：行高亮状态由调用方维护，点击 / 键盘高亮经 activeChange 回传 */
+    activeRowKeys: {
       type: Array as PropType<(number | string)[]>,
-      default: () => [],
+      default: undefined,
     },
     /** 时间范围 [from, to] */
     timeRange: {
@@ -121,8 +123,10 @@ export default defineComponent({
     displayColFieldsChange: (displayColFields: string[]) => Array.isArray(displayColFields),
     pageSizeChange: (pageSize: number) => typeof pageSize === 'number',
     sortChange: (sort: string | string[]) => typeof sort === 'string' || Array.isArray(sort),
-    showAlertDetail: (row: AlertTableItem, _defaultTab?: string) => row,
+    showAlertDetail: (row: AlertTableItem, _defaultTab?: AlarmCenterPanelTabType) => row,
     showActionDetail: (row: ActionTableItem) => row,
+    /** 高亮行变化回调（透传 CommonTable activeChange） */
+    activeChange: (rowKeys: Array<number | string>) => Array.isArray(rowKeys),
     selectionChange: (selectedRowKeys: string[], options?: SelectOptions<any>) =>
       Array.isArray(selectedRowKeys) && options,
     openAlertDialog: (
@@ -138,6 +142,7 @@ export default defineComponent({
   setup(props, { emit }) {
     // const alarmStore = useAlarmCenterStore();
     const router = useRouter();
+    const route = useRoute();
     const tableRef = useTemplateRef<InstanceType<typeof CommonTable>>('tableRef');
 
     /** hover 场景使用的popover工具函数 */
@@ -155,7 +160,7 @@ export default defineComponent({
     /** 表格滚动优化：滚动时禁用 pointerEvents 并隐藏 popover */
     useTableScrollOptimize({
       targetElement: tableRef,
-      scrollContainerSelector: props.scrollContainerSelector,
+      scrollContainerElement: props.scrollContainerSelector,
       onScroll: () => {
         hoverPopoverTools.hidePopover();
         clickPopoverTools.hidePopover();
@@ -186,6 +191,7 @@ export default defineComponent({
     /** 创建场景表格渲染器上下文 */
     const scenarioContext: ActionScenario['context'] & AlertScenario['context'] & IncidentScenario['context'] = {
       router,
+      route,
       handleAlertSliderShowDetail,
       hoverPopoverTools,
       clickPopoverTools,
@@ -245,18 +251,29 @@ export default defineComponent({
                   ) as unknown as SlotReturnValue
               : null
           }
+          loadingCell={(column, rowIndex) =>
+            (
+              <AlarmTableSkeletonCell
+                columnKey={column.colKey}
+                rowIndex={rowIndex}
+                variant={this.tableScenarioClassName === 'incident-table' ? 'incident' : 'default'}
+              />
+            ) as unknown as SlotReturnValue
+          }
+          activeRowKeys={this.activeRowKeys}
           autoFillSpace={!this.data?.length}
           columns={this.transformedColumns}
           data={this.data}
-          defaultActiveRowKeys={this.defaultActiveRowKeys}
           empty={this.tableEmpty}
           headerAffixedTop={this.headerAffixedTop}
           horizontalScrollAffixedBottom={this.horizontalScrollAffixedBottom}
           loading={this.loading}
           pagination={this.pagination}
+          refreshKey={this.currentScenario?.name}
           selectedRowKeys={this.selectedRowKeys}
           sort={this.sort}
           tableSettings={this.settings}
+          onActiveChange={(rowKeys: Array<number | string>) => this.$emit('activeChange', rowKeys)}
           onColumnResizeChange={context => this.$emit('columnResizeChange', context)}
           onCurrentPageChange={page => this.$emit('currentPageChange', page)}
           onDisplayColFieldsChange={displayColFields => this.$emit('displayColFieldsChange', displayColFields)}

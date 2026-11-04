@@ -29,9 +29,10 @@ import { Component, ProvideReactive, Ref, Watch } from 'vue-property-decorator';
 import { Component as tsc } from 'vue-tsx-support';
 
 import { getLinkMapping } from 'monitor-api/modules/commons';
-import { APP_NAV_COLORS } from 'monitor-common/utils';
+import { APP_NAV_COLORS, getBizRouteHref } from 'monitor-common/utils';
 import { globalUrlFeatureMap } from 'monitor-common/utils/global-feature-map';
 import CommonNavBar from 'monitor-pc/pages/monitor-k8s/components/common-nav-bar';
+import { dispatchApmK8sCacheFlush } from 'monitor-pc/pages/monitor-k8s/monitor-k8s-apm';
 import AuthorityModal from 'monitor-ui/authority-modal';
 
 import debounce from '../common/debounce-decorator';
@@ -96,6 +97,13 @@ export default class App extends tsc<object> {
     this.menuToggle = localStorage.getItem('navigationToggle') === 'true';
     Vue.prototype.$authorityStore = authorityStore;
     this.getDocsLinkMapping();
+    // APM 内部路由切换时，在旧页面销毁前通知子组件持久化（如 K8s 容器监控 target 缓存）
+    this.$router.beforeEach((to, from, next) => {
+      if (from.name && from.name !== to.name) {
+        dispatchApmK8sCacheFlush();
+      }
+      next();
+    });
   }
   /** 获取文档链接 */
   async getDocsLinkMapping() {
@@ -184,7 +192,7 @@ export default class App extends tsc<object> {
     if (navId !== this.$route.name) {
       const parentRoute = this.$router.options.routes.find(item => item.name === navId);
       if (parentRoute) {
-        location.href = `${location.origin}${location.pathname}?bizId=${window.cc_biz_id}#${parentRoute.path}`;
+        location.href = getBizRouteHref(parentRoute.path, window.cc_biz_id);
       } else {
         this.handleReload();
       }
@@ -197,7 +205,7 @@ export default class App extends tsc<object> {
     const { needClearQuery } = this.$route.meta;
     // 清空query查询条件
     if (needClearQuery) {
-      location.href = `${location.origin}${location.pathname}?bizId=${window.cc_biz_id}#${this.$route.path}`;
+      location.href = getBizRouteHref(this.$route.path, window.cc_biz_id);
     } else {
       location.search = `?bizId=${window.cc_biz_id}`;
     }
@@ -337,7 +345,6 @@ export default class App extends tsc<object> {
               </bk-navigation-menu>
             </div>
           ) : undefined}
-          {/* {this.navigationBar} */}
           {this.showNav && (
             <CommonNavBar
               class='common-nav-bar-single'

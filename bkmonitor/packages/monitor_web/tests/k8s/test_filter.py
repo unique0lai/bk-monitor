@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -9,17 +8,15 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
-from datetime import datetime
-
-import mock
+from unittest import mock
 from django.test import TestCase
 from django.utils import timezone
-from humanize import naturaldelta
 
 from bkmonitor.models import BCSCluster
 from monitor_web.k8s.core.filters import (
     ContainerFilter,
     NamespaceFilter,
+    NodeFilter,
     PodFilter,
     WorkloadFilter,
     load_resource_filter,
@@ -58,6 +55,27 @@ class TestFilter(TestCase):
         self.assertEqual(
             ContainerFilter("bk-monitor-web").filter_string(),
             'container_name="bk-monitor-web"',
+        )
+
+    def test_filter_string_escapes_regex(self):
+        # 多值走 =~ 正则匹配，资源名中的正则元字符（如 . ）需转义，避免误匹配。
+        # 输出处于双引号字符串字面量内，反斜杠须成对（\\.），
+        # 单写 \. 会被 PromQL 解析报 unknown escape sequence。
+        self.assertEqual(
+            PodFilter(["app.v1-abc", "app.v2-def"]).filter_string(),
+            r'pod_name=~"^(app\\.v1-abc|app\\.v2-def)$"',
+        )
+        # node 名常为 IP，是最典型的含 . 资源名
+        self.assertEqual(
+            NodeFilter(["127.0.0.1", "127.0.0.2"]).filter_string(),
+            r'node=~"^(127\\.0\\.0\\.1|127\\.0\\.0\\.2)$"',
+        )
+        # 单值走精确匹配（=），不经过正则，保持原样
+        self.assertEqual(PodFilter("app.v1").filter_string(), 'pod_name="app.v1"')
+        # 常见带连字符名称不应被转义（- 在正则中无特殊含义）
+        self.assertEqual(
+            PodFilter(["bk-monitor-web-5dc76bbfd7-8w9c6", "bk-monitor-web-query-api-5c6d68c5dc-jcn74"]).filter_string(),
+            'pod_name=~"^(bk-monitor-web-5dc76bbfd7-8w9c6|bk-monitor-web-query-api-5c6d68c5dc-jcn74)$"',
         )
 
     def test_filter_with_resource_ns(self):
@@ -239,9 +257,6 @@ class TestGetResourcesDetail(TestCase):
             "resource_type": "pod",
             "pod_name": "pf-f991b578413c4ce48d7d92d53f2021f9-6c9757758b-4qmxp",
         }
-        age = naturaldelta(
-            datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.utcnow().replace(tzinfo=timezone.utc)
-        )
         result = GetResourceDetail()(validated_request_data)
         expect_data = [
             {
@@ -288,73 +303,7 @@ class TestGetResourcesDetail(TestCase):
                 "type": "status",
                 "value": {"type": "success", "text": "正常"},
             },
-            {"key": "age", "name": "存活时间", "type": "string", "value": age},
-            {
-                "key": "request_cpu_usage_ratio",
-                "name": "CPU使用率(request)",
-                "type": "progress",
-                "value": {"value": 96.5, "label": "96.5%", "status": "SUCCESS"},
-            },
-            {
-                "key": "limit_cpu_usage_ratio",
-                "name": "CPU使用率(limit)",
-                "type": "progress",
-                "value": {"value": 96.5, "label": "96.5%", "status": "SUCCESS"},
-            },
-            {
-                "key": "request_memory_usage_ratio",
-                "name": "内存使用率(request)",
-                "type": "progress",
-                "value": {"value": 54.98, "label": "54.98%", "status": "SUCCESS"},
-            },
-            {
-                "key": "limit_memory_usage_ratio",
-                "name": "内存使用率(limit) ",
-                "type": "progress",
-                "value": {"value": 54.98, "label": "54.98%", "status": "SUCCESS"},
-            },
-            {
-                "key": "resource_usage_cpu",
-                "name": "CPU使用量",
-                "type": "string",
-                "value": "",
-            },
-            {
-                "key": "resource_usage_memory",
-                "name": "内存使用量",
-                "type": "string",
-                "value": "",
-            },
-            {
-                "key": "resource_usage_disk",
-                "name": "磁盘使用量",
-                "type": "string",
-                "value": "",
-            },
-            {
-                "key": "resource_requests_cpu",
-                "name": "cpu request",
-                "type": "string",
-                "value": "0",
-            },
-            {
-                "key": "resource_limits_cpu",
-                "name": "cpu limit",
-                "type": "string",
-                "value": "0",
-            },
-            {
-                "key": "resource_requests_memory",
-                "name": "memory request",
-                "type": "string",
-                "value": "0",
-            },
-            {
-                "key": "resource_limits_memory",
-                "name": "memory limit",
-                "type": "string",
-                "value": "0",
-            },
+            {"key": "age", "name": "存活时间", "type": "string", "value": "a moment"},
             {"key": "pod_ip", "name": "Pod IP", "type": "string", "value": "127.0.0.1"},
             {
                 "key": "node_ip",
@@ -376,6 +325,7 @@ class TestGetResourcesDetail(TestCase):
             },
             {"key": "label_list", "name": "标签", "type": "kv", "value": []},
             {"key": "images", "name": "镜像", "type": "list", "value": [""]},
+            {"key": "ingress_service_relation", "name": "ingress/service关联", "type": "list", "value": []},
         ]
 
         self.assertEqual(result, expect_data)
@@ -389,9 +339,6 @@ class TestGetResourcesDetail(TestCase):
             "workload_name": "pf-f991b578413c4ce48d7d92d53f2021f9",
             "workload_type": "Deployment",
         }
-        age = naturaldelta(
-            datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.utcnow().replace(tzinfo=timezone.utc)
-        )
         result = GetResourceDetail()(validated_request_data)
 
         expect_data = [
@@ -442,7 +389,7 @@ class TestGetResourcesDetail(TestCase):
                 "value": 1,
             },
             {"key": "resources", "name": "资源", "type": "kv", "value": []},
-            {"key": "age", "name": "存活时间", "type": "string", "value": age},
+            {"key": "age", "name": "存活时间", "type": "string", "value": "a moment"},
         ]
         self.assertEqual(result, expect_data)
 
@@ -455,9 +402,6 @@ class TestGetResourcesDetail(TestCase):
             "pod_name": "pf-f991b578413c4ce48d7d92d53f2021f9-6c9757758b-4qmxp",
             "container_name": "monitor-main-container",
         }
-        age = naturaldelta(
-            datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.utcnow().replace(tzinfo=timezone.utc)
-        )
         result = GetResourceDetail()(validated_request_data)
 
         expect_data = [
@@ -522,25 +466,7 @@ class TestGetResourcesDetail(TestCase):
                 "type": "string",
                 "value": "",
             },
-            {
-                "key": "resource_usage_cpu",
-                "name": "CPU使用量",
-                "type": "string",
-                "value": "",
-            },
-            {
-                "key": "resource_usage_memory",
-                "name": "内存使用量",
-                "type": "string",
-                "value": "",
-            },
-            {
-                "key": "resource_usage_disk",
-                "name": "磁盘使用量",
-                "type": "string",
-                "value": "",
-            },
-            {"key": "age", "name": "存活时间", "type": "string", "value": age},
+            {"key": "age", "name": "存活时间", "type": "string", "value": "a moment"},
         ]
         self.assertEqual(result, expect_data)
 
@@ -551,9 +477,6 @@ class TestGetResourcesDetail(TestCase):
             "namespace": "bkmonitor",
             "resource_type": "cluster",
         }
-        age = naturaldelta(
-            datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.utcnow().replace(tzinfo=timezone.utc)
-        )
         with mock.patch("bkmonitor.models.BCSCluster.update_monitor_status") as mock_update_monitor_status:
             mock_update_monitor_status.return_value = None
 
@@ -575,36 +498,18 @@ class TestGetResourcesDetail(TestCase):
                 },
                 {"key": "environment", "name": "环境", "type": "string", "value": "正式"},
                 {"key": "node_count", "name": "节点数量", "type": "number", "value": 18},
-                {
-                    "key": "cpu_usage_ratio",
-                    "name": "CPU使用率",
-                    "type": "progress",
-                    "value": {"value": 19.22, "label": "19.22%", "status": "SUCCESS"},
-                },
-                {
-                    "key": "memory_usage_ratio",
-                    "name": "内存使用率",
-                    "type": "progress",
-                    "value": {"value": 65.36, "label": "65.36%", "status": "SUCCESS"},
-                },
-                {
-                    "key": "disk_usage_ratio",
-                    "name": "磁盘使用率",
-                    "type": "progress",
-                    "value": {"value": 51.45, "label": "51.45%", "status": "SUCCESS"},
-                },
                 {"key": "area_name", "name": "区域", "type": "string", "value": ""},
                 {
                     "key": "created_at",
                     "name": "创建时间",
                     "type": "string",
-                    "value": age,
+                    "value": "a moment",
                 },
                 {
                     "key": "updated_at",
                     "name": "更新时间",
                     "type": "string",
-                    "value": age,
+                    "value": "a moment",
                 },
                 {"key": "project_name", "name": "所属项目", "type": "string", "value": ""},
                 {"key": "description", "name": "描述", "type": "string", "value": ""},
@@ -880,19 +785,18 @@ class TestK8sListResources(TestCase):
         # 验证meta类型
         self.assertIsInstance(meta, K8sNamespaceMeta)
         query_set = meta.filter.filter_queryset
-        # 验证orm sql即可。 namespace 未定义ORM，因此直接用workload的表, 获取namespace信息
+        # 验证orm sql即可。 namespace 未定义ORM，因此直接用pod的表, 获取namespace信息
         self.assertEqual(
             str(query_set.query),
             (
-                "SELECT `bkmonitor_bcsworkload`.`bk_biz_id`, "
-                "`bkmonitor_bcsworkload`.`bcs_cluster_id`, "
-                "`bkmonitor_bcsworkload`.`namespace` FROM `bkmonitor_bcsworkload` WHERE "
-                "(`bkmonitor_bcsworkload`.`bcs_cluster_id` = BCS-K8S-00000 AND "
-                "`bkmonitor_bcsworkload`.`bk_biz_id` = 2) "
-                "ORDER BY `bkmonitor_bcsworkload`.`id` ASC"
+                "SELECT `bkmonitor_bcspod`.`bk_biz_id`, "
+                "`bkmonitor_bcspod`.`bcs_cluster_id`, "
+                "`bkmonitor_bcspod`.`namespace` FROM `bkmonitor_bcspod` WHERE "
+                "`bkmonitor_bcspod`.`bcs_cluster_id` = BCS-K8S-00000 "
+                "ORDER BY `bkmonitor_bcspod`.`id` ASC"
             ),
         )
-        # 因为用的workload表查询namespace信息， 因此需要验证去重
+        # 因为用的pod表查询namespace信息， 因此需要验证去重
         orm_resource = [
             NameSpace(
                 **{
@@ -916,7 +820,7 @@ class TestK8sListResources(TestCase):
             meta.meta_prom,
             "sum by (namespace) "
             '(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",'
-            'bk_biz_id="2",container_name!="POD"}[1m]))',
+            'container_name!="POD"}[1m]))',
         )
 
         # 验证基于promql 获取 namespace对象
@@ -999,9 +903,9 @@ class TestK8sListResources(TestCase):
                 {
                     "count": len(orm_resource + promql_resource[:1]),
                     "items": [
-                        {'bcs_cluster_id': 'BCS-K8S-00000', 'bk_biz_id': 2, 'namespace': 'apm-demo'},
-                        {'bcs_cluster_id': 'BCS-K8S-00000', 'bk_biz_id': 2, 'namespace': 'default'},
-                        {'bcs_cluster_id': 'BCS-K8S-00000', 'bk_biz_id': 2, 'namespace': 'blueking'},
+                        {"bcs_cluster_id": "BCS-K8S-00000", "bk_biz_id": 2, "namespace": "apm-demo"},
+                        {"bcs_cluster_id": "BCS-K8S-00000", "bk_biz_id": 2, "namespace": "default"},
+                        {"bcs_cluster_id": "BCS-K8S-00000", "bk_biz_id": 2, "namespace": "blueking"},
                     ],
                 },
             )
@@ -1022,13 +926,12 @@ class TestK8sListResources(TestCase):
             self.assertEqual(
                 str(meta.filter.filter_queryset.query),
                 (
-                    "SELECT `bkmonitor_bcsworkload`.`bk_biz_id`, "
-                    "`bkmonitor_bcsworkload`.`bcs_cluster_id`, "
-                    "`bkmonitor_bcsworkload`.`namespace` FROM `bkmonitor_bcsworkload` WHERE "
-                    "(`bkmonitor_bcsworkload`.`bcs_cluster_id` = BCS-K8S-00000 AND "
-                    "`bkmonitor_bcsworkload`.`bk_biz_id` = 2 AND "
-                    "`bkmonitor_bcsworkload`.`namespace` LIKE %blue%) "
-                    "ORDER BY `bkmonitor_bcsworkload`.`id` ASC"
+                    "SELECT `bkmonitor_bcspod`.`bk_biz_id`, "
+                    "`bkmonitor_bcspod`.`bcs_cluster_id`, "
+                    "`bkmonitor_bcspod`.`namespace` FROM `bkmonitor_bcspod` WHERE "
+                    "(`bkmonitor_bcspod`.`bcs_cluster_id` = BCS-K8S-00000 AND "
+                    "`bkmonitor_bcspod`.`namespace` LIKE %blue%) "
+                    "ORDER BY `bkmonitor_bcspod`.`id` ASC"
                 ),
             )
             # 验证 带 query_string 条件的 promql
@@ -1037,7 +940,7 @@ class TestK8sListResources(TestCase):
                 (
                     "sum by (namespace) "
                     '(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",'
-                    'bk_biz_id="2",container_name!="POD",namespace=~"(blue)"}[1m]))'
+                    'container_name!="POD",namespace=~"(blue)"}[1m]))'
                 ),
             )
             # 第一个namespace: blueking 命中 检索
@@ -1096,8 +999,8 @@ class TestK8sListResources(TestCase):
             ns_list = ListK8SResources()(validated_request_data)["items"]
             self.assertEqual(
                 [
-                    {'bk_biz_id': 2, 'bcs_cluster_id': 'BCS-K8S-00000', 'namespace': 'bkmonitor-operator'},
-                    {'bk_biz_id': 2, 'bcs_cluster_id': 'BCS-K8S-00000', 'namespace': 'blueking'},
+                    {"bk_biz_id": 2, "bcs_cluster_id": "BCS-K8S-00000", "namespace": "bkmonitor-operator"},
+                    {"bk_biz_id": 2, "bcs_cluster_id": "BCS-K8S-00000", "namespace": "blueking"},
                 ],
                 ns_list,
             )
@@ -1128,8 +1031,8 @@ class TestK8sListResources(TestCase):
                 "SELECT `bkmonitor_bcsworkload`.`id`, `bkmonitor_bcsworkload`.`bk_biz_id`, "
                 "`bkmonitor_bcsworkload`.`bcs_cluster_id`, `bkmonitor_bcsworkload`.`type`, "
                 "`bkmonitor_bcsworkload`.`name`, `bkmonitor_bcsworkload`.`namespace` FROM "
-                "`bkmonitor_bcsworkload` WHERE (`bkmonitor_bcsworkload`.`bcs_cluster_id` = "
-                "BCS-K8S-00000 AND `bkmonitor_bcsworkload`.`bk_biz_id` = 2) "
+                "`bkmonitor_bcsworkload` WHERE `bkmonitor_bcsworkload`.`bcs_cluster_id` = "
+                "BCS-K8S-00000 "
                 "ORDER BY `bkmonitor_bcsworkload`.`id` ASC"
             ),
         )
@@ -1137,8 +1040,8 @@ class TestK8sListResources(TestCase):
         self.assertEqual(
             meta.meta_prom,
             "sum by (workload_kind, workload_name, namespace) "
-            '(rate(container_cpu_usage_seconds_total{'
-            'bcs_cluster_id="BCS-K8S-00000",bk_biz_id="2",container_name!="POD"}[1m]))',
+            "(rate(container_cpu_usage_seconds_total{"
+            'bcs_cluster_id="BCS-K8S-00000",container_name!="POD"}[1m]))',
         )
         # orm_resource = (
         #     BCSWorkload.objects.filter(**validated_request_data["filter_dict"])
@@ -1148,8 +1051,8 @@ class TestK8sListResources(TestCase):
         # 验证get_from_meta
         workload_list = ListK8SResources()(validated_request_data)
         expect_workload_list = [
-            {'workload': 'Deployment:bk-monitor-web'},
-            {'workload': 'Deployment:bk-monitor-web-worker'},
+            {"workload": "Deployment:bk-monitor-web"},
+            {"workload": "Deployment:bk-monitor-web-worker"},
         ]
         self.assertEqual(
             workload_list,
@@ -1169,7 +1072,7 @@ class TestK8sListResources(TestCase):
             meta.meta_prom,
             "sum by (workload_kind, workload_name, namespace) "
             '(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",'
-            'bk_biz_id="2",container_name!="POD",namespace="blueking",workload_name=~"monitor"}[1m]))',
+            'container_name!="POD",namespace="blueking",workload_name=~"monitor"}[1m]))',
         )
         query_result = [
             {
@@ -1212,9 +1115,9 @@ class TestK8sListResources(TestCase):
             validated_request_data["with_history"] = True
             workload_list = ListK8SResources()(validated_request_data)
             expect_workload_list = [
-                {'namespace': 'blueking', 'workload': 'Deployment:bk-monitor-web'},
-                {'namespace': 'blueking', 'workload': 'Deployment:bk-monitor-web-beat'},
-                {'namespace': 'blueking', 'workload': 'Deployment:bk-monitor-web-worker'},
+                {"namespace": "blueking", "workload": "Deployment:bk-monitor-web"},
+                {"namespace": "blueking", "workload": "Deployment:bk-monitor-web-beat"},
+                {"namespace": "blueking", "workload": "Deployment:bk-monitor-web-worker"},
             ]
             self.assertEqual(
                 workload_list,
@@ -1252,8 +1155,7 @@ class TestK8sListResources(TestCase):
                 "`bkmonitor_bcspod`.`workload_type`, "
                 "`bkmonitor_bcspod`.`workload_name` "
                 "FROM `bkmonitor_bcspod` WHERE "
-                "(`bkmonitor_bcspod`.`bcs_cluster_id` = BCS-K8S-00000 AND "
-                "`bkmonitor_bcspod`.`bk_biz_id` = 2) "
+                "`bkmonitor_bcspod`.`bcs_cluster_id` = BCS-K8S-00000 "
                 "ORDER BY `bkmonitor_bcspod`.`id` ASC"
             ),
         )
@@ -1261,8 +1163,8 @@ class TestK8sListResources(TestCase):
         self.assertEqual(
             meta.meta_prom,
             "sum by (workload_kind, workload_name, namespace, pod_name) "
-            '(rate(container_cpu_usage_seconds_total{'
-            'bcs_cluster_id="BCS-K8S-00000",bk_biz_id="2",container_name!="POD"}[1m]))',
+            "(rate(container_cpu_usage_seconds_total{"
+            'bcs_cluster_id="BCS-K8S-00000",container_name!="POD"}[1m]))',
         )
 
         # 校验包含更多查询的内容
@@ -1288,7 +1190,7 @@ class TestK8sListResources(TestCase):
             meta.meta_prom,
             "sum by (workload_kind, workload_name, namespace, pod_name) "
             '(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",'
-            'bk_biz_id="2",container_name!="POD",namespace="blueking",pod_name=~"(monitor)"}[1m]))',
+            'container_name!="POD",namespace="blueking",pod_name=~"(monitor)"}[1m]))',
         )
         query_result = [
             # mock 历史数据
@@ -1330,6 +1232,120 @@ class TestK8sListResources(TestCase):
             ] + [obj.to_meta_dict() for obj in orm_resource]
             self.assertEqual(pod_list, {"count": len(expect_pod_list), "items": expect_pod_list})
 
+    def test_with_history_pod_fills_page_size_from_history_series(self):
+        workload_name = "bk-monitor-history-fill"
+        validated_request_data = {
+            "scenario": "performance",
+            "bcs_cluster_id": "BCS-K8S-00000",
+            "start_time": 1735801850,
+            "end_time": 1735805450,
+            "filter_dict": {"namespace": "blueking", "workload": [f"Deployment:{workload_name}"]},
+            "page_size": 35,
+            "page": 1,
+            "resource_type": "pod",
+            "with_history": True,
+            "page_type": "scrolling",
+            "bk_biz_id": 2,
+            "order_by": "desc",
+            "method": "sum",
+            "column": "container_cpu_usage_seconds_total",
+        }
+        latest_time = 1733104260000
+        old_time = latest_time - 60000
+
+        def build_series(pod_name, datapoints):
+            return {
+                "dimensions": {
+                    "namespace": "blueking",
+                    "pod_name": pod_name,
+                    "workload_kind": "Deployment",
+                    "workload_name": workload_name,
+                },
+                "target": f"{{namespace=blueking,pod_name={pod_name}}}",
+                "metric_field": "_result_",
+                "datapoints": datapoints,
+                "alias": "_result_",
+                "type": "line",
+                "dimensions_translation": {},
+                "unit": "",
+            }
+
+        current_prefix = f"{workload_name}-current-"
+        history_prefix = f"{workload_name}-history-"
+        current_series = [
+            build_series(f"{current_prefix}{index:02d}", [[1000 + index, latest_time]]) for index in range(12)
+        ]
+        history_series = [
+            build_series(f"{history_prefix}{index:02d}", [[100 + index, old_time], [None, latest_time]])
+            for index in range(24)
+        ]
+
+        with mock.patch("core.drf_resource.resource.grafana.graph_unify_query") as mock_graph_unify_query:
+            mock_graph_unify_query.return_value = {"series": current_series + history_series}
+            pod_list = ListK8SResources()(validated_request_data)
+
+        pod_names = [item["pod"] for item in pod_list["items"]]
+        expected_current_pod_names = [f"{current_prefix}{index:02d}" for index in range(11, -1, -1)]
+        expected_history_pod_names = [f"{history_prefix}{index:02d}" for index in range(23, 0, -1)]
+        self.assertEqual(pod_list["count"], 36)
+        self.assertEqual(len(pod_list["items"]), 35)
+        self.assertEqual(pod_names, expected_current_pod_names + expected_history_pod_names)
+
+    def test_with_network_pod_workload_filter(self):
+        validated_request_data = {
+            "scenario": "network",
+            "bcs_cluster_id": "BCS-K8S-00000",
+            "start_time": 1735801850,
+            "end_time": 1735805450,
+            "filter_dict": {"namespace": "blueking", "workload": ["Deployment:bk-monitor-web"]},
+            "page_size": 10,
+            "page": 1,
+            "resource_type": "pod",
+            "with_history": True,
+            "page_type": "scrolling",
+            "bk_biz_id": 2,
+            "order_by": "desc",
+            "method": "sum",
+            "column": "container_network_receive_bytes_total",
+        }
+        query_result = [
+            {
+                "dimensions": {
+                    "namespace": "blueking",
+                    "pod": "bk-monitor-web-579f6bf4bc-nmld9",
+                    "pod_name": "bk-monitor-web-579f6bf4bc-nmld9",
+                },
+                "target": "{namespace=blueking, pod=bk-monitor-web-579f6bf4bc-nmld9}",
+                "metric_field": "_result_",
+                "datapoints": [[661.64, 1733104260000]],
+                "alias": "_result_",
+                "type": "line",
+                "dimensions_translation": {},
+                "unit": "",
+            }
+        ]
+        with mock.patch("core.drf_resource.resource.grafana.graph_unify_query") as mock_graph_unify_query:
+            mock_graph_unify_query.return_value = {"series": query_result}
+            pod_list = ListK8SResources()(validated_request_data)
+
+        query_params = mock_graph_unify_query.call_args.args[0]
+        promql = query_params["query_configs"][0]["promql"]
+        self.assertIn('namespace="blueking"', promql)
+        self.assertIn('workload_kind="Deployment"', promql)
+        self.assertIn('workload_name="bk-monitor-web"', promql)
+        self.assertEqual(
+            pod_list,
+            {
+                "count": 1,
+                "items": [
+                    {
+                        "namespace": "blueking",
+                        "pod": "bk-monitor-web-579f6bf4bc-nmld9",
+                    }
+                ],
+            },
+        )
+
     def test_with_container(self):
         validated_request_data = {
             "bk_biz_id": 2,
@@ -1364,8 +1380,7 @@ class TestK8sListResources(TestCase):
                 "`bkmonitor_bcscontainer`.`pod_name`, "
                 "`bkmonitor_bcscontainer`.`workload_type`, "
                 "`bkmonitor_bcscontainer`.`workload_name` FROM `bkmonitor_bcscontainer` WHERE "
-                "(`bkmonitor_bcscontainer`.`bcs_cluster_id` = BCS-K8S-00000 AND "
-                "`bkmonitor_bcscontainer`.`bk_biz_id` = 2) "
+                "`bkmonitor_bcscontainer`.`bcs_cluster_id` = BCS-K8S-00000 "
                 "ORDER BY `bkmonitor_bcscontainer`.`id` ASC"
             ),
         )
@@ -1373,8 +1388,8 @@ class TestK8sListResources(TestCase):
         self.assertEqual(
             meta.meta_prom,
             (
-                'sum by (workload_kind, workload_name, namespace, container_name, pod_name) '
-                '(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",bk_biz_id="2",'
+                "sum by (workload_kind, workload_name, namespace, container_name, pod_name) "
+                '(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",'
                 'container_name!="POD"}[1m]))'
             ),
         )
@@ -1383,11 +1398,12 @@ class TestK8sListResources(TestCase):
         orm_resource = (
             BCSContainer.objects.filter(namespace="blueking", workload_name="bk-monitor-web")
             # BCSContainer.objects.filter(**validated_request_data["filter_dict"])
-            .filter(name__icontains=validated_request_data["query_string"]).only(*K8sContainerMeta.only_fields)
+            .filter(name__icontains=validated_request_data["query_string"])
+            .only(*K8sContainerMeta.only_fields)
         )
         # 验证 get_from_meta
         contianer_list = ListK8SResources()(validated_request_data)
-        expect_container_list = [{'container': 'bk-monitor-web'}]
+        expect_container_list = [{"container": "bk-monitor-web"}]
         self.assertEqual(
             contianer_list,
             {"count": len(expect_container_list), "items": expect_container_list},
@@ -1405,15 +1421,15 @@ class TestK8sListResources(TestCase):
             meta.meta_prom,
             "sum by (workload_kind, workload_name, namespace, container_name, pod_name) "
             '(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",'
-            'bk_biz_id="2",container_name!="POD",namespace="blueking",workload_name="bk-monitor-web",'
+            'container_name!="POD",namespace="blueking",workload_name="bk-monitor-web",'
             'container_name=~"(monitor)"}[1m]))',
         )
         meta.set_agg_interval(1732240257, 1732240257 + 1800)
         self.assertEqual(
             meta.meta_prom,
             (
-                'sum by (workload_kind, workload_name, namespace, container_name, pod_name) '
-                '(last_over_time(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",bk_biz_id="2",'
+                "sum by (workload_kind, workload_name, namespace, container_name, pod_name) "
+                '(last_over_time(rate(container_cpu_usage_seconds_total{bcs_cluster_id="BCS-K8S-00000",'
                 'container_name!="POD",namespace="blueking",workload_name="bk-monitor-web",'
                 'container_name=~"(monitor)"}[1m])[1m:]))'
             ),

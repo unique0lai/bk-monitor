@@ -61,8 +61,10 @@ INSTALLED_APPS += (
     "monitor_api",
     "monitor_web",
     "apm_web",
+    "rum_web",
     "apm_ebpf",
     "apm",
+    "rum",
     "weixin.core",
     "weixin",
     "core.drf_resource",
@@ -144,6 +146,15 @@ else:
             },
         }
     )
+
+for _db in DATABASES.values():
+    if _db.get("ENGINE", "").startswith("dj_db_conn_pool."):
+        # 池化连接跨请求复用：隔离级别在建立物理连接时设置一次，避免每次取连接都执行 SET
+        _db["OPTIONS"] = {
+            **_db.get("OPTIONS", {}),
+            "isolation_level": None,
+            "init_command": "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        }
 
 SILENCED_SYSTEM_CHECKS = ["urls.W005"]
 
@@ -417,7 +428,7 @@ DIVIDE_SYMBOL = "=======bkmonitor======="
 BK_SUPPLIER_ID = 0
 
 # 登录缓存时间配置, 单位秒（与django cache单位一致）
-LOGIN_CACHE_EXPIRED = 60
+LOGIN_CACHE_EXPIRED = 300
 
 # 蓝鲸微信请求URL前缀
 WEIXIN_SITE_URL = os.environ.get("BKAPP_WEIXIN_SITE_URL", SITE_URL + "weixin/")
@@ -466,6 +477,7 @@ CSRF_USE_SESSIONS = True
 
 # 设置最大请求大小
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.getenv("BKAPP_FILE_UPLOAD_MAX_MEMORY_SIZE", 10 * 1024 * 1024))
 
 # 设置pyinstrument的profiler开关
 PYINSTRUMENT_URL_ARGUMENT = "bk-monitor-profile"

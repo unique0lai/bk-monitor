@@ -1,4 +1,5 @@
 import { formatFileSize, random } from '@/common/util';
+import { getSaveFailureMessage, isRequestErrorAlreadyShown } from './save-failure';
 import type {
   CollectOperateType,
   ICollectListRowData,
@@ -17,7 +18,7 @@ export const STATUS_ENUM = [
     background: '#C5DBFF',
   },
   {
-    label: window.$t('部署中'),
+    label: window.$t('未知'),
     value: 'UNKNOWN',
     color: '#3A84FF',
     background: '#C5DBFF',
@@ -64,6 +65,10 @@ export const STATUS_ENUM_FILTER = [
     label: window.$t('停用'),
     value: 'terminated',
   },
+  {
+    label: window.$t('未知'),
+    value: 'unknown',
+  },
 ];
 /**
  * 全局日志分类
@@ -77,6 +82,17 @@ export const GLOBAL_CATEGORIES_ENUM = [
   { label: window.$t('第三方ES'), value: 'es' },
   { label: window.$t('自定义上报'), value: 'custom_report' },
 ];
+
+/** 日志类型图标映射（log_access_type -> icon） */
+export const LOG_TYPE_ICON_MAP: Record<string, string> = {
+  linux: 'bklog-icon bklog-zhujicaiji-zhujirizhi',
+  winevent: 'bklog-icon bklog-zhujicaiji-windows-event-rizhi',
+  container_file: 'bklog-icon bklog-k8s-wenjiancaiji',
+  container_stdout: 'bklog-icon bklog-k8s-biaozhunshuchu',
+  bkdata: 'bklog-icon bklog-3fang-jisuanpingtai',
+  es: 'bklog-icon bklog-3fang-es',
+  custom_report: 'bklog-icon bklog-3fang-zidingyishangbao',
+};
 /**
  * 自定义日志分类
  */
@@ -95,8 +111,14 @@ export const COLLECTOR_SCENARIO_ENUM = [
   { value: 'custom', label: window.$t('自定义') },
 ];
 
-/** 表格需要展示的字段 */
-export const SETTING_FIELDS = [
+/** 采集项来源（空间类型） */
+export const IS_RELATED_SPACE_ENUM = [
+  { label: window.$t('当前空间'), value: 'current_space' },
+  { label: window.$t('关联空间'), value: 'related_space' },
+];
+
+/** 旧版表格需要展示的字段 */
+export const LEGACY_SETTING_FIELDS = [
   // 数据ID
   {
     id: 'bk_data_id',
@@ -121,7 +143,7 @@ export const SETTING_FIELDS = [
   },
   // 存储名
   {
-    id: 'table_id',
+    id: 'bk_data_name',
     label: window.$t('存储名'),
   },
   // 存储名
@@ -129,6 +151,11 @@ export const SETTING_FIELDS = [
     id: 'index_set_id',
     label: window.$t('所属索引集'),
     disabled: true,
+  },
+  // 采集项来源
+  {
+    id: 'is_related_space',
+    label: window.$t('采集项来源'),
   },
   // 接入类型
   {
@@ -185,6 +212,60 @@ export const SETTING_FIELDS = [
   },
 ];
 
+/** 表格需要展示的字段 */
+export const SETTING_FIELDS = [
+  {
+    id: 'collector_config_name',
+    label: window.$t('采集名 / 数据名'),
+    disabled: true,
+  },
+  {
+    id: 'storage_usage',
+    label: window.$t('日用量 / 总用量'),
+    disabled: true,
+  },
+  {
+    id: 'storage_display_name',
+    label: window.$t('存储集群 / 过期时间'),
+  },
+  {
+    id: 'log_access_type',
+    label: window.$t('接入类型'),
+  },
+  {
+    id: 'label',
+    label: window.$t('标签'),
+  },
+  {
+    id: 'bk_data_name',
+    label: window.$t('存储名'),
+  },
+  {
+    id: 'es_host_state',
+    label: window.$t('采集状态'),
+  },
+  {
+    id: 'updated_by',
+    label: window.$t('最近更新'),
+  },
+  {
+    id: 'index_set_id',
+    label: window.$t('所属索引集'),
+  },
+  {
+    id: 'is_related_space',
+    label: window.$t('采集项来源'),
+  },
+  {
+    id: 'collector_scenario_id',
+    label: window.$t('日志类型'),
+  },
+  {
+    id: 'created_by',
+    label: window.$t('创建'),
+  },
+];
+
 /**
  *  表格操作列【操作】，默认只外放：检索、编辑
     - 日志采集 / 更多：清洗、脱敏、存储设置、克隆、停用、删除、一键检测
@@ -197,10 +278,10 @@ export const MENU_LIST = [
     label: window.$t('清洗'),
     key: 'clean',
   },
-  // {
-  //   label: window.$t('脱敏'),
-  //   key: 'desensitization',
-  // },
+  {
+    label: window.$t('脱敏'),
+    key: 'masking',
+  },
   {
     label: window.$t('存储设置'),
     key: 'storage',
@@ -234,6 +315,17 @@ export const MENU_LIST = [
  */
 export const showMessage = (message: string, theme: 'error' | 'success' | 'warning' = 'success'): void => {
   window.mainComponent?.$bkMessage({ message, theme });
+};
+
+export const showCollectSaveFailure = (payload: unknown, fallback: string): void => {
+  showMessage(getSaveFailureMessage(payload, fallback), 'error');
+};
+
+export const showUnshownRequestError = (error: unknown, fallback: string): void => {
+  if (isRequestErrorAlreadyShown(error)) {
+    return;
+  }
+  showCollectSaveFailure(error, fallback);
 };
 
 // 常量定义
@@ -358,9 +450,31 @@ export const btnGroupList: Array<ISelectItem> = [
   },
 ];
 
-/** 操作符映射 */
+/** 操作符映射（数据层旧写法 -> 规范名） */
 export const operatorMapping = {
   '!=': 'neq',
+};
+
+/**
+ * 将数据层操作符归一化为展示层操作符。
+ *
+ * 展示层会把「当前过滤模式的主操作符」统一改写成 '='（见 log-filter 的 operatorOptions）：
+ * - 字符串（match）模式：'include'（包含）改写为 '='
+ * - 分隔符（separator）模式：'eq'（等于）改写为 '='
+ *
+ * 而数据层（后端 PluginParamOpEnum：= / != / eq / neq / include / exclude / regex / nregex，
+ * 以及旧数据的 match_type）使用的是规范名 include / eq，二者并不一致。
+ * 因此读入数据时必须按当前过滤模式做一次逆向归一化，
+ * 否则下拉框匹配不到任何 bk-option，操作符单元格会显示为空。
+ *
+ * @param op 数据层操作符
+ * @param isMatchType 当前是否为字符串（match）过滤模式
+ */
+export const normalizeOperator = (op: string, isMatchType: boolean): string => {
+  const base = operatorMapping[op as keyof typeof operatorMapping] ?? op;
+  if (isMatchType && base === 'include') return '=';
+  if (!isMatchType && base === 'eq') return '=';
+  return base;
 };
 
 export const tableRowBaseObj: ITableRowItem = {
@@ -415,6 +529,7 @@ export const getOperatorCanClick = (row: ICollectListRowData, operateType: Colle
   const isTerminated = status === 'terminated';
   const isSuccess = status === 'success';
   const isFailed = status === 'failed';
+  const isUnknown = status === 'unknown';
   const isCompleted = row.storage_cluster_id !== -1; // 采集项已完成：storage_cluster_id 存在
 
   switch (operateType) {
@@ -422,8 +537,8 @@ export const getOperatorCanClick = (row: ICollectListRowData, operateType: Colle
       // 检索 - 判定 is_search 字段
       return !!(row.is_search as boolean);
     case 'edit':
-      // 编辑 - 采集状态不为"停用"
-      return !isTerminated;
+      // 编辑 - 采集状态不为"停用"且允许编辑
+      return !isTerminated && !!(row.is_editable as boolean);
     case 'clean':
       // 清洗 - 采集项已完成且采集状态不为"停用"
       return isCompleted && !isTerminated;
@@ -434,17 +549,17 @@ export const getOperatorCanClick = (row: ICollectListRowData, operateType: Colle
       // 克隆 - 无限制条件
       return true;
     case 'stop':
-      // 停用 - 采集状态为"正常"或"异常"
-      return isSuccess || isFailed;
+      // 停用 - 采集状态为"正常"、"异常"或"未知"
+      return isSuccess || isFailed || isUnknown;
     case 'start':
       // 启用 - 采集状态为"停用"
       return isTerminated;
     case 'delete':
-      // 只有采集项需要已停用才能删除，计算平台、第三方ES、自定义上报不需要限制
+      // 采集项已停用或状态未知时可删除，计算平台、第三方ES、自定义上报不限制状态
       if (['bkdata', 'es', 'custom_report'].includes(row.log_access_type)) {
         return true;
       }
-      return isTerminated;
+      return isTerminated || isUnknown;
     default:
       return true;
   }
@@ -470,13 +585,13 @@ export const getContainerNameList = (containerName = '') => {
  * @param {Array} excludeFiles 原始exclude_files值（对象数组/字符串数组）
  * @returns {Array<string>} 标准化后的非空字符串数组
  */
-export const formatExcludeFiles = excludeFiles => {
+export const formatExcludeFiles = (excludeFiles: Array<any>): Array<string> => {
   // 1. 容错处理：非数组/空数组直接返回空数组
   if (!Array.isArray(excludeFiles) || excludeFiles.length === 0) {
     return [];
   }
 
-  const resultArr = [];
+  const resultArr: string[] = [];
   // 2. 遍历数组，区分「对象项」和「字符串项」
   excludeFiles.forEach(item => {
     // 情况A：元素是对象，且包含value属性 → 提取value
@@ -492,5 +607,6 @@ export const formatExcludeFiles = excludeFiles => {
     }
   });
 
-  return resultArr;
+  // 3. 过滤掉空字符串
+  return resultArr.filter(str => str !== '');
 };

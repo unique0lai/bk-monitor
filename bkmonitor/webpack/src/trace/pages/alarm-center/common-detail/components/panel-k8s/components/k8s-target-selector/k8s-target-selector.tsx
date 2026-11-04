@@ -24,7 +24,7 @@
  * IN THE SOFTWARE.
  */
 
-import { type PropType, computed, defineComponent } from 'vue';
+import { type ComputedRef, type PropType, computed, defineComponent, inject } from 'vue';
 
 import { Select } from 'bkui-vue';
 
@@ -57,6 +57,8 @@ export default defineComponent({
     change: (selectedTarget: AlertK8sTargetItem) => selectedTarget,
   },
   setup(props, { emit }) {
+    const traceSpanInfo = inject<ComputedRef<any>>('traceSpanInfo');
+    const displayKey = computed(() => (traceSpanInfo?.value ? 'display_name' : props.groupBy));
     /** 一次遍历构建选择器列表与映射对象 */
     const targetSelectorData = computed(() =>
       (props.targetList ?? []).reduce<{
@@ -83,6 +85,18 @@ export default defineComponent({
     /** 当前选中对象的唯一标识 */
     const currentTargetUniqueId = computed(() => getTargetUniqueId(props.currentTarget));
 
+    /** 当前选中对象的文本 */
+    const selectTargetText = computed(() => {
+      if (!props.currentTarget) return window.i18n.t('请选择');
+      const { namespace = '', workload = '', pod = '' } = props.currentTarget || {};
+      return `[${namespace}] ${workload || pod}`;
+    });
+
+    const selectTargetTextTooltip = computed(() => {
+      const { bcs_cluster_id: clusterId = '' } = (props.currentTarget || {}) as any;
+      return `${selectTargetText.value}（${window.i18n.t('集群')}: ${clusterId}）`;
+    });
+
     /**
      * @method getTargetUniqueId
      * @description 基于目标对象所有属性值生成唯一标识
@@ -106,8 +120,11 @@ export default defineComponent({
     };
 
     return {
+      displayKey,
+      selectTargetText,
       targetSelectorData,
       currentTargetUniqueId,
+      selectTargetTextTooltip,
       handleSelected,
     };
   },
@@ -115,23 +132,46 @@ export default defineComponent({
     return (
       <div class='k8s-target-selector'>
         <Select
-          displayKey={this.groupBy}
-          filterable={false}
+          filterOption={(input, option) => {
+            if (!input || !option.bcs_cluster_id) return true;
+            const { namespace, workload, pod, bcs_cluster_id: clusterId } = option;
+            const targetText = `[${namespace}] ${workload || pod}（${this.$t('集群')}: ${clusterId}）`;
+            return targetText.toLowerCase().includes(input.toLowerCase());
+          }}
+          popoverOptions={{
+            boundary: 'parent',
+            extCls: 'k8s-target-selector-popover',
+          }}
+          displayKey={this.displayKey}
           idKey={TARGET_UNIQUE_ID_KEY}
           list={this.targetSelectorData.targetListWithUniqueId}
           modelValue={this.currentTargetUniqueId}
-          popoverOptions={{ boundary: 'parent' }}
+          filterable
           onSelect={this.handleSelected}
         >
           {{
             trigger: () => (
-              <div class='k8s-target-selector-trigger-container'>
-                <div class='trigger-main'>
-                  <span class='selected-text'>{this.currentTarget?.[this.groupBy] ?? '--'}</span>
+              <div
+                key={this.selectTargetText}
+                class='k8s-target-selector-trigger-container'
+              >
+                <div
+                  class='trigger-main'
+                  v-overflow-tips={{ content: this.selectTargetTextTooltip, placement: 'top' }}
+                >
+                  {this.selectTargetText}
                 </div>
                 <div class='trigger-suffix'>
                   <i class='icon-monitor icon-arrow-down' />
                 </div>
+              </div>
+            ),
+            optionRender: ({ item }) => (
+              <div
+                class='k8s-target-selector-item'
+                v-overflow-tips
+              >
+                {`[${item.namespace}] ${item.workload || item.pod}（${this.$t('集群')}: ${item.bcs_cluster_id}）`}
               </div>
             ),
           }}

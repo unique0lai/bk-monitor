@@ -36,7 +36,7 @@ import {
   watch,
 } from 'vue';
 
-import { useDebounceFn } from '@vueuse/core';
+import { useDebounceFn, useEventListener } from '@vueuse/core';
 import { Button, Checkbox, Input } from 'bkui-vue';
 import { bizWithAlertStatistics } from 'monitor-api/modules/home';
 import EmptyStatus, { type EmptyStatusOperationType } from 'trace/components/empty-status/empty-status';
@@ -85,6 +85,7 @@ export default defineComponent({
     const selectRef = useTemplateRef<HTMLDivElement>('selectRef');
     const wrapRef = useTemplateRef<HTMLDivElement>('wrapRef');
     const typeListRef = useTemplateRef<HTMLDivElement>('typeListRef');
+    const searchInputRef = useTemplateRef<InstanceType<typeof Input>>('searchInput');
 
     const localValue = shallowRef<number[]>([]);
     /* 当前的主空间 */
@@ -109,6 +110,12 @@ export default defineComponent({
     const isErr = shallowRef(false);
     /* 是否弹出弹窗 */
     const isOpen = shallowRef(false);
+    /** 键盘高亮项 id */
+    const highlightId = shallowRef<null | number | string>(null);
+    /** 避免 keydown 与 enter 各触发一次导致多选勾选被抵消 */
+    let lastEnterAt = 0;
+    /** 下拉打开时在 window 捕获阶段监听键盘，绕过 Input 默认 stopPropagation */
+    let stopKeyboardListen: (() => void) | null = null;
     /* 当前分页数据 */
     const pagination = shallowReactive<{
       count: number;
@@ -133,12 +140,18 @@ export default defineComponent({
     });
 
     const handleDebounceSearchChange = useDebounceFn(handleSearchChange, 300);
+    /** bizWithAlertStatistics 返回的业务名缓存，供已选无权限业务兜底展示 */
+    const bizNameMap = shallowRef(new Map<number, string>());
 
     initLocalSpaceList();
-    onUnmounted(() => {});
+    onUnmounted(() => {
+      unbindKeyboard();
+    });
     watch(
       () => props.value,
       val => {
+        // value 可能在 setAllowed 完成后才变为目标无权限 biz，需补齐列表项后再同步勾选文案
+        ensureSelectedNoAuthSpaces(val);
         handleWatchValue(val);
       }
     );
@@ -177,6 +190,61 @@ export default defineComponent({
       emit('applyAuth', [bizId]);
     }
 
+    function isSpecialSpaceId(id: number | string) {
+      if (specialIds.includes(id as (typeof specialIds)[number]) || specialIds.includes(String(id) as any)) {
+        return true;
+      }
+      const num = Number(id);
+      return num === authorityBizId || num === hasDataBizId;
+    }
+
+    function syncNoAuthBizIds() {
+      const noAuthIds: number[] = [];
+      for (const item of localSpaceList.value) {
+        if (item.noAuth && !item.hasData) {
+          noAuthIds.push(+item.id);
+        }
+      }
+      appStore.noAuthBizIds = noAuthIds;
+    }
+
+    /**
+     * 已选但不在列表中的业务补成无权限项（对齐旧版：无权限也可展示并申请）
+     * 不依赖 business_list 是否命中，避免 id 类型不一致 / 接口缺项导致触发器空白
+     */
+    function ensureSelectedNoAuthSpaces(val: (number | string)[] = []) {
+      const existingIds = new Set(localSpaceList.value.map(item => +item.id));
+      const missing: ILocalSpaceList[] = [];
+      for (const id of val) {
+        if (isSpecialSpaceId(id)) continue;
+        const numId = Number(id);
+        if (!Number.isFinite(numId) || numId === 0 || existingIds.has(numId)) continue;
+        const name = bizNameMap.value.get(numId) || `#${numId}`;
+        const noAuthItem = {
+          space_name: name,
+          isSpecial: false,
+          tags: [],
+          isCheck: false,
+          show: true,
+          preciseMatch: false,
+          py_text: '',
+          space_id: String(numId),
+          space_type_id: ETagsType.BKCC,
+          id: numId,
+          bk_biz_id: numId,
+          name,
+          noAuth: true,
+          hasData: false,
+        } as unknown as ILocalSpaceList;
+        missing.push(noAuthItem);
+        existingIds.add(numId);
+      }
+      if (!missing.length) return;
+      localSpaceList.value = [...localSpaceList.value, ...missing];
+      syncNoAuthBizIds();
+      setPaginationData(true);
+    }
+
     function handleWatchValue(val) {
       if (JSON.stringify(val) === JSON.stringify(localValue.value)) {
         return;
@@ -186,7 +254,8 @@ export default defineComponent({
       const nameList = [];
       const strList = [];
       for (const item of localSpaceList.value) {
-        const has = localValue.value.includes(item.id);
+        // 兼容 number / string id，避免无权限项勾选与触发器文案丢失
+        const has = localValue.value.some(v => String(v) === String(item.id) || +v === +item.id);
         item.isCheck = has;
         if (has) {
           nameList.push(item.name);
@@ -221,7 +290,7 @@ export default defineComponent({
           ...nullItem,
           bk_biz_id: hasDataBizId,
           id: hasDataBizId,
-          name: t('-我有告警的空间-'),
+          name: props.needIncidentOption ? t('-我有故障的空间-') : t('-我有告警的空间-'),
         } as any);
       }
       if (props.needAuthorityOption) {
@@ -269,8 +338,11 @@ export default defineComponent({
       isOpen.value = true;
       sortSpaceList();
       setPaginationData(true);
+      resetHighlight(true);
+      bindKeyboard();
       setTimeout(() => {
         addMousedownEvent();
+        searchInputRef.value?.focus();
       }, 300);
     }
 
@@ -311,9 +383,11 @@ export default defineComponent({
       popInstance?.destroy?.();
       searchValue.value = '';
       searchTypeId.value = '';
+      highlightId.value = null;
       popInstance = null;
       controller?.abort?.();
       isOpen.value = false;
+      unbindKeyboard();
       for (const item of localSpaceList.value) {
         item.show = true;
         item.preciseMatch = false;
@@ -324,7 +398,7 @@ export default defineComponent({
           resetCurBiz(+localCurrentSpace.value);
         }
       }
-      if (!!localValue.value.length && JSON.stringify(props.value) !== JSON.stringify(localValue.value)) {
+      if (localValue.value.length && JSON.stringify(props.value) !== JSON.stringify(localValue.value)) {
         handleAutoSetCurBiz();
         setTimeout(() => {
           handleChange();
@@ -434,19 +508,31 @@ export default defineComponent({
     }
 
     async function setAllowed() {
-      // eslint-disable-next-line @typescript-eslint/naming-convention
-      const { business_list, business_with_alert, business_with_permission } = await bizWithAlertStatistics().catch(
-        () => ({})
-      );
-      const allBizList = business_list.map(item => ({
-        id: item.bk_biz_id,
+      const statistics = (await bizWithAlertStatistics().catch(() => ({}))) as {
+        business_list?: { bk_biz_id: number; bk_biz_name: string }[];
+        business_with_alert?: { bk_biz_id: number; bk_biz_name: string }[];
+        business_with_permission?: { bk_biz_id: number; bk_biz_name: string }[];
+      };
+      const businessList = statistics.business_list || [];
+      const businessWithAlert = statistics.business_with_alert || [];
+      const businessWithPermission = statistics.business_with_permission || [];
+      const allBizList = businessList.map(item => ({
+        id: +item.bk_biz_id,
         name: item.bk_biz_name,
       }));
-      // const businessWithPermissionSet = new Set();
-      const curIdsSet = new Set();
+      const nameMap = new Map<number, string>();
+      for (const item of allBizList) {
+        nameMap.set(item.id, item.name);
+      }
+      for (const item of businessWithAlert) {
+        nameMap.set(+item.bk_biz_id, item.bk_biz_name);
+      }
+      bizNameMap.value = nameMap;
+
+      const curIdsSet = new Set<number>();
       for (const item of localSpaceList.value) {
-        if (!specialIds.includes(item.id)) {
-          curIdsSet.add(item.id);
+        if (!isSpecialSpaceId(item.id)) {
+          curIdsSet.add(+item.id);
         }
       }
       const nullItem = {
@@ -461,51 +547,54 @@ export default defineComponent({
         space_type_id: ETagsType.BKCC,
       };
       const otherSpaces = [];
-      if (business_with_alert?.length) {
-        for (const item of business_with_alert) {
-          if (!curIdsSet.has(item.bk_biz_id)) {
-            curIdsSet.add(item.bk_biz_id);
-            otherSpaces.push({
-              ...nullItem,
-              ...item,
-              id: item.bk_biz_id,
-              name: item.bk_biz_name,
-              noAuth: true,
-              hasData: true,
-            });
-          }
+      for (const item of businessWithAlert) {
+        const bizId = +item.bk_biz_id;
+        if (!curIdsSet.has(bizId)) {
+          curIdsSet.add(bizId);
+          otherSpaces.push({
+            ...nullItem,
+            ...item,
+            id: bizId,
+            bk_biz_id: bizId,
+            name: item.bk_biz_name,
+            noAuth: true,
+            hasData: true,
+          });
         }
       }
-      const data =
-        business_with_permission.map(item => ({
-          ...item,
-          id: item.bk_biz_id,
-          name: `[${item.bk_biz_id}] ${item.bk_biz_name}`,
-        })) || [];
+      const permissionIds = new Set(businessWithPermission.map(item => +item.bk_biz_id));
+      // 当前已选但不在有权限列表中的业务：补无权限项（接口无名时用 #id 兜底）
       for (const id of props.value) {
-        const bizItem = allBizList.find(set => set.id === id);
-        if (bizItem && !data.some(set => set.id === id)) {
-          if (!curIdsSet.has(bizItem.id)) {
-            curIdsSet.add(bizItem.id);
-            otherSpaces.push({
-              ...nullItem,
-              ...bizItem,
-              id: bizItem.id,
-              name: bizItem.name,
-              noAuth: true,
-              hasData: false,
-            });
-          }
-        }
+        if (isSpecialSpaceId(id)) continue;
+        const numId = Number(id);
+        if (!Number.isFinite(numId) || numId === 0 || curIdsSet.has(numId) || permissionIds.has(numId)) continue;
+        const bizItem = allBizList.find(set => set.id === numId);
+        const name = bizItem?.name || nameMap.get(numId) || `#${numId}`;
+        curIdsSet.add(numId);
+        otherSpaces.push({
+          ...nullItem,
+          ...(bizItem || {}),
+          id: numId,
+          bk_biz_id: numId,
+          name,
+          space_name: name,
+          space_id: String(numId),
+          noAuth: true,
+          hasData: false,
+        });
       }
-      localSpaceList.value.push(...otherSpaces);
+      if (otherSpaces.length) {
+        localSpaceList.value = [...localSpaceList.value, ...otherSpaces];
+      }
+      syncNoAuthBizIds();
+      // value 可能已在 await 期间更新，再兜底补一次
+      ensureSelectedNoAuthSpaces(props.value);
       localValue.value = [];
       handleWatchValue(props.value);
       setPaginationData(true);
     }
 
     function setPaginationData(isInit = false) {
-      const showData = [];
       const prevArr = [];
       const nextArr = [];
 
@@ -519,7 +608,7 @@ export default defineComponent({
         }
       }
 
-      showData.push(...prevArr, ...nextArr);
+      const showData = prevArr.concat(nextArr);
       pagination.count = showData.length;
       if (isInit) {
         pagination.current = 1;
@@ -566,6 +655,9 @@ export default defineComponent({
       }
       triggerRef(localSpaceList);
       setPaginationData(true);
+      if (isOpen.value) {
+        resetHighlight(false);
+      }
     }
 
     function selectOption(item: ILocalSpaceList, v: boolean) {
@@ -594,7 +686,9 @@ export default defineComponent({
     }
 
     function handleSelectOption(item: ILocalSpaceList) {
-      if (!!item.noAuth && !item.hasData) {
+      // 无权限业务：点击整行与「申请权限」一致，走申请流程
+      if (item.noAuth && !item.hasData) {
+        handleApplyAuth(item.id);
         return;
       }
       selectOption(item, !item.isCheck);
@@ -645,6 +739,124 @@ export default defineComponent({
     function handleSearchType(typeId: string) {
       searchTypeId.value = typeId === searchTypeId.value ? '' : typeId;
       handleSearchChange(searchValue.value);
+    }
+
+    function isSameSpaceId(a: null | number | string, b: null | number | string) {
+      if (a == null || b == null) return false;
+      return String(a) === String(b);
+    }
+
+    /** 打开时优先高亮当前/已选空间；搜索/筛选后高亮第一项 */
+    function resetHighlight(preferCurrent: boolean) {
+      const items = pagination.data;
+      if (!items.length) {
+        highlightId.value = null;
+        return;
+      }
+      if (preferCurrent) {
+        const preferredId = needCurSpace.value ? localCurrentSpace.value : localValue.value[0];
+        const matched =
+          preferredId != null
+            ? items.find(item => isSameSpaceId(item.id, preferredId))
+            : items.find(item => item.isCheck);
+        if (matched) {
+          highlightId.value = matched.id;
+          scrollHighlightIntoView();
+          return;
+        }
+      }
+      highlightId.value = items[0].id;
+      scrollHighlightIntoView();
+    }
+
+    function scrollHighlightIntoView() {
+      if (highlightId.value == null || highlightId.value === '') return;
+      nextTick(() => {
+        const el = wrapRef.value?.querySelector?.(`[data-space-id="${highlightId.value}"]`) as HTMLElement;
+        el?.scrollIntoView?.({ block: 'nearest' });
+      });
+    }
+
+    function bindKeyboard() {
+      unbindKeyboard();
+      stopKeyboardListen = useEventListener(window, 'keydown', handleWindowKeydown, { capture: true });
+    }
+
+    function unbindKeyboard() {
+      stopKeyboardListen?.();
+      stopKeyboardListen = null;
+    }
+
+    function handleWindowKeydown(event: KeyboardEvent) {
+      if (!isOpen.value || event.isComposing) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        event.stopPropagation();
+        moveHighlight(event.key === 'ArrowDown' ? 1 : -1);
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        event.stopPropagation();
+        confirmHighlightItem();
+      }
+    }
+
+    /** 单选：Enter 选中并关闭；多选：Enter 只切换勾选，面板保持打开 */
+    function confirmHighlightItem() {
+      const now = Date.now();
+      if (now - lastEnterAt < 50) return;
+      lastEnterAt = now;
+      const target = pagination.data.find(item => isSameSpaceId(item.id, highlightId.value));
+      if (!target) return;
+      if (props.multiple) {
+        if (target.noAuth && !target.hasData) return;
+        handleCheckOption(!target.isCheck, target);
+        scrollHighlightIntoView();
+        return;
+      }
+      handleSelectOption(target);
+    }
+
+    /** 方向键在可见项间移动；触底且还有分页时先加载再继续 */
+    function moveHighlight(step: number) {
+      const items = pagination.data;
+      if (!items.length) return;
+      const index = items.findIndex(item => isSameSpaceId(item.id, highlightId.value));
+      if (index < 0) {
+        highlightId.value = items[step > 0 ? 0 : items.length - 1].id;
+        scrollHighlightIntoView();
+        return;
+      }
+      let next = index + step;
+      if (next < 0) {
+        next = 0;
+      } else if (next >= items.length) {
+        const beforeCount = items.length;
+        setPaginationData(false);
+        if (pagination.data.length > beforeCount) {
+          next = Math.min(index + step, pagination.data.length - 1);
+          highlightId.value = pagination.data[next].id;
+          scrollHighlightIntoView();
+          return;
+        }
+        next = items.length - 1;
+      }
+      highlightId.value = pagination.data[next].id;
+      scrollHighlightIntoView();
+    }
+
+    function handleContentMouseDown(e: MouseEvent) {
+      const inputEl = (searchInputRef.value as null | { $el?: HTMLElement })?.$el;
+      if (inputEl?.contains(e.target as Node)) {
+        return;
+      }
+      const target = e.target as HTMLElement;
+      // 复选框、权限按钮等需要保留默认行为，避免 mousedown.preventDefault 把 click 吃掉
+      if (target.closest?.('.bk-checkbox, .bk-button, a, button')) {
+        return;
+      }
+      e.preventDefault();
     }
 
     /**
@@ -710,6 +922,7 @@ export default defineComponent({
       pagination,
       needCurSpace,
       localCurrentSpace,
+      highlightId,
       handleChangeChoiceType,
       handleSearchType,
       t,
@@ -723,6 +936,8 @@ export default defineComponent({
       handleSetCurBiz,
       handleDebounceSearchChange,
       handleOperation,
+      handleContentMouseDown,
+      isSameSpaceId,
     };
   },
   render() {
@@ -783,9 +998,11 @@ export default defineComponent({
           <div
             ref='wrapRef'
             class={componentClassNames.pop}
+            onMousedown={this.handleContentMouseDown}
           >
             <div class='search-input'>
               <Input
+                ref='searchInput'
                 v-model={this.searchValue}
                 behavior={'simplicity'}
                 placeholder={this.t('请输入关键字或标签')}
@@ -852,6 +1069,7 @@ export default defineComponent({
                     class={[
                       'space-list-item',
                       { active: !this.multiple && item.isCheck },
+                      { highlight: this.isSameSpaceId(item.id, this.highlightId) },
                       {
                         'no-hover-btn':
                           !this.needCurSpace ||
@@ -860,6 +1078,8 @@ export default defineComponent({
                           (!!item.noAuth && !item.hasData),
                       },
                     ]}
+                    v-authority={{ active: !!(item.noAuth && !item.hasData) }}
+                    data-space-id={item.id}
                     onClick={() => this.handleSelectOption(item)}
                   >
                     {this.multiple && (
@@ -897,13 +1117,16 @@ export default defineComponent({
                     )} */}
                     </span>
                     <span class='space-tags'>
-                      {!!item.noAuth && !item.hasData ? (
+                      {item.noAuth && !item.hasData ? (
                         <Button
                           class='auth-button'
                           size='small'
                           theme='primary'
                           text
-                          onClick={() => this.handleApplyAuth(item.id)}
+                          onClick={(e: Event) => {
+                            e.stopPropagation();
+                            this.handleApplyAuth(item.id);
+                          }}
                         >
                           {this.t('申请权限')}
                         </Button>

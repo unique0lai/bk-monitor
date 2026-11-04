@@ -8,7 +8,12 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext_lazy as _, gettext_noop
+
+
+SOURCE_ANALYSIS_BKAPI_ACCESS_TOKEN_PLACEHOLDER = "__BKAICLI_ACCESS_TOKEN__"
+SOURCE_ANALYSIS_AIDEV_ACCESS_TOKEN_PLACEHOLDER = "__BKAIDEV_ACCESS_TOKEN__"
+SOURCE_ANALYSIS_BKFARA_TASK_ID_PLACEHOLDER = "__BKFARA_TASK_ID__"
 
 
 class IssueStatus:
@@ -25,6 +30,9 @@ class IssueStatus:
         (RESOLVED, _("已解决")),
         (ARCHIVED, _("归档")),
     )
+
+    # status → 中文标签，用于面向用户的报错文案（避免直接暴露 pending_review 等枚举值）
+    LABELS = dict(CHOICES)
 
 
 class IssuePriority:
@@ -49,6 +57,11 @@ class IssueActivityType:
     ASSIGNEE_CHANGE = "assignee_change"
     PRIORITY_CHANGE = "priority_change"
     NAME_CHANGE = "name_change"
+    # 合并/拆分活动：content 字段使用结构化 JSON，区分 manual 与 by_main_resolve / by_main_archive
+    MERGED_INTO = "merged_into"
+    SPLIT_FROM = "split_from"
+    CREATE_TAPD = "create_tapd"
+    TAPD_LINK = "tapd_link"
 
     CHOICES = (
         (CREATE, _("创建")),
@@ -58,7 +71,158 @@ class IssueActivityType:
         (ASSIGNEE_CHANGE, _("负责人变更")),
         (PRIORITY_CHANGE, _("优先级变更")),
         (NAME_CHANGE, _("名称变更")),
+        (MERGED_INTO, _("合并进主")),
+        (SPLIT_FROM, _("从主拆分")),
+        (CREATE_TAPD, _("创建TAPD")),
+        (TAPD_LINK, _("关联TAPD")),
     )
+
+
+class SourceAnalysisStatus:
+    """源码分析执行记录主状态。
+
+    四方链路的外部任务状态统一映射到这四个值，失败的具体位置由 SourceAnalysisFailureStage 单独承载。
+
+    以下各源码分析常量类的 CHOICES / LABELS 只供序列化层拼展示文案，不要挂到 Model 字段的 choices 上：
+    翻译文案会被冻结进迁移文件，切换 locale 后会生成无关的 AlterField。
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+    # 活动态：同一 Issue 同时只允许存在一条
+    ACTIVE_STATUSES = (PENDING, RUNNING)
+    TERMINAL_STATUSES = (SUCCESS, FAILED)
+
+    CHOICES = (
+        (PENDING, _("等待执行")),
+        (RUNNING, _("分析中")),
+        (SUCCESS, _("分析完成")),
+        (FAILED, _("分析失败")),
+    )
+
+    LABELS = dict(CHOICES)
+
+
+class SourceAnalysisStage:
+    """源码分析执行阶段，仅活动态有值，终态一律为空。"""
+
+    WAITING = "waiting"
+    SOURCE_PREPARING = "source_preparing"
+    ANALYZING = "analyzing"
+    VALIDATING = "validating"
+    ARCHIVING = "archiving"
+
+    CHOICES = (
+        (WAITING, _("正在创建分析任务")),
+        (SOURCE_PREPARING, _("正在准备源码")),
+        (ANALYZING, _("正在结合告警证据分析源码")),
+        (VALIDATING, _("正在校验分析结果")),
+        (ARCHIVING, _("正在归档分析结果")),
+    )
+
+    LABELS = dict(CHOICES)
+
+
+class SourceAnalysisTriggerType:
+    """执行记录的触发方式。本期只有手动触发，不存在自动触发。"""
+
+    INITIAL = "initial"
+    RETRY = "retry"
+    REANALYZE = "reanalyze"
+
+    CHOICES = (
+        (INITIAL, _("首次分析")),
+        (RETRY, _("失败重试")),
+        (REANALYZE, _("重新分析")),
+    )
+
+
+class SourceAnalysisFailureStage:
+    """失败位置。只用于定位，不扩充主状态。"""
+
+    TASK_CREATE = "task_create"
+    TASK_EXECUTE = "task_execute"
+    SOURCE_PREPARE = "source_prepare"
+    AI_ANALYSIS = "ai_analysis"
+    RESULT_VALIDATE = "result_validate"
+    RESULT_ARCHIVE = "result_archive"
+    RESULT_PERSIST = "result_persist"
+
+    CHOICES = (
+        (TASK_CREATE, _("创建分析任务")),
+        (TASK_EXECUTE, _("执行分析任务")),
+        (SOURCE_PREPARE, _("准备源码")),
+        (AI_ANALYSIS, _("AI 分析")),
+        (RESULT_VALIDATE, _("校验分析结果")),
+        (RESULT_ARCHIVE, _("归档分析结果")),
+        (RESULT_PERSIST, _("持久化分析结果")),
+    )
+
+
+class SourceAnalysisFailureMessage:
+    """BKM 本地产生的失败文案。
+
+    执行任务只保存稳定原文，查询接口再按当前请求语言翻译，避免把 Celery Worker
+    的默认语言固化到执行记录中。``gettext_noop`` 只负责标记待翻译文案。
+    """
+
+    BKFARA_ENSURE_MISSING_PROVISION_ID = gettext_noop("BKFara 初始化场景响应缺少 provision_id")
+    BKFARA_PROVISION_ID_CONFLICT = gettext_noop("相同场景初始化请求返回了不同的 provision_id")
+    BKFARA_SCENE_STATE_INVALID = gettext_noop("BKFara 场景初始化状态响应非法")
+    BKFARA_SCENE_FAILED = gettext_noop("BKFara 场景初始化失败")
+    BKFARA_TRIGGER_MISSING_TASK_ID = gettext_noop("BKFara 触发分析响应缺少 analysis_task_id")
+    BKFARA_TASK_ID_CONFLICT = gettext_noop("相同 analysis_id 返回了不同的 BKFara task_id")
+    BKFARA_TASK_STATE_INVALID = gettext_noop("BKFara 任务状态响应非法")
+    BKFARA_TASK_FAILED = gettext_noop("BKFara 源码分析任务执行失败")
+    BKFARA_REQUEST_FAILED = gettext_noop("BKFara 请求失败")
+    BKFARA_REQUEST_REJECTED = gettext_noop("BKFara 接口拒绝请求，请检查鉴权、权限和请求参数后重试。")
+    BKFARA_UPSTREAM_RETRY_TIMEOUT = gettext_noop("BKFara 接口请求失败且任务已超过重试时限，请稍后重新分析。")
+    USER_ACCESS_TOKEN_UNAVAILABLE = gettext_noop(
+        "无法获取仓库配置人的访问凭证，请由仓库配置人登录后发起分析；其他用户不能代其补齐凭证。"
+    )
+    RESULT_NOT_JSON = gettext_noop("分析结果不是有效的 JSON，请重试；若持续失败请联系管理员。")
+    RESULT_SCHEMA_UNSUPPORTED = gettext_noop("分析结果版本暂不受支持，请重试；若持续失败请联系管理员。")
+    RESULT_SCHEMA_INVALID = gettext_noop("分析结果格式校验失败，请重试；若持续失败请联系管理员。")
+    RESULT_SEMANTIC_INVALID = gettext_noop("分析结果语义校验失败，请重试；若持续失败请联系管理员。")
+
+    LOCALIZED_MESSAGES = frozenset(
+        {
+            BKFARA_ENSURE_MISSING_PROVISION_ID,
+            BKFARA_PROVISION_ID_CONFLICT,
+            BKFARA_SCENE_STATE_INVALID,
+            BKFARA_SCENE_FAILED,
+            BKFARA_TRIGGER_MISSING_TASK_ID,
+            BKFARA_TASK_ID_CONFLICT,
+            BKFARA_TASK_STATE_INVALID,
+            BKFARA_TASK_FAILED,
+            BKFARA_REQUEST_FAILED,
+            BKFARA_REQUEST_REJECTED,
+            BKFARA_UPSTREAM_RETRY_TIMEOUT,
+            USER_ACCESS_TOKEN_UNAVAILABLE,
+            RESULT_NOT_JSON,
+            RESULT_SCHEMA_UNSUPPORTED,
+            RESULT_SCHEMA_INVALID,
+            RESULT_SEMANTIC_INVALID,
+        }
+    )
+
+
+class SourceAnalysisResultType:
+    """分析结论类型。两者都属于成功终态，证据不足不等于系统失败。"""
+
+    HIGH_CONFIDENCE = "HIGH_CONFIDENCE"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+    CHOICES = (
+        (HIGH_CONFIDENCE, _("分析完成")),
+        (INSUFFICIENT_EVIDENCE, _("分析完成（证据不足）")),
+    )
+
+    # status=success 时优先按结论类型取用户文案，区分证据不足场景
+    STATUS_LABELS = dict(CHOICES)
 
 
 class ImpactScopeDimension:
@@ -106,116 +270,96 @@ class ImpactScopeDimension:
     #
     # 结构说明：
     #   - key: 简化两段式维度标识 "impact_scope.{dimension}"
-    #   - value: 列表，每个元素为一组查询条件
-    #     - keys: AlertDocument 中可查询的字段列表
-    #       - "event.XXX"     → 走顶层 term 查询
-    #       - "tags.XXX"      → 走 event.tags nested 查询
-    #       - "query_string"  → 走 query_string 查询（value_tpl 为完整查询语句）
-    #     - value_tpl: 值模板，{field} 占位符对应 instance_list 中的字段名
-    #     - condition: 元素间的组合逻辑
-    #       - "or"  → 该元素与列表中其他元素为"或"关系，任一命中即匹配
-    #       - "and" → 该元素与列表中其他元素为"与"关系，必须同时满足
-    #       同一元素内多个 keys 之间始终为"或"关系
+    #   - value: 列表，统一为单个 query_string 元素
+    #     - keys: 固定为 ["query_string"]，后端按 query_string 查询处理
+    #     - value_tpl: 完整的 query_string 查询语句，{field} 占位符对应 instance_list 中的字段名
+    #       多个子条件用大写 OR / AND 连接；冒号等保留字符需用反斜杠转义
+    #       tags.XXX 字段由后端查询转换层自动处理为 nested 查询
+    #     - condition: 合并后仅作占位，统一为 "and"
     #
     # 后端在返回 impact_scope 时，会将 value_tpl 中的占位符替换为实例的实际值，
     # 渲染后的结果存放在 instance_list 每个实例的 alert_query_fields 字段中
     ALERT_QUERY_MAPPING = {
         "impact_scope.set": [
             {
-                "keys": ["event.bk_topo_node", "tags.bk_topo_node"],
-                "value_tpl": "set|{set_id}",
-                "condition": "or",
+                "keys": ["query_string"],
+                "value_tpl": "set_id:{set_id} OR tags.set_id:{set_id}",
+                "condition": "and",
             },
         ],
         "impact_scope.host": [
             {
-                "keys": ["event.bk_host_id", "tags.bk_host_id"],
-                "value_tpl": "{bk_host_id}",
-                "condition": "or",
+                "keys": ["query_string"],
+                "value_tpl": "bk_host_id:{bk_host_id} OR tags.bk_host_id:{bk_host_id}",
+                "condition": "and",
             },
         ],
         "impact_scope.service_instances": [
             {
-                "keys": [
-                    "event.bk_service_instance_id",
-                    "tags.bk_service_instance_id",
-                    "tags.bk_target_service_instance_id",
-                ],
-                "value_tpl": "{bk_service_instance_id}",
-                "condition": "or",
+                "keys": ["query_string"],
+                "value_tpl": (
+                    "bk_service_instance_id:{bk_service_instance_id} "
+                    "OR tags.bk_service_instance_id:{bk_service_instance_id} "
+                    "OR tags.bk_target_service_instance_id:{bk_service_instance_id}"
+                ),
+                "condition": "and",
             },
         ],
         "impact_scope.cluster": [
             {
-                "keys": ["tags.bcs_cluster_id"],
-                "value_tpl": "{bcs_cluster_id}",
-                "condition": "or",
+                "keys": ["query_string"],
+                "value_tpl": "tags.bcs_cluster_id:{bcs_cluster_id}",
+                "condition": "and",
             },
         ],
-        # node: 需同时满足集群过滤（and），否则同集群不同命名空间的同名节点会误匹配
+        # node: 需同时满足集群过滤（AND），否则同集群不同命名空间的同名节点会误匹配
         "impact_scope.node": [
             {
-                "keys": ["tags.bcs_cluster_id"],
-                "value_tpl": "{bcs_cluster_id}",
+                "keys": ["query_string"],
+                "value_tpl": (
+                    "tags.bcs_cluster_id:{bcs_cluster_id} "
+                    "AND (event.target:{node} OR tags.node:{node} OR tags.node_name:{node})"
+                ),
                 "condition": "and",
             },
-            {
-                "keys": ["event.target", "tags.node", "tags.node_name"],
-                "value_tpl": "{node}",
-                "condition": "or",
-            },
         ],
-        # service: 需同时满足集群过滤（and），避免跨集群同名 service 误匹配
+        # service: 需同时满足集群过滤（AND），避免跨集群同名 service 误匹配
         "impact_scope.service": [
             {
-                "keys": ["tags.bcs_cluster_id"],
-                "value_tpl": "{bcs_cluster_id}",
+                "keys": ["query_string"],
+                "value_tpl": (
+                    "tags.bcs_cluster_id:{bcs_cluster_id} "
+                    "AND (event.target:{service} OR tags.service:{service} OR tags.service_name:{service})"
+                ),
                 "condition": "and",
-            },
-            {
-                "keys": ["event.target", "tags.service", "tags.service_name"],
-                "value_tpl": "{service}",
-                "condition": "or",
             },
         ],
-        # pod: 需同时满足集群过滤（and），避免跨集群同名 pod 误匹配
+        # pod: 需同时满足集群过滤（AND），避免跨集群同名 pod 误匹配
         "impact_scope.pod": [
             {
-                "keys": ["tags.bcs_cluster_id"],
-                "value_tpl": "{bcs_cluster_id}",
+                "keys": ["query_string"],
+                "value_tpl": (
+                    "tags.bcs_cluster_id:{bcs_cluster_id} "
+                    "AND (event.target:{pod} OR tags.pod:{pod} OR tags.pod_name:{pod})"
+                ),
                 "condition": "and",
-            },
-            {
-                "keys": ["event.target", "tags.pod", "tags.pod_name"],
-                "value_tpl": "{pod}",
-                "condition": "or",
             },
         ],
         # apm_app: event.target 格式为 "{app_name}:{service_name}"，需前缀匹配
-        # query_string 中双引号内 * 不作为通配符，需用 \: 转义冒号，* 才能作为通配符生效
-        # 渲染示例：event.target:nf\:* → 匹配 event.target 以 "nf:" 开头的所有文档
+        # 冒号为 query_string 保留字符，需用 \: 转义，* 才能作为通配符生效
         "impact_scope.apm_app": [
             {
                 "keys": ["query_string"],
-                "value_tpl": "event.target:{app_name}\\:*",
-                "condition": "or",
-            },
-            {
-                "keys": ["tags.app_name"],
-                "value_tpl": "{app_name}",
-                "condition": "or",
+                "value_tpl": "event.target:{app_name}\\:* OR tags.app_name:{app_name}",
+                "condition": "and",
             },
         ],
+        # apm_service: event.target 中的冒号需转义
         "impact_scope.apm_service": [
             {
-                "keys": ["event.target"],
-                "value_tpl": "{app_name}:{service_name}",
-                "condition": "or",
-            },
-            {
-                "keys": ["tags.service_name"],
-                "value_tpl": "{service_name}",
-                "condition": "or",
+                "keys": ["query_string"],
+                "value_tpl": ("event.target:{app_name}\\:{service_name} OR tags.service_name:{service_name}"),
+                "condition": "and",
             },
         ],
     }

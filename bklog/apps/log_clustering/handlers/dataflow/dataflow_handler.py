@@ -29,7 +29,6 @@ from django.conf import settings
 from django.utils.translation import gettext as _
 from jinja2 import FileSystemLoader
 from jinja2.sandbox import SandboxedEnvironment as Environment
-from retrying import retry
 
 from apps.api import (
     BkDataAIOPSApi,
@@ -38,13 +37,14 @@ from apps.api import (
     BkDataMetaApi,
     TransferApi,
 )
-from apps.api.base import DataApiRetryClass, check_result_is_true
+from apps.feature_toggle.handlers.toggle import FeatureToggleObject
+from apps.feature_toggle.plugins.constants import NEW_CLASS_ALERT_NEW_SERIES
 from apps.log_clustering.constants import (
     AGGS_FIELD_PREFIX,
     DEFAULT_NEW_CLS_HOURS,
-    MAX_FAILED_REQUEST_RETRY,
     NOT_NEED_EDIT_NODES,
     PatternEnum,
+    SIGNATURE_FIELD,
     StorageTypeEnum,
 )
 from apps.log_clustering.exceptions import (
@@ -55,6 +55,7 @@ from apps.log_clustering.exceptions import (
     QueryFieldsException,
 )
 from apps.log_clustering.handlers.aiops.base import BaseAiopsHandler
+from apps.log_clustering.handlers.aiops.config import get_online_clustering_config
 from apps.log_clustering.handlers.data_access.data_access import DataAccessHandler
 from apps.log_clustering.handlers.dataflow.constants import (
     CLUSTERING_DEFAULT_MODEL_INPUT_FIELDS,
@@ -110,11 +111,12 @@ from apps.log_clustering.handlers.dataflow.data_cls import (
     UpdateOnlineTaskCls,
 )
 from apps.log_clustering.models import ClusteringConfig
+from apps.log_databus.handlers.doris_cluster import DorisClusterHandler
 from apps.log_databus.models import CollectorConfig
 from apps.log_search.constants import DEFAULT_TIME_FIELD, TimeFieldUnitEnum, TimeFieldTypeEnum
 from apps.log_search.handlers.index_set import BaseIndexSetHandler
+from apps.log_search.handlers.search.aggs_handlers import AggsViewAdapter
 from apps.log_search.models import LogIndexSet, Scenario
-from apps.log_search.views.aggs_views import AggsViewAdapter
 from apps.log_trace.serializers import DateHistogramSerializer
 from apps.utils.drf import custom_params_valid
 from apps.utils.log import logger
@@ -131,9 +133,13 @@ class DataFlowHandler(BaseAiopsHandler):
         request_dict = self._set_username(export_request)
         return BkDataDataFlowApi.export_flow(request_dict)
 
-    @retry(stop_max_attempt_number=3, wait_random_min=3 * 60 * 1000, wait_random_max=10 * 60 * 1000)
     def operator_flow(
-        self, flow_id: int, consuming_mode: str = "continue", cluster_group: str = "default", action=ActionEnum.START
+        self,
+        flow_id: int,
+        consuming_mode: str = "continue",
+        cluster_group: str = "default",
+        action=ActionEnum.START,
+        bk_biz_id: int = None,
     ):
         """
         启动flow
@@ -143,8 +149,9 @@ class DataFlowHandler(BaseAiopsHandler):
         @param action 操作flow
         """
         cluster_group = self.conf.get("aiops_default_cluster_group", cluster_group)
+        bk_biz_id = bk_biz_id if bk_biz_id is not None else self.conf.get("bk_biz_id")
         start_request = OperatorFlowCls(flow_id=flow_id, consuming_mode=consuming_mode, cluster_group=cluster_group)
-        request_dict = self._set_username(start_request)
+        request_dict = self._set_bkdata_request_params(start_request, bk_biz_id=bk_biz_id)
         return ActionHandler.get_action_handler(action_num=action)(request_dict)
 
     @classmethod
@@ -177,19 +184,22 @@ class DataFlowHandler(BaseAiopsHandler):
         log_index_set_all_fields = LogIndexSet.objects.get(index_set_id=clustering_config.index_set_id).get_fields()
         return {field["field_name"]: field["field_name"] for field in log_index_set_all_fields["fields"]}
 
-    def check_and_start_clean_task(self, result_table_id):
+    def check_and_start_clean_task(self, result_table_id, bk_biz_id: int = None):
         """
         检查并启动清洗任务
         """
-        result_table = BkDataMetaApi.result_tables.retrieve(self._set_username({"result_table_id": result_table_id}))
+        result_table = BkDataMetaApi.result_tables.retrieve(
+            self._set_bkdata_request_params({"result_table_id": result_table_id}, bk_biz_id=bk_biz_id)
+        )
         if result_table["processing_type"] == "clean":
             logger.info(f"check_and_start_clean_task: result_table_id -> {result_table_id}")
             result = BkDataDatabusApi.post_tasks(
-                self._set_username(
+                self._set_bkdata_request_params(
                     {
                         "result_table_id": result_table_id,
                         "storages": ["kafka"],
-                    }
+                    },
+                    bk_biz_id=bk_biz_id,
                 )
             )
             logger.info(f"check_and_start_clean_task: result_table_id -> {result_table_id}, result -> {result}")
@@ -238,15 +248,15 @@ class DataFlowHandler(BaseAiopsHandler):
         not_clustering_rule_list = ["where", "NOT", "(", default_filter_rule, rules_str, ")"]
         return " ".join(filter_rule_list), " ".join(not_clustering_rule_list)
 
-    # SQL 字符串字面量转义: 至少处理反斜杠和单引号, 避免值里含 ' 时把 SQL 写坏
-    _SQL_STR_ESCAPE_MAP = str.maketrans({"\\": "\\\\", "'": "\\'"})
+    # SQL 字符串字面量转义: 单引号使用 SQL 标准的双单引号转义，避免 DataFlow/Flink SQL 解析失败
+    _SQL_STR_ESCAPE_MAP = str.maketrans({"\\": "\\\\", "'": "''"})
 
     @classmethod
     def _quote_sql_literal(cls, value) -> str:
         """把任意 filter rule 的 value 转成可直接拼进 Flink SQL 的字符串字面量.
 
         - 反斜杠 \\  -> \\\\
-        - 单引号 '   -> \\'
+        - 单引号 '   -> ''
         - 其余字符(含 %, _) 透传, LIKE 通配符由调用方在外层自行追加
         """
         return "'" + str(value).translate(cls._SQL_STR_ESCAPE_MAP) + "'"
@@ -654,15 +664,7 @@ class DataFlowHandler(BaseAiopsHandler):
         @return:
         """
         return BkDataDataFlowApi.get_latest_deploy_data(
-            params={
-                "flow_id": flow_id,
-                "bk_username": self.conf.get("bk_username"),
-                "no_request": True,
-                "bk_biz_id": bk_biz_id,
-            },
-            data_api_retry_cls=DataApiRetryClass.create_retry_obj(
-                fail_check_functions=[check_result_is_true], stop_max_attempt_number=MAX_FAILED_REQUEST_RETRY
-            ),
+            params=self._set_bkdata_request_params({"flow_id": flow_id}, bk_biz_id=bk_biz_id),
         )
 
     def get_dataflow_info(self, flow_id, bk_biz_id):
@@ -672,25 +674,17 @@ class DataFlowHandler(BaseAiopsHandler):
         @return:
         """
         return BkDataDataFlowApi.get_dataflow(
-            params={
-                "flow_id": flow_id,
-                "bk_username": self.conf.get("bk_username"),
-                "no_request": True,
-                "bk_biz_id": bk_biz_id,
-            },
-            data_api_retry_cls=DataApiRetryClass.create_retry_obj(
-                fail_check_functions=[check_result_is_true], stop_max_attempt_number=MAX_FAILED_REQUEST_RETRY
-            ),
+            params=self._set_bkdata_request_params({"flow_id": flow_id}, bk_biz_id=bk_biz_id),
         )
 
-    def get_serving_data_processing_id_config(self, result_table_id):
+    def get_serving_data_processing_id_config(self, result_table_id, bk_biz_id):
         """
         get_serving_data_processing_id_config
         @param result_table_id:
         @return:
         """
         return BkDataAIOPSApi.serving_data_processing_id_config(
-            params={"data_processing_id": result_table_id, "bk_username": self.conf.get("bk_username")}
+            params=self._set_bkdata_request_params({"data_processing_id": result_table_id}, bk_biz_id=bk_biz_id),
         )
 
     def get_model_available_storage_cluster(self):
@@ -710,7 +704,7 @@ class DataFlowHandler(BaseAiopsHandler):
                 break
         return available_storage_cluster
 
-    def update_model_instance(self, model_instance_id):
+    def update_model_instance(self, model_instance_id, bk_biz_id):
         """
         update_model_instance
         @param model_instance_id:
@@ -742,7 +736,7 @@ class DataFlowHandler(BaseAiopsHandler):
             filter_id=model_instance_id,
             execute_config=execute_config,
         )
-        request_dict = self._set_username(update_model_instance_request)
+        request_dict = self._set_bkdata_request_params(update_model_instance_request, bk_biz_id=bk_biz_id)
         return BkDataAIOPSApi.update_execute_config(request_dict)
 
     def update_filter_rules(self, index_set_id):
@@ -808,6 +802,7 @@ class DataFlowHandler(BaseAiopsHandler):
 
     def update_predict_node(self, index_set_id):
         clustering_config = ClusteringConfig.get_by_index_set_id(index_set_id=index_set_id)
+        self.conf = get_online_clustering_config(clustering_config.bk_biz_id)
 
         st_list = OnlineTaskTrainingArgs.ST_LIST
         if clustering_config.max_dist_list == OnlineTaskTrainingArgs.MAX_DIST_LIST_OLD:
@@ -862,7 +857,7 @@ class DataFlowHandler(BaseAiopsHandler):
         @return:
         """
         return BkDataDataFlowApi.get_flow_graph(
-            self._set_username(request_data_cls={"flow_id": flow_id, "bk_biz_id": bk_biz_id})
+            self._set_bkdata_request_params(request_data_cls={"flow_id": flow_id}, bk_biz_id=bk_biz_id)
         )
 
     def update_flow_nodes(self, config, flow_id, node_id, bk_biz_id):
@@ -874,8 +869,8 @@ class DataFlowHandler(BaseAiopsHandler):
         @return:
         """
         return BkDataDataFlowApi.patch_flow_nodes(
-            self._set_username(
-                request_data_cls={"flow_id": flow_id, "node_id": node_id, "bk_biz_id": bk_biz_id, **config}
+            self._set_bkdata_request_params(
+                request_data_cls={"flow_id": flow_id, "node_id": node_id, **config}, bk_biz_id=bk_biz_id
             )
         )
 
@@ -1344,7 +1339,8 @@ class DataFlowHandler(BaseAiopsHandler):
         }
         # 模型应用 id
         data_processing_id_config = self.get_serving_data_processing_id_config(
-            clustering_config.predict_flow["clustering_predict"]["result_table_id"]
+            clustering_config.predict_flow["clustering_predict"]["result_table_id"],
+            clustering_config.bk_biz_id,
         )
         if operator == OperatorOnlineTaskEnum.UPDATE:
             update_online_task_request = UpdateOnlineTaskCls(
@@ -1354,7 +1350,9 @@ class DataFlowHandler(BaseAiopsHandler):
                 aiops_stage="serving_stream_ci",
                 online_task_id=clustering_config.online_task_id,
             )
-            request_dict = self._set_username(update_online_task_request)
+            request_dict = self._set_bkdata_request_params(
+                update_online_task_request, bk_biz_id=clustering_config.bk_biz_id
+            )
 
         elif operator == OperatorOnlineTaskEnum.CREATE:
             create_online_task_request = CreateOnlineTaskCls(
@@ -1363,7 +1361,9 @@ class DataFlowHandler(BaseAiopsHandler):
                 trigger={"auto_trigger_type": "stream_event"},
                 aiops_stage="serving_stream_ci",
             )
-            request_dict = self._set_username(create_online_task_request)
+            request_dict = self._set_bkdata_request_params(
+                create_online_task_request, bk_biz_id=clustering_config.bk_biz_id
+            )
         else:
             raise Exception(f"invalid online task operator: {operator}, only support create or update")
         return request_dict
@@ -1543,7 +1543,7 @@ class DataFlowHandler(BaseAiopsHandler):
             storage = TransferApi.get_result_table_storage(
                 params={
                     "result_table_list": collector_config.table_id,
-                    "storage_type": StorageTypeEnum.ELASTICSEARCH.value,
+                    "storage_type": collector_config.storage_cluster_type,
                 }
             )[collector_config.table_id]
             es_storage["expires"] = str(storage["storage_config"].get("retention"))
@@ -1630,9 +1630,27 @@ class DataFlowHandler(BaseAiopsHandler):
         return logical_physical_map
 
     @classmethod
+    def _build_clustered_signature_alias_setting(
+        cls, clustering_config: ClusteringConfig, logical_physical_map: dict | None = None
+    ) -> dict:
+        """
+        聚类结果表 signature 读别名：query_alias=signature -> 物理字段 __dist_{pattern_level}
+        供 NewSeries agg_dimension / 页面展示使用。在线路已统一为单敏感度 LEVEL_05。
+        """
+        dist_logical = f"{AGGS_FIELD_PREFIX}_{PatternEnum.LEVEL_05.value}"
+        if logical_physical_map is not None:
+            field_name = logical_physical_map.get(dist_logical, dist_logical.lower())
+        else:
+            field_name = dist_logical
+        return {"field_name": field_name, "query_alias": SIGNATURE_FIELD}
+
+    @classmethod
     def _build_clustered_doris_alias_settings(cls, index_set: LogIndexSet, clustering_config: ClusteringConfig) -> list:
         logical_physical_map = cls._build_clustered_doris_logical_physical_map(clustering_config)
-        fixed_alias_settings = [{"field_name": DEFAULT_TIME_FIELD.lower(), "query_alias": DEFAULT_TIME_FIELD}]
+        fixed_alias_settings = [
+            {"field_name": DEFAULT_TIME_FIELD.lower(), "query_alias": DEFAULT_TIME_FIELD},
+            cls._build_clustered_signature_alias_setting(clustering_config, logical_physical_map),
+        ]
 
         inherited_alias_settings = []
         for alias_setting in index_set.query_alias_settings or []:
@@ -1698,15 +1716,57 @@ class DataFlowHandler(BaseAiopsHandler):
 
     @classmethod
     def _build_clustered_doris_route_params(cls, index_set: LogIndexSet, clustering_config: ClusteringConfig) -> dict:
+        # 不带 cluster_id 时 metadata 会把存储建到默认 Doris 集群上，查询会打到错误的集群
+        cluster_id = DorisClusterHandler.get_cluster_id(
+            bkbase_table_id=clustering_config.clustered_rt,
+            # flow 刚创建时 BkBase 侧可能还查不到存储，此时按下发 flow 时使用的集群名兜底
+            fallback_cluster_name=clustering_config.doris_storage or "",
+        )
+        if not cluster_id:
+            raise DorisStorageNotExistException(
+                DorisStorageNotExistException.MESSAGE.format(index_set_id=index_set.index_set_id)
+            )
         return {
             **cls._build_clustered_route_base_params(index_set, clustering_config),
             "storage_type": StorageTypeEnum.DORIS.value,
+            "cluster_id": cluster_id,
             "bkbase_table_id": clustering_config.clustered_rt,
             "table_id": (
                 f"bklog_index_set_{index_set.index_set_id}_{clustering_config.clustered_rt.replace('.', '_')}.__doris__"
             ),
             "query_alias_settings": cls._build_clustered_doris_alias_settings(index_set, clustering_config),
         }
+
+    @classmethod
+    def _get_clustered_es_field_names(
+        cls, index_set: LogIndexSet, clustering_config: ClusteringConfig
+    ) -> set[str] | None:
+        """
+        获取聚类结果表在 ES 上的真实字段名，返回 None 表示这次拿不到
+
+        空结果按"拿不到"处理，不能当成"字段都不存在"：新建聚类时结果表刚定义出来、
+        数据还没写进 ES，mapping 必然为空，按不存在处理会把别名裁光，
+        抛异常还会中断 create_predict_flow，留下 online_task_id 为空的半创建状态。
+        """
+        from apps.log_search.handlers.search.mapping_handlers import MappingHandlers
+
+        try:
+            field_names = MappingHandlers(
+                indices=clustering_config.clustered_rt,
+                index_set_id=index_set.index_set_id,
+                scenario_id=Scenario.BKDATA,
+                storage_cluster_id=index_set.storage_cluster_id,
+                time_field=index_set.time_field,
+                only_search=True,
+            ).get_mapping_field_names()
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                "get mapping fields of clustered result table(%s) failed: %s",
+                clustering_config.clustered_rt,
+                error,
+            )
+            return None
+        return field_names or None
 
     @classmethod
     def _build_clustered_es_route_params(cls, index_set: LogIndexSet, clustering_config: ClusteringConfig) -> dict:
@@ -1719,12 +1779,70 @@ class DataFlowHandler(BaseAiopsHandler):
                 clustering_config.clustered_rt,
             ),
         }
-        if index_set.query_alias_settings:
-            route_params["query_alias_settings"] = copy.deepcopy(index_set.query_alias_settings)
+        signature_alias = cls._build_clustered_signature_alias_setting(clustering_config)
+        # 入口索引集的别名是按源表字段配的，聚类结果表的字段集合与源表并不一致。
+        # 别名指向的物理字段在聚类结果表里不存在时，改写后一定查不到数据，因此按真实 mapping 裁剪。
+        clustered_field_names = cls._get_clustered_es_field_names(index_set, clustering_config)
+        inherited_alias_settings = []
+        for alias_setting in index_set.query_alias_settings or []:
+            # 字段集合拿不到时不裁剪：新建聚类和 ES 抖动都会走到这里，
+            # 裁掉配置正确的别名一样会让检索查不到数据，撞名别名留到下次同步再裁。
+            if clustered_field_names is not None and alias_setting.get("field_name") not in clustered_field_names:
+                logger.info(
+                    "skip inherited alias(%s -> %s) for clustered result table(%s): physical field does not exist",
+                    alias_setting.get("query_alias"),
+                    alias_setting.get("field_name"),
+                    clustering_config.clustered_rt,
+                )
+                continue
+            inherited_alias_settings.append(alias_setting)
+
+        merged_alias_settings = []
+        seen_query_alias = set()
+        for alias_setting in (signature_alias, *inherited_alias_settings):
+            query_alias = alias_setting.get("query_alias")
+            if not query_alias or query_alias in seen_query_alias:
+                continue
+            seen_query_alias.add(query_alias)
+            merged_alias_settings.append(copy.deepcopy(alias_setting))
+        if merged_alias_settings:
+            route_params["query_alias_settings"] = merged_alias_settings
         return route_params
 
     @classmethod
-    def sync_clustered_route(cls, index_set_id: int, raise_exception: bool = False) -> bool:
+    def _build_clustered_bulk_route_params(cls, index_set: LogIndexSet, clustering_config: ClusteringConfig) -> dict:
+        if clustering_config.storage_type == StorageTypeEnum.DORIS.value:
+            route_params = cls._build_clustered_doris_route_params(index_set, clustering_config)
+        else:
+            route_params = cls._build_clustered_es_route_params(index_set, clustering_config)
+        route_params = copy.deepcopy(route_params)
+        space_type = route_params.pop("space_type")
+        space_id = route_params.pop("space_id")
+        data_label = route_params.pop("data_label")
+        # 显式声明 is_enable=True：单条 create_or_update_log_router 的 update 分支不会修改 is_enable，
+        # 无法把曾被停用（is_enable=False）的聚类结果表重新启用；改走批量接口并对齐 IndexSetHandler.sync_router。
+        route_params["is_enable"] = True
+        return {
+            "space_type": space_type,
+            "space_id": space_id,
+            "data_label": data_label,
+            "table_info": [route_params],
+        }
+
+    @classmethod
+    def sync_clustered_route(
+        cls,
+        index_set_id: int,
+        raise_exception: bool = False,
+        query_alias_settings: list | None = None,
+    ) -> bool:
+        """
+        同步聚类结果表路由
+
+        query_alias_settings 传入时以它为准，不再回读数据库：
+        带 Doris 标签的索引集不会把别名落到 LogIndexSet.query_alias_settings，
+        回读只能拿到旧值，会让聚类路由和源表路由的别名长期不一致。
+        """
         index_set = LogIndexSet.objects.filter(index_set_id=index_set_id).first()
         clustering_config = ClusteringConfig.get_by_index_set_id(index_set_id=index_set_id, raise_exception=False)
         if not index_set or not clustering_config:
@@ -1740,13 +1858,14 @@ class DataFlowHandler(BaseAiopsHandler):
                 index_set_id,
             )
             return False
+        if query_alias_settings is not None:
+            # index_set 是这里新查出来的对象，只改内存不落库，避免影响调用方持久化时机
+            index_set.query_alias_settings = query_alias_settings
 
-        if clustering_config.storage_type == StorageTypeEnum.DORIS.value:
-            route_params = cls._build_clustered_doris_route_params(index_set, clustering_config)
-        else:
-            route_params = cls._build_clustered_es_route_params(index_set, clustering_config)
         try:
-            TransferApi.create_or_update_log_router(route_params)
+            # 构建路由参数需要查询存储集群，失败时同样不能下发路由，否则会落到默认 Doris 集群
+            bulk_route_params = cls._build_clustered_bulk_route_params(index_set, clustering_config)
+            TransferApi.bulk_create_or_update_log_router(bulk_route_params)
             return True
         except Exception as error:
             logger.exception("sync clustered route for index set(%s) failed: %s", index_set_id, error)
@@ -1756,16 +1875,21 @@ class DataFlowHandler(BaseAiopsHandler):
 
     def create_predict_flow(self, index_set_id: int):
         clustering_config = ClusteringConfig.get_by_index_set_id(index_set_id=index_set_id)
+        self.conf = get_online_clustering_config(clustering_config.bk_biz_id)
 
         # 检查清洗任务是否已经正常启动，若未启动，则启动之
-        self.check_and_start_clean_task(clustering_config.bkdata_etl_result_table_id)
+        self.check_and_start_clean_task(
+            clustering_config.bkdata_etl_result_table_id, bk_biz_id=clustering_config.bk_biz_id
+        )
 
         all_fields_dict = self.get_fields_dict(clustering_config=clustering_config)
         predict_flow_dict = asdict(
             self._init_predict_flow(
                 result_table_id=clustering_config.bkdata_etl_result_table_id,
                 model_id=clustering_config.model_id,
-                model_release_id=self.get_latest_released_id(clustering_config.model_id),
+                model_release_id=self.get_latest_released_id(
+                    clustering_config.model_id, bk_biz_id=clustering_config.bk_biz_id
+                ),
                 bk_biz_id=clustering_config.bk_biz_id,
                 index_set_id=index_set_id,
                 clustering_config=clustering_config,
@@ -1782,8 +1906,9 @@ class DataFlowHandler(BaseAiopsHandler):
             flow_name=f"{settings.ENVIRONMENT}_{clustering_config.bk_biz_id}_{clustering_config.index_set_id}_online_flow",
             project_id=self.conf.get("project_id"),
         )
-        request_dict = self._set_username(create_predict_flow_request)
-        request_dict.update({"bk_biz_id": clustering_config.bk_biz_id})
+        request_dict = self._set_bkdata_request_params(
+            create_predict_flow_request, bk_biz_id=clustering_config.bk_biz_id
+        )
         result = BkDataDataFlowApi.create_flow(request_dict)
         clustering_config.predict_flow = predict_flow_dict
         clustering_config.predict_flow_id = result["flow_id"]
@@ -1792,13 +1917,16 @@ class DataFlowHandler(BaseAiopsHandler):
         clustering_config.clustered_rt = predict_flow_dict["format_signature"]["result_table_id"]
         clustering_config.save()
         # 创建聚类结果表路由信息
-        self.sync_clustered_route(index_set_id=index_set_id)
+        self.sync_clustered_route(index_set_id=index_set_id, raise_exception=True)
 
         # 添加一步更新 update_model_instance
         data_processing_id_config = self.get_serving_data_processing_id_config(
-            clustering_config.predict_flow["clustering_predict"]["result_table_id"]
+            clustering_config.predict_flow["clustering_predict"]["result_table_id"],
+            clustering_config.bk_biz_id,
         )
-        self.update_model_instance(model_instance_id=data_processing_id_config["id"])
+        self.update_model_instance(
+            model_instance_id=data_processing_id_config["id"], bk_biz_id=clustering_config.bk_biz_id
+        )
 
         online_task = self.create_online_task(index_set_id=index_set_id)
         clustering_config.online_task_id = online_task["ci_id"]
@@ -1812,6 +1940,7 @@ class DataFlowHandler(BaseAiopsHandler):
         @return:
         """
         clustering_config = ClusteringConfig.get_by_index_set_id(index_set_id=index_set_id)
+        self.conf = get_online_clustering_config(clustering_config.bk_biz_id)
         if not clustering_config.predict_flow_id:
             logger.info(f"update predict flow not found: index_set_id -> {index_set_id}")
             return
@@ -1826,7 +1955,9 @@ class DataFlowHandler(BaseAiopsHandler):
             self._init_predict_flow(
                 result_table_id=clustering_config.bkdata_etl_result_table_id,
                 model_id=clustering_config.model_id,
-                model_release_id=self.get_latest_released_id(clustering_config.model_id),
+                model_release_id=self.get_latest_released_id(
+                    clustering_config.model_id, bk_biz_id=clustering_config.bk_biz_id
+                ),
                 bk_biz_id=clustering_config.bk_biz_id,
                 index_set_id=clustering_config.index_set_id,
                 clustering_config=clustering_config,
@@ -1845,7 +1976,7 @@ class DataFlowHandler(BaseAiopsHandler):
         clustering_config.predict_flow = predict_flow_dict
         clustering_config.model_output_rt = predict_flow_dict["clustering_predict"]["result_table_id"]
         clustering_config.save()
-        self.sync_clustered_route(index_set_id=index_set_id)
+        self.sync_clustered_route(index_set_id=index_set_id, raise_exception=True)
         logger.info(f"update predict flow success: flow_id -> {clustering_config.predict_flow_id}")
 
     def _init_log_count_aggregation_flow(
@@ -1854,6 +1985,7 @@ class DataFlowHandler(BaseAiopsHandler):
         bk_biz_id: int,
         index_set_id: int,
         clustering_config: ClusteringConfig,
+        include_agg: bool = True,
     ):
         """
         初始化 create_log_count_aggregation_flow
@@ -1872,6 +2004,7 @@ class DataFlowHandler(BaseAiopsHandler):
             log_count_signatures=log_count_signatures,
             table_name_no_id=table_name_no_id,
             result_table_id=result_table_id,
+            include_agg=include_agg,
             agg=RealTimeCls(
                 fields="",
                 table_name=f"bklog_{index_set_id}_agg",
@@ -1899,6 +2032,20 @@ class DataFlowHandler(BaseAiopsHandler):
 
         return log_count_aggregation_flow
 
+    @staticmethod
+    def _should_include_log_count_agg(clustering_config: ClusteringConfig) -> bool:
+        """存量 IntelligentDetect 或灰度关闭时保留日志数量聚合分支。"""
+        if clustering_config.new_cls_strategy_output or clustering_config.new_cls_pattern_rt:
+            return True
+        flow_config = clustering_config.log_count_aggregation_flow or {}
+        if flow_config.get("include_agg") is False:
+            return False
+        return not FeatureToggleObject.switch(
+            NEW_CLASS_ALERT_NEW_SERIES,
+            biz_id=clustering_config.bk_biz_id,
+            default=True,
+        )
+
     def create_log_count_aggregation_flow(self, index_set_id):
         """
         create_log_count_aggregation_flow
@@ -1906,13 +2053,16 @@ class DataFlowHandler(BaseAiopsHandler):
         @return:
         """
         clustering_config = ClusteringConfig.get_by_index_set_id(index_set_id=index_set_id)
+        self.conf = get_online_clustering_config(clustering_config.bk_biz_id)
         result_table_id = clustering_config.predict_flow["clustering_predict"]["result_table_id"]
+        include_agg = self._should_include_log_count_agg(clustering_config)
         log_count_aggregation_flow_dict = asdict(
             self._init_log_count_aggregation_flow(
                 result_table_id=result_table_id,
                 bk_biz_id=clustering_config.bk_biz_id,  # 当前业务id
                 index_set_id=clustering_config.index_set_id,
                 clustering_config=clustering_config,
+                include_agg=include_agg,
             )
         )
         log_count_aggregation_flow = self._render_template(
@@ -1925,13 +2075,16 @@ class DataFlowHandler(BaseAiopsHandler):
             flow_name=f"{settings.ENVIRONMENT}_{clustering_config.bk_biz_id}_{clustering_config.index_set_id}_agg_flow",
             project_id=self.conf.get("project_id"),
         )
-        request_dict = self._set_username(create_log_count_aggregation_flow_request)
-        request_dict.update({"bk_biz_id": clustering_config.bk_biz_id})
+        request_dict = self._set_bkdata_request_params(
+            create_log_count_aggregation_flow_request, bk_biz_id=clustering_config.bk_biz_id
+        )
         result = BkDataDataFlowApi.create_flow(request_dict)
 
         clustering_config.log_count_aggregation_flow = log_count_aggregation_flow_dict
         clustering_config.log_count_aggregation_flow_id = result["flow_id"]
-        clustering_config.new_cls_pattern_rt = log_count_aggregation_flow_dict["agg"]["result_table_id"]
+        clustering_config.new_cls_pattern_rt = (
+            log_count_aggregation_flow_dict["agg"]["result_table_id"] if include_agg else ""
+        )
         clustering_config.signature_pattern_rt = log_count_aggregation_flow_dict["pattern"]["result_table_id"]
         clustering_config.save()
         return result
@@ -1943,6 +2096,7 @@ class DataFlowHandler(BaseAiopsHandler):
         @return:
         """
         clustering_config = ClusteringConfig.get_by_index_set_id(index_set_id=index_set_id)
+        self.conf = get_online_clustering_config(clustering_config.bk_biz_id)
         if not clustering_config.log_count_aggregation_flow_id:
             logger.info(f"update agg flow not found: index_set_id -> {index_set_id}")
             return
@@ -1970,7 +2124,7 @@ class DataFlowHandler(BaseAiopsHandler):
         self.deal_predict_flow(nodes=nodes, flow=flow, bk_biz_id=clustering_config.bk_biz_id)
 
         # 重启 flow
-        self.operator_flow(flow_id=flow_id, action=ActionEnum.RESTART)
+        self.operator_flow(flow_id=flow_id, action=ActionEnum.RESTART, bk_biz_id=clustering_config.bk_biz_id)
         clustering_config.log_count_aggregation_flow = log_count_aggregation_flow_dict
         clustering_config.save(update_fields=["log_count_aggregation_flow"])
         logger.info(f"update agg flow success: flow_id -> {clustering_config.log_count_aggregation_flow_id}")

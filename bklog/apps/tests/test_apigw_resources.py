@@ -1,0 +1,186 @@
+"""
+Tencent is pleased to support the open source community by making BK-LOG 蓝鲸日志平台 available.
+Copyright (C) 2021 THL A29 Limited, a Tencent company.  All rights reserved.
+BK-LOG 蓝鲸日志平台 is licensed under the MIT License.
+License for BK-LOG 蓝鲸日志平台:
+--------------------------------------------------------------------
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+We undertake not to change the open source license (MIT license) applicable to the current version of
+the project delivered to anyone in the future.
+"""
+
+from pathlib import Path
+
+import yaml
+from django.test import SimpleTestCase
+from django.urls import resolve
+
+
+PUBLIC_RESOURCES = {
+    ("GET", "/clustering_config/{index_set_id}/config/"),
+    ("GET", "/databus_collectors/"),
+    ("GET", "/databus_collectors/{collector_config_id}/"),
+    ("GET", "/databus_collectors/{collector_config_id}/subscription_status/"),
+    ("GET", "/databus_collectors/{collector_config_id}/task_status/"),
+    ("GET", "/index_set/{index_set_id}/"),
+    ("GET", "/index_group/"),
+    ("GET", "/databus_collectors/{collector_config_id}/update_context/"),
+    ("GET", "/search_index_set/"),
+    ("GET", "/search_index_set/{index_set_id}/fields/"),
+    ("POST", "/databus_collectors/fast_create/"),
+    ("POST", "/databus_collectors/{collector_config_id}/fast_update/"),
+    ("POST", "/databus_collectors/{collector_config_id}/start/"),
+    ("POST", "/databus_collectors/{collector_config_id}/stop/"),
+    ("POST", "/databus_collectors/{collector_config_id}/update_or_create_clean_config/"),
+    ("POST", "/databus_custom_create/"),
+    ("POST", "/esquery_search/"),
+    ("POST", "/index_set/"),
+    ("POST", "/pattern/{index_set_id}/search/"),
+    ("POST", "/pattern/{index_set_id}/remark/"),
+    ("POST", "/query/ts/"),
+    ("POST", "/query/ts/raw/"),
+    ("POST", "/query/ts/reference/"),
+    ("POST", "/search/index_set/{index_set_id}/aggs/terms/"),
+    ("POST", "/search/index_set/generate_querystring/"),
+    ("POST", "/{collector_config_id}/databus_custom_update/"),
+    ("PUT", "/index_set/{index_set_id}/"),
+    ("PUT", "/pattern/{index_set_id}/update_remark/"),
+    ("DELETE", "/databus_collectors/{collector_config_id}/"),
+    ("DELETE", "/index_set/{index_set_id}/"),
+    ("DELETE", "/pattern/{index_set_id}/delete_remark/"),
+}
+
+USER_VERIFIED_RESOURCES = {
+    ("POST", "/pattern/{index_set_id}/remark/"),
+    ("PUT", "/pattern/{index_set_id}/update_remark/"),
+    ("DELETE", "/pattern/{index_set_id}/delete_remark/"),
+}
+
+
+class ApiGatewayResourcesTests(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        bklog_root = Path(__file__).resolve().parents[2]
+        resources_path = bklog_root / "support-files" / "apigw" / "resources.yaml"
+        cls.resources = yaml.safe_load(resources_path.read_text(encoding="utf-8"))
+        cls.zh_docs_dir = resources_path.parent / "apidocs" / "zh"
+
+    def test_public_resources_match_approved_scope(self):
+        public_resources = {
+            (method.upper(), path)
+            for path, methods in self.resources["paths"].items()
+            for method, operation in methods.items()
+            if operation["x-bk-apigateway-resource"]["isPublic"]
+        }
+
+        self.assertEqual(public_resources, PUBLIC_RESOURCES)
+
+    def test_public_resources_require_app_and_resource_permissions(self):
+        for method, path in PUBLIC_RESOURCES:
+            resource = self.resources["paths"][path][method.lower()]["x-bk-apigateway-resource"]
+            self.assertTrue(resource["allowApplyPermission"], f"{method} {path}")
+            self.assertEqual(
+                resource["authConfig"],
+                {
+                    "userVerifiedRequired": (method, path) in USER_VERIFIED_RESOURCES,
+                    "appVerifiedRequired": True,
+                    "resourcePermissionRequired": True,
+                },
+                f"{method} {path}",
+            )
+
+    def test_public_search_helper_resources_map_to_existing_actions(self):
+        expected_backends = {
+            "/search/index_set/{index_set_id}/aggs/terms/": (
+                "post",
+                "/api/v1/search/index_set/{index_set_id}/aggs/terms/",
+                "terms",
+            ),
+            "/search/index_set/generate_querystring/": (
+                "post",
+                "/api/v1/search/index_set/generate_querystring/",
+                "generate_querystring",
+            ),
+        }
+
+        for path, (method, backend_path, action) in expected_backends.items():
+            resource = self.resources["paths"][path][method]["x-bk-apigateway-resource"]
+            self.assertEqual(resource["backend"]["method"], method)
+            self.assertEqual(resource["backend"]["path"], backend_path)
+
+            resolved = resolve(backend_path.format(index_set_id=1))
+            self.assertEqual(resolved.func.actions[method], action)
+
+    def test_index_group_list_resource_maps_to_existing_action(self):
+        resource = self.resources["paths"]["/index_group/"]["get"]["x-bk-apigateway-resource"]
+        self.assertEqual(resource["backend"]["method"], "get")
+        self.assertEqual(resource["backend"]["path"], "/api/v1/index_group/")
+        self.assertEqual(resolve(resource["backend"]["path"]).func.actions["get"], "list")
+
+    def test_log_access_collector_resource_maps_to_existing_action(self):
+        resource = self.resources["paths"]["/databus/log_access/collector/"]["post"]["x-bk-apigateway-resource"]
+        self.assertEqual(resource["backend"]["method"], "post")
+        self.assertEqual(resource["backend"]["path"], "/api/v1/databus/log_access/collector/")
+        self.assertEqual(resolve(resource["backend"]["path"]).func.actions["post"], "collector")
+
+    def test_public_search_helper_docs_use_apigw_auth_keys(self):
+        for operation_id in (
+            "index_set_terms",
+            "generate_querystring",
+            "list_databus_collectors",
+            "retrieve_databus_collector",
+        ):
+            content = (self.zh_docs_dir / f"{operation_id}.md").read_text(encoding="utf-8")
+
+            self.assertIn("| bk_app_code", content, operation_id)
+            self.assertIn("| bk_app_secret", content, operation_id)
+            self.assertNotIn("| app_code", content, operation_id)
+            self.assertNotIn("| app_secret", content, operation_id)
+
+    def test_delete_resources_keep_private_compatibility_paths(self):
+        paths = self.resources["paths"]
+
+        self.assertIn("delete", paths["/index_set/{index_set_id}/"])
+        self.assertIn("delete", paths["/databus_collectors/{collector_config_id}/"])
+
+        compatibility_resources = {
+            "/delete_index_set/{index_set_id}/": "esb_delete_index_set",
+            "/databus/collectors/{collector_config_id}/": "delete_databus_collectors",
+        }
+        for path, operation_id in compatibility_resources.items():
+            resource = paths[path]["delete"]
+            self.assertEqual(resource["operationId"], operation_id)
+            self.assertFalse(resource["x-bk-apigateway-resource"]["isPublic"])
+
+    def test_operation_ids_are_unique(self):
+        operation_ids = [
+            operation["operationId"] for methods in self.resources["paths"].values() for operation in methods.values()
+        ]
+
+        self.assertEqual(len(operation_ids), len(set(operation_ids)))
+
+    def test_public_resources_have_chinese_docs(self):
+        for methods in self.resources["paths"].values():
+            for operation in methods.values():
+                resource = operation["x-bk-apigateway-resource"]
+                if not resource["isPublic"]:
+                    continue
+
+                operation_id = operation["operationId"]
+                doc_path = self.zh_docs_dir / f"{operation_id}.md"
+                self.assertTrue(doc_path.is_file(), f"missing API document: {doc_path.name}")
+
+                content = doc_path.read_text(encoding="utf-8")
+                self.assertIn("## 功能描述", content, doc_path.name)
+                self.assertIn("## 请求", content, doc_path.name)

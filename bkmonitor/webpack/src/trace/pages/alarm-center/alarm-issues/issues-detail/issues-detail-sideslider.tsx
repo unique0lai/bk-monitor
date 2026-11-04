@@ -23,25 +23,30 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { defineComponent, shallowRef, watch } from 'vue';
+import { type PropType, defineComponent, onUnmounted, shallowRef, watch } from 'vue';
 
 import { Sideslider } from 'bkui-vue';
-import { issueDetail } from 'monitor-api/modules/issue';
 import { convertDurationArray } from 'monitor-common/utils';
-import { getDefaultTimezone, updateTimezone } from 'monitor-pc/i18n/dayjs';
+import { updateTimezone } from 'monitor-pc/i18n/dayjs';
+import { storeToRefs } from 'pinia';
+import { appendQueryStringCondition } from 'trace/components/retrieval-filter/query-string-utils';
 import { type IWhereItem, EMode } from 'trace/components/retrieval-filter/typing';
 
+import { DetailLoadStatus } from '../../common-detail/detail-loading';
 import IssuesImpactScopeDrawer from '../components/issues-impact-scope-drawer/issues-impact-scope-drawer';
+import { useIssuesAiAnalysis } from '../composables/use-issues-ai-analysis';
+import IssuesLoading from './components/issues-loading';
 import IssuesSliderHeader from './components/issues-slider-header';
 import IssuesSliderWrapper from './components/issues-slider-wrapper';
 import RefreshRate from '@/components/refresh-rate/refresh-rate';
 import { mergeWhereList } from '@/components/retrieval-filter/utils';
 import TimeRange from '@/components/time-range/time-range';
-import useRequestAbort from '@/hooks/useRequestAbort';
+import { useIssuesDetailStore } from '@/store/modules/issues-detail';
 
 import type { CommonCondition } from '../../typings';
-import type { ImpactScopeEvent, ImpactScopeResource, IssueDetail } from '../typing';
+import type { ImpactScopeEvent, ImpactScopeResource } from '../typing';
 import type { ImpactScopeResourceKeyType, IssuePriorityType, IssueStatusType } from '../typing/constants';
+import type { AlarmCenterPanelTabType } from '@/pages/alarm-center/utils/constant';
 
 import './issues-detail-sideslider.scss';
 
@@ -57,11 +62,6 @@ export default defineComponent({
       type: String,
       default: '',
     },
-    /** issues 第一个告警产生时间 (秒级时间戳) */
-    firstAlarmTime: {
-      type: [Number, String],
-      default: 'now-1h',
-    },
     /** issues BizId */
     issueBizId: {
       type: Number,
@@ -71,16 +71,21 @@ export default defineComponent({
       type: Boolean,
       default: true,
     },
+    /** 告警详情页签（视图/日志/调用链等）默认选中项 */
+    defaultInnerTab: {
+      type: String as PropType<'' | AlarmCenterPanelTabType>,
+      default: '',
+    },
   },
-  emits: ['update:show', 'next', 'previous'],
+  emits: ['update:show', 'next', 'previous', 'createTapd'],
   setup(props, { emit }) {
-    const detail = shallowRef<IssueDetail>(undefined);
-    const loading = shallowRef(false);
+    const issuesDetailStore = useIssuesDetailStore();
+    const { clearSetTimeout } = useIssuesAiAnalysis();
+    const { bizId, issueId, detail, loading, error, timeRange, timezone, refreshInterval } =
+      storeToRefs(issuesDetailStore);
     const isFullscreen = shallowRef(false);
-    const timeRange = shallowRef<(number | string)[]>(['now-1h', 'now']);
-    const timezone = shallowRef(getDefaultTimezone());
-    const refreshInterval = shallowRef(-1);
     let timer = null;
+    const refreshKey = shallowRef(0);
     // 筛选条件状态
     const conditions = shallowRef<IWhereItem[]>([]);
     const queryString = shallowRef('');
@@ -89,47 +94,46 @@ export default defineComponent({
     const impactScopeResource = shallowRef<ImpactScopeResource>(null);
     const impactScopeResourceKey = shallowRef<'' | ImpactScopeResourceKeyType>('');
     const impactScopeDrawerShow = shallowRef(false);
-    /** 初始化默认查询时间范围 */
-    const initTimeRange = () => {
-      const firstAlarmTime = props.firstAlarmTime || 'now-1h';
-      const time = Number(firstAlarmTime);
-      timeRange.value = [Number.isNaN(time) ? firstAlarmTime : time * 1000, 'now'];
-    };
-
-    const { run, signal } = useRequestAbort<IssueDetail>(issueDetail);
-
-    /** 获取Issue详情数据 */
-    const getIssueDetailData = async (hasLoading = true) => {
-      if (!props.show) return;
-      if (hasLoading) {
-        loading.value = true;
-      }
-
-      const res = await run({
-        bk_biz_id: props.issueBizId,
-        id: props.issueId,
-      });
-      if (signal?.aborted) return;
-      detail.value = res;
-      loading.value = false;
-    };
-
+    // 同步 props 到 Store，驱动 Store 自动请求详情（仅 show 时同步；reset 由 handleShowChange / onUnmounted 负责）
+    // 注意：TAPD 首次授权回调场景中，alarm-center 打开本侧滑后，此处同步会触发 store.fetchDetail，
+    // detail 数据到达后反过来驱动 IssuesTapd 的弹窗显示（show = createTapdSliderShow && !!detail）。
     watch(
-      () => [props.issueBizId, props.issueId, props.firstAlarmTime],
+      () => [props.show, props.issueBizId, props.issueId],
       () => {
+        clearSetTimeout();
+        if (timer) clearInterval(timer);
+        timer = null;
+        refreshInterval.value = -1;
+        impactScopeDrawerShow.value = false;
+        impactScopeResource.value = null;
+        impactScopeResourceKey.value = '';
         if (props.show) {
-          initTimeRange();
-          getIssueDetailData();
+          bizId.value = props.issueBizId;
+          issueId.value = props.issueId;
         } else {
-          detail.value = undefined;
+          issuesDetailStore.reset();
         }
       },
       { immediate: true }
     );
-
     const handleShowChange = (isShow: boolean) => {
+      // 关闭侧滑时主动重置 Store，避免 detail 残留污染下次打开（也切断 IssuesTapd 的 !!detail 条件）
+      // alarm-center 所有运行时关闭均经此函数（无外部直接置 alarmDetailShow=false 的运行时路径）
+      if (!isShow) {
+        if (timer) clearInterval(timer);
+        timer = null;
+        issuesDetailStore.reset();
+        clearSetTimeout();
+      }
       emit('update:show', isShow);
     };
+
+    // 组件被 v-if 卸载时兜底重置（如 alarmType 切换离开 ISSUES，show 来不及变 false）
+    onUnmounted(() => {
+      clearSetTimeout();
+      if (timer) clearInterval(timer);
+      if (issueId.value === props.issueId && bizId.value === props.issueBizId) issuesDetailStore.reset();
+    });
 
     /** 下一个 */
     const handleNext = () => {
@@ -151,12 +155,15 @@ export default defineComponent({
       timezone.value = value;
       window.timezone = value;
       updateTimezone(value);
+      timeRange.value = [...timeRange.value];
+      refreshKey.value += 1;
     };
 
     /** 强制刷新 */
     const handleImmediateRefresh = () => {
       timeRange.value = [...timeRange.value];
-      getIssueDetailData();
+      refreshKey.value += 1;
+      issuesDetailStore.refresh();
     };
 
     /** 自动刷新调整 */
@@ -180,6 +187,10 @@ export default defineComponent({
       isFullscreen.value = value;
     };
 
+    const handleCreateTapd = () => {
+      emit('createTapd', true);
+    };
+
     const handleConditionChange = (val: IWhereItem[]) => {
       conditions.value = val;
     };
@@ -190,6 +201,11 @@ export default defineComponent({
 
     const handleFilterModeChange = (val: EMode) => {
       filterMode.value = val;
+    };
+
+    /** issues 重命名 */
+    const handleNameChange = (name: string) => {
+      detail.value = { ...detail.value, name };
     };
 
     /** 负责人变更 */
@@ -222,7 +238,7 @@ export default defineComponent({
           conditionResult = convertDurationArray(condition.value as string[]);
         }
         conditions.value = mergeWhereList(
-          conditions.value,
+          conditions.value.filter(item => item.key !== condition.key),
           conditionResult.map(condition => ({
             key: condition.key,
             method: condition.method,
@@ -237,8 +253,8 @@ export default defineComponent({
           }))
         );
       } else {
-        const value = `${queryString.value ? ' AND ' : ''}${condition.method === 'neq' ? '-' : ''}${condition.key}: ${condition.value[0]}`;
-        queryString.value = value;
+        const newClause = `${condition.method === 'neq' ? '-' : ''}${condition.key}: ${condition.value[0]}`;
+        queryString.value = appendQueryStringCondition(queryString.value, condition.key, newClause);
       }
     };
 
@@ -248,6 +264,10 @@ export default defineComponent({
       timezone,
       refreshInterval,
       detail,
+      loading,
+      error,
+      refreshKey,
+      retry: issuesDetailStore.fetchDetail,
       conditions,
       queryString,
       filterMode,
@@ -262,6 +282,7 @@ export default defineComponent({
       handleImmediateRefresh,
       handleRefreshChange,
       handleToggleFullscreen,
+      handleCreateTapd,
       handleConditionChange,
       handleQueryStringChange,
       handleFilterModeChange,
@@ -270,6 +291,7 @@ export default defineComponent({
       handleStatusAction,
       handleImpactScopeClick,
       handleAddCondition,
+      handleNameChange,
     };
   },
   render() {
@@ -280,6 +302,7 @@ export default defineComponent({
         v-slots={{
           header: () => (
             <IssuesSliderHeader
+              key={`${this.issueBizId}:${this.issueId}`}
               v-slots={{
                 tools: () => [
                   <TimeRange
@@ -299,7 +322,10 @@ export default defineComponent({
               }}
               detail={this.detail}
               isFullscreen={this.isFullscreen}
+              loading={this.loading && !this.detail}
               showStepBtn={this.showStepBtn}
+              onCreateTapdSliderShowChange={this.handleCreateTapd}
+              onNameChange={this.handleNameChange}
               onNext={this.handleNext}
               onPrevious={this.handlePrevious}
               onToggleFullscreen={this.handleToggleFullscreen}
@@ -307,12 +333,21 @@ export default defineComponent({
           ),
           default: () => (
             <div class='issues-detail-side-slider-content'>
+              <DetailLoadStatus
+                error={this.error}
+                loading={this.loading && !!this.detail}
+                onRetry={this.retry}
+              />
+              {!this.detail && !this.error && <IssuesLoading />}
               {this.detail && (
                 <IssuesSliderWrapper
+                  key={`${this.issueBizId}:${this.issueId}`}
                   conditions={this.conditions}
+                  defaultInnerTab={this.defaultInnerTab}
                   detail={this.detail}
                   filterMode={this.filterMode}
                   queryString={this.queryString}
+                  refreshKey={String(this.refreshKey)}
                   timeRange={this.timeRange}
                   onAssigneeChange={this.handleAssigneeChange}
                   onConditionChange={this.handleConditionChange}

@@ -24,16 +24,28 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { Component, Emit, InjectReactive, Prop, Provide, ProvideReactive, Ref, Watch, Inject } from 'vue-property-decorator';
+import {
+  Component,
+  Emit,
+  InjectReactive,
+  Prop,
+  Provide,
+  ProvideReactive,
+  Ref,
+  Watch,
+} from 'vue-property-decorator';
 import { Component as tsc } from 'vue-tsx-support';
+import _ from 'lodash';
 
 import { APM_ALARM_TEMPLATE_ROUTER_QUERY_KEYS } from 'apm/pages/alarm-template/constant';
+import { LLM_SESSION_TAB_QUERY_KEY } from 'apm/pages/service/contents/llm_session/constants';
 import { isEqual } from 'lodash';
 import { getSceneView, getSceneViewList } from 'monitor-api/modules/scene_view';
 import bus from 'monitor-common/utils/event-bus';
 import { deepClone, isObject, random } from 'monitor-common/utils/utils';
 import DashboardPanel from 'monitor-ui/chart-plugins/components/dashboard-panel';
 import { DEFAULT_INTERVAL, DEFAULT_METHOD } from 'monitor-ui/chart-plugins/constants/dashbord';
+import { APM_TRACE_ROUTER_QUERY_KEYS } from 'monitor-ui/chart-plugins/plugins/apm-trace-explore/constants';
 import { APM_LOG_ROUTER_QUERY_KEYS } from 'monitor-ui/chart-plugins/plugins/monitor-retrieve/monitor-retrieve';
 import {
   type DashboardMode,
@@ -116,6 +128,8 @@ const DEFAULT_QUERY_DATA = {
   filterDict: {},
 };
 
+const ALARM_CENTER_DASHBOARD_IDS = ['service-default-alarm_center', 'alarm_center'];
+
 interface ICommonPageEvent {
   onSceneTypeChange: SceneType;
   onTabChange: string;
@@ -126,6 +140,8 @@ interface ICommonPageEvent {
 interface ICommonPageProps {
   // 详情返回操作
   backToOverviewKey?: string;
+  // 内容区由 customContent 插槽自行渲染的面板类型，命中时不渲染 DashboardPanel
+  customContentPanelTypes?: string[];
   // 默认汇聚方法
   defalutMethod?: string;
   defaultDashboardId?: string;
@@ -152,15 +168,18 @@ export const Event_EXPORT_QUERY_KEYS = ['targets', 'filterMode', 'commonWhere', 
 const ALARM_TEMPLATE_QUERY_KEYS = ['quickStatus', 'searchKeyword', 'sort'];
 const CUSTOM_GRAPH_V2_QUERY_KEYS = ['viewPayload', 'viewColumn', 'showStatisticalValue'];
 const customRouterQueryKeys = [
+  'apmK8sParams',
   'sliceStartTime',
   'sliceEndTime',
   'callOptions',
   ...APM_ALARM_TEMPLATE_ROUTER_QUERY_KEYS,
   // log-retrieve图所需的路由参数
   ...APM_LOG_ROUTER_QUERY_KEYS,
+  ...APM_TRACE_ROUTER_QUERY_KEYS,
   ...Event_EXPORT_QUERY_KEYS,
   ...ALARM_TEMPLATE_QUERY_KEYS,
   ...CUSTOM_GRAPH_V2_QUERY_KEYS,
+  LLM_SESSION_TAB_QUERY_KEY,
 ];
 @Component({
   components: {
@@ -189,6 +208,8 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
   @Prop({ default: () => [], type: Array }) readonly toggleTabSearchFilterKeys: string[];
   // 默认汇聚方法
   @Prop({ default: '' }) readonly defalutMethod: string;
+  // 内容区交由 customContent 插槽渲染的面板类型
+  @Prop({ default: () => [], type: Array }) readonly customContentPanelTypes: string[];
 
   // 监控左侧栏是否收缩配置 自愈默认未收缩
   @InjectReactive('toggleSet') toggleSet: boolean;
@@ -320,7 +341,7 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
   get compareTypeMap(): PanelToolsType.CompareId[] {
     return (
       !this.readonly &&
-      (this.isCheckedHost || !!this.sceneData?.options?.panel_tool?.need_compare_target
+      (this.isCheckedHost || this.sceneData?.options?.panel_tool?.need_compare_target
         ? ['none', 'target', 'time']
         : ['none', 'time'])
     );
@@ -404,7 +425,7 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
     const panels = this.isPreciseFilter
       ? this.preciseFilteringPanels
       : this.handleGetLocalPanels(this.isOverview ? this.sceneData.overview_panels : this.sceneData.panels);
-    if (this.sceneData?.options?.enable_index_list && !!panels.length) {
+    if (this.sceneData?.options?.enable_index_list && panels.length) {
       let curTagChartId = '';
       const { mode } = this.sceneData;
       const list = panels.reduce((total, row) => {
@@ -444,7 +465,7 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
         }
         return total;
       }, []);
-      if (list.length === 1 && !!list[0].children?.length) return list[0].children;
+      if (list.length === 1 && list[0].children?.length) return list[0].children;
       return list;
     }
     return [];
@@ -493,6 +514,13 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
   get isApmServiceOverview() {
     return this.sceneId === 'apm_service';
   }
+  /**
+   * 内容区是否由 customContent 插槽渲染。
+   * 分发依据与 ChartWrapper 一致（视图配置里的面板类型），只是提升到内容区一层，跳过图表包装。
+   */
+  get isCustomContentPanel() {
+    return this.customContentPanelTypes.includes(this.localPanels?.[0]?.type);
+  }
   /** 是否需要额外的参数 */
   get hasOtherParams() {
     return !!this.currentTabData?.params;
@@ -509,7 +537,16 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
   /* 当前单图模式下dashboard-panel是否需要padding */
   /* 当前单图模式下dashboard-panel是否需要padding */
   get isSingleChartNoPadding() {
-    const noPaddingTypeList = ['apm-relation-graph', 'apm-service-caller-callee', 'log-retrieve', 'custom_metric_v2', 'alarm_center', 'trace'];
+    const noPaddingTypeList = [
+      'apm-relation-graph',
+      'apm-service-caller-callee',
+      'log-retrieve',
+      'custom_metric_v2',
+      'alarm_center',
+      'llm_overview',
+      'trace',
+      'container',
+    ];
     return this.isSingleChart && noPaddingTypeList.includes(this.localPanels?.[0]?.type);
     // return (
     //   this.isSingleChart &&
@@ -630,6 +667,38 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
     bus.$off('dashboardModeChange', this.handleDashboardModeChange);
     bus.$off('switch_scenes_type');
   }
+  @Watch('timeRange', { immediate: true })
+  handleGlobalTimeRangeChange(val: TimeRangeType) {
+    window.LOCAL_OLD_TIME_RANGE = val;
+  }
+
+  @Watch('dashboardId', { immediate: true })
+  handleDashboardIdChange(newDashboardId: string, oldDashboardId: string) {
+    if (!oldDashboardId || !newDashboardId) {
+      return;
+    }
+
+    if (ALARM_CENTER_DASHBOARD_IDS.includes(newDashboardId)) {
+      // 从其他默认时间的tab切换到告警，告警使用默认七天
+      if (_.isEqual(window.LOCAL_OLD_TIME_RANGE, ['now-1h', 'now'])) {
+        this.handleTimeRangeChange(['now-7d', 'now']);
+        return;
+      }
+
+      this.handleTimeRangeChange(window.LOCAL_OLD_TIME_RANGE);
+    } else {
+      // 从告警默认时间切到其他tab，其他tab使用默认近一小时
+      if (ALARM_CENTER_DASHBOARD_IDS.includes(oldDashboardId)) {
+        if (_.isEqual(window.LOCAL_OLD_TIME_RANGE, ['now-7d', 'now'])) {
+          this.handleTimeRangeChange(['now-1h', 'now']);
+          return;
+        }
+
+        this.handleTimeRangeChange(window.LOCAL_OLD_TIME_RANGE);
+      }
+    }
+  }
+
   @Watch('backToOverviewKey')
   backToOverviewKeyChange() {
     this.localSceneType = 'overview';
@@ -648,7 +717,8 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
   handleRouteQueryChange(val = {}) {
     for (const key in val) {
       if (customRouterQueryKeys.includes(key)) {
-        this.customRouteQuery[key] = val[key];
+        const value = val[key];
+        this.customRouteQuery[key] = typeof value === 'string' ? value : JSON.stringify(value);
       }
     }
   }
@@ -692,7 +762,11 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
           v = val;
         } else {
           if (/^(\[|\{)/.test(val)) {
-            v = JSON.parse(val);
+            try {
+              v = JSON.parse(val);
+            } catch {
+              v = val;
+            }
           } else if (/^-?[1-9]?[0-9]*[1-9]+$/.test(val)) {
             v = +val;
           } else {
@@ -724,13 +798,17 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
         this.groups = Array.isArray(val) ? val : [val];
       } else if (!['key'].includes(key)) {
         if (customRouterQueryKeys.includes(key)) {
-          this.customRouteQuery[key] = val;
-        } else if (typeof val === 'string' && /^-?[1-9]?[0-9]*[1-9]+$/.test(val)) {
-          this[key] = +val;
+          this.customRouteQuery[key] = typeof val === 'string' ? val : JSON.stringify(val);
+          // 优先匹配时间范围
         } else if (['from', 'to'].includes(key)) {
           // this[key] = Array.isArray(val) ? val : isNaN(+val) ? val : +val;
-          key === 'from' && (this.timeRange[0] = val as string);
-          key === 'to' && (this.timeRange[1] = val as string);
+          if (key === 'from') {
+            this.timeRange[0] = val as string;
+          } else if (key === 'to') {
+            this.timeRange[1] = val as string;
+          }
+        } else if (typeof val === 'string' && /^-?[1-9]?[0-9]*[1-9]+$/.test(val)) {
+          this[key] = +val;
         } else if (key === 'queryData') {
           try {
             const {
@@ -958,7 +1036,7 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
     if (this.sceneData?.panelCount <= 6) {
       const indexStorage = new Storage();
       const defaultIndexData = indexStorage.get(INDEX_LIST_DEFAULT_CONFIG_KEY);
-      if (!defaultIndexData || !!defaultIndexData?.expand) {
+      if (!defaultIndexData || defaultIndexData?.expand) {
         indexStorage.set(INDEX_LIST_DEFAULT_CONFIG_KEY, {
           height: ASIDE_COLLAPSE_HEIGHT,
           placement: defaultIndexData?.placement || 'bottom',
@@ -1432,9 +1510,17 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
         groupByVariables: JSON.stringify(this.groupByVariables),
       };
     }
+    const customRouteQuery: Record<string, number | string> = {};
+    for (const [key, value] of Object.entries(this.customRouteQuery || {})) {
+      if (value === undefined || value === null) {
+        customRouteQuery[key] = value as never;
+        continue;
+      }
+      customRouteQuery[key] = typeof value === 'string' || typeof value === 'number' ? value : JSON.stringify(value);
+    }
     const query = {
       ...filters,
-      ...this.customRouteQuery,
+      ...customRouteQuery,
       ...groupByVariables,
       method: this.method,
       interval: this.interval.toString(),
@@ -1455,11 +1541,11 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
       queryString: this.queryString,
       preciseFilter: String(this.isPreciseFilter) /** 是否开启精准过滤 */,
       compares:
-        this.compareType === 'target' && !!this.compares.targets?.length
+        this.compareType === 'target' && this.compares.targets?.length
           ? encodeURIComponent(JSON.stringify(this.compares))
           : undefined /** 目标对比 */,
       timeOffset:
-        this.compareType === 'time' && !!this.timeOffset.length
+        this.compareType === 'time' && this.timeOffset.length
           ? encodeURIComponent(JSON.stringify(this.timeOffset))
           : undefined /** 时间对比 */,
       isGroupByLimit: this.isGroupByLimit ? 'true' : 'false',
@@ -1618,6 +1704,9 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
     this.localSceneType = item.type as SceneType;
     // 清除 log-retrieve 图所需的路由参数
     for (const key of APM_LOG_ROUTER_QUERY_KEYS) {
+      this.customRouteQuery[key] = undefined;
+    }
+    for (const key of APM_TRACE_ROUTER_QUERY_KEYS) {
       this.customRouteQuery[key] = undefined;
     }
     if (this.tab2SceneType && item.type === 'detail') {
@@ -2065,19 +2154,23 @@ export default class CommonPageNew extends tsc<ICommonPageProps, ICommonPageEven
                     <div class='view-has-no-data-main'>{this.$slots.noData}</div>
                   )}
                   {this.filtersReady ? (
-                    <DashboardPanel
-                      id={this.dashboardPanelId}
-                      key={this.sceneData.id}
-                      column={this.sceneData.mode === 'custom' ? 'custom' : this.columns + 1}
-                      dashboardId={this.dashboardId}
-                      isSingleChart={this.isSingleChart}
-                      needOverviewBtn={!!this.sceneData?.list?.length}
-                      panels={this.dashbordMode === 'chart' ? this.preciseFilteringPanels : this.sceneData.list}
-                      singleChartNoPadding={this.isSingleChartNoPadding}
-                      // onLinkTo={this.handleUpdateCurrentData}
-                      onBackToOverview={this.handleBackToOverview}
-                      onLintToDetail={this.handleLinkToDetail}
-                    />
+                    this.isCustomContentPanel ? (
+                      <div class='dashboard-custom-content'>{this.$slots.customContent}</div>
+                    ) : (
+                      <DashboardPanel
+                        id={this.dashboardPanelId}
+                        key={this.sceneData.id}
+                        column={this.sceneData.mode === 'custom' ? 'custom' : this.columns + 1}
+                        dashboardId={this.dashboardId}
+                        isSingleChart={this.isSingleChart}
+                        needOverviewBtn={!!this.sceneData?.list?.length}
+                        panels={this.dashbordMode === 'chart' ? this.preciseFilteringPanels : this.sceneData.list}
+                        singleChartNoPadding={this.isSingleChartNoPadding}
+                        // onLinkTo={this.handleUpdateCurrentData}
+                        onBackToOverview={this.handleBackToOverview}
+                        onLintToDetail={this.handleLinkToDetail}
+                      />
+                    )
                   ) : (
                     <div class='empty-wrapper'>{this.$t('加载中...')}</div>
                   )}

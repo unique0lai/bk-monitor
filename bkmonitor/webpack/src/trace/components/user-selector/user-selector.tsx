@@ -101,11 +101,17 @@ export default defineComponent({
       type: Boolean,
       default: false,
     },
+    /** 最近选择用户 ID 列表，传入后在下拉右侧展示最近选择 */
+    recentUserIds: {
+      type: Array as PropType<string[]>,
+      default: () => [],
+    },
   },
   emits: {
     'update:modelValue': (value: string[]) => Array.isArray(value),
     change: (userInfos: IUserInfo[]) => Array.isArray(userInfos),
     blur: () => true,
+    focus: () => true,
     dragStart: (dragStartEvent: UserSelectorDragEvent) => dragStartEvent instanceof Object,
     dragEnd: (dragEndEvent: UserSelectorDragEvent) => dragEndEvent instanceof Object,
   },
@@ -152,6 +158,12 @@ export default defineComponent({
      */
     const handleBlur = () => {
       emit('blur');
+    };
+    /**
+     * @description 输入框聚焦
+     */
+    const handleFocus = () => {
+      emit('focus');
     };
 
     /**
@@ -221,6 +233,7 @@ export default defineComponent({
       handleDragStart,
       handleDragEnd,
       handleBlur,
+      handleFocus,
     };
   },
   render() {
@@ -238,6 +251,7 @@ export default defineComponent({
         modelValue={this.modelValue}
         multiple={this.multiple}
         placeholder={this.placeholder}
+        recentUserIds={this.recentUserIds}
         renderListItem={this.listItemRender}
         renderTag={this.tagItemRender}
         tenantId={this.componentConfig.tenantId}
@@ -246,6 +260,7 @@ export default defineComponent({
         onChange={this.handleUserInfoChange}
         onDragEnd={this.handleDragEnd}
         onDragStart={this.handleDragStart}
+        onFocus={this.handleFocus}
         onUpdate:modelValue={this.handleUpdateModuleValue}
       />
     );

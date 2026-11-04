@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -9,17 +8,30 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+import re
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Dict, List, Optional
 
 from django.utils import timezone
 from django.utils.functional import cached_property
 from humanize import naturaldelta
+from kubernetes.utils.quantity import parse_quantity
 
 from bkmonitor.utils.common_utils import camel_obj_key_to_underscore
 
 # 采集器up指标
 BKM_METRICBEAT_ENDPOINT_UP = "bkm_metricbeat_endpoint_up"
+
+
+def validate_k8s_namespace(namespace: str) -> str:
+    """校验并返回 Kubernetes namespace。"""
+    if (
+        not isinstance(namespace, str)
+        or len(namespace) > 63
+        or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", namespace) is None
+    ):
+        raise ValueError(f"invalid Kubernetes namespace: {namespace!r}")
+    return namespace
 
 
 class BcsClusterType:
@@ -138,33 +150,20 @@ class ReadyStatus:
     COMPLETE = "complete"
 
 
-def get_cpu_without_unit(cpu_with_unit: str):
+def get_cpu_without_unit(cpu_with_unit: str | int | float | None) -> float:
     """CPU资源量单位转换 ."""
-    if cpu_with_unit.endswith("m"):
-        return int(cpu_with_unit[:-1]) / 1000
-    return int(cpu_with_unit)
+    quantity = parse_quantity(0 if cpu_with_unit is None else cpu_with_unit)
+    if not quantity.is_finite():
+        raise ValueError(f"invalid CPU quantity: {cpu_with_unit!r}")
+    return float(quantity)
 
 
-def get_memory_without_unit(memory_with_unit: str):
+def get_memory_without_unit(memory_with_unit: str | int | float | None) -> int:
     """内存资源量单位转换 ."""
-    # https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-    units = ["K", "M", "G", "T", "P", "E"]
-    is_power_of_two = False
-    if memory_with_unit.endswith("i"):
-        is_power_of_two = True
-        memory_with_unit = memory_with_unit[:-1]
-    memory_unit = memory_with_unit[-1]
-    if memory_unit not in units:
-        try:
-            return int(memory_with_unit)
-        except Exception:
-            return 0
-    memory_number = int(memory_with_unit[:-1])
-    unit_index = units.index(memory_unit)
-    power = 1000
-    if is_power_of_two:
-        power = 1024
-    return memory_number * pow(power, (unit_index + 1))
+    quantity = parse_quantity(0 if memory_with_unit is None else memory_with_unit)
+    if not quantity.is_finite():
+        raise ValueError(f"invalid memory quantity: {memory_with_unit!r}")
+    return int(quantity)
 
 
 def translate_timestamp_since(start_time):
@@ -180,7 +179,7 @@ def translate_timestamp_since(start_time):
     return naturaldelta(start_at_current_timezone_naive)
 
 
-def get_progress_value(value: float) -> Dict:
+def get_progress_value(value: float) -> dict:
     """
     计算进度条数据
     """
@@ -199,7 +198,7 @@ def get_progress_value(value: float) -> Dict:
 
 
 class KubernetesV1ObjectJsonParser:
-    def __init__(self, config: Dict):
+    def __init__(self, config: dict):
         self.config = config
         # API的版本
         api_version = self.config.get("apiVersion")
@@ -285,7 +284,7 @@ class KubernetesWorkloadJsonParser(KubernetesV1ObjectJsonParser):
         return self.metadata.get("ownerReferences", [])
 
     @cached_property
-    def top_workload_type(self) -> Optional[str]:
+    def top_workload_type(self) -> str | None:
         """获得顶层的workload类型 ."""
         result = None
         workload_type = self.kind
@@ -580,19 +579,16 @@ class KubernetesPodJsonParser(KubernetesV1ObjectJsonParser):
     @cached_property
     def resources(self):
         """获得资源限额配置 ."""
-        requests_cpu = 0
-        limits_cpu = 0
+        requests_cpu = 0.0
+        limits_cpu = 0.0
         requests_memory = 0
         limits_memory = 0
-        containers = self.spec.get("containers", [])
+        containers = self.spec.get("containers") or []
         # 获得所有容器的资源总和
         for container in containers:
-            limits = container.get("resources", {}).get("limits", {})
-            requests = container.get("resources", {}).get("requests", {})
-            if not limits:
-                limits = {}
-            if not requests:
-                requests = {}
+            resources = container.get("resources") or {}
+            limits = resources.get("limits") or {}
+            requests = resources.get("requests") or {}
             requests_cpu += get_cpu_without_unit(requests.get("cpu", "0"))
             limits_cpu += get_cpu_without_unit(limits.get("cpu", "0"))
             requests_memory += get_memory_without_unit(requests.get("memory", "0"))
@@ -700,21 +696,21 @@ class KubernetesPodJsonParser(KubernetesV1ObjectJsonParser):
         return reason
 
     @cached_property
-    def containers(self) -> List:
+    def containers(self) -> list:
         return self.spec.get("containers", [])
 
     @cached_property
-    def container_statuses(self) -> List:
+    def container_statuses(self) -> list:
         return self.status.get("containerStatuses", [])
 
 
 class KubernetesContainerJsonParser:
-    def __init__(self, pod: Dict, container: Dict):
+    def __init__(self, pod: dict, container: dict):
         self.pod_parser = KubernetesPodJsonParser(pod)
         self.container = container
 
     @cached_property
-    def container_status(self) -> Dict:
+    def container_status(self) -> dict:
         """获得容器当前的状态 ."""
         container_statuses = self.pod_parser.container_statuses
         for container_status in container_statuses:
@@ -753,13 +749,14 @@ class KubernetesContainerJsonParser:
     def resources(self):
         """获得容器资源配置 ."""
         # 集群限制的配置
-        limits = self.container.get("resources", {}).get("limits", {})
+        resources = self.container.get("resources") or {}
+        limits = resources.get("limits") or {}
         # 集群调度使用的资源
-        requests = self.container.get("resources", {}).get("requests", {})
+        requests = resources.get("requests") or {}
 
-        requests_cpu = float(get_cpu_without_unit(requests.get("cpu", "0")))
+        requests_cpu = get_cpu_without_unit(requests.get("cpu", "0"))
         # CPU上限值
-        limits_cpu = float(get_cpu_without_unit(limits.get("cpu", "0")))
+        limits_cpu = get_cpu_without_unit(limits.get("cpu", "0"))
         requests_memory = get_memory_without_unit(requests.get("memory", "0"))
         # 内存上限值
         limits_memory = get_memory_without_unit(limits.get("memory", "0"))
@@ -793,7 +790,7 @@ class KubernetesIngressJsonParser(KubernetesV1ObjectJsonParser):
         return self.spec.get("ingressClassName")
 
     @cached_property
-    def service_list(self) -> List:
+    def service_list(self) -> list:
         services = set()
         # 提取默认后端（如果存在）
         default_backend: dict = self.spec.get("defaultBackend", {})
@@ -817,7 +814,7 @@ class KubernetesIngressJsonParser(KubernetesV1ObjectJsonParser):
 
 class KubernetesServiceJsonParser(KubernetesV1ObjectJsonParser):
     @cached_property
-    def status(self) -> Dict:
+    def status(self) -> dict:
         return self.config.get("status", {})
 
     @cached_property
@@ -825,7 +822,7 @@ class KubernetesServiceJsonParser(KubernetesV1ObjectJsonParser):
         """获得服务的类型 ."""
         return self.spec.get("type")
 
-    def load_balancer_status_stringer(self, load_balancer: Dict) -> str:
+    def load_balancer_status_stringer(self, load_balancer: dict) -> str:
         """解析负载均衡器配置 ."""
         ingress_list = load_balancer.get("ingress", [])
         result = set()
@@ -844,7 +841,7 @@ class KubernetesServiceJsonParser(KubernetesV1ObjectJsonParser):
         return self.spec.get("clusterIP", "")
 
     @cached_property
-    def cluster_ips(self) -> List:
+    def cluster_ips(self) -> list:
         return self.spec.get("clusterIPs", [])
 
     @cached_property
@@ -914,26 +911,29 @@ class KubernetesServiceJsonParser(KubernetesV1ObjectJsonParser):
             count += len(addresses) * len(ports)
         return count
 
-    def get_endpoint(self, endpoints) -> Dict:
+    def get_endpoint(self, endpoints) -> dict | None:
         """获得匹配的endpoint ."""
         # 创建service对象的同时，kubernetes会创建同名的endpoints的对象
+        if isinstance(endpoints, Mapping):
+            return endpoints.get((self.namespace, self.name))
         for e in endpoints:
-            if e.get("metadata", {}).get("name") == self.name:
+            metadata = e.get("metadata", {})
+            if (metadata.get("namespace"), metadata.get("name")) == (self.namespace, self.name):
                 return e
 
     def get_pod_count(self, endpoints) -> int:
         """获得pod的数量 ."""
         return len(self.get_pod_name_list(endpoints))
 
-    def get_pod_name_list(self, endpoints) -> List:
+    def get_pod_name_list(self, endpoints) -> list:
         """获得配置的所有pod的名称列表 ."""
         pod_name_list = []
         endpoint = self.get_endpoint(endpoints)
         if not endpoint:
             return pod_name_list
-        subsets = endpoint.get("subsets", [])
+        subsets = endpoint.get("subsets") or []
         for subset in subsets:
-            addresses = subset.get("addresses", [])
+            addresses = subset.get("addresses") or []
             for address in addresses:
                 target_ref = address.get("targetRef", {})
                 if target_ref and target_ref.get("kind", "") == "Pod":

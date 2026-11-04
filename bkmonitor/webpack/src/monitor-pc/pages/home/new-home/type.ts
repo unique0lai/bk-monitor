@@ -68,8 +68,8 @@ export interface ISearchItem {
   compare_hosts?: IDataItem[];
   height?: string;
   name?: string;
-  nameSearch?: string;
   project_name?: string;
+  service_name?: string;
   strategy_id?: number;
   trace_id?: string;
   type?: string;

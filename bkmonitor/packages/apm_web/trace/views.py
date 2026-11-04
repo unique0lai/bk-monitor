@@ -8,6 +8,9 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+from django.middleware.gzip import GZipMiddleware
+from django.utils.cache import patch_vary_headers
+from django.utils.http import parse_header_parameters
 from rest_framework.decorators import action
 
 from apm_web.decorators import user_visit_record
@@ -19,6 +22,7 @@ from apm_web.trace.resources import (
     GetFieldsOptionValuesResource,
     ListFlattenSpanResource,
     ListFlattenTraceResource,
+    ListLinkResource,
     ListOptionValuesResource,
     ListSpanHostInstancesResource,
     ListSpanResource,
@@ -40,9 +44,10 @@ from apm_web.trace.resources import (
     TraceStatisticsResource,
 )
 from apm_web.trace.serializers import TraceFieldsTopkRequestSerializer
-from apm_web.utils import generate_csv_file_download_response
+from bkmonitor.utils.csv import generate_csv_file_download_response
 from bkmonitor.iam import ActionEnum, ResourceEnum
-from bkmonitor.iam.drf import InstanceActionForDataPermission
+from bkmonitor.iam.drf import InstanceActionForDataPermission, ViewBusinessPermission
+from bkmonitor.utils.request import is_ajax_request
 from core.drf_resource.viewsets import ResourceRoute, ResourceViewSet
 from packages.apm_web.handlers.trace_handler.dimension_statistics import (
     DimensionStatisticsAPIHandler,
@@ -52,16 +57,44 @@ from packages.apm_web.handlers.trace_handler.dimension_statistics import (
 class TraceQueryViewSet(ResourceViewSet):
     INSTANCE_ID = "app_name"
 
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if self.action not in {"trace_detail", "span_detail"}:
+            return response
+
+        patch_vary_headers(response, ("X-Requested-With", "Accept-Encoding"))
+        if not is_ajax_request(request):
+            return response
+        for encoding in request.META.get("HTTP_ACCEPT_ENCODING", "").split(","):
+            name, parameters = parse_header_parameters(encoding)
+            if name != "gzip":
+                continue
+            try:
+                accepts_gzip = 0 < float(parameters.get("q", "1")) <= 1
+            except ValueError:
+                accepts_gzip = False
+            if accepts_gzip:
+                middleware = GZipMiddleware(lambda request: None)
+
+                def compress(rendered):
+                    return middleware.process_response(request, rendered)
+
+                if hasattr(response, "add_post_render_callback"):
+                    response.add_post_render_callback(compress)
+                else:
+                    response = compress(response)
+            break
+        return response
+
     def get_permissions(self):
-        if self.action in [
-            "trace_option_value",
-            "trace_charts",
-            "list_traces",
-            "trace_detail",
-            "list_flatten_traces",
-            "list_flatten_spans",
-            "list_spans",
-        ]:
+        """默认按 APM 应用实例鉴权。
+
+        原先只有白名单内的 action 会鉴权，其余返回空列表，连 DRF 默认的业务权限一起失效了。
+        少数接口（如 trace_list_by_id、静态选项列表、查询串生成）请求里没有 app_name，
+        `InstanceActionForDataPermission` 取不到实例 ID 会直接抛错，这些退到业务级鉴权。
+        """
+        data = self.request.query_params if self.request.method == "GET" else self.request.data
+        if data.get(self.INSTANCE_ID):
             return [
                 InstanceActionForDataPermission(
                     self.INSTANCE_ID,
@@ -70,7 +103,7 @@ class TraceQueryViewSet(ResourceViewSet):
                     get_instance_id=Application.get_application_id_by_app_name,
                 )
             ]
-        return []
+        return [ViewBusinessPermission()]
 
     resource_routes = [
         ResourceRoute(
@@ -154,6 +187,7 @@ class TraceQueryViewSet(ResourceViewSet):
         ResourceRoute("POST", TraceFieldStatisticsInfoResource, "field_statistics_info"),
         ResourceRoute("POST", TraceFieldStatisticsGraphResource, "field_statistics_graph"),
         ResourceRoute("POST", TraceGenerateQueryStringResource, "generate_query_string"),
+        ResourceRoute("POST", ListLinkResource, endpoint="list_links"),
     ]
 
     @action(methods=["POST"], detail=False, url_path="download_topk")

@@ -24,17 +24,19 @@
  * IN THE SOFTWARE.
  */
 
-import { type Ref, computed, defineComponent, inject, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { type Ref, computed, defineComponent, inject, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 
-import { Dialog, Form, Input, Loading, Message, Popover, Progress, Tag } from 'bkui-vue';
+import { Dialog, Form, Input, Loading, Message, Popover, Progress } from 'bkui-vue';
 import { editIncident, incidentAlertAggregate } from 'monitor-api/modules/incident';
 import { useI18n } from 'vue-i18n';
 import { useRoute, useRouter } from 'vue-router';
 
+import { pickIncidentListQuery } from '../../alarm-center/utils/incident-list-query';
 import ChatGroup from '../alarm-detail/chat-group/chat-group';
 import { LEVEL_LIST } from '../constant';
 import { useIncidentInject } from '../utils';
 import FailureEditDialog from './failure-edit-dialog';
+import FailureHeaderCollapseLabels from './failure-header-collapse-labels';
 
 import type { IIncident } from '../types';
 import type { IAggregationRoot } from '../types';
@@ -49,6 +51,7 @@ export default defineComponent({
     const route = useRoute();
     const router = useRouter();
     const isShow = ref<boolean>(false);
+    const autoFocusReason = ref<boolean>(false);
     const isShowResolve = ref<boolean>(false);
     const listLoading = ref(false);
     const alertAggregateData = ref<IAggregationRoot[]>([]);
@@ -122,7 +125,6 @@ export default defineComponent({
         });
     };
     const handleBack = () => {
-      // 回退到告警列表是携带告警列表已经配置的时间范围，避免查询时间丢失
       const { from, to, fromPage } = route.query;
       const { bk_biz_id } = incidentDetail.value;
       if (fromPage === 'event') {
@@ -134,14 +136,10 @@ export default defineComponent({
         }
         window.location.href = `${origin}${pathname}?bizId=${bk_biz_id}#/event-center?searchType=incident&activeFilterId=incident&bizIds=${bk_biz_id}${timeRangText}`;
       } else {
-        // 默认返回新版告警中心
+        // 返回新版告警中心，还原进入详情前的全部列表检索参数
         router.push({
           name: 'alarm-center',
-          query: {
-            alarmType: 'incident',
-            ...(from && to ? { from: from as string, to: to as string } : {}),
-            bizIds: [bk_biz_id],
-          },
+          query: pickIncidentListQuery(route.query),
         });
       }
     };
@@ -178,9 +176,10 @@ export default defineComponent({
       );
     };
     const renderStatusIcon = (status = 'closed') => {
+      const statusLowerCase = status.toLowerCase();
       // 未恢复
-      if (status === 'abnormal') {
-        const data: IAggregationRoot = alertAggregateData.value.filter(item => item.id === 'ABNORMAL')[0];
+      if (statusLowerCase === 'abnormal') {
+        const data: IAggregationRoot = alertAggregateData.value.filter(item => item.id.toUpperCase() === 'ABNORMAL')[0];
         return (
           <Progress
             width={38}
@@ -195,7 +194,7 @@ export default defineComponent({
           </Progress>
         );
       }
-      const info = statusList[status];
+      const info = statusList[statusLowerCase];
       return (
         <i
           style={{ color: info?.color }}
@@ -309,10 +308,19 @@ export default defineComponent({
       chatGroupDialog.alertIds.splice(0, chatGroupDialog.alertIds.length, id);
       chatGroupDialog.show = true;
     };
+
+    // 监听弹窗变化，自动回填故障原因
+    watch(isShowResolve, val => {
+      if (val) {
+        incidentReason.value = incidentDetailData.value?.incident_reason || '';
+      }
+    });
+
     return {
       DialogFn,
       incidentDetailData,
       isShow,
+      autoFocusReason,
       levelList,
       t,
       statusTips,
@@ -369,26 +377,27 @@ export default defineComponent({
             {level_alias}
           </span>
           <div class='header-info'>
-            <span class='info-id'>{id}</span>
+            <div class='info-id'>{id}</div>
             <div class='info-name'>
-              <label
-                class='info-name-title mr8'
+              <div
+                class='info-name-title'
                 title={incident_name}
               >
                 {incident_name}
-              </label>
-              {(labels || []).map((item: any) => (
-                <Tag key={item}>{item.replace(/\//g, '')}</Tag>
-              ))}
-              <span
-                class='info-edit'
-                onClick={() => {
-                  this.isShow = true;
-                }}
-              >
-                <i class='icon-monitor icon-bianji info-edit-icon' />
-                {this.t('编辑')}
-              </span>
+              </div>
+              {/* 标签与编辑贴在一起，剩余空白留在编辑按钮右侧 */}
+              <div class='info-name-extra'>
+                <FailureHeaderCollapseLabels labels={labels || []} />
+                <div
+                  class='info-edit'
+                  onClick={() => {
+                    this.isShow = true;
+                  }}
+                >
+                  <i class='icon-monitor icon-bianji info-edit-icon' />
+                  {this.t('编辑')}
+                </div>
+              </div>
             </div>
           </div>
           <Popover
@@ -441,11 +450,15 @@ export default defineComponent({
             </div>
           </div>
           <FailureEditDialog
+            autoFocusReason={this.autoFocusReason}
             levelList={this.levelList}
             visible={this.isShow}
             onEditSuccess={this.onEditSuccess}
             onUpdate:isShow={(val: boolean) => {
               this.isShow = val;
+              if (!val) {
+                this.autoFocusReason = false;
+              }
             }}
           />
           {this.DialogFn()}

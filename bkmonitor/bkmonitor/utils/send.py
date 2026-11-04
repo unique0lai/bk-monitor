@@ -23,14 +23,17 @@ from django.template.loader import get_template
 from django.utils.translation import gettext as _
 
 from bkmonitor.models import GlobalConfig
+from bkmonitor.utils.sms import get_sms_template_mode, render_standard_sms, standard_sms_template_kind
+from bkmonitor.utils.sms_context import standard_sms_values
 from bkmonitor.utils.template import AlarmNoticeTemplate, AlarmOperateNoticeTemplate
 from bkmonitor.utils.text import (
     cut_line_str_by_max_bytes,
     cut_str_by_max_bytes,
     get_content_length,
 )
+from bkmonitor.utils.user import get_wxwork_mention_names
 from common.context_processors import Platform
-from constants.action import ActionPluginType, NoticeType, NoticeWay
+from constants.action import ActionPluginType, NoticeChannel, NoticeType, NoticeWay
 from core.drf_resource import api
 from core.prometheus import metrics
 
@@ -99,6 +102,7 @@ class BaseSender:
         content_template_path="",
         notice_type=NoticeType.ALERT_NOTICE,
         bk_tenant_id=None,
+        sms_template_mode=None,
     ):
         """
         :param context: EventContext or dict
@@ -107,6 +111,12 @@ class BaseSender:
         """
         self.context = context
         self.bk_tenant_id = bk_tenant_id
+        self._sms_render_error = None
+        sms_kind = standard_sms_template_kind(content_template_path)
+        self.sms_template_mode = "legacy"
+        if sms_kind and self._get_notice_channel(context) != NoticeChannel.BK_CHAT:
+            self.sms_template_mode = sms_template_mode if sms_template_mode is not None else get_sms_template_mode()
+        self._sms_standard_body = self.sms_template_mode == "standard"
         try:
             self.bk_biz_id = int(self.context.get("target").business.bk_biz_id)
         except Exception as error:
@@ -138,17 +148,31 @@ class BaseSender:
         content_template = notice_template_class(content_template_path)
         self.encoding = None if self.notice_way in self.NoEncoding else self.Utf8Encoding
         self.context["encoding"] = self.encoding
-        self.title = title_template.render(context_dict)
         try:
-            self.content = content_template.render(context_dict)
+            self.title = title_template.render(context_dict)
+        except Exception as e:
+            # 标题渲染失败（如模板渲染收窄误伤）不应阻断整条通知发送。
+            # 下游 CMSI 的 title/heading 为非空 CharField，空标题同样会被拒绝，
+            # 因此回退到系统通知标题，并以固定文案兜底保证非空。
+            logger.exception("failed to render notice title, fallback to default title: %s", e)
+            self.title = context_dict.get("notice_title") or _("蓝鲸监控")
+        try:
+            if self._sms_standard_body:
+                self.content = render_standard_sms(sms_kind, standard_sms_values(sms_kind, context_dict))
+            else:
+                self.content = content_template.render(context_dict)
         except Exception as e:
             logger.exception(e)
             self.content = str(e)
+            if self._sms_standard_body:
+                self._sms_render_error = self.content
             return
         self.msg_type = "markdown" if self.notice_way in settings.MD_SUPPORTED_NOTICE_WAYS else "text"
         self.handle_content_length(content_template, context_dict)
 
     def handle_content_length(self, content_template, context_dict):
+        if self._sms_standard_body:
+            return
         content_limit = self.get_content_limit(self.notice_way)
         # 渲染后的总提长度: self.content（这里做了特殊字符的replace, 一个特殊字符占1个长度)
         content_length = get_content_length(self.content, self.encoding)
@@ -176,17 +200,29 @@ class BaseSender:
     def get_sender(cls, context: dict[str, Any]) -> str | None:
         return settings.WECOM_ROBOT_ACCOUNT.get(str(context.get("alert_level")))
 
+    @staticmethod
+    def _get_notice_channel(context: Any) -> str | None:
+        if context is None:
+            return None
+        if isinstance(context, dict):
+            return context.get("notice_channel")
+        return getattr(context, "notice_channel", None)
+
     @classmethod
     def is_wxwork_layouts_enabled(
         cls, bk_biz_id: int, notice_way: str, context: dict[str, Any], content_template_path: str
     ) -> bool:
         """判断是否切换至企业微信卡片通知
         判断规则：
+        - 通知渠道不能是 bkchat：外部 webhook 无法渲染 layouts 卡片。
         - 业务 ID 在灰度业务列表内。
-        - 通知渠道为企微机器人或 RTX。
+        - 通知方式为企微机器人或 RTX。
         - RTX 渠道需开启企微机器人功能且配置发送者。
         - layouts 通知模板 存在。
         """
+        if cls._get_notice_channel(context) == NoticeChannel.BK_CHAT:
+            return False
+
         is_gray: bool = (
             bk_biz_id in settings.WECOM_LAYOUTS_BIZ_LIST or str(bk_biz_id) in settings.WECOM_LAYOUTS_BIZ_LIST
         )
@@ -346,12 +382,12 @@ class BaseSender:
             # 需要判断真正通知的方式是否与默认的一致，不一致的话要重置msg_type
             self.msg_type = "markdown" if notice_way in settings.MD_SUPPORTED_NOTICE_WAYS else "text"
             self.encoding = None if notice_way in self.NoEncoding else self.Utf8Encoding
-        if isinstance(self.content, Exception):
+        if self._sms_render_error is not None or isinstance(self.content, Exception):
             return {
                 notice_receiver: {"message": str(self.content), "result": False} for notice_receiver in notice_receivers
             }
 
-        if not self._is_wxwork_layouts_enabled:
+        if not self._is_wxwork_layouts_enabled and not (notice_way == NoticeWay.SMS and self._sms_standard_body):
             # 模块化消息推送，由 _format_layouts 进行长度限制，无需限制整体长度。
             self.content = self.get_notice_content(notice_way, self.content)
         method = getattr(self, "send_{}".format(notice_way.replace("-", "_")), None)
@@ -513,7 +549,8 @@ class Sender(BaseSender):
             f"{self._blocked_notice_log_prefix}send.sms({','.join(notice_receivers)}): "
             f"\ncontent: {self.content} \naction_plugin {action_plugin}"
         )
-        self.content = self.get_notice_content(NoticeWay.SMS, self.content)
+        if not self._sms_standard_body:
+            self.content = self.get_notice_content(NoticeWay.SMS, self.content)
         retry_params = {
             "api_module": "api.cmsi.default",
             "resource": "SendSms",
@@ -622,8 +659,9 @@ class Sender(BaseSender):
             return {"msgtype": "message", "chatid": "|".join(_chat_ids), "layouts": _layouts}
 
         url: str = settings.WXWORK_BOT_WEBHOOK_URL
+        if not url:
+            return {"errcode": -1, "errmsg": [_("未配置蓝鲸监控群机器人回调地址，请联系管理员")]}
         if sender:
-            # 进入 send_wxwork_layouts 说明 url 已经存在，这里无需重复检查。
             if "?key=" in url:
                 url = url.split("?key=", 1)[0] + f"?key={sender}"
 
@@ -631,9 +669,13 @@ class Sender(BaseSender):
             return requests.post(url, json=_construct_params(content, chat_ids)).json()
 
         send_result: dict[str, Any] = {"errcode": 0, "errmsg": []}
+        mention_map = get_wxwork_mention_names(
+            [user for chat_id in chat_ids for user in mentioned_users.get(chat_id, [])]
+        )
         for chat_id in chat_ids:
             send_content: str = content
             chat_mentioned_users: list[str] = mentioned_users.get(chat_id, [])
+            chat_mentioned_users = [mention_map.get(user, user) for user in chat_mentioned_users]
             if chat_mentioned_users:
                 mentioned_users_string: str = "".join([f"<@{user}>" for user in chat_mentioned_users])
                 mentioned_users_string = f"**{mentioned_title or _('告警接收人')}: **{mentioned_users_string}"
@@ -660,9 +702,13 @@ class Sender(BaseSender):
             return r.json()
 
         send_result = {"errcode": 0, "errmsg": []}
+        mention_map = get_wxwork_mention_names(
+            [user for chat_id in chat_ids for user in mentioned_users.get(chat_id, [])]
+        )
         for chat_id in chat_ids:
             params = {"msgtype": msgtype, "chatid": chat_id}
             chat_mentioned_users = mentioned_users.get(chat_id, [])
+            chat_mentioned_users = [mention_map.get(user, user) for user in chat_mentioned_users]
             msg_content = {}
             send_content = content.rstrip("\n")
             if chat_mentioned_users:
@@ -850,8 +896,14 @@ class Sender(BaseSender):
 
 
 class NoneTemplateSender(Sender):
-    def __init__(self, title="", content="", context=None):
+    def __init__(self, title="", content="", context=None, bk_tenant_id=None, sms_template_mode=None):
         self.context = context or {}
+        self.bk_tenant_id = bk_tenant_id
+        self._sms_render_error = None
+        self.mentioned_users = self.context.get("mentioned_users")
+        self._is_wxwork_layouts_enabled = False
+        self.sms_template_mode = sms_template_mode or "legacy"
+        self._sms_standard_body = self.sms_template_mode == "standard"
         self.title = title
         self.content = content
         self.msg_type = "text"
@@ -861,6 +913,13 @@ class NoneTemplateSender(Sender):
 
 
 class ChannelBkchatSender(BaseSender):
+    @classmethod
+    def is_wxwork_layouts_enabled(
+        cls, bk_biz_id: int, notice_way: str, context: dict[str, Any], content_template_path: str
+    ) -> bool:
+        # bkchat 外部 webhook 无法渲染企微 layouts 卡片，始终走 markdown/text
+        return False
+
     def send_default(self, notice_way, notice_receivers, action_plugin=ActionPluginType.NOTICE):
         """
         蓝鲸信息流通知发送

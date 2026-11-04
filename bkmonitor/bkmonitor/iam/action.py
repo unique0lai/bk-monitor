@@ -84,6 +84,13 @@ GRAFANA_DASHBOARD_RESOURCE = {
     "related_instance_selections": [{"system_id": settings.BK_IAM_SYSTEM_ID, "id": "grafana_dashboard_list"}],
 }
 
+RUM_APPLICATION_RESOURCE = {
+    "id": "rum_application",
+    "system_id": settings.BK_IAM_SYSTEM_ID,
+    "selection_mode": "instance",
+    "related_instance_selections": [{"system_id": settings.BK_IAM_SYSTEM_ID, "id": "rum_application_list_v2"}],
+}
+
 
 class ActionEnum:
     VIEW_BUSINESS = ActionMeta(
@@ -126,6 +133,26 @@ class ActionEnum:
         version=1,
     )
 
+    USING_LOG_COLLECTION_MCP = ActionMeta(
+        id="using_log_collection_mcp",
+        name=_("使用日志采集MCP"),
+        name_en="Using Log Collection MCP",
+        type="manage",
+        related_resource_types=[SPACE_RESOURCE],
+        related_actions=[VIEW_BUSINESS.id],
+        version=1,
+    )
+
+    USING_LOG_EXTRACT_MCP = ActionMeta(
+        id="using_log_extract_mcp",
+        name=_("使用日志提取MCP"),
+        name_en="Using Log Extract MCP",
+        type="manage",
+        related_resource_types=[SPACE_RESOURCE],
+        related_actions=[VIEW_BUSINESS.id],
+        version=1,
+    )
+
     USING_METADATA_MCP = ActionMeta(
         id="using_metadata_mcp",
         name=_("使用元数据MCP"),
@@ -138,11 +165,21 @@ class ActionEnum:
 
     USING_ALARM_MCP = ActionMeta(
         id="using_alarm_mcp",
-        name=_("使用告警MCP"),
-        name_en="Using Alarm MCP",
+        name=_("使用告警查询MCP"),
+        name_en="Using Alarm Query MCP",
         type="view",
         related_resource_types=[SPACE_RESOURCE],
         related_actions=[VIEW_BUSINESS.id],
+        version=1,
+    )
+
+    USING_ALARM_HANDLING_MCP = ActionMeta(
+        id="using_alarm_handling_mcp",
+        name=_("使用告警处置MCP"),
+        name_en="Using Alarm Handling MCP",
+        type="manage",
+        related_resource_types=[SPACE_RESOURCE],
+        related_actions=[USING_ALARM_MCP.id],
         version=1,
     )
 
@@ -150,6 +187,16 @@ class ActionEnum:
         id="using_apm_mcp",
         name=_("使用APM MCP"),
         name_en="Using APM MCP",
+        type="view",
+        related_resource_types=[SPACE_RESOURCE],
+        related_actions=[VIEW_BUSINESS.id],
+        version=1,
+    )
+
+    USING_OPERATION_MCP = ActionMeta(
+        id="using_operation_mcp",
+        name=_("使用运营数据MCP"),
+        name_en="Using Operation MCP",
         type="view",
         related_resource_types=[SPACE_RESOURCE],
         related_actions=[VIEW_BUSINESS.id],
@@ -333,6 +380,26 @@ class ActionEnum:
         type="manage",
         related_resource_types=[SPACE_RESOURCE],
         related_actions=[VIEW_BUSINESS.id, VIEW_RULE.id, VIEW_NOTIFY_TEAM.id],
+        version=1,
+    )
+
+    VIEW_RECORDING_RULE = ActionMeta(
+        id="view_recording_rule_v2",
+        name=_("查看预计算规则"),
+        name_en="View RecordingRule",
+        type="view",
+        related_resource_types=[SPACE_RESOURCE],
+        related_actions=[VIEW_BUSINESS.id],
+        version=1,
+    )
+
+    MANAGE_RECORDING_RULE = ActionMeta(
+        id="manage_recording_rule_v2",
+        name=_("管理预计算规则"),
+        name_en="Manage RecordingRule",
+        type="manage",
+        related_resource_types=[SPACE_RESOURCE],
+        related_actions=[VIEW_BUSINESS.id, VIEW_RECORDING_RULE.id],
         version=1,
     )
 
@@ -571,6 +638,26 @@ class ActionEnum:
         version=1,
     )
 
+    VIEW_RUM_APPLICATION = ActionMeta(
+        id="view_rum_application_v2",
+        name=_("RUM应用查看"),
+        name_en="RUM Application View",
+        type="view",
+        related_resource_types=[RUM_APPLICATION_RESOURCE],
+        related_actions=[VIEW_BUSINESS.id],
+        version=1,
+    )
+
+    MANAGE_RUM_APPLICATION = ActionMeta(
+        id="manage_rum_application_v2",
+        name=_("RUM应用管理"),
+        name_en="RUM Application Manage",
+        type="manage",
+        related_resource_types=[RUM_APPLICATION_RESOURCE],
+        related_actions=[],
+        version=1,
+    )
+
 
 _all_actions = {action.id: action for action in ActionEnum.__dict__.values() if isinstance(action, ActionMeta)}
 
@@ -583,6 +670,7 @@ def get_action_by_id(action_id: str | ActionMeta) -> ActionMeta:
         # 如果已经是实例，则直接返回
         return action_id
 
+    action_id = _BUSINESS_TO_LEGACY.get(action_id, action_id)
     if action_id not in _all_actions:
         raise ActionNotExistError({"action_id": action_id})
 
@@ -652,6 +740,8 @@ MINI_ACTION_IDS = [
     ActionEnum.IMPORT_CONFIG.id,
     ActionEnum.VIEW_APM_APPLICATION.id,
     ActionEnum.MANAGE_APM_APPLICATION.id,
+    ActionEnum.VIEW_RUM_APPLICATION.id,
+    ActionEnum.MANAGE_RUM_APPLICATION.id,
     ActionEnum.VIEW_INCIDENT.id,
     ActionEnum.MANAGE_INCIDENT.id,
     ActionEnum.USE_PUBLIC_SYNTHETIC_LOCATION.id,
@@ -678,3 +768,45 @@ ADMIN_ACTION_IDS = [
     ActionEnum.MANAGE_PUBLIC_SYNTHETIC_LOCATION.id,
     ActionEnum.VIEW_SELF_STATE.id,
 ]
+
+# Explicit protocol mapping; do not infer action versions from suffixes.
+_ACTION_ALIAS_TO_BUSINESS = {
+    "view_business_v2": "view_business",
+    "explore_metric_v2": "explore_metric",
+    "view_synthetic_v2": "view_synthetic",
+    "view_host_v2": "view_host",
+    "view_event_v2": "view_event",
+    "view_plugin_v2": "view_plugin",
+    "view_collection_v2": "view_collection",
+    "view_notify_team_v2": "view_notify_team",
+    "view_rule_v2": "view_rule",
+    "view_recording_rule_v2": "view_recording_rule",
+    "manage_recording_rule_v2": "manage_recording_rule",
+    "view_downtime_v2": "view_downtime",
+    "view_custom_metric_v2": "view_custom_metric",
+    "view_custom_event_v2": "view_custom_event",
+    "view_dashboard_v2": "view_dashboard",
+    "export_config_v2": "export_config",
+    "manage_synthetic_v2": "manage_synthetic",
+    "manage_host_v2": "manage_host",
+    "manage_event_v2": "manage_event",
+    "manage_plugin_v2": "manage_plugin",
+    "manage_collection_v2": "manage_collection",
+    "manage_notify_team_v2": "manage_notify_team",
+    "manage_rule_v2": "manage_rule",
+    "manage_downtime_v2": "manage_downtime",
+    "manage_custom_metric_v2": "manage_custom_metric",
+    "manage_custom_event_v2": "manage_custom_event",
+    "manage_dashboard_v2": "manage_dashboard",
+    "manage_datasource_v2": "manage_datasource",
+    "import_config_v2": "import_config",
+    "view_apm_application_v2": "view_apm_application",
+    "view_rum_application_v2": "view_rum_application",
+    "manage_apm_application_v2": "manage_apm_application",
+    "manage_rum_application_v2": "manage_rum_application",
+}
+_BUSINESS_TO_LEGACY = {value: key for key, value in _ACTION_ALIAS_TO_BUSINESS.items()}
+
+
+def canonicalize_action_id(action_id):
+    return _ACTION_ALIAS_TO_BUSINESS.get(action_id, action_id)

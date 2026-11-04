@@ -55,6 +55,14 @@ export default defineComponent({
       type: Array<any>,
       default: () => [],
     },
+    templateSpaceUid: {
+      type: String,
+      default: '',
+    },
+    isExternal: {
+      type: Boolean,
+      default: false,
+    },
   },
   setup(props, { emit, expose }) {
     const { t } = useLocale();
@@ -75,13 +83,15 @@ export default defineComponent({
 
     const isCustomize = computed(() => ruleType.value === 'customize');
     const spaceUid = computed(() => store.state.spaceUid);
+    const templateSpaceUid = computed(() => props.templateSpaceUid || spaceUid.value);
     const currentTemplate = computed(() => {
       if (!templateRuleId.value) {
-        return {} as any;
+        return null;
       }
 
-      return templateList.value.find(item => item.id === templateRuleId.value);
+      return templateList.value.find(item => item.id === templateRuleId.value) || null;
     });
+    const hasMatchedTemplate = computed(() => Boolean(currentTemplate.value));
     const isOriginTemplateConfig = computed(() => props.defaultValue.regex_rule_type === 'template');
     const isSameTemplateId = computed(() => props.defaultValue.regex_template_id === templateRuleId.value);
     /** 快速导入的dom */
@@ -105,9 +115,8 @@ export default defineComponent({
         }
         return;
       }
-      if (!templateRuleId.value && templateList.value.length > 0) {
-        templateRuleId.value = templateList.value[0].id;
-        handleSelectTemplate(templateRuleId.value);
+      if (!templateRuleId.value) {
+        emit('rule-list-change', []);
       }
     };
 
@@ -174,7 +183,7 @@ export default defineComponent({
     const initTemplateList = async () => {
       const res = (await $http.request('logClustering/ruleTemplate', {
         params: {
-          space_uid: spaceUid.value,
+          space_uid: templateSpaceUid.value,
         },
       })) as IResponseData<RuleTemplate[]>;
       templateList.value = res.data.map((item, index) => ({
@@ -188,13 +197,12 @@ export default defineComponent({
       emit('search', searchValue.value);
     };
 
-    const handleSelectTemplate = (value: number) => {
-      templateRuleId.value = value;
-      const selectTemplateStr = templateList.value.find(item => item.id === value)?.predefined_varibles || '';
-      if (selectTemplateStr) {
-        emit('rule-list-change', base64ToRuleArr(selectTemplateStr));
-      }
-    };
+    function handleSelectTemplate(value?: number) {
+      const matchedTemplate = templateList.value.find(item => item.id === value);
+      templateRuleId.value = matchedTemplate?.id || 0;
+      const selectTemplateStr = matchedTemplate?.predefined_varibles || '';
+      emit('rule-list-change', selectTemplateStr ? base64ToRuleArr(selectTemplateStr) : []);
+    }
 
     const handleRefresh = async () => {
       await initTemplateList();
@@ -283,7 +291,7 @@ export default defineComponent({
         name: 'templateManage',
         query,
       });
-      window.open(href.href, '_blank');
+      window.open(href.href, '_blank', 'noopener,noreferrer');
     };
 
     initTemplateList();
@@ -406,16 +414,18 @@ export default defineComponent({
                     name={option.name}
                   />
                 ))}
-                <div
-                  class='template-manage-extension'
-                  slot='extension'
-                  on-click={() => handleGoTemplateManage()}
-                >
-                  <log-icon type='shezhi' />
-                  {t('模板管理')}
-                </div>
+                {!props.isExternal && (
+                  <div
+                    class='template-manage-extension'
+                    slot='extension'
+                    on-click={() => handleGoTemplateManage()}
+                  >
+                    <log-icon type='shezhi' />
+                    {t('模板管理')}
+                  </div>
+                )}
               </bk-select>
-              {templateRuleId.value > 0 && (
+              {!props.isExternal && templateRuleId.value > 0 && hasMatchedTemplate.value && (
                 <bk-button
                   size='small'
                   theme='primary'
@@ -449,7 +459,7 @@ export default defineComponent({
                     </div>
                   </div>
                 </div>
-                {isOriginTemplateConfig.value && isSameTemplateId.value && (
+                {isOriginTemplateConfig.value && isSameTemplateId.value && hasMatchedTemplate.value && (
                   <bk-button
                     size='small'
                     theme='primary'

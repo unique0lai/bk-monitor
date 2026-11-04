@@ -11,13 +11,16 @@ specific language governing permissions and limitations under the License.
 import abc
 import base64
 import datetime
+import ipaddress
 import json
 import logging
 import random
 import re
 import string
+import tempfile
 import time
 import traceback
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, Self
 
 import arrow
@@ -105,6 +108,8 @@ class ClusterInfo(models.Model):
 
     CONSUL_PREFIX_PATH = f"{config.CONSUL_PATH}/unify-query/data/storage"
     CONSUL_VERSION_PATH = f"{config.CONSUL_PATH}/unify-query/version/storage"
+    REDIS_PREFIX_KEY = f"{config.UNIFY_QUERY_REDIS_KV_BASE_PATH}:data:storage"
+    REDIS_CHANNEL = f"{REDIS_PREFIX_KEY}:storage_channel"
 
     TYPE_INFLUXDB = "influxdb"
     TYPE_KAFKA = "kafka"
@@ -114,6 +119,17 @@ class ClusterInfo(models.Model):
     TYPE_ARGUS = "argus"
     TYPE_VM = "victoria_metrics"
     TYPE_DORIS = "doris"
+    TYPE_SURREALDB = "surrealdb"
+
+    DEFAULT_CHECK_TIMEOUT = 5
+    CHECK_STATUS_AVAILABLE = "available"
+    CHECK_STATUS_UNAVAILABLE = "unavailable"
+    CHECK_STATUS_UNSUPPORTED = "unsupported"
+    CHECK_ERROR_CONNECTION_FAILED = "CONNECTION_FAILED"
+    CHECK_ERROR_CLUSTER_UNHEALTHY = "CLUSTER_UNHEALTHY"
+    CHECK_ERROR_HTTP_UNHEALTHY = "HTTP_UNHEALTHY"
+    CHECK_ERROR_INVALID_CONFIG = "INVALID_CONFIG"
+    CHECK_ERROR_UNSUPPORTED_CLUSTER_TYPE = "UNSUPPORTED_CLUSTER_TYPE"
 
     CLUSTER_TYPE_CHOICES = (
         (TYPE_INFLUXDB, "influxDB"),
@@ -124,6 +140,7 @@ class ClusterInfo(models.Model):
         (TYPE_VM, "victoria_metrics"),
         (TYPE_DORIS, "doris"),
         (TYPE_BKDATA, "bkdata"),
+        (TYPE_SURREALDB, "surrealdb"),
     )
 
     # 默认注册系统名
@@ -207,6 +224,708 @@ class ClusterInfo(models.Model):
 
         return data
 
+    def health_check(self, timeout: int | None = None, include_node_details: bool = False) -> dict[str, Any]:
+        """探测集群连接和可用状态，返回统一结构。"""
+
+        if timeout is None:
+            timeout = self.DEFAULT_CHECK_TIMEOUT
+        checker_name = {
+            self.TYPE_DORIS: "_check_doris_cluster",
+            self.TYPE_ES: "_check_es_cluster",
+            self.TYPE_KAFKA: "_check_kafka_cluster",
+            self.TYPE_VM: "_check_vm_cluster",
+        }.get(self.cluster_type)
+
+        if not checker_name:
+            return self._build_cluster_check_result(
+                status=self.CHECK_STATUS_UNSUPPORTED,
+                is_connected=False,
+                is_available=False,
+                error=self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_UNSUPPORTED_CLUSTER_TYPE,
+                    message=f"暂不支持探测集群类型: {self.cluster_type}",
+                    details={"cluster_type": self.cluster_type},
+                ),
+            )
+
+        try:
+            if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+                raise ValueError("timeout 必须是大于 0 的整数")
+            if self.cluster_type == self.TYPE_ES and include_node_details:
+                return getattr(self, checker_name)(
+                    timeout=timeout,
+                    include_node_details=True,
+                )
+            return getattr(self, checker_name)(timeout=timeout)
+        except ValueError as error:
+            return self._build_cluster_check_result(
+                status=self.CHECK_STATUS_UNAVAILABLE,
+                is_connected=False,
+                is_available=False,
+                error=self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_INVALID_CONFIG,
+                    message="集群探测配置不完整或不合法",
+                    details=self._format_check_exception(error),
+                ),
+            )
+        except Exception as error:  # pylint: disable=broad-except
+            logger.exception(
+                "ClusterInfo.health_check failed, cluster_id->[%s], cluster_type->[%s]",
+                self.cluster_id,
+                self.cluster_type,
+            )
+            return self._build_cluster_check_result(
+                status=self.CHECK_STATUS_UNAVAILABLE,
+                is_connected=False,
+                is_available=False,
+                error=self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_CONNECTION_FAILED,
+                    message="集群连接失败",
+                    details=self._format_check_exception(error),
+                ),
+            )
+
+    def check_connectivity(self, timeout: int | None = None) -> dict[str, Any]:
+        """仅检查 ES/Doris 集群能否建立连接，不采集健康、节点或容量信息。"""
+
+        if timeout is None:
+            timeout = self.DEFAULT_CHECK_TIMEOUT
+        checker_name = {
+            self.TYPE_ES: "_check_es_connectivity",
+            self.TYPE_DORIS: "_check_doris_connectivity",
+        }.get(self.cluster_type)
+
+        if not checker_name:
+            return {
+                "is_connected": False,
+                "error": self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_UNSUPPORTED_CLUSTER_TYPE,
+                    message=f"暂不支持检查集群连通性: {self.cluster_type}",
+                    details={"cluster_type": self.cluster_type},
+                ),
+            }
+
+        try:
+            if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+                raise ValueError("timeout 必须是大于 0 的整数")
+            getattr(self, checker_name)(timeout=timeout)
+        except ValueError as error:
+            return {
+                "is_connected": False,
+                "error": self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_INVALID_CONFIG,
+                    message="集群连接配置不完整或不合法",
+                    details=self._format_check_exception(error),
+                ),
+            }
+        except Exception as error:  # pylint: disable=broad-except
+            logger.exception(
+                "ClusterInfo.check_connectivity failed, cluster_id->[%s], cluster_type->[%s]",
+                self.cluster_id,
+                self.cluster_type,
+            )
+            return {
+                "is_connected": False,
+                "error": self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_CONNECTION_FAILED,
+                    message="集群连接失败",
+                    details=self._format_check_exception(error),
+                ),
+            }
+        return {"is_connected": True, "error": None}
+
+    def _check_es_connectivity(self, timeout: int) -> None:
+        client = es_tools.get_client_by_datasource_info(
+            {
+                "port": self.port,
+                "schema": self.schema,
+                "version": self.version,
+                "domain_name": self.domain_name,
+                "is_ssl_verify": self.is_ssl_verify,
+                "auth_info": {"password": self.password, "username": self.username},
+            }
+        )
+        if not client.ping(params={"request_timeout": timeout}):
+            raise ConnectionError("Elasticsearch ping 失败")
+
+    def _check_doris_connectivity(self, timeout: int) -> None:
+        self._validate_check_endpoint()
+        connection = pymysql.connect(
+            host=self.domain_name,
+            port=int(self.port),
+            user=self.username or "",
+            password=self.password or "",
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+        finally:
+            connection.close()
+
+    def _build_cluster_check_result(
+        self,
+        status: str,
+        is_connected: bool,
+        is_available: bool,
+        error: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """统一集群探测返回格式。"""
+
+        return {
+            "cluster_id": self.cluster_id,
+            "cluster_name": self.cluster_name,
+            "cluster_type": self.cluster_type,
+            "status": status,
+            "is_connected": is_connected,
+            "is_available": is_available,
+            "error": error,
+            "details": details or {},
+        }
+
+    @staticmethod
+    def _build_cluster_check_error(code: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"code": code, "message": message, "details": details or {}}
+
+    @staticmethod
+    def _format_check_exception(error: Exception) -> dict[str, str]:
+        return {"type": error.__class__.__name__, "message": str(error)}
+
+    @staticmethod
+    def _parse_check_int(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_check_float(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(str(value).strip().rstrip("%"))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_check_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int | float):
+            return bool(value)
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+    @staticmethod
+    def _normalize_es_roles(value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, list | tuple | set):
+            return [str(role) for role in value if role not in (None, "", "-")]
+        return [role.strip() for role in str(value).split(",") if role.strip() and role.strip() != "-"]
+
+    @classmethod
+    def _build_es_node_roles_lookup(
+        cls, node_rows: list[dict[str, Any]]
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """将 CAT nodes 的版本差异投影为按节点名和 IP 查询的角色映射。"""
+
+        roles_by_name: dict[str, list[str]] = {}
+        roles_by_ip: dict[str, list[str]] = {}
+        for row in node_rows:
+            if not isinstance(row, dict):
+                continue
+            roles = cls._normalize_es_roles(cls._get_check_row_value(row, "node.role", "role", "roles", "nodeRole"))
+            name = cls._get_check_row_value(row, "name", "node")
+            ip = cls._get_check_row_value(row, "ip")
+            if name not in (None, ""):
+                roles_by_name[str(name)] = roles
+            if ip not in (None, ""):
+                roles_by_ip[str(ip)] = roles
+        return roles_by_name, roles_by_ip
+
+    @staticmethod
+    def _parse_doris_size_bytes(value: Any) -> int | None:
+        """将 SHOW BACKENDS 的容量值转换为 bytes。"""
+
+        if value in (None, ""):
+            return None
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return int(value)
+
+        match = re.fullmatch(r"\s*([+-]?[\d,.]+)\s*([KMGTPE]?B)?\s*", str(value), flags=re.IGNORECASE)
+        if not match:
+            return None
+
+        try:
+            number = float(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        unit = (match.group(2) or "B").upper()
+        unit_power = {"B": 0, "KB": 1, "MB": 2, "GB": 3, "TB": 4, "PB": 5, "EB": 6}
+        return int(number * (1024 ** unit_power[unit]))
+
+    @staticmethod
+    def _calculate_check_percent(used: int | None, total: int | None) -> float | None:
+        if used is None or total in (None, 0):
+            return None
+        return round(used * 100 / total, 2)
+
+    @staticmethod
+    def _sum_check_values(values: list[int | None]) -> int | None:
+        valid_values = [value for value in values if value is not None]
+        return sum(valid_values) if valid_values else None
+
+    @staticmethod
+    def _get_check_row_value(row: dict[str, Any], *names: str) -> Any:
+        for name in names:
+            if name in row:
+                return row[name]
+        normalized_row = {str(key).lower(): value for key, value in row.items()}
+        for name in names:
+            if name.lower() in normalized_row:
+                return normalized_row[name.lower()]
+        return None
+
+    @classmethod
+    def _build_check_capacity(
+        cls, total_bytes: int | None, available_bytes: int | None, used_bytes: int | None = None
+    ) -> dict[str, int | float | None]:
+        if used_bytes is None and total_bytes is not None and available_bytes is not None:
+            used_bytes = max(total_bytes - available_bytes, 0)
+        return {
+            "total_bytes": total_bytes,
+            "used_bytes": used_bytes,
+            "available_bytes": available_bytes,
+            "used_percent": cls._calculate_check_percent(used_bytes, total_bytes),
+        }
+
+    @classmethod
+    def _build_doris_backend_detail(cls, row: dict[str, Any]) -> dict[str, Any]:
+        total_bytes = cls._parse_doris_size_bytes(cls._get_check_row_value(row, "TotalCapacity"))
+        available_bytes = cls._parse_doris_size_bytes(cls._get_check_row_value(row, "AvailCapacity"))
+        capacity = cls._build_check_capacity(total_bytes=total_bytes, available_bytes=available_bytes)
+        row_used_percent = cls._parse_check_float(cls._get_check_row_value(row, "UsedPct"))
+        if row_used_percent is not None:
+            capacity["used_percent"] = row_used_percent
+
+        return {
+            "backend_id": cls._parse_check_int(cls._get_check_row_value(row, "BackendId")),
+            "host": cls._get_check_row_value(row, "Host"),
+            "alive": cls._parse_check_bool(cls._get_check_row_value(row, "Alive")),
+            "decommissioned": cls._parse_check_bool(
+                cls._get_check_row_value(row, "SystemDecommissioned", "IsDecommissioned")
+            ),
+            "tablet_count": cls._parse_check_int(cls._get_check_row_value(row, "TabletNum")),
+            "capacity": capacity,
+            "data_used_bytes": cls._parse_doris_size_bytes(cls._get_check_row_value(row, "DataUsedCapacity")),
+            "trash_used_bytes": cls._parse_doris_size_bytes(
+                cls._get_check_row_value(row, "TrashUsedCapacity", "TrashUsedCapcacity")
+            ),
+            "remote_used_bytes": cls._parse_doris_size_bytes(cls._get_check_row_value(row, "RemoteUsedCapacity")),
+            "max_disk_used_percent": cls._parse_check_float(cls._get_check_row_value(row, "MaxDiskUsedPct")),
+            "last_heartbeat": cls._get_check_row_value(row, "LastHeartbeat"),
+            "error_message": cls._get_check_row_value(row, "ErrMsg", "ErrorMessage") or "",
+            "version": cls._get_check_row_value(row, "Version"),
+            "node_role": cls._get_check_row_value(row, "NodeRole"),
+        }
+
+    def _validate_check_endpoint(self) -> None:
+        if not self.domain_name:
+            raise ValueError("domain_name 不能为空")
+        if not self.port:
+            raise ValueError("port 不能为空")
+
+    @staticmethod
+    def _write_check_temp_file(stack: ExitStack, content: str) -> str:
+        temp_file = stack.enter_context(tempfile.NamedTemporaryFile(mode="w+", delete=True))
+        temp_file.write(content)
+        temp_file.flush()
+        return temp_file.name
+
+    @staticmethod
+    def _get_kafka_admin_client_class():
+        from confluent_kafka.admin import AdminClient
+
+        return AdminClient
+
+    def _normalize_kafka_bootstrap_host(self, host: str) -> str:
+        if host.startswith("["):
+            match = re.fullmatch(r"\[(?P<address>[^\]]+)\](?::(?P<port>\d+))?", host)
+            if not match:
+                raise ValueError(f"Kafka bootstrap host 非法: {host}")
+
+            address = ipaddress.ip_address(match.group("address"))
+            port = int(match.group("port") or self.port)
+            if address.version == 6:
+                return f"[{address.compressed}]:{port}"
+            return f"{address.compressed}:{port}"
+
+        if host.count(":") == 1:
+            return host
+
+        if host.count(":") > 1:
+            address_part, port_part = host.rsplit(":", 1)
+            if port_part.isdigit():
+                try:
+                    address = ipaddress.ip_address(address_part)
+                except ValueError:
+                    pass
+                else:
+                    if address.version == 6:
+                        return f"[{address.compressed}]:{int(port_part)}"
+                    return f"{address.compressed}:{int(port_part)}"
+
+            address = ipaddress.ip_address(host)
+            if address.version == 6:
+                return f"[{address.compressed}]:{self.port}"
+            return f"{address.compressed}:{self.port}"
+
+        return f"{host}:{self.port}"
+
+    def _compose_kafka_bootstrap_servers(self) -> str:
+        self._validate_check_endpoint()
+        bootstrap_servers = []
+        for host in str(self.domain_name).split(","):
+            host = host.strip()
+            if not host:
+                continue
+            bootstrap_servers.append(self._normalize_kafka_bootstrap_host(host))
+
+        if not bootstrap_servers:
+            raise ValueError("Kafka bootstrap servers 为空")
+
+        return ",".join(bootstrap_servers)
+
+    def _build_kafka_admin_config(self, timeout: int, stack: ExitStack) -> dict[str, Any]:
+        bootstrap_servers = self._compose_kafka_bootstrap_servers()
+        conf: dict[str, Any] = {
+            "bootstrap.servers": bootstrap_servers,
+            "socket.timeout.ms": timeout * 1000,
+            "request.timeout.ms": timeout * 1000,
+            "metadata.request.timeout.ms": timeout * 1000,
+        }
+
+        has_ssl = bool(
+            self.is_ssl_verify or self.ssl_certificate_authorities or self.ssl_certificate or self.ssl_certificate_key
+        )
+        use_ssl = self.security_protocol in {"SSL", "SASL_SSL"} or has_ssl
+        has_credentials = bool(self.username and self.password)
+        if self.is_auth:
+            if not has_credentials:
+                raise ValueError("Kafka 开启鉴权但缺少 username/password")
+            security_protocol = "SASL_SSL" if use_ssl else config.KAFKA_SASL_PROTOCOL
+            conf["sasl.mechanisms"] = self.sasl_mechanisms or config.KAFKA_SASL_MECHANISM
+            conf["sasl.username"] = self.username
+            conf["sasl.password"] = self.password
+        else:
+            security_protocol = "SSL" if use_ssl else "PLAINTEXT"
+        conf["security.protocol"] = security_protocol
+
+        if self.ssl_insecure_skip_verify:
+            conf["enable.ssl.certificate.verification"] = False
+        if self.ssl_certificate_authorities:
+            conf["ssl.ca.location"] = self._write_check_temp_file(stack, self.ssl_certificate_authorities)
+        if self.ssl_certificate:
+            conf["ssl.certificate.location"] = self._write_check_temp_file(stack, self.ssl_certificate)
+        if self.ssl_certificate_key:
+            conf["ssl.key.location"] = self._write_check_temp_file(stack, self.ssl_certificate_key)
+
+        return conf
+
+    def _check_kafka_cluster(self, timeout: int) -> dict[str, Any]:
+        with ExitStack() as stack:
+            conf = self._build_kafka_admin_config(timeout=timeout, stack=stack)
+            metadata = self._get_kafka_admin_client_class()(conf).list_topics(timeout=timeout)
+
+        return self._build_cluster_check_result(
+            status=self.CHECK_STATUS_AVAILABLE,
+            is_connected=True,
+            is_available=True,
+            details={
+                "bootstrap_servers": conf["bootstrap.servers"],
+                "broker_count": len(metadata.brokers or {}),
+                "topic_count": len(metadata.topics or {}),
+                "security_protocol": conf.get("security.protocol"),
+                "sasl_mechanisms": conf.get("sasl.mechanisms"),
+                "auth_enabled": self.is_auth,
+            },
+        )
+
+    def _check_es_cluster(self, timeout: int, include_node_details: bool = False) -> dict[str, Any]:
+        client = es_tools.get_client_by_datasource_info(
+            {
+                "port": self.port,
+                "schema": self.schema,
+                "version": self.version,
+                "domain_name": self.domain_name,
+                "is_ssl_verify": self.is_ssl_verify,
+                "auth_info": {"password": self.password, "username": self.username},
+            }
+        )
+        try:
+            health = client.cluster.health(request_timeout=timeout)
+        except TypeError:
+            health = client.cluster.health()
+
+        health_status = (health or {}).get("status")
+        number_of_data_nodes = self._parse_check_int((health or {}).get("number_of_data_nodes"))
+        details = {
+            "health_status": health_status,
+            "number_of_nodes": (health or {}).get("number_of_nodes"),
+            "active_shards": (health or {}).get("active_shards"),
+            "initializing_shards": (health or {}).get("initializing_shards"),
+            "relocating_shards": (health or {}).get("relocating_shards"),
+            "unassigned_shards": (health or {}).get("unassigned_shards"),
+            "nodes": {"total": number_of_data_nodes, "available": number_of_data_nodes},
+        }
+        roles_by_name: dict[str, list[str]] = {}
+        roles_by_ip: dict[str, list[str]] = {}
+        if include_node_details:
+            try:
+                node_rows = client.cat.nodes(
+                    format="json",
+                    h="name,ip,node.role",
+                    params={"request_timeout": timeout},
+                )
+                if not isinstance(node_rows, list):
+                    raise ValueError("Elasticsearch nodes 返回格式不正确")
+                roles_by_name, roles_by_ip = self._build_es_node_roles_lookup(node_rows)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    "ClusterInfo ES node roles collection failed, cluster_id->[%s], error->[%s]",
+                    self.cluster_id,
+                    error,
+                )
+                details.setdefault("collection_errors", []).append(
+                    {
+                        "component": "node_details",
+                        "code": "ES_NODES_QUERY_FAILED",
+                        "message": "Elasticsearch 节点角色查询失败",
+                        "details": self._format_check_exception(error),
+                    }
+                )
+        try:
+            allocations = client.cat.allocation(format="json", bytes="b", params={"request_timeout": timeout})
+            if not isinstance(allocations, list):
+                raise ValueError("Elasticsearch allocation 返回格式不正确")
+
+            node_details = []
+            for row in allocations:
+                if not isinstance(row, dict):
+                    continue
+                total_bytes = self._parse_check_int(self._get_check_row_value(row, "disk.total", "diskTotal"))
+                available_bytes = self._parse_check_int(self._get_check_row_value(row, "disk.avail", "diskAvail"))
+                used_bytes = self._parse_check_int(self._get_check_row_value(row, "disk.used", "diskUsed"))
+                # _cat/allocation 会包含 UNASSIGNED 汇总行，该行没有磁盘容量。
+                if total_bytes is None:
+                    continue
+                capacity = self._build_check_capacity(
+                    total_bytes=total_bytes,
+                    available_bytes=available_bytes,
+                    used_bytes=used_bytes,
+                )
+                row_used_percent = self._parse_check_float(
+                    self._get_check_row_value(row, "disk.percent", "diskPercent")
+                )
+                if row_used_percent is not None:
+                    capacity["used_percent"] = row_used_percent
+                node_name = self._get_check_row_value(row, "node", "name")
+                node_ip = self._get_check_row_value(row, "ip")
+                roles = roles_by_name.get(str(node_name)) if node_name not in (None, "") else None
+                if roles is None and node_ip not in (None, ""):
+                    roles = roles_by_ip.get(str(node_ip))
+                if roles is None:
+                    roles = self._normalize_es_roles(
+                        self._get_check_row_value(row, "node.role", "role", "roles", "nodeRole")
+                    )
+                node_details.append(
+                    {
+                        "name": node_name,
+                        "host": self._get_check_row_value(row, "host"),
+                        "ip": node_ip,
+                        "roles": roles,
+                        "shard_count": self._parse_check_int(self._get_check_row_value(row, "shards", "shardCount")),
+                        "capacity": capacity,
+                        "indices_store_bytes": self._parse_check_int(
+                            self._get_check_row_value(row, "disk.indices", "diskIndices")
+                        ),
+                    }
+                )
+
+            total_bytes = self._sum_check_values([row["capacity"]["total_bytes"] for row in node_details])
+            available_bytes = self._sum_check_values([row["capacity"]["available_bytes"] for row in node_details])
+            used_bytes = self._sum_check_values([row["capacity"]["used_bytes"] for row in node_details])
+            details["capacity"] = self._build_check_capacity(
+                total_bytes=total_bytes,
+                available_bytes=available_bytes,
+                used_bytes=used_bytes,
+            )
+            details["indices_store_bytes"] = self._sum_check_values(
+                [row["indices_store_bytes"] for row in node_details]
+            )
+            details["node_details"] = node_details
+            if number_of_data_nodes is None:
+                details["nodes"] = {"total": len(node_details), "available": len(node_details)}
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                "ClusterInfo ES allocation collection failed, cluster_id->[%s], error->[%s]",
+                self.cluster_id,
+                error,
+            )
+            details.setdefault("collection_errors", []).append(
+                {
+                    "component": "capacity",
+                    "code": "ES_ALLOCATION_QUERY_FAILED",
+                    "message": "Elasticsearch 集群容量查询失败",
+                    "details": self._format_check_exception(error),
+                }
+            )
+        if health_status == "red":
+            return self._build_cluster_check_result(
+                status=self.CHECK_STATUS_UNAVAILABLE,
+                is_connected=True,
+                is_available=False,
+                error=self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_CLUSTER_UNHEALTHY,
+                    message="Elasticsearch 集群健康状态为 red",
+                    details=details,
+                ),
+                details=details,
+            )
+
+        return self._build_cluster_check_result(
+            status=self.CHECK_STATUS_AVAILABLE,
+            is_connected=True,
+            is_available=True,
+            details=details,
+        )
+
+    def _check_vm_cluster(self, timeout: int) -> dict[str, Any]:
+        self._validate_check_endpoint()
+        schema = self.schema if self.schema in ("http", "https") else "http"
+        url = f"{schema}://{self.domain_name}:{self.port}/health"
+        with ExitStack() as stack:
+            verify: bool | str = True
+            if schema == "https":
+                if self.ssl_insecure_skip_verify:
+                    verify = False
+                elif self.ssl_certificate_authorities:
+                    verify = self._write_check_temp_file(stack, self.ssl_certificate_authorities)
+
+            response = requests.get(url, timeout=timeout, verify=verify)
+
+        details = {"url": url, "status_code": response.status_code}
+        if response.status_code >= 400:
+            details["response"] = response.text[:200]
+            return self._build_cluster_check_result(
+                status=self.CHECK_STATUS_UNAVAILABLE,
+                is_connected=True,
+                is_available=False,
+                error=self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_HTTP_UNHEALTHY,
+                    message="VictoriaMetrics health 接口返回异常状态码",
+                    details=details,
+                ),
+                details=details,
+            )
+
+        return self._build_cluster_check_result(
+            status=self.CHECK_STATUS_AVAILABLE,
+            is_connected=True,
+            is_available=True,
+            details=details,
+        )
+
+    def _check_doris_cluster(self, timeout: int) -> dict[str, Any]:
+        self._validate_check_endpoint()
+        connection = pymysql.connect(
+            host=self.domain_name,
+            port=int(self.port),
+            user=self.username or "",
+            password=self.password or "",
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                row = cursor.fetchone()
+                details: dict[str, Any] = {"query": "SELECT 1", "response": row}
+                try:
+                    cursor.execute("SHOW BACKENDS")
+                    backend_rows = cursor.fetchall()
+                    if not isinstance(backend_rows, list | tuple):
+                        raise ValueError("Doris SHOW BACKENDS 返回格式不正确")
+
+                    node_details = [
+                        self._build_doris_backend_detail(backend_row)
+                        for backend_row in backend_rows
+                        if isinstance(backend_row, dict)
+                    ]
+                    active_nodes = [node for node in node_details if not node["decommissioned"]]
+                    available_nodes = [node for node in active_nodes if node["alive"]]
+                    details["nodes"] = {"total": len(active_nodes), "available": len(available_nodes)}
+
+                    total_bytes = self._sum_check_values([node["capacity"]["total_bytes"] for node in active_nodes])
+                    available_bytes = self._sum_check_values(
+                        [node["capacity"]["available_bytes"] for node in active_nodes]
+                    )
+                    details["capacity"] = self._build_check_capacity(
+                        total_bytes=total_bytes,
+                        available_bytes=available_bytes,
+                    )
+                    details["data_used_bytes"] = self._sum_check_values(
+                        [node["data_used_bytes"] for node in active_nodes]
+                    )
+                    details["trash_used_bytes"] = self._sum_check_values(
+                        [node["trash_used_bytes"] for node in active_nodes]
+                    )
+                    details["remote_used_bytes"] = self._sum_check_values(
+                        [node["remote_used_bytes"] for node in active_nodes]
+                    )
+                    details["tablet_count"] = self._sum_check_values([node["tablet_count"] for node in active_nodes])
+                    max_disk_used_percent = [
+                        node["max_disk_used_percent"]
+                        for node in active_nodes
+                        if node["max_disk_used_percent"] is not None
+                    ]
+                    details["max_disk_used_percent"] = max(max_disk_used_percent) if max_disk_used_percent else None
+                    details["node_details"] = node_details
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        "ClusterInfo Doris backend collection failed, cluster_id->[%s], error->[%s]",
+                        self.cluster_id,
+                        error,
+                    )
+                    details.setdefault("collection_errors", []).append(
+                        {
+                            "component": "backends",
+                            "code": "DORIS_BACKENDS_QUERY_FAILED",
+                            "message": "Doris 集群后端状态和容量查询失败",
+                            "details": self._format_check_exception(error),
+                        }
+                    )
+        finally:
+            connection.close()
+
+        return self._build_cluster_check_result(
+            status=self.CHECK_STATUS_AVAILABLE,
+            is_connected=True,
+            is_available=True,
+            details=details,
+        )
+
     @classmethod
     def refresh_consul_storage_config(cls):
         """
@@ -248,6 +967,51 @@ class ClusterInfo(models.Model):
         hash_consul.put(key=cls.CONSUL_VERSION_PATH, value={"time": time.time()})
 
         logger.info(f"all es table info is refresh to consul success count->[{total_count}].")
+
+    @staticmethod
+    def _format_storage_address(schema: str, host: str, port: int) -> str:
+        """IPv6 地址需要方括号，才能被 UQ 的 URL 解析器识别。"""
+        if not (host.startswith("[") and host.endswith("]")):
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                pass
+            else:
+                if address.version == 6:
+                    host = f"[{address.compressed}]"
+        return f"{schema}://{host}:{port}"
+
+    @classmethod
+    def refresh_redis_storage_config(cls):
+        """全量发布 UQ Storage 配置，清理已删除集群后通知重载。"""
+        storage_by_id = {storage.cluster_id: storage for storage in cls.objects.all()}
+        redis_client = RedisTools().client
+        expected_keys = {f"{cls.REDIS_PREFIX_KEY}:{cluster_id}" for cluster_id in storage_by_id}
+
+        for cluster_id, storage in storage_by_id.items():
+            schema = storage.schema if storage.schema in ("http", "https") else "http"
+            value = {
+                "address": cls._format_storage_address(schema, storage.domain_name, storage.port),
+                "username": storage.username,
+                "password": storage.password,
+                "type": storage.cluster_type,
+            }
+            # SET 不设 TTL，同时清除旧 Key 可能存在的过期时间。
+            redis_client.set(f"{cls.REDIS_PREFIX_KEY}:{cluster_id}", json.dumps(value))
+
+        existing_keys = {
+            key.decode("utf-8") if isinstance(key, bytes) else key
+            for key in redis_client.scan_iter(match=f"{cls.REDIS_PREFIX_KEY}:*")
+        }
+        stale_keys = existing_keys - expected_keys
+        if stale_keys:
+            redis_client.delete(*stale_keys)
+
+        redis_client.publish(
+            cls.REDIS_CHANNEL,
+            json.dumps({"storage_ids": sorted(storage_by_id), "timestamp": time.time()}),
+        )
+        logger.info("refreshed storage redis config: count=%s, deleted=%s", len(storage_by_id), len(stale_keys))
 
     def base64_with_prefix(self, content: str | None) -> str | None:
         """编码，并添加上前缀"""
@@ -297,6 +1061,7 @@ class ClusterInfo(models.Model):
                 "display_name": self.display_name,
                 "version": self.version,
                 "custom_option": self.custom_option,
+                "default_settings": self.default_settings,
                 "registered_system": self.registered_system,
                 "creator": self.creator,
                 "create_time": arrow.get(self.create_time).timestamp,
@@ -434,7 +1199,14 @@ class ClusterInfo(models.Model):
             )
             raise ValueError(_("集群名【{}】与已有集群冲突，请确认后重试").format(cluster_name))
 
-        if cluster_type not in (cls.TYPE_INFLUXDB, cls.TYPE_ES, cls.TYPE_KAFKA, cls.TYPE_REDIS, cls.TYPE_ARGUS):
+        if cluster_type not in (
+            cls.TYPE_INFLUXDB,
+            cls.TYPE_ES,
+            cls.TYPE_KAFKA,
+            cls.TYPE_REDIS,
+            cls.TYPE_ARGUS,
+            cls.TYPE_DORIS,
+        ):
             logger.error(
                 f"reg_system->[{registered_system}] try to add cluster type->[{cluster_type}] but is not at CLUSTER_TYPE_CHOICES, nothing "
                 "will do"
@@ -447,7 +1219,7 @@ class ClusterInfo(models.Model):
         ).exists():
             logger.error(
                 f"reg_system->[{registered_system}] try to add cluster->[{cluster_type}] with domain->[{domain_name}] port->[{port}] username->[{username}] "
-                f"pass->[{password}] which already has the same cluster config , nothing will do."
+                "which already has the same cluster config , nothing will do."
             )
             raise ValueError(_("存在同样配置集群，请确认后重试"))
 
@@ -487,7 +1259,7 @@ class ClusterInfo(models.Model):
         new_cluster.cluster_init()
 
         # 同步集群配置到bkbase
-        if new_cluster.cluster_type == ClusterInfo.TYPE_ES:
+        if new_cluster.cluster_type in (ClusterInfo.TYPE_ES, ClusterInfo.TYPE_DORIS):
             ClusterConfig.sync_cluster_config(cluster=new_cluster)
 
         return new_cluster
@@ -504,7 +1276,7 @@ class ClusterInfo(models.Model):
         schema=None,
         is_ssl_verify=None,
         version=None,
-        label="",
+        label=None,
         default_settings=None,
         ssl_verification_mode: str | None = None,
         ssl_certificate_authorities: str | None = None,
@@ -539,6 +1311,12 @@ class ClusterInfo(models.Model):
 
         from metadata.models.data_link.data_link_configs import ClusterConfig
 
+        previous_sync_fields = ClusterConfig.sync_fields(self)
+        if self.cluster_type == self.TYPE_DORIS and default_settings is not None:
+            if not isinstance(default_settings, dict):
+                raise ValueError("default_settings 必须是 JSON 对象")
+            default_settings = {**(self.default_settings or {}), **default_settings}
+
         args = {
             "display_name": display_name,
             "description": description,
@@ -565,15 +1343,24 @@ class ClusterInfo(models.Model):
                 setattr(self, attribute_name, value)
                 # 由于已经有更新了，所以需要更新最后更新者
                 self.last_modify_user = operator
-                logger.info(
-                    f"cluster->[{self.cluster_name}] attribute->[{attribute_name}] is set to->[{value}] by->[{operator}]"
-                )
+                logger.info(f"cluster->[{self.cluster_name}] attribute->[{attribute_name}] updated by->[{operator}]")
+
+        # 仅实际下发字段变化时同步，元数据修改不依赖 BKBase。
+        needs_sync = previous_sync_fields != ClusterConfig.sync_fields(self)
+        if needs_sync and self.cluster_type == self.TYPE_ES and not self.CLUSTER_NAME_REGEX.match(self.cluster_name):
+            original_cluster_name = self.cluster_name
+            self.cluster_name = f"auto_cluster_name_{self.cluster_id}"
+            logger.warning(
+                "cluster(%s) cluster_name: %s is not valid, set to: %s",
+                self.cluster_id,
+                original_cluster_name,
+                self.cluster_name,
+            )
 
         self.save()
         logger.info(f"cluster->[{self.cluster_name}] update success.")
 
-        # 同步集群配置到bkbase（目前仅支持ES集群）
-        if self.cluster_type == ClusterInfo.TYPE_ES:
+        if needs_sync:
             ClusterConfig.sync_cluster_config(cluster=self)
 
         return True
@@ -703,96 +1490,6 @@ class StorageResultTable:
 
     def update_storage(self, **kwargs):
         """更新存储配置"""
-        from metadata.models.space.space_table_id_redis import SpaceTableIDRedis
-
-        space_client = SpaceTableIDRedis()
-
-        # 仅当 last_storage_cluster_id 和 new_storage_cluster_id 不一致时，更新存储集群记录。
-        if self.storage_type == ClusterInfo.TYPE_ES and kwargs.get("storage_cluster_id", "") != "":
-            try:
-                # 当集群发生迁移时，创建StorageClusterRecord记录
-                last_storage_cluster_id = self.storage_cluster_id
-                new_storage_cluster_id = kwargs.get("storage_cluster_id")
-
-                logger.info(
-                    "update_storage: table_id->[%s] update es_storage_cluster_id to ->[%s].old_cluster->[%s]",
-                    self.table_id,
-                    new_storage_cluster_id,
-                    last_storage_cluster_id,
-                )
-
-                if last_storage_cluster_id != new_storage_cluster_id:
-                    # 更新上一次集群记录，更新停止写入时间
-                    record, _ = StorageClusterRecord.objects.update_or_create(
-                        bk_tenant_id=self.bk_tenant_id,
-                        table_id=self.table_id,
-                        cluster_id=last_storage_cluster_id,
-                        defaults={
-                            "is_current": False,
-                            "disable_time": django_timezone.now(),
-                        },
-                    )
-                    logger.info(
-                        "update_storage: table_id->[%s] update_or_create es_storage_record success,old_cluster->[%s]",
-                        self.table_id,
-                        record.cluster_id,
-                    )
-
-                    # 创建新纪录
-                    new_record, _ = StorageClusterRecord.objects.update_or_create(
-                        bk_tenant_id=self.bk_tenant_id,
-                        table_id=self.table_id,
-                        cluster_id=new_storage_cluster_id,
-                        enable_time=django_timezone.now(),
-                        defaults={
-                            "is_current": True,
-                        },
-                    )
-                    logger.info(
-                        "update_storage: table_id->[%s] update_or_create es_storage_record success,new_cluster->[%s]",
-                        self.table_id,
-                        new_record.cluster_id,
-                    )
-
-                records_queryset = StorageClusterRecord.objects.filter(
-                    bk_tenant_id=self.bk_tenant_id, table_id=self.table_id, cluster_id=new_storage_cluster_id
-                )
-
-                # 若DB中不存在当前集群ID的记录,那么需要额外创建(避免非前端迁移行为导致的路由异常)
-                if not records_queryset.exists():
-                    logger.warning(
-                        "update_storage: table_id->[%s] update es_storage_cluster_id may be failed, no record found",
-                        self.table_id,
-                    )
-                    result_table = ResultTable.objects.get(bk_tenant_id=self.bk_tenant_id, table_id=self.table_id)
-                    # 先将存量记录的is_current更改为False
-                    StorageClusterRecord.objects.filter(
-                        bk_tenant_id=self.bk_tenant_id, table_id=self.table_id, is_current=True
-                    ).update(is_current=False, disable_time=result_table.last_modify_time)
-
-                    StorageClusterRecord.objects.get_or_create(
-                        table_id=self.table_id,
-                        cluster_id=new_storage_cluster_id,
-                        is_current=True,
-                        defaults={"enable_time": result_table.last_modify_time},
-                    )
-
-                # 刷新RESULT_TABLE_DETAIL路由,需要先找到该RT关联的虚拟RT
-                virtual_rt_list = list(
-                    ESStorage.objects.filter(bk_tenant_id=self.bk_tenant_id, origin_table_id=self.table_id).values_list(
-                        "table_id", flat=True
-                    )
-                )
-                table_ids = [self.table_id] + virtual_rt_list
-                logger.info("update_storage: table_id->[%s] try to refresh es_table_id_detail", json.dumps(table_ids))
-                space_client.push_es_table_id_detail(
-                    bk_tenant_id=self.bk_tenant_id, table_id_list=table_ids, is_publish=True
-                )
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning(
-                    "update_storage: table_id->[%s] update es_storage_cluster_id failed,error->[%s]", self.table_id, e
-                )
-
         # 遍历获取所有可以更新的字段，逐一更新
         for field_name in self.UPGRADE_FIELD_CONFIG:
             # 尝试获取配置
@@ -1989,7 +2686,8 @@ class ESStorage(models.Model, StorageResultTable):
         refresh_dict = {}
         for table_info in info_list:
             # 如果结果表已经废弃了，则不需要继续更新路径
-            if table_info.is_index_enable():
+            # 查询配置需要保留给历史数据读取，不能因默认存储切到 Doris 而删除。
+            if table_info.is_index_enable(require_default_storage=False):
                 refresh_dict[table_info.table_id] = table_info
                 continue
 
@@ -2061,6 +2759,8 @@ class ESStorage(models.Model, StorageResultTable):
         index_set=None,
         need_create_index=True,
         origin_table_id=None,
+        create_storage_cluster_record=True,
+        raise_on_index_error=True,
         **kwargs,
     ):
         """
@@ -2083,9 +2783,14 @@ class ESStorage(models.Model, StorageResultTable):
         :param index_set: 索引集
         :param need_create_index: 是否需要创建索引，默认为 True
         :param origin_table_id: 原始结果表ID
+        :param create_storage_cluster_record: 是否创建当前存储集群记录，非默认存储创建时应关闭
+        :param raise_on_index_error: 建索引失败是否抛出异常；关闭时保留存储配置，由周期任务补建
         :param kwargs: 其他配置参数
         :return:
         """
+
+        # ResultTable 的存储配置统一使用 storage_cluster_id，对 ES 兼容该参数名。
+        cluster_id = cluster_id or kwargs.get("storage_cluster_id")
 
         # 0. 判断是否需要使用默认集群信息
         if cluster_id is None:
@@ -2162,21 +2867,20 @@ class ESStorage(models.Model, StorageResultTable):
 
         # 创建集群记录，第一条记录的enable_time需要设置为最小时间
         # 使用 1970-01-01 而不是 datetime.min，因为 MySQL DATETIME 类型不支持 0001-01-01
-        storage_record, tag = StorageClusterRecord.objects.update_or_create(
-            table_id=table_id,
-            cluster_id=cluster_id,
-            bk_tenant_id=bk_tenant_id,
-            defaults={
-                "is_current": True,
-                "enable_time": datetime.datetime(1970, 1, 1),
-            },
-        )
-        logger.info(
-            "create_table: table_id->[%s] update_or_create es_storage_record success,old_cluster->[%s]",
-            table_id,
-            storage_record.cluster_id,
-        )
-        if new_record.need_create_index:  # 如果需要,则创建索引
+        if create_storage_cluster_record:
+            storage_record = StorageClusterRecord.objects.update_or_create(
+                table_id=table_id,
+                cluster_id=cluster_id,
+                bk_tenant_id=bk_tenant_id,
+                enable_time=django_timezone.make_aware(datetime.datetime(1970, 1, 1)),
+                defaults={"is_current": True},
+            )[0]
+            logger.info(
+                "create_table: table_id->[%s] update_or_create es_storage_record success,cluster->[%s]",
+                table_id,
+                storage_record.cluster_id,
+            )
+        if enable_create_index and new_record.need_create_index:  # 如果需要,则创建索引
             logger.info(
                 "create_table: table_id->[%s] under bk_tenant_id->[%s] need_create_index,is_sync_db->[%s]",
                 table_id,
@@ -2186,13 +2890,14 @@ class ESStorage(models.Model, StorageResultTable):
             try:
                 new_record.create_es_index(is_sync_db)
             except Exception as e:  # pylint: disable=broad-except
-                logger.error(
+                logger.exception(
                     "create_table: table_id->[%s] under bk_tenant_id->[%s] create_es_index failed,error->[%s]",
                     table_id,
                     bk_tenant_id,
                     e,
                 )
-                raise e
+                if raise_on_index_error:
+                    raise
 
         # 针对单个结果表推送数据很快，不用异步处理
         try:
@@ -2201,8 +2906,8 @@ class ESStorage(models.Model, StorageResultTable):
             logger.info(
                 "create_table: table_id->[%s] under bk_tenant_id->[%s] push detail start", table_id, bk_tenant_id
             )
-            SpaceTableIDRedis().push_es_table_id_detail(
-                table_id_list=[table_id], is_publish=True, bk_tenant_id=bk_tenant_id
+            SpaceTableIDRedis().push_table_id_detail(
+                bk_tenant_id=bk_tenant_id, table_id_list=[table_id], is_publish=True
             )
         except Exception as e:  # pylint: disable=broad-except
             logger.error("table_id: %s push detail failed, error: %s", table_id, e)
@@ -2352,15 +3057,22 @@ class ESStorage(models.Model, StorageResultTable):
             logger.error("query es cluster error by retry 3, error: %s", e)
             return True
 
-    def is_index_enable(self):
+    def is_index_enable(self, require_default_storage: bool = True):
         """判断index是否启用中"""
 
-        # 判断如果结果表已经废弃了，那么不再进行index的创建
-        if not ResultTable.objects.filter(
-            table_id=self.table_id, is_enable=True, is_deleted=False, bk_tenant_id=self.bk_tenant_id
-        ).exists():
+        # 只有启用、未删除且仍以 ES 为默认存储的结果表才允许管理索引和写别名。
+        result_table_query = ResultTable.objects.filter(
+            table_id=self.table_id,
+            is_enable=True,
+            is_deleted=False,
+            bk_tenant_id=self.bk_tenant_id,
+        )
+        if require_default_storage:
+            result_table_query = result_table_query.filter(default_storage=ClusterInfo.TYPE_ES)
+        if not result_table_query.exists():
             logger.info(
-                "table_id->[%s] under bk_tenant_id->[%s] now is delete or disable, no index will create.",
+                "table_id->[%s] under bk_tenant_id->[%s] now is deleted, disabled or not using ES, "
+                "no index or write alias will be managed.",
                 self.table_id,
                 self.bk_tenant_id,
             )
@@ -2390,18 +3102,19 @@ class ESStorage(models.Model, StorageResultTable):
     def search_format_v1(self):
         return f"{self.index_name}_*"
 
-    def index_exist(self):
+    def index_exist(self, request_timeout: int | None = None):
         """
         判断该index是否已经存在,优先v2，随后v1
         :return: True | False
         """
-        stat_info_list = self.es_client.indices.stats(self.search_format_v2())
+        request_kwargs = {"request_timeout": request_timeout} if request_timeout is not None else {}
+        stat_info_list = self.es_client.indices.stats(self.search_format_v2(), **request_kwargs)
         for stat_index_name in list(stat_info_list["indices"].keys()):
             re_result = self.index_re_v2.match(stat_index_name)
             if re_result:
                 logger.debug("table_id->[%s] found v2 index list->[%s]", self.table_id, str(stat_info_list))
                 return True
-        stat_info_list = self.es_client.indices.stats(self.search_format_v1())
+        stat_info_list = self.es_client.indices.stats(self.search_format_v1(), **request_kwargs)
         for stat_index_name in list(stat_info_list["indices"].keys()):
             re_result = self.index_re_v1.match(stat_index_name)
             if re_result:
@@ -2410,11 +3123,14 @@ class ESStorage(models.Model, StorageResultTable):
         logger.info("table_id->[%s] no index", self.table_id)
         return False
 
-    def _get_index_infos(self, namespaced: str) -> tuple[dict[str, dict[str, Any]], str]:
-        index_version = ""
+    def _get_index_infos(
+        self, namespaced: str, request_timeout: int | None = None
+    ) -> tuple[dict[str, dict[str, Any]], str]:
         extra = {ESNamespacedClientType.CAT.value: {"format": "json"}, ESNamespacedClientType.INDICES.value: {}}[
             namespaced
         ]
+        if request_timeout is not None:
+            extra["request_timeout"] = request_timeout
         getdata = {
             ESNamespacedClientType.CAT.value: lambda d: {idx["index"]: idx for idx in d},
             ESNamespacedClientType.INDICES.value: lambda d: d["indices"],
@@ -2424,18 +3140,26 @@ class ESStorage(models.Model, StorageResultTable):
             ESNamespacedClientType.INDICES.value: self.es_client.indices.stats,
         }[namespaced]
 
-        index_info_map: dict[str, dict[str, Any]] = getdata(func(index=self.search_format_v2(), **extra))
-        if len(index_info_map) != 0:
-            index_version = "v2"
-        else:
-            index_info_map: dict[str, dict[str, Any]] = getdata(func(index=self.search_format_v1(), **extra))
-            if len(index_info_map) != 0:
-                index_version = "v1"
+        # 通配符可能命中索引名前缀更长的其他结果表，需先精确过滤再判断索引版本。
+        for index_version, search_format, index_re in (
+            ("v2", self.search_format_v2(), self.index_re_v2),
+            ("v1", self.search_format_v1(), self.index_re_v1),
+        ):
+            raw_index_info_map: dict[str, dict[str, Any]] = getdata(func(index=search_format, **extra))
+            index_info_map = {
+                index_name: index_info
+                for index_name, index_info in raw_index_info_map.items()
+                if index_re.fullmatch(index_name)
+            }
+            if index_info_map:
+                return index_info_map, index_version
 
-        return index_info_map, index_version
+        return {}, ""
 
-    def get_index_names(self) -> list[str]:
-        index_info_map, index_version = self._get_index_infos(ESNamespacedClientType.CAT.value)
+    def get_index_names(self, request_timeout: int | None = None) -> list[str]:
+        index_info_map, index_version = self._get_index_infos(
+            ESNamespacedClientType.CAT.value, request_timeout=request_timeout
+        )
         if index_version == "v2":
             index_re = self.index_re_v2
         else:
@@ -2449,7 +3173,7 @@ class ESStorage(models.Model, StorageResultTable):
             index_names.append(index_name)
         return index_names
 
-    def get_index_stats(self):
+    def get_index_stats(self, request_timeout: int | None = None):
         """
         获取index的统计信息
         stats格式为：{
@@ -2464,10 +3188,10 @@ class ESStorage(models.Model, StorageResultTable):
           }
         }
         """
-        return self._get_index_infos(ESNamespacedClientType.INDICES.value)
+        return self._get_index_infos(ESNamespacedClientType.INDICES.value, request_timeout=request_timeout)
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), reraise=True)
-    def current_index_info(self):
+    def current_index_info(self, request_timeout: int | None = None):
         """
         返回当前使用的最新index相关的信息
         :return: {
@@ -2476,7 +3200,7 @@ class ESStorage(models.Model, StorageResultTable):
             "size": 123123,  # index大小，单位byte
         }
         """
-        indices, index_version = self.get_index_stats()
+        indices, index_version = self.get_index_stats(request_timeout=request_timeout)
         # 如果index_re为空，说明没找到任何可用的index
         if index_version == "":
             logger.info("index->[%s] has no index now, will raise a fake not found error", self.index_name)
@@ -2785,7 +3509,10 @@ class ESStorage(models.Model, StorageResultTable):
         last_read_alias_name = f"{es_storage.index_name}_{last_date_str}_read"
 
         # 确定上一个写别名指向的索引
-        last_indexes = list(es_storage.es_client.indices.get_alias(name=last_write_alias_name).keys())
+        try:
+            last_indexes = list(es_storage.es_client.indices.get_alias(name=last_write_alias_name).keys())
+        except (elasticsearch5.NotFoundError, elasticsearch.NotFoundError, elasticsearch6.NotFoundError):
+            last_indexes = []
         if not last_indexes:
             print("上一个索引没有进行配置，因此也不需要进行写别名的移动")
             return
@@ -2803,7 +3530,7 @@ class ESStorage(models.Model, StorageResultTable):
         if not force_move:
             for index in last_indexes:
                 index_info = es_storage.get_index_info(index)
-                if index_info["status"] == "red":
+                if index_info.get("index_status") == "red":
                     print(f"索引->[{index}]状态为red，因此要强制进行写别名的移动")
                     force_move = True
                     break
@@ -2830,10 +3557,17 @@ class ESStorage(models.Model, StorageResultTable):
                     f"模拟执行, _update_aliases_with_retry, actions->[{actions}], new_index_name->[{latest_index_name}]"
                 )
 
-    def create_or_update_aliases(self, ahead_time=1440, force_rotate: bool = False, is_moving_cluster: bool = False):
+    def create_or_update_aliases(
+        self,
+        ahead_time=1440,
+        force_rotate: bool = False,
+        is_moving_cluster: bool = False,
+        strict: bool = False,
+    ):
         """
         更新alias，如果有已存在的alias，则将其指向最新的index，并根据ahead_time前向预留一定的alias
         只有当即将切换的索引完全就绪时，才进行索引-别名的绑定关系切换，防止数据丢失
+        :param strict: 严格模式下索引未就绪或别名操作失败时直接抛出，供存储切换前同步准备使用
         """
 
         logger.info("create_or_update_aliases: start to create or update aliases for table_id->[%s]", self.table_id)
@@ -2901,9 +3635,15 @@ class ESStorage(models.Model, StorageResultTable):
                         last_index_name,
                     )
                 except RetryError:  # 若重试后依然失败，则认为未就绪
+                    if strict:
+                        raise
                     is_ready = False
 
                 if not is_ready and not force_rotate:
+                    if strict:
+                        raise RuntimeError(
+                            _("结果表[{}]的ES索引[{}]尚未就绪，无法切换存储").format(self.table_id, last_index_name)
+                        )
                     # 2.4.1 如果索引未就绪且不属于强制轮转，记录日志并跳过，将last_index_name变为上次的索引
                     logger.warning(
                         "create_or_update_aliases: table_id->[%s] index->[%s] is not ready, will skip creation.",
@@ -2984,6 +3724,8 @@ class ESStorage(models.Model, StorageResultTable):
                         self.table_id,
                         e.__cause__ if isinstance(e, RetryError) else e,
                     )
+                    if strict:
+                        raise
                     continue
 
                 try:
@@ -2997,7 +3739,7 @@ class ESStorage(models.Model, StorageResultTable):
                     )
                 except Exception as e:  # pylint: disable=broad-except
                     logger.error(
-                        "create_or_update_aliases: table_id->[%s] ,index->[%s],get alias info failed, error->[%s]",
+                        "create_or_update_aliases: table_id->[%s] ,index->[%s],get alias info failed, error->[%r]",
                         self.table_id,
                         last_index_name,
                         e,
@@ -3019,16 +3761,19 @@ class ESStorage(models.Model, StorageResultTable):
                 )
                 # slice_gap maybe zero, will cause dead loop
                 if self.slice_gap <= 0:
-                    return
+                    return True
                 now_gap += self.slice_gap
 
-    def create_index_and_aliases(self, ahead_time=1440):
-        # 1. 创建索引
-        self.create_index_v2()
-        # 2. 更新对应的别名<->索引绑定关系
-        self.create_or_update_aliases(ahead_time)
+        return True
 
-    def update_index_and_aliases(self, ahead_time=1440, is_moving_cluster=False):
+    def create_index_and_aliases(self, ahead_time=1440, strict: bool = False):
+        # 1. 创建索引
+        if self.create_index_v2() is False:
+            return False
+        # 2. 更新对应的别名<->索引绑定关系
+        return self.create_or_update_aliases(ahead_time, strict=strict)
+
+    def update_index_and_aliases(self, ahead_time=1440, is_moving_cluster=False, strict: bool = False):
         logger.info(
             "update_index_and_aliases: table_id->[%s], try to update index and aliases,is_moving_cluster->[%s]",
             self.table_id,
@@ -3036,9 +3781,14 @@ class ESStorage(models.Model, StorageResultTable):
         )
 
         # 1. 更新索引
-        self.update_index_v2()
+        if self.update_index_v2() is False:
+            return False
         # 2. 更新对应的别名<->索引绑定关系
-        self.create_or_update_aliases(ahead_time=ahead_time, is_moving_cluster=is_moving_cluster)
+        return self.create_or_update_aliases(
+            ahead_time=ahead_time,
+            is_moving_cluster=is_moving_cluster,
+            strict=strict,
+        )
 
     @retry(
         stop=stop_after_attempt(3),
@@ -3066,7 +3816,8 @@ class ESStorage(models.Model, StorageResultTable):
 
             # 遍历所有索引并检查其状态
             indices_health = health.get("indices", {})
-            all_green = all(index_info.get("status") == ES_READY_STATUS for index_info in indices_health.values())
+            index_health = indices_health.get(index_name)
+            all_green = bool(index_health) and index_health.get("status") == ES_READY_STATUS
 
             if all_green:
                 return True
@@ -3418,6 +4169,8 @@ class ESStorage(models.Model, StorageResultTable):
             response = self.es_client.indices.update_aliases(
                 body={"actions": actions}, request_timeout=settings.METADATA_REQUEST_ES_TIMEOUT_SECONDS
             )
+            if isinstance(response, dict) and response.get("acknowledged") is False:
+                raise RuntimeError(_("结果表[{}]的ES别名更新未被集群确认").format(self.table_id))
             logger.info(
                 "update_aliases_with_retry: table_id->[%s] update aliases response [%s]", self.table_id, response
             )
@@ -3712,9 +4465,16 @@ class ESStorage(models.Model, StorageResultTable):
                 )
                 long_term_storage_indices = []
 
-        # 获取 StorageClusterRecord 中的所有关联集群记录（包括当前和历史集群）
+        # 仅处理 ES 类型的历史集群；Doris 等其他存储共用历史表，但不能交给 ES 客户端清理。
+        es_cluster_ids = ClusterInfo.objects.filter(
+            bk_tenant_id=self.bk_tenant_id, cluster_type=ClusterInfo.TYPE_ES
+        ).values_list("cluster_id", flat=True)
         storage_records = StorageClusterRecord.objects.filter(
-            table_id=self.table_id, is_deleted=False, is_current=False, bk_tenant_id=self.bk_tenant_id
+            table_id=self.table_id,
+            is_deleted=False,
+            is_current=False,
+            bk_tenant_id=self.bk_tenant_id,
+            cluster_id__in=es_cluster_ids,
         )
 
         # 遍历所有集群记录
@@ -5350,6 +6110,8 @@ class StorageClusterRecord(models.Model):
 
     table_id = models.CharField(max_length=128, db_index=True, verbose_name="采集项结果表名")
     bk_tenant_id = models.CharField("租户ID", max_length=256, null=True, default="system")
+    bkbase_table_id = models.CharField("BKBase结果表ID", max_length=255, default="", blank=True)
+    physical_tables = models.JSONField("物理表用途映射", default=dict)
     cluster_id = models.BigIntegerField(db_index=True, verbose_name="存储集群ID")
     is_deleted = models.BooleanField(default=False, verbose_name="是否删除/停用")
     is_current = models.BooleanField(default=False, verbose_name="是否是当前最新存储集群")
@@ -5366,6 +6128,88 @@ class StorageClusterRecord(models.Model):
 
     class Meta:
         unique_together = ("table_id", "cluster_id", "enable_time", "bk_tenant_id")  # 联合索引，保证唯一性
+
+    @classmethod
+    def switch_current_cluster(
+        cls,
+        *,
+        table_id: str,
+        bk_tenant_id: str,
+        target_cluster_id: int,
+        target_storage_type: str,
+        switch_time: datetime.datetime,
+        creator: str,
+        force_new_segment: bool = False,
+    ) -> tuple["StorageClusterRecord", bool]:
+        """原子关闭旧 current，并为目标集群创建新的写入时间段。"""
+
+        try:
+            ClusterInfo.objects.get(
+                bk_tenant_id=bk_tenant_id,
+                cluster_id=target_cluster_id,
+                cluster_type=target_storage_type,
+            )
+        except ClusterInfo.DoesNotExist:
+            logger.error(
+                "switch_current_cluster: invalid target cluster, table_id->[%s], tenant->[%s], "
+                "cluster_id->[%s], storage_type->[%s]",
+                table_id,
+                bk_tenant_id,
+                target_cluster_id,
+                target_storage_type,
+            )
+            raise ValueError(
+                _("存储集群[{}]不存在、租户不匹配或类型不是[{}]").format(target_cluster_id, target_storage_type)
+            )
+
+        current_records = list(
+            cls.objects.select_for_update()
+            .filter(table_id=table_id, bk_tenant_id=bk_tenant_id, is_current=True)
+            .order_by("id")
+        )
+        target_current_records = [
+            record for record in current_records if record.cluster_id == target_cluster_id and not record.is_deleted
+        ]
+        if target_current_records and not force_new_segment:
+            # 同集群重复修改时保留最新 target current，并顺手关闭旧版本遗留的其他 current。
+            current_record = target_current_records[-1]
+            stale_current_ids = [record.id for record in current_records if record.id != current_record.id]
+            if stale_current_ids:
+                cls.objects.filter(id__in=stale_current_ids).update(
+                    is_current=False,
+                    disable_time=switch_time,
+                )
+            logger.info(
+                "switch_current_cluster: table_id->[%s] already uses cluster_id->[%s], skip duplicate segment",
+                table_id,
+                target_cluster_id,
+            )
+            return current_record, False
+
+        if current_records:
+            cls.objects.filter(id__in=[record.id for record in current_records]).update(
+                is_current=False,
+                disable_time=switch_time,
+            )
+
+        new_record = cls.objects.create(
+            table_id=table_id,
+            bk_tenant_id=bk_tenant_id,
+            cluster_id=target_cluster_id,
+            is_deleted=False,
+            is_current=True,
+            enable_time=switch_time,
+            creator=creator,
+        )
+        logger.info(
+            "switch_current_cluster: table_id->[%s] switched to storage_type->[%s], cluster_id->[%s], "
+            "switch_time->[%s]",
+            table_id,
+            target_storage_type,
+            target_cluster_id,
+            switch_time,
+        )
+        return new_record, True
 
     @classmethod
     def compose_table_id_storage_cluster_records(cls, table_id, bk_tenant_id=DEFAULT_TENANT_ID):
@@ -5471,6 +6315,7 @@ class DorisStorage(models.Model, StorageResultTable):
     bk_tenant_id = models.CharField("租户ID", max_length=256, null=True, default="system")
     bkbase_table_id = models.CharField("bkbase表名", max_length=128, null=True)
     origin_table_id = models.CharField("原始结果表名", max_length=128, blank=True, null=True)
+    physical_tables = models.JSONField("物理表用途映射", default=dict)
     source_type = models.CharField("数据源类型", max_length=32, default="log")
 
     index_set = models.TextField("索引集", blank=True, null=True)
@@ -5600,9 +6445,17 @@ class DorisStorage(models.Model, StorageResultTable):
             "source": source,
         }
 
-    def get_doris_connection_config(self) -> dict[str, Any]:
+    def get_doris_connection_config(self, storage_cluster_id: int | None = None) -> dict[str, Any]:
         """通过 storage_cluster_id 获取 Doris MySQL 协议连接信息。"""
-        cluster = self.get_effective_storage().storage_cluster
+        effective_storage = self.get_effective_storage()
+        if storage_cluster_id is None:
+            cluster = effective_storage.storage_cluster
+        else:
+            cluster = ClusterInfo.objects.get(
+                bk_tenant_id=effective_storage.bk_tenant_id,
+                cluster_id=storage_cluster_id,
+                cluster_type=ClusterInfo.TYPE_DORIS,
+            )
         return {
             "host": cluster.domain_name,
             "port": cluster.port,
@@ -5639,7 +6492,14 @@ class DorisStorage(models.Model, StorageResultTable):
             "storage_config": spec.get("storage_config") or {},
         }
 
-    def _query_doris_physical_metadata(self, database: str, table: str, connection_config: dict[str, Any]) -> dict:
+    def _query_doris_physical_metadata(
+        self,
+        database: str,
+        table: str,
+        connection_config: dict[str, Any],
+        timeout: int = 10,
+        include_create_table: bool = True,
+    ) -> dict:
         connection = pymysql.connect(
             host=connection_config["host"],
             port=int(connection_config["port"]),
@@ -5648,9 +6508,9 @@ class DorisStorage(models.Model, StorageResultTable):
             database=database,
             charset="utf8mb4",
             cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=10,
-            read_timeout=10,
-            write_timeout=10,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
         )
         try:
             with connection.cursor() as cursor:
@@ -5686,16 +6546,18 @@ class DorisStorage(models.Model, StorageResultTable):
                 )
                 partitions = cursor.fetchall()
 
-                quoted_table = ".".join([self._quote_doris_identifier(database), self._quote_doris_identifier(table)])
-                cursor.execute(f"SHOW CREATE TABLE {quoted_table}")
-                create_table = cursor.fetchall()
-
-                return {
+                result = {
                     "tables": tables,
                     "columns": columns,
                     "partitions": partitions,
-                    "show_create_table": create_table,
                 }
+                if include_create_table:
+                    quoted_table = ".".join(
+                        [self._quote_doris_identifier(database), self._quote_doris_identifier(table)]
+                    )
+                    cursor.execute(f"SHOW CREATE TABLE {quoted_table}")
+                    result["show_create_table"] = cursor.fetchall()
+                return result
         finally:
             connection.close()
 
@@ -5730,7 +6592,10 @@ class DorisStorage(models.Model, StorageResultTable):
             connection.close()
 
     def query_latest_physical_storage_records(
-        self, limit: int = 1, order_field: str = "dtEventTimeStamp"
+        self,
+        limit: int = 1,
+        order_field: str = "dtEventTimeStamp",
+        storage_cluster_id: int | None = None,
     ) -> dict[str, Any]:
         """
         从 Doris 物理表按时间字段倒序拉取最新 N 条原始数据。
@@ -5819,7 +6684,7 @@ class DorisStorage(models.Model, StorageResultTable):
 
         connection_config = None
         try:
-            connection_config = self.get_doris_connection_config()
+            connection_config = self.get_doris_connection_config(storage_cluster_id=storage_cluster_id)
             result["storage_cluster"] = self._serialize_storage_cluster(connection_config)
         except Exception as error:  # pylint: disable=broad-except
             errors.append(
@@ -5850,7 +6715,12 @@ class DorisStorage(models.Model, StorageResultTable):
 
         return result
 
-    def query_physical_storage_metadata(self) -> dict[str, Any]:
+    def query_physical_storage_metadata(
+        self,
+        storage_cluster_id: int | None = None,
+        timeout: int = 10,
+        include_create_table: bool = True,
+    ) -> dict[str, Any]:
         """
         查询 DorisStorage 关联物理表的原始元信息。
 
@@ -5961,7 +6831,7 @@ class DorisStorage(models.Model, StorageResultTable):
 
         connection_config = None
         try:
-            connection_config = self.get_doris_connection_config()
+            connection_config = self.get_doris_connection_config(storage_cluster_id=storage_cluster_id)
             result["storage_cluster"] = self._serialize_storage_cluster(connection_config)
         except Exception as error:  # pylint: disable=broad-except
             errors.append(
@@ -5978,6 +6848,8 @@ class DorisStorage(models.Model, StorageResultTable):
                     database=physical_table["database"],
                     table=physical_table["table"],
                     connection_config=connection_config,
+                    timeout=timeout,
+                    include_create_table=include_create_table,
                 )
             except Exception as error:  # pylint: disable=broad-except
                 errors.append(
@@ -6004,6 +6876,7 @@ class DorisStorage(models.Model, StorageResultTable):
         field_config_mapping=None,
         expire_days=30,
         storage_cluster_id=None,
+        create_storage_cluster_record=True,
         **kwargs,
     ):
         """
@@ -6019,6 +6892,7 @@ class DorisStorage(models.Model, StorageResultTable):
         :param field_config_mapping: 字段/分词配置
         :param expire_days: 过期天数
         :param storage_cluster_id: 存储集群ID
+        :param create_storage_cluster_record: 是否创建当前存储集群记录，非默认存储创建时应关闭
         :param kwargs: 其他参数
         """
         # 0. 判断是否需要使用默认集群信息
@@ -6043,7 +6917,7 @@ class DorisStorage(models.Model, StorageResultTable):
 
         # 2. 创建物理存储表记录
         try:
-            with transaction.atomic():
+            with transaction.atomic(using=config.DATABASE_CONNECTION_NAME):
                 new_record = cls.objects.create(
                     table_id=table_id,
                     bk_tenant_id=bk_tenant_id,
@@ -6056,22 +6930,22 @@ class DorisStorage(models.Model, StorageResultTable):
                     expire_days=expire_days,
                     storage_cluster_id=storage_cluster_id,
                 )
-                # 创建集群记录，第一条记录的enable_time需要设置为最小时间
-                # 使用 1970-01-01 而不是 datetime.min，因为 MySQL DATETIME 类型不支持 0001-01-01
-                StorageClusterRecord.objects.update_or_create(
-                    bk_tenant_id=bk_tenant_id,
-                    table_id=table_id,
-                    cluster_id=storage_cluster_id,
-                    defaults={
-                        "enable_time": datetime.datetime(1970, 1, 1),
-                        "is_current": True,
-                    },
-                )
+                if create_storage_cluster_record:
+                    # 使用 1970-01-01 而不是 datetime.min，因为 MySQL DATETIME 不支持 0001-01-01。
+                    StorageClusterRecord.objects.update_or_create(
+                        bk_tenant_id=bk_tenant_id,
+                        table_id=table_id,
+                        cluster_id=storage_cluster_id,
+                        enable_time=django_timezone.make_aware(datetime.datetime(1970, 1, 1)),
+                        defaults={"is_current": True},
+                    )
                 logger.info("CreateDorisStorage: create Doris storage table[%s] success", new_record.table_id)
         except Exception as e:  # pylint: disable=broad-except
             logger.error("CreateDorisStorage: create Doris storage table[%s] failed, error[%s]", table_id, e)
+            raise
 
         logger.info("CreateDorisStorage: create Doris storage table->[%s] successfully", table_id)
+        return new_record
 
     def add_field(self, field):
         pass
@@ -6107,6 +6981,143 @@ class DorisStorage(models.Model, StorageResultTable):
         # 将存储的修改时间去掉，防止MD5命中失败
         consul_config["cluster_config"].pop("last_modify_time")
 
+        return consul_config
+
+    def get_client(self):
+        pass
+
+
+class SurrealDBStorage(models.Model, StorageResultTable):
+    """
+    SurrealDB 图数据库存储表
+    用于存储关联关系数据（顶点 + 边），通过 BKBase SurrealDBBinding 链路写入
+    """
+
+    STORAGE_TYPE = ClusterInfo.TYPE_SURREALDB
+    UPGRADE_FIELD_CONFIG = ("table_type", "vertices", "relations", "storage_cluster_id")
+    JSON_FIELDS = ("vertices", "relations")
+
+    TEMPORARY_TABLE_TYPE = "temporary"  # 图能力表，支持顶点/边写入，支持指标入图
+    NORMAL_TABLE_TYPE = "normal"  # 基础表，无图能力
+
+    table_id = models.CharField("结果表ID", max_length=128)
+    bk_tenant_id = models.CharField("租户ID", max_length=256, null=True, default="system")
+    table_type = models.CharField("图表类型", max_length=32, default=TEMPORARY_TABLE_TYPE)
+    vertices = models.JSONField("顶点定义", default=list)
+    relations = models.JSONField("关系定义", default=list)
+    storage_cluster_id = models.IntegerField("存储集群")
+
+    class Meta:
+        verbose_name = "SurrealDB存储表"
+        verbose_name_plural = "SurrealDB存储表"
+        unique_together = (("table_id", "bk_tenant_id"),)
+
+    @classmethod
+    def create_table(
+        cls,
+        table_id,
+        is_sync_db=True,
+        bk_tenant_id="system",
+        table_type=TEMPORARY_TABLE_TYPE,
+        vertices=None,
+        relations=None,
+        storage_cluster_id=None,
+        create_storage_cluster_record=True,
+        **kwargs,
+    ):
+        """
+        创建/更新 SurrealDB 存储表记录（幂等，多次调用不会报错）
+        :param table_id: 结果表ID
+        :param is_sync_db: 是否同步创建（保留参数，SurrealDB 侧由 BKBase 负责实际建表）
+        :param bk_tenant_id: 租户ID
+        :param table_type: 图表类型，temporary=图能力表，normal=基础表
+        :param vertices: 顶点定义列表
+        :param relations: 关系定义列表
+        :param storage_cluster_id: SurrealDB 集群ID
+        :param create_storage_cluster_record: 是否创建当前存储集群记录，作为额外存储时应关闭
+        """
+        if storage_cluster_id is None:
+            storage_cluster_id = ClusterInfo.objects.get(
+                bk_tenant_id=bk_tenant_id, cluster_type=ClusterInfo.TYPE_SURREALDB, is_default_cluster=True
+            ).cluster_id
+            logger.info("CreateSurrealDBStorage: use default SurrealDB cluster->[%s]", storage_cluster_id)
+        else:
+            if not ClusterInfo.objects.filter(
+                bk_tenant_id=bk_tenant_id, cluster_type=ClusterInfo.TYPE_SURREALDB, cluster_id=storage_cluster_id
+            ).exists():
+                logger.error("CreateSurrealDBStorage: storage cluster[%s] not exist", storage_cluster_id)
+                raise ValueError("SurrealDB存储集群配置有误，请确认或联系管理员处理")
+
+        try:
+            with atomic(config.DATABASE_CONNECTION_NAME):
+                record, created = cls.objects.update_or_create(
+                    table_id=table_id,
+                    bk_tenant_id=bk_tenant_id,
+                    defaults={
+                        "table_type": table_type,
+                        "vertices": vertices or [],
+                        "relations": relations or [],
+                        "storage_cluster_id": storage_cluster_id,
+                    },
+                )
+                if create_storage_cluster_record:
+                    surrealdb_cluster_ids = ClusterInfo.objects.filter(
+                        bk_tenant_id=bk_tenant_id,
+                        cluster_type=ClusterInfo.TYPE_SURREALDB,
+                    ).values_list("cluster_id", flat=True)
+                    StorageClusterRecord.objects.filter(
+                        bk_tenant_id=bk_tenant_id,
+                        table_id=table_id,
+                        is_current=True,
+                        cluster_id__in=surrealdb_cluster_ids,
+                    ).exclude(cluster_id=storage_cluster_id).update(is_current=False)
+                    StorageClusterRecord.objects.update_or_create(
+                        bk_tenant_id=bk_tenant_id,
+                        table_id=table_id,
+                        cluster_id=storage_cluster_id,
+                        defaults={
+                            "enable_time": django_timezone.make_aware(datetime.datetime(1970, 1, 1)),
+                            "is_current": True,
+                        },
+                    )
+                action = "created" if created else "updated"
+                logger.info("CreateSurrealDBStorage: %s SurrealDB storage table[%s] success", action, record.table_id)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("CreateSurrealDBStorage: create SurrealDB storage table[%s] failed, error[%s]", table_id, e)
+            raise
+
+        logger.info("CreateSurrealDBStorage: ensure SurrealDB storage table->[%s] successfully", table_id)
+
+    def add_field(self, field):
+        pass
+
+    def update_storage(self, **kwargs):
+        """更新普通 SurrealDB storage，并校验目标集群归属当前租户。"""
+        storage_cluster_id = kwargs.get("storage_cluster_id")
+        if (
+            storage_cluster_id is not None
+            and not ClusterInfo.objects.filter(
+                bk_tenant_id=self.bk_tenant_id,
+                cluster_type=ClusterInfo.TYPE_SURREALDB,
+                cluster_id=storage_cluster_id,
+            ).exists()
+        ):
+            raise ValueError("SurrealDB存储集群配置有误，请确认或联系管理员处理")
+        return super().update_storage(**kwargs)
+
+    @property
+    def consul_config(self):
+        """返回 SurrealDB 存储配置，供通用 ResultTable storage 查询序列化。"""
+        consul_config = {
+            "storage_config": {
+                "table_type": self.table_type,
+                "vertices": self.vertices or [],
+                "relations": self.relations or [],
+                "bk_tenant_id": self.bk_tenant_id,
+            }
+        }
+        consul_config.update(self.storage_cluster.consul_config)
+        consul_config["cluster_config"].pop("last_modify_time", None)
         return consul_config
 
     def get_client(self):

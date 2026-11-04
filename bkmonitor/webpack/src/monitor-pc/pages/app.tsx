@@ -30,7 +30,7 @@ import { Component as tsc } from 'vue-tsx-support';
 import { addListener, removeListener } from '@blueking/fork-resize-detector';
 import { getLinkMapping, listStickySpaces } from 'monitor-api/modules/commons';
 import { getDashboardList } from 'monitor-api/modules/grafana';
-import { APP_NAV_COLORS, LANGUAGE_COOKIE_KEY } from 'monitor-common/utils';
+import { APP_NAV_COLORS, LANGUAGE_COOKIE_KEY, parseBizId } from 'monitor-common/utils';
 import debounce from 'monitor-common/utils/debounce-decorator';
 import bus from 'monitor-common/utils/event-bus';
 import { docCookies, random } from 'monitor-common/utils/utils';
@@ -166,13 +166,19 @@ export default class App extends tsc<object> {
     if (this.$route.path.includes('exception/403')) this.headerNav = this.$route.query.parentRoute as string;
     if (!this.navActive) {
       list = this.routeList.find(item => item.id === this.headerNav)?.children || [];
-      // ai 设置 enable_aiops为true 则ai设置不展示 false 则ai设置页面展示
-      list = list.filter(item => !(item.id === 'ai' && !window.enable_aiops));
+      // 异常检测或 Issue AI 分析任一能力开放时展示 AI 设置
+      list = list.filter(item => !(item.id === 'ai' && !window.enable_aiops && !window.enable_issue_ai_analysis));
       return list;
     }
     list = this.routeList.find(item => item.id === this.navActive)?.children || [];
-    // ai 设置 enable_aiops为true 则ai设置不展示 false 则ai设置页面展示
-    list = list.filter(item => !(item.id === 'ai' && !window.enable_aiops));
+    list = list.filter(item => {
+      // 异常检测或 Issue AI 分析任一能力开放时展示 AI 设置
+      if (item.id === 'ai') return !!window.enable_aiops || !!window.enable_issue_ai_analysis;
+      if (item.id === 'rum-explore') {
+        return window.rum_biz_list?.includes(+this.bizId);
+      }
+      return true;
+    });
     return list;
   }
   get navRouteList() {
@@ -183,7 +189,7 @@ export default class App extends tsc<object> {
     return this.$store.getters.bizList;
   }
   get hasBusinessAuth() {
-    return this.$store.getters.bizList.some(item => +item.id === +this.bizId);
+    return !!this.$store.getters.bizIdMap?.has?.(+this.bizId);
   }
   // 业务列表
   get bizList() {
@@ -195,7 +201,7 @@ export default class App extends tsc<object> {
     );
   }
   get bizName() {
-    return this.$store.getters.bizList.find(item => +item.id === +this.bizId)?.text;
+    return this.$store.getters.bizIdMap?.get?.(+this.bizId)?.text;
   }
 
   // 当前是否全屏
@@ -214,6 +220,8 @@ export default class App extends tsc<object> {
   }
   @Watch('$route.name', { immediate: true })
   async handlerRouteChange() {
+    // 切换子应用的时候，需要以url为准矫正最新的业务id
+    this.checkAndUpdateBizId();
     this.handleSowNav();
     this.headerNav = this.navActive;
   }
@@ -244,6 +252,14 @@ export default class App extends tsc<object> {
       },
     ];
     this.getDocsLinkMapping();
+  }
+  /** 检查并更新业务id。旧链接 `?bizId=2/#/` 的 search 是 `bizId=2/`，必须走 parseBizId。 */
+  checkAndUpdateBizId() {
+    const urlBizId = parseBizId(new URL(window.location.href).searchParams.get('bizId'));
+    const storeBizId = this.$store.getters.bizId;
+    if (Number.isFinite(urlBizId) && urlBizId !== storeBizId) {
+      this.$store.commit('app/SET_BIZ_ID', urlBizId);
+    }
   }
   /** 获取文档链接 */
   async getDocsLinkMapping() {
@@ -386,7 +402,7 @@ export default class App extends tsc<object> {
     if (isMicroApp) {
       hasRouteChange = location.hash !== item.href;
     }
-    if (hasRouteChange && !!item.href) {
+    if (hasRouteChange && item.href) {
       // await this.$nextTick();
       // if (!(this.$router as any).history.pending) {
       const route = item.usePath ? { path: item.path } : { name: item.id };
@@ -599,7 +615,9 @@ export default class App extends tsc<object> {
           }
           const navList = this.routeList.find(item => item.id === this.headerNav).children;
           if (navList?.length) {
-            const storeRoute = storeVal[this.headerNav];
+            const storedMenu = storeVal[this.headerNav];
+            const storeRoute =
+              storedMenu?.name === 'performance' || storedMenu?.path === '/performance' ? { name: 'host' } : storedMenu;
             const hasRoute = navList.find(
               item => item.id === storeRoute?.name || item?.children?.some(set => set.id === storeRoute?.name)
             );
@@ -900,6 +918,9 @@ export default class App extends tsc<object> {
                                 }
                                 if (this.$store.getters.k8sV2EnableList && menu.id === 'k8s-new') return true;
                                 return false;
+                              }
+                              if (menu.id === 'rum') {
+                                return window.rum_biz_list?.includes(+this.bizId);
                               }
                               return true;
                             })

@@ -76,7 +76,7 @@
     padding-top: 12px;
 
     .app-list-title {
-      width: 56px;
+      min-width: 56px;
       height: 22px;
       margin: 0 0 12px 16px;
       font-size: 14px;
@@ -281,6 +281,11 @@
       .data-item.disabled .biz-name-01 .biz-app-alias,
       .data-item.disabled .biz-name-01 .biz-app-name {
         color: #c4c6cc;
+      }
+
+      .data-item.keyboard-active {
+        outline: 1px solid #3a84ff;
+        outline-offset: -1px;
       }
 
       // item选中状态

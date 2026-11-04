@@ -2,11 +2,13 @@ import abc
 import ipaddress
 import logging
 import math
+import queue
 import re
+import threading
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from datetime import timedelta
-from multiprocessing.pool import IMapIterator
+from multiprocessing.pool import ApplyResult
 from typing import Any, TypeVar
 
 from django.db.models import Count, Q
@@ -83,8 +85,14 @@ class SearchItem(metaclass=abc.ABCMeta):
 
     @classmethod
     def search(
-        cls, bk_tenant_id: str, username: str, query: str, limit: int = 5, current_bk_biz_id: int | None = None
-    ) -> list[dict] | None:
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> Iterable[dict[str, Any]] | None:
         """
         Search the query in the search item.
         数据格式:
@@ -118,7 +126,13 @@ class AlertSearchItem(SearchItem):
 
     @classmethod
     def search(
-        cls, bk_tenant_id: str, username: str, query: str, limit: int = 5, current_bk_biz_id: int | None = None
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> list[dict] | None:
         """
         Search the alert by alert id
@@ -177,7 +191,13 @@ class StrategySearchItem(SearchItem):
 
     @classmethod
     def search(
-        cls, bk_tenant_id: str, username: str, query: str, limit: int = 5, current_bk_biz_id: int | None = None
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> list[dict] | None:
         """
         Search the strategy by strategy id
@@ -226,7 +246,7 @@ class TraceSearchItem(SearchItem):
     """
     Search item for trace.
 
-    实现两条互补查询路径并行竞速：
+    实现两条互补查询路径并行收集：
     - Path A 预计算：复用 ``DataLink.pre_calculate_config`` 共享表，覆盖老数据广度。
     - Path B 直查：按候选业务/应用打分取 TopN，直查 ``Application.trace_result_table_id``，
       覆盖预计算分钟级写入延迟。
@@ -235,6 +255,8 @@ class TraceSearchItem(SearchItem):
     RE_TRACE_ID = re.compile(r"^[0-9a-z]{32}$")
 
     _RAW_QUERY_TOP_N = 25
+    _TRACE_TOP_K = 3
+    _TRACE_SEARCH_TIMEOUT = 10
     _CURRENT_BIZ_WEIGHT = 1  # 当前业务基础分
     _DEFAULT_BIZ_WEIGHT = 1  # 默认业务基础分
     _HAS_SERVICE_APP_WEIGHT = 0.5  # 有服务关联的应用加分，提升命中率较低但价值较高的应用
@@ -246,30 +268,65 @@ class TraceSearchItem(SearchItem):
         return bool(cls.RE_TRACE_ID.match(query))
 
     @staticmethod
-    def _first_truthy_concurrent(items: Sequence[_T], fn: Callable[[_T], _R], max_workers: int) -> _R | None:
-        """并发执行 ``fn(item)``，返回首个 truthy 结果；剩余任务通过 ``terminate`` 取消调度。
+    def _should_stop(
+        stop_event: threading.Event,
+        trace_stop: threading.Event,
+        deadline: float,
+    ) -> bool:
+        return stop_event.is_set() or trace_stop.is_set() or time.monotonic() >= deadline
 
-        ``fn`` 内部需自行吞掉异常并返回 falsy 值，否则首个抛错的任务会终结迭代。
-        """
-        if not items:
-            return None
-        pool = ThreadPool(min(len(items), max(1, max_workers)))
+    @classmethod
+    def _iter_probe_results(
+        cls,
+        candidates: Sequence[_T],
+        probe: Callable[[_T], _R | None],
+        max_workers: int,
+        stop_event: threading.Event,
+        trace_stop: threading.Event,
+        deadline: float,
+    ) -> Generator[_R, None, None]:
+        """使用滑动窗口并发探测候选，停止后不再提交新任务。"""
+        if not candidates:
+            return
+
+        candidate_iter = iter(candidates)
+        worker_count = min(len(candidates), max(1, max_workers))
+        pool = ThreadPool(worker_count)
+        pending: list[ApplyResult] = []
         try:
-            for result in pool.imap_unordered(fn, items):
-                if result:
-                    return result
+            while len(pending) < worker_count and not cls._should_stop(stop_event, trace_stop, deadline):
+                try:
+                    candidate = next(candidate_iter)
+                except StopIteration:
+                    break
+                pending.append(pool.apply_async(probe, (candidate,)))
+
+            while pending and not cls._should_stop(stop_event, trace_stop, deadline):
+                future = next((result for result in pending if result.ready()), None)
+                if future is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(min(0.05, remaining))
+                    continue
+
+                pending.remove(future)
+                try:
+                    result = future.get()
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("[TraceSearch] probe failed")
+                else:
+                    if result is not None:
+                        yield result
+
+                if cls._should_stop(stop_event, trace_stop, deadline):
+                    break
+                try:
+                    candidate = next(candidate_iter)
+                except StopIteration:
+                    continue
+                pending.append(pool.apply_async(probe, (candidate,)))
         finally:
             pool.terminate()
-        return None
-
-    @staticmethod
-    def _safe_call(fn: Callable[[], _R], err_msg: str) -> _R | None:
-        """调用 ``fn``，捕获并记录异常，返回 None。用于路径级隔离。"""
-        try:
-            return fn()
-        except Exception:  # pylint: disable=broad-except
-            logger.exception(err_msg)
-            return None
 
     @classmethod
     def _build_item(cls, trace_id: str, app: Application) -> dict[str, Any]:
@@ -303,9 +360,12 @@ class TraceSearchItem(SearchItem):
             q: QueryConfigBuilder = QueryConfigBuilder((DataTypeLabel.LOG, DataSourceLabel.BK_APM)).table(table_id)
         else:
             q: QueryConfigBuilder = TraceQueryGuard.get_q([target])
-        qs: UnifyQuerySet = (
-            UnifyQuerySet()
-            .add_query(q.filter(trace_id__eq=trace_id).time_field(time_field).values(*fields))
+        qs: UnifyQuerySet = UnifyQuerySet()
+        if target is not None:
+            # 适配多租户场景，严格传入 scope，用于推导租户。
+            qs = qs.scope(target.app.bk_biz_id)
+        qs = (
+            qs.add_query(q.filter(trace_id__eq=trace_id).time_field(time_field).values(*fields))
             .time_align(False)
             .start_time(int((now - timedelta(days=7).total_seconds()) * 1000))
             .end_time(now * 1000)
@@ -342,35 +402,68 @@ class TraceSearchItem(SearchItem):
             return []
 
     @classmethod
-    def _path_precalc(cls, bk_tenant_id: str, trace_id: str, limit: int) -> list[dict[str, Any]]:
-        """Path A：多 cluster 并发查询预计算表，装配 items 输出"""
+    def _path_precalc(
+        cls,
+        bk_tenant_id: str,
+        trace_id: str,
+        stop_event: threading.Event,
+        trace_stop: threading.Event,
+        deadline: float,
+    ) -> Generator[Application, None, None]:
+        """Path A：使用滑动窗口持续产出各预计算表命中的应用。"""
+        if cls._should_stop(stop_event, trace_stop, deadline):
+            return
         table_ids: list[str] = cls._load_precalc_table_ids()
         if not table_ids:
-            return []
+            return
 
-        app_infos: list[dict[str, Any]] = (
-            cls._first_truthy_concurrent(
-                table_ids,
-                lambda tid: cls._query_precalc_apps_by_trace_id(trace_id, tid, limit),
-                max_workers=5,
-            )
-            or []
-        )
-
-        items: list[dict[str, Any]] = []
-        for info in app_infos:
+        def _probe_table(table_id: str) -> list[dict[str, Any]]:
+            if cls._should_stop(stop_event, trace_stop, deadline):
+                return []
             try:
-                bk_biz_id = int(info["bk_biz_id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            app_name: str | None = info.get("app_name")
-            if not app_name:
-                continue
-            app = Application.objects.filter(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id, app_name=app_name).first()
-            if not app:
-                continue
-            items.append(cls._build_item(trace_id, app))
-        return items
+                return cls._query_precalc_apps_by_trace_id(trace_id, table_id)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "[TraceSearch] precalc query failed, trace_id=%s table=%s",
+                    trace_id,
+                    table_id,
+                )
+                return []
+
+        for app_infos in cls._iter_probe_results(
+            table_ids,
+            _probe_table,
+            max_workers=5,
+            stop_event=stop_event,
+            trace_stop=trace_stop,
+            deadline=deadline,
+        ):
+            for info in app_infos:
+                if cls._should_stop(stop_event, trace_stop, deadline):
+                    return
+                try:
+                    bk_biz_id = int(info["bk_biz_id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                app_name: str | None = info.get("app_name")
+                if not app_name:
+                    continue
+                app = (
+                    Application.objects.filter(
+                        bk_tenant_id=bk_tenant_id,
+                        bk_biz_id=bk_biz_id,
+                        app_name=app_name,
+                    )
+                    .only(
+                        "application_id",
+                        "bk_biz_id",
+                        "app_name",
+                        "app_alias",
+                    )
+                    .first()
+                )
+                if app:
+                    yield app
 
     # ---------- Path B: 直查 ----------
 
@@ -431,9 +524,18 @@ class TraceSearchItem(SearchItem):
         if not biz_ids:
             return []
 
+        # 候选最终会按业务得分重新排序，仅加载后续评分、探测和结果装配实际读取的字段。
         apps = list(
-            Application.objects.filter(bk_tenant_id=bk_tenant_id, bk_biz_id__in=list(biz_ids)).exclude(
-                trace_result_table_id=""
+            Application.objects.filter(bk_tenant_id=bk_tenant_id, bk_biz_id__in=list(biz_ids))
+            .exclude(trace_result_table_id="")
+            .order_by()
+            .only(
+                "application_id",
+                "bk_biz_id",
+                "app_name",
+                "app_alias",
+                "trace_result_table_id",
+                "service_count",
             )
         )
         if not apps:
@@ -461,21 +563,28 @@ class TraceSearchItem(SearchItem):
         username: str,
         trace_id: str,
         bk_biz_id: int | None,
-    ) -> list[dict[str, Any]]:
-        """Path B：TopN 候选应用并发直查，首个命中即返回。"""
+        stop_event: threading.Event,
+        trace_stop: threading.Event,
+        deadline: float,
+    ) -> Generator[Application, None, None]:
+        """Path B：使用滑动窗口持续产出原始 Trace 表命中的应用。"""
+        if cls._should_stop(stop_event, trace_stop, deadline):
+            return
         apps = cls._collect_candidate_apps(bk_tenant_id, username, bk_biz_id)
         if not apps:
-            return []
+            return
 
         logger.info(
             "[TraceSearch] raw path candidate apps, trace_id=%s, bk_biz_id=%s, candidates=%s",
             trace_id,
             bk_biz_id,
-            ",".join([f"{app.bk_biz_id}-{app.app_name}" for app in apps]),
+            ",".join(f"{app.bk_biz_id}-{app.app_name}" for app in apps),
         )
 
         def _probe_app(app: Application) -> Application | None:
             """探测单应用原始 Trace 表是否命中 trace_id；异常按 miss 处理"""
+            if cls._should_stop(stop_event, trace_stop, deadline):
+                return None
             try:
                 if cls._query_raw_apps_by_trace_id(trace_id, app):
                     return app
@@ -487,36 +596,146 @@ class TraceSearchItem(SearchItem):
                 )
             return None
 
-        hit_app = cls._first_truthy_concurrent(apps, _probe_app, max_workers=min(len(apps), 8))
-        return [cls._build_item(trace_id, hit_app)] if hit_app else []
+        yield from cls._iter_probe_results(
+            apps,
+            _probe_app,
+            max_workers=8,
+            stop_event=stop_event,
+            trace_stop=trace_stop,
+            deadline=deadline,
+        )
 
     @classmethod
     def search(
-        cls, bk_tenant_id: str, username: str, query: str, limit: int = 5, current_bk_biz_id: int | None = None
-    ) -> list[dict] | None:
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
         """
-        Search the trace by trace id
-        extended fields: trace_id, app_name, app_alias
+        Search the trace by trace id, yielding a complete snapshot for every new application hit.
         """
         trace_id = query
+        request_stop = stop_event if stop_event is not None else threading.Event()
+        if request_stop.is_set():
+            return
 
-        # 路径级隔离：单条路径异常被吞掉并返回 None，让另一路仍有机会贡献结果
-        path_funcs: list[Callable[[], list[dict[str, Any]] | None]] = [
-            lambda: cls._safe_call(
-                lambda: cls._path_precalc(bk_tenant_id, trace_id, limit),
-                f"[TraceSearch] precalc path failed, trace_id={trace_id}",
+        deadline = time.monotonic() + cls._TRACE_SEARCH_TIMEOUT
+        trace_stop = threading.Event()
+        app_queue: queue.Queue[Any] = queue.Queue()
+        path_done = object()
+        paths: list[tuple[str, Iterable[Application]]] = [
+            (
+                "precalc",
+                cls._path_precalc(
+                    bk_tenant_id,
+                    trace_id,
+                    stop_event=request_stop,
+                    trace_stop=trace_stop,
+                    deadline=deadline,
+                ),
             ),
-            lambda: cls._safe_call(
-                lambda: cls._path_raw(bk_tenant_id, username, trace_id, current_bk_biz_id),
-                f"[TraceSearch] raw path failed, trace_id={trace_id}",
+            (
+                "raw",
+                cls._path_raw(
+                    bk_tenant_id,
+                    username,
+                    trace_id,
+                    current_bk_biz_id,
+                    stop_event=request_stop,
+                    trace_stop=trace_stop,
+                    deadline=deadline,
+                ),
             ),
         ]
 
-        items = cls._first_truthy_concurrent(path_funcs, lambda fn: fn(), max_workers=len(path_funcs))
-        if not items:
-            return None
+        def _drain_path(path_name: str, path: Iterable[Application]) -> None:
+            try:
+                for app in path:
+                    if cls._should_stop(request_stop, trace_stop, deadline):
+                        break
+                    app_queue.put(app)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "[TraceSearch] %s path failed, trace_id=%s",
+                    path_name,
+                    trace_id,
+                )
+            finally:
+                close = getattr(path, "close", None)
+                try:
+                    if close is not None:
+                        close()
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        "[TraceSearch] %s path close failed, trace_id=%s",
+                        path_name,
+                        trace_id,
+                    )
+                finally:
+                    app_queue.put(path_done)
 
-        return [{"type": "trace", "name": "Trace", "items": items}]
+        path_pool = ThreadPool(len(paths))
+        unfinished_paths = len(paths)
+        seen_apps: dict[int, Application] = {}
+        checked_app_ids: set[int] = set()
+        try:
+            for path_name, path in paths:
+                path_pool.apply_async(_drain_path, (path_name, path))
+
+            while (
+                len(seen_apps) < cls._TRACE_TOP_K
+                and unfinished_paths
+                and not cls._should_stop(request_stop, trace_stop, deadline)
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    app = app_queue.get(timeout=min(0.2, remaining))
+                except queue.Empty:
+                    continue
+                if app is path_done:
+                    unfinished_paths -= 1
+                    continue
+                if app.application_id in checked_app_ids:
+                    continue
+                checked_app_ids.add(app.application_id)
+
+                # 两条路径统一校验应用查看权限，无权限命中不进入快照，也不占用 TopK。
+                allowed_items: list[dict] = filter_data_by_permission(
+                    bk_tenant_id=bk_tenant_id,
+                    data=[
+                        {
+                            "application_id": app.application_id,
+                            "bk_biz_id": app.bk_biz_id,
+                            "app_name": app.app_name,
+                        }
+                    ],
+                    actions=[ActionEnum.VIEW_APM_APPLICATION],
+                    resource_meta=ResourceEnum.APM_APPLICATION,
+                    id_field=lambda item: item["application_id"],
+                    instance_create_func=ResourceEnum.APM_APPLICATION.create_instance_by_info,
+                    mode="any",
+                    username=username,
+                )
+                if not allowed_items:
+                    continue
+
+                seen_apps[app.application_id] = app
+                if len(seen_apps) >= cls._TRACE_TOP_K:
+                    trace_stop.set()
+                yield {
+                    "type": "trace",
+                    "name": "Trace",
+                    "items": [cls._build_item(trace_id, hit_app) for hit_app in seen_apps.values()],
+                }
+        finally:
+            trace_stop.set()
+            path_pool.terminate()
 
 
 class ApmApplicationSearchItem(SearchItem):
@@ -524,18 +743,24 @@ class ApmApplicationSearchItem(SearchItem):
     Search item for apm application.
     """
 
-    RE_APP_NAME = re.compile(r"^[a-z0-9_-]{1,50}$")
+    RE_APP_NAME = re.compile(r"^[a-zA-Z0-9_.-]{1,50}$")
 
     @classmethod
     def match(cls, query: str) -> bool:
         """
-        1-50字符，由小写字母、数字、下划线、中划线组成
+        1-50字符，由小写字母、数字、下划线、中划线、点组成
         """
         return not AlertSearchItem.RE_ALERT_ID.match(query) and not TraceSearchItem.RE_TRACE_ID.match(query)
 
     @classmethod
     def search(
-        cls, bk_tenant_id: str, username: str, query: str, limit: int = 5, current_bk_biz_id: int | None = None
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> list[dict] | None:
         """
         Search the application by application name
@@ -584,6 +809,84 @@ class ApmApplicationSearchItem(SearchItem):
         return [{"type": "apm_application", "name": _("APM应用"), "items": items}]
 
 
+class ApmServiceSearchItem(ApmApplicationSearchItem):
+    """在授权业务中匹配服务，有查看权限的应用排在前面，无权限的也一并返回。"""
+
+    @classmethod
+    def _list_applications(cls, bk_tenant_id: str, services: list[dict]) -> list[dict[str, Any]]:
+        app_keys = {(service["bk_biz_id"], service["app_name"]) for service in services}
+        applications = (
+            Application.objects.filter(
+                bk_tenant_id=bk_tenant_id,
+                bk_biz_id__in={bk_biz_id for bk_biz_id, _ in app_keys},
+                app_name__in={app_name for _, app_name in app_keys},
+            )
+            .order_by()
+            .values("bk_biz_id", "app_name", "application_id")
+        )
+        return [app for app in applications if (app["bk_biz_id"], app["app_name"]) in app_keys]
+
+    @classmethod
+    def search(
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> list[dict] | None:
+        if stop_event is not None and stop_event.is_set():
+            return
+        bk_biz_ids = cls._get_allowed_bk_biz_ids(bk_tenant_id, username, ActionEnum.VIEW_BUSINESS)
+        if not bk_biz_ids:
+            return
+        # 业务超过 100 个时省略业务过滤。
+        services = api.apm_api.search_service_names(
+            bk_biz_ids=[] if len(bk_biz_ids) > 100 else bk_biz_ids, query=query, limit=limit
+        )
+        if not services:
+            return
+
+        applications = cls._list_applications(bk_tenant_id, services)
+        allowed = filter_data_by_permission(
+            bk_tenant_id=bk_tenant_id,
+            data=applications,
+            actions=[ActionEnum.VIEW_APM_APPLICATION],
+            resource_meta=ResourceEnum.APM_APPLICATION,
+            id_field=lambda d: d["application_id"],
+            instance_create_func=ResourceEnum.APM_APPLICATION.create_instance_by_info,
+            mode="any",
+            username=username,
+        )
+        allowed_keys = {(app["bk_biz_id"], app["app_name"]) for app in allowed}
+        app_map = {(app["bk_biz_id"], app["app_name"]): app for app in applications}
+        ranked, others = [], []
+        for service in services:
+            key = (service["bk_biz_id"], service["app_name"])
+            if key not in app_map:
+                continue
+            if key in allowed_keys:
+                ranked.append(service)
+            else:
+                others.append(service)
+        services = [*ranked, *others][:limit]
+        if not services:
+            return
+        items = [
+            {
+                "bk_biz_id": service["bk_biz_id"],
+                "bk_biz_name": cls._get_biz_name(service["bk_biz_id"]),
+                "application_id": app_map[(service["bk_biz_id"], service["app_name"])]["application_id"],
+                "app_name": service["app_name"],
+                "service_name": service["service_name"],
+                "name": service["service_name"],
+            }
+            for service in services
+        ]
+        return [{"type": "apm_service", "name": _("APM服务"), "items": items}]
+
+
 class HostSearchItem(SearchItem):
     """
     Search item for host.
@@ -600,7 +903,13 @@ class HostSearchItem(SearchItem):
 
     @classmethod
     def search(
-        cls, bk_tenant_id: str, username: str, query: str, limit: int = 5, current_bk_biz_id: int | None = None
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> list[dict] | None:
         """
         Search the host by host name
@@ -677,7 +986,13 @@ class BCSClusterSearchItem(SearchItem):
 
     @classmethod
     def search(
-        cls, bk_tenant_id: str, username: str, query: str, limit: int = 5, current_bk_biz_id: int | None = None
+        cls,
+        bk_tenant_id: str,
+        username: str,
+        query: str,
+        limit: int = 5,
+        current_bk_biz_id: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> list[dict] | None:
         """
         Search the bcs cluster by cluster name
@@ -736,6 +1051,7 @@ class Searcher:
         StrategySearchItem,
         TraceSearchItem,
         ApmApplicationSearchItem,
+        ApmServiceSearchItem,
         HostSearchItem,
         BCSClusterSearchItem,
     ]
@@ -750,30 +1066,63 @@ class Searcher:
         Search the query in the search items.
         """
         search_items = [item for item in self.search_items if item.match(query)]
+        if not search_items:
+            return
 
-        with ThreadPool() as pool:
-            results: IMapIterator = pool.imap_unordered(
-                lambda item: item.search(
-                    self.bk_tenant_id, self.username, query, limit=limit, current_bk_biz_id=self.current_bk_biz_id
-                ),
-                search_items,
-            )
+        request_stop = threading.Event()
+        output_queue: queue.Queue[Any] = queue.Queue()
+        item_done = object()
 
-            start_time = time.time()
-            for __ in range(len(search_items)):
+        def _consume_item(item: type[SearchItem]) -> None:
+            snapshots: Iterable[dict[str, Any]] | None = None
+            try:
+                snapshots = item.search(
+                    self.bk_tenant_id,
+                    self.username,
+                    query,
+                    limit=limit,
+                    current_bk_biz_id=self.current_bk_biz_id,
+                    stop_event=request_stop,
+                )
+                for snapshot in snapshots or []:
+                    if request_stop.is_set():
+                        break
+                    output_queue.put(snapshot)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("Searcher search error, query: %s, item: %s", query, item.__name__)
+            finally:
                 try:
-                    result: list[dict] | None = results.next(timeout=5)
-                except StopIteration:
-                    break
-                except TimeoutError:
-                    logger.error(f"Searcher search timeout, query: {query}")
-                    continue
-                except Exception as e:
-                    logger.exception(f"Searcher search error, query: {query}, error: {e}")
-                    continue
+                    close = getattr(snapshots, "close", None)
+                    if close:
+                        close()
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("Searcher close error, query: %s, item: %s", query, item.__name__)
+                finally:
+                    output_queue.put(item_done)
 
-                if time.time() - start_time > timeout:
-                    break
+        effective_timeout = timeout
+        if TraceSearchItem in search_items:
+            effective_timeout = max(timeout, TraceSearchItem._TRACE_SEARCH_TIMEOUT)
 
-                if result:
-                    yield from result
+        pool = ThreadPool(len(search_items))
+        unfinished_items = len(search_items)
+        try:
+            for item in search_items:
+                pool.apply_async(_consume_item, (item,))
+
+            deadline = time.monotonic() + effective_timeout
+            while unfinished_items and not request_stop.is_set() and time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    snapshot = output_queue.get(timeout=min(0.2, remaining))
+                except queue.Empty:
+                    continue
+                if snapshot is item_done:
+                    unfinished_items -= 1
+                    continue
+                yield snapshot
+        finally:
+            request_stop.set()
+            pool.terminate()

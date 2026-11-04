@@ -29,11 +29,10 @@ import {
   alertDetail,
   alertEventTagDetail,
   alertHostTarget,
-  alertK8sMetricList,
-  alertK8sScenarioList,
   alertK8sTarget,
   listAlertFeedback,
 } from 'monitor-api/modules/alert_v2';
+import { scenarioMetricList } from 'monitor-api/modules/k8s';
 import { listK8sResources } from 'monitor-api/modules/k8s';
 import { getSceneView } from 'monitor-api/modules/scene_view';
 import { BookMarkModel } from 'monitor-ui/chart-plugins/typings';
@@ -104,7 +103,7 @@ export const getHostTargetList = async (params: { alertId: string; bizId: number
   const data = await alertHostTarget<{ alert_id: string; bk_biz_id: number }, AlertHostTargetItem[]>({
     alert_id: alertId,
     bk_biz_id: bizId,
-  }).catch(() => [] as AlertHostTargetItem[]);
+  });
   return data;
 };
 
@@ -120,7 +119,7 @@ export const getDetailSceneView = async (bizId: number, id: string) => {
     scene_id: 'host',
     type: 'detail',
     id,
-  }).catch(() => ({ id: '', panels: [], name: '' }));
+  });
 
   const transformData = new BookMarkModel(sceneData || { id: '', panels: [], name: '' });
   const unGroupKey = '__UNGROUP__';
@@ -147,22 +146,6 @@ export const getDetailSceneView = async (bizId: number, id: string) => {
 // ==============================end 详情-主机/进程-相关接口 end==============================
 
 // ==============================start 详情-容器-相关接口 start==============================
-/**
- * @method getAlertK8sScenarioList 获取可选场景列表
- * @description 告警详情-容器-可选场景列表
- * @param {object} params 请求参数
- * @param {string} params.alertId 告警ID
- * @param {number} params.bizId 业务ID
- * @returns {Promise<SceneEnum[]>} 可选场景列表
- */
-export const getAlertK8sScenarioList = async (params: { alertId: string; bizId: number }) => {
-  const { alertId, bizId } = params;
-  const data = await alertK8sScenarioList<{ alert_id: string; bk_biz_id: number }, SceneEnum[]>({
-    alert_id: alertId,
-    bk_biz_id: bizId,
-  }).catch(() => [] as SceneEnum[]);
-  return data;
-};
 
 /**
  * @method getAlertK8sScenarioMetricList 获取场景下的指标列表
@@ -178,10 +161,10 @@ export const getAlertK8sScenarioMetricList = async (
   options?: RequestOptions
 ) => {
   const { bizId, scenario } = params;
-  const data = await alertK8sMetricList<{ bk_biz_id: number; scenario: SceneEnum }, AlertK8SMetricItem[]>(
+  const data = await scenarioMetricList<{ bk_biz_id: number; scenario: SceneEnum }, AlertK8SMetricItem[]>(
     { bk_biz_id: bizId, scenario },
     options
-  ).catch(() => [] as AlertK8SMetricItem[]);
+  );
   return data.reduce((prev, curr) => {
     // show_chart 为 true 的指标才展示
     const children = curr?.children?.filter?.(e => e.show_chart) ?? [];
@@ -204,13 +187,7 @@ export const getAlertK8sTarget = async (params: { alertId: string; bizId: number
   const data = await alertK8sTarget<{ alert_id: string; bk_biz_id: number }, AlertK8sTargetResult>({
     alert_id: alertId,
     bk_biz_id: bizId,
-  }).catch(
-    () =>
-      ({
-        resource_type: '',
-        target_list: [],
-      }) as unknown as AlertK8sTargetResult
-  );
+  });
   return data;
 };
 
@@ -242,7 +219,6 @@ export const fetchWorkloadPodList = async (
     },
     options
   )
-    .then(res => res?.items ?? [])
-    .catch(() => []);
+    .then(res => res?.items ?? []);
 };
 // ==============================end 详情-容器-相关接口 end==============================

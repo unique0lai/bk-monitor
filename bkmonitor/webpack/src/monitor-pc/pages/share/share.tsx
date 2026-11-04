@@ -82,7 +82,20 @@ export default class SharePage extends tsc<object> {
       });
       const host = has_permission ? location.origin + location.pathname : data.weWebData.host;
       const path = !has_permission && process.env.NODE_ENV === 'production' ? `${location.pathname}apm/` : '';
-      url = `${host}${path}?bizId=${this.$store.getters.bizId}/#${data?.path || '/'}?${route.href.replace(
+      url = `${host}${path}?bizId=${this.$store.getters.bizId}#${data?.path || '/'}?${route.href.replace(
+        /^#\/([^?]*)\?/g,
+        ''
+      )}`;
+    } else if (/^\/trace/.test(data.path)) {
+      // trace 处理
+      const route = this.$router.resolve({
+        name: data.path,
+        params: data.params,
+        query: data.query,
+      });
+      const host = has_permission ? location.origin + location.pathname : data.weWebData.host;
+      const path = !has_permission && process.env.NODE_ENV === 'production' ? `${location.pathname}trace/` : '';
+      url = `${host}${path}?bizId=${this.$store.getters.bizId}#${data?.path || '/'}?${route.href.replace(
         /^#\/([^?]*)\?/g,
         ''
       )}`;
@@ -94,7 +107,7 @@ export default class SharePage extends tsc<object> {
       });
       url = `${process.env.NODE_ENV === 'development' ? `http://${process.env.devUrl}` : location.origin}${
         location.pathname
-      }?bizId=${this.$store.getters.bizId}/${route.href}`;
+      }?bizId=${this.$store.getters.bizId}${route.href.startsWith('#') ? route.href : `#${route.href}`}`;
     }
     if (has_permission) {
       location.replace(url);
@@ -115,7 +128,7 @@ export default class SharePage extends tsc<object> {
       setShadowDom: true,
       keepAlive: false,
       data: {
-        // host: `http://${process.env.devHost}:7002`,
+        // host: `http://${process.env.devHost}:7004`,
         // parentRoute: '/fta/',
         ...(data.weWebData || {}),
         token: this.token,

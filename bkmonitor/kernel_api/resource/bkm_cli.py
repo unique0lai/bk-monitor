@@ -8,8 +8,11 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+import json
+
 from rest_framework import serializers
 
+from bkmonitor.utils import request as request_context
 from core.drf_resource import Resource
 from kernel_api.rpc import KernelRPCRegistry
 from kernel_api.rpc.bkm_cli_registry import BkmCliOpRegistry
@@ -39,15 +42,33 @@ class BkmCliOpCallResource(Resource):
         op = BkmCliOpRegistry.resolve(validated_request_data["op_id"])
         params = inject_bk_tenant_id(validated_request_data.get("params") or {})
 
+        # 服务桥出口统一 json-safe 归一：把所有 bkm_cli.* 函数的返回值过一遍
+        # json.loads(json.dumps(result, default=str))，把 datetime / Decimal / lazy 等
+        # 非 JSON-safe 对象转成字符串，再交给 ResponseSerializer 的 JSONField。
+        # 为什么在出口统一做：commands.py:72 是同一类 bug 的逐函数补丁（diagnose_ts_metric_sync
+        # 单独归一），但任何新增/已有 op 只要返回了非 JSON-safe 字段就会复发
+        # （read-db-model 整行 datetime 序列化崩即是此因，报「result 值必须是有效 JSON」）。
+        # 在服务桥唯一出口统一归一是根治：杜绝该类 bug 在任意 bkm_cli.* 函数处再复发。
+        raw_result = KernelRPCRegistry.execute(op.func_name, params)
+        result = json.loads(json.dumps(raw_result, default=str))
+        audit = {
+            "capability_level": op.capability_level,
+            "risk_level": op.risk_level,
+            "requires_confirmation": op.requires_confirmation,
+            "audit_tags": op.audit_tags,
+        }
+        if op.requires_confirmation:
+            declared_operator = result.get("requested_operator") if isinstance(result, dict) else None
+            if isinstance(declared_operator, str) and declared_operator.strip():
+                audit["declared_operator"] = declared_operator.strip()
+            request_caller = request_context.get_request_username()
+            if isinstance(request_caller, str) and request_caller.strip():
+                audit["request_caller"] = request_caller.strip()
+
         return {
             "op_id": op.op_id,
             "func_name": op.func_name,
             "protocol": "bkm_cli_op_call",
-            "result": KernelRPCRegistry.execute(op.func_name, params),
-            "audit": {
-                "capability_level": op.capability_level,
-                "risk_level": op.risk_level,
-                "requires_confirmation": op.requires_confirmation,
-                "audit_tags": op.audit_tags,
-            },
+            "result": result,
+            "audit": audit,
         }

@@ -8,6 +8,7 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+import copy
 import datetime
 import functools
 import itertools
@@ -19,6 +20,8 @@ from typing import Any
 from datetime import timedelta
 
 import arrow
+from django.conf import settings
+from django.db import transaction
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
@@ -28,9 +31,11 @@ from apm_web.constants import (
     SyncScope,
     CategoryEnum,
     CMDBCategoryIconMap,
+    DataStatus,
     ServiceDetailReqTypeChoices,
     ServiceRelationLogTypeChoices,
 )
+from apm_web.handlers.config_handler.code import CodeRemarkHandler
 from apm_web.handlers.service_handler import ServiceHandler
 from apm_web.handlers.span_handler import SpanHandler
 from apm_web.strategy.dispatch.entity import EntitySet
@@ -47,8 +52,8 @@ from apm_web.models import (
     UriServiceRelation,
     ServiceBase,
 )
-from apm_web.profile.doris.querier import QueryTemplate
 from apm_web.serializers import ApplicationListSerializer, ServiceApdexConfigSerializer
+from apm_web.tasks import update_application_config
 from apm_web.service.serializers import (
     AppServiceRelationSerializer,
     LogServiceRelationOutputSerializer,
@@ -59,18 +64,24 @@ from apm_web.service.serializers import (
     SetCodeRedefinedRuleRequestSerializer,
     SetCodeRemarkRequestSerializer,
     BaseCodeRedefinedRequestSerializer,
+    build_service_notice_group_name,
     build_code_remark_configs,
 )
 from apm_web.topo.handle.relation.relation_metric import RelationMetricHandler
 from bkm_space.errors import NoRelatedResourceError
 from bkm_space.validate import validate_bk_biz_id
+from bkmonitor.action.serializers import UserGroupDetailSlz
 from bkmonitor.commons.tools import batch_request
+from bkmonitor.models import UserGroup
 from bkmonitor.utils.cache import lru_cache_with_ttl
 from bkmonitor.utils.thread_backend import InheritParentThread, run_threads
 from bkmonitor.utils.thread_backend import ThreadPool
 from bkmonitor.utils.time_tools import get_datetime_range
 from bkmonitor.utils.common_utils import count_md5
+from constants.alert import PUBLIC_NOTICE_CONFIG
+from constants.apm import TelemetryDataType
 from core.drf_resource import Resource, api
+from monitor_web.data_explorer.event.constants import EventCategory
 
 
 class ApplicationListResource(Resource):
@@ -220,22 +231,15 @@ class ServiceInfoResource(Resource):
         return ServiceApdexConfigSerializer(instance=instance).data
 
     @classmethod
-    def get_profiling_info(
-        cls, app: Application, bk_biz_id: int, app_name: str, service_name: str, start_time: int, end_time: int
-    ) -> dict[str, Any]:
-        """获取服务的 profiling 状态"""
-        res = {"application_id": app.application_id, "is_enabled_profiling": app.is_enabled_profiling}
-        if app.is_enabled_profiling:
-            # 获取此服务是否有 Profiling 数据
-            try:
-                count = QueryTemplate(bk_biz_id, app_name).get_service_count(start_time, end_time, service_name)
-                res["is_profiling_data_normal"] = bool(count)
-            except Exception:  # pylint: disable=broad-except
-                res["is_profiling_data_normal"] = False
-        else:
-            res["is_profiling_data_normal"] = False
-
-        return res
+    def get_profiling_info(cls, app: Application, node: dict[str, Any]) -> dict[str, Any]:
+        """按服务心跳获取当前性能分析状态。"""
+        data_status = ServiceHandler.build_service_data_status(app, [node], data_type=TelemetryDataType.PROFILING.value)
+        return {
+            "application_id": app.application_id,
+            "is_enabled_profiling": app.is_enabled_profiling,
+            "is_profiling_data_normal": data_status[node["topo_key"]][TelemetryDataType.PROFILING.value]
+            == DataStatus.NORMAL,
+        }
 
     @classmethod
     def get_labels(cls, bk_biz_id: int, app_name: str, service_name: str) -> list[Any]:
@@ -272,15 +276,6 @@ class ServiceInfoResource(Resource):
         event_res = pool.apply_async(EventServiceRelation.get_relations, kwds=base_query_param)
         uri_res = pool.apply_async(self.get_uri_relation_infos, kwds=base_query_param)
         label_res = pool.apply_async(self.get_labels, kwds=base_query_param)
-        profiling_res = pool.apply_async(
-            self.get_profiling_info,
-            kwds={
-                "app": app,
-                **base_query_param,
-                "start_time": validate_data["start_time"],
-                "end_time": validate_data["end_time"],
-            },
-        )
         pool.close()
         pool.join()
 
@@ -308,8 +303,7 @@ class ServiceInfoResource(Resource):
                 *uri_relation_infos,
             ],
         )
-        profiling_info: dict[str, Any] = profiling_res.get()
-        service_info.update(profiling_info)
+        service_info.update(self.get_profiling_info(app, service_info))
 
         service_info["relation"] = {
             "app_relation": app_relation_info,
@@ -472,13 +466,25 @@ class LogServiceRelationBkLogIndexSet(Resource):
 class ServiceConfigResource(Resource):
     RequestSerializer = ServiceConfigSerializer
 
-    RELATION_MODEL_MAP = {
+    RELATION_MODEL_MAP: dict[str, type[ServiceBase]] = {
         "app_relation": AppServiceRelation,
         "cmdb_relation": CMDBServiceRelation,
         "log_relation_list": LogServiceRelation,
         "apdex_relation": ApdexServiceRelation,
         "uri_relation": UriServiceRelation,
         "event_relation": EventServiceRelation,
+        "incremental_cicd_relations": EventServiceRelation,
+        "incremental_k8s_relations": EventServiceRelation,
+    }
+    INCREMENTAL_EVENT_RELATION_CONFIG: dict[str, tuple[str, tuple[str, ...]]] = {
+        "incremental_cicd_relations": (
+            EventCategory.CICD_EVENT.value,
+            ("project_id", "pipeline_id"),
+        ),
+        "incremental_k8s_relations": (
+            EventCategory.K8S_EVENT.value,
+            ("bcs_cluster_id", "namespace", "kind", "name"),
+        ),
     }
 
     @classmethod
@@ -509,23 +515,153 @@ class ServiceConfigResource(Resource):
         return list(unique_relations.values())
 
     @classmethod
-    def update_relation(cls, bk_biz_id: int, app_name: str, service_name: str, relation_type: str, relation_data: Any):
+    def _get_event_relation_for_update(
+        cls,
+        bk_biz_id: int,
+        app_name: str,
+        service_name: str,
+        table: str,
+    ) -> dict[str, Any]:
+        # 当前表暂无作用域唯一约束：若存在历史重复记录，这里固定读取最小 ID，sync_relations 则由 QuerySet 的遍历顺序决定最终更新对象。
+        # 唯一约束与重复数据治理需另行收敛。
+        return (
+            EventServiceRelation.get_relation_qs(
+                bk_biz_id,
+                app_name,
+                [service_name],
+                table=table,
+            )
+            .select_for_update()
+            .order_by("id")
+            .values("relations", "options")
+            .first()
+            or {}
+        )
+
+    @classmethod
+    def _prepare_event_relations(
+        cls,
+        bk_biz_id: int,
+        app_name: str,
+        service_name: str,
+        relations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        prepared_relations: list[dict[str, Any]] = [dict(relation) for relation in relations]
+        for relation in prepared_relations:
+            if (
+                relation.get("table") != EventCategory.K8S_EVENT.value
+                or relation.get("relations")
+                or (relation.get("options") or {}).get("is_auto") is not True
+            ):
+                continue
+
+            # SaaS 自动关联模式固定提交空 relations，不能用该空值覆盖外部平台已绑定的 Workload。
+            existing_relation: dict[str, Any] = cls._get_event_relation_for_update(
+                bk_biz_id,
+                app_name,
+                service_name,
+                EventCategory.K8S_EVENT.value,
+            )
+            existing_relations: list[dict[str, Any]] = existing_relation.get("relations") or []
+            if not existing_relations:
+                continue
+
+            options: dict[str, Any] = dict(existing_relation.get("options") or {})
+            options.update(relation.get("options") or {})
+            options["is_auto"] = False
+            relation["relations"] = existing_relations
+            relation["options"] = options
+
+        return prepared_relations
+
+    @classmethod
+    def _prepare_incremental_event_relations(
+        cls,
+        bk_biz_id: int,
+        app_name: str,
+        service_name: str,
+        table: str,
+        unique_fields: tuple[str, ...],
+        new_relations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        existing_relation: dict[str, Any] = cls._get_event_relation_for_update(
+            bk_biz_id,
+            app_name,
+            service_name,
+            table,
+        )
+        existing_relations: list[dict[str, Any]] = existing_relation.get("relations") or []
+        options: dict[str, Any] = dict(existing_relation.get("options") or {})
+        if table == EventCategory.K8S_EVENT.value:
+            # 外部注册的 Workload 必须落到手动关联模式，否则配置页不渲染 relations，下次保存会被空列表覆盖。
+            options["is_auto"] = False
+
+        deduped_relations: dict[tuple[Any, ...], dict[str, Any]] = {}
+        # 存量排在新增数据之前，身份相同时由 setdefault 保留原配置。
+        for relation in itertools.chain(existing_relations, new_relations):
+            unique_key: tuple[Any, ...] = tuple(relation.get(field) for field in unique_fields)
+            deduped_relations.setdefault(unique_key, relation)
+
+        return [{"table": table, "relations": list(deduped_relations.values()), "options": options}]
+
+    @classmethod
+    def update_relation(
+        cls,
+        bk_biz_id: int,
+        app_name: str,
+        service_name: str,
+        relation_type: str,
+        relation_data: Any,
+    ) -> None:
         if relation_type not in cls.RELATION_MODEL_MAP:
             return
 
         # 预处理数据
         model_cls: type[ServiceBase] = cls.RELATION_MODEL_MAP[relation_type]
-        prepare_handler: Callable[[Any], list[dict[str, Any]]] = getattr(
-            cls, f"_prepare_{relation_type}", cls._prepare_default
+        incremental_config: tuple[str, tuple[str, ...]] | None = cls.INCREMENTAL_EVENT_RELATION_CONFIG.get(
+            relation_type
         )
-        prepare_datas: list[dict[str, Any]] = prepare_handler(relation_data)
+        if incremental_config is not None:
+            if not relation_data:
+                return
+            table, unique_fields = incremental_config
+            prepare_datas: list[dict[str, Any]] = cls._prepare_incremental_event_relations(
+                bk_biz_id,
+                app_name,
+                service_name,
+                table,
+                unique_fields,
+                relation_data,
+            )
+        elif relation_type == "event_relation":
+            prepare_datas = cls._prepare_event_relations(
+                bk_biz_id,
+                app_name,
+                service_name,
+                relation_data,
+            )
+        else:
+            prepare_handler: Callable[[Any], list[dict[str, Any]]] = getattr(
+                cls, f"_prepare_{relation_type}", cls._prepare_default
+            )
+            prepare_datas = prepare_handler(relation_data)
+
         # 构建模型记录数据
         records: list[dict[str, Any]] = [
             {"bk_biz_id": bk_biz_id, "app_name": app_name, "service_name": service_name, "is_global": False, **data}
             for data in prepare_datas
         ]
         # 执行同步
-        if relation_type == "event_relation":
+        if incremental_config is not None:
+            model_cls.sync_relations(
+                bk_biz_id,
+                app_name,
+                service_name,
+                records,
+                is_delete=False,
+                table=table,
+            )
+        elif relation_type == "event_relation":
             model_cls.sync_relations(bk_biz_id, app_name, service_name, records, is_delete=False)
         else:
             model_cls.sync_relations(bk_biz_id, app_name, service_name, records)
@@ -540,10 +676,55 @@ class ServiceConfigResource(Resource):
             json.dumps(labels),
         )
 
+    @staticmethod
+    def update_notice_group(bk_biz_id: int, app_name: str, service_name: str, owners: list[str]) -> None:
+        with transaction.atomic(settings.BACKEND_DATABASE_NAME):  # pyright: ignore[reportGeneralTypeIssues]
+            group_name: str = build_service_notice_group_name(app_name, service_name)
+            # owners 是全量覆盖语义；去重时保留调用方顺序，避免重复通知人。
+            receivers: list[dict[str, str]] = [{"id": owner, "type": "user"} for owner in dict.fromkeys(owners)]
+            # 对已有告警组加行锁，保证读取成员与本次覆盖更新处于同一事务。
+            user_group: UserGroup | None = (
+                UserGroup.objects.select_for_update().filter(bk_biz_id=bk_biz_id, name=group_name).first()
+            )
+            # 开启轮值的告警组由排班规则驱动，不能用普通负责人覆盖当前排班配置。
+            if user_group is not None and user_group.need_duty:
+                raise serializers.ValidationError({"owners": _("服务告警组已开启轮值，不能通过 owners 覆盖通知人")})
+
+            # 新建时初始化公共通知配置；更新时只提交 duty_arranges，保留已有通知配置。
+            if user_group is None:
+                notice_config: dict[str, Any] = copy.deepcopy(PUBLIC_NOTICE_CONFIG)
+                for notify_config in (
+                    notice_config["alert_notice"][0]["notify_config"]
+                    + notice_config["action_notice"][0]["notify_config"]
+                ):
+                    notify_config["type"] = ["rtx"]
+
+                user_group_serializer: serializers.BaseSerializer = UserGroupDetailSlz(
+                    data={
+                        "bk_biz_id": bk_biz_id,
+                        "name": group_name,
+                        "duty_arranges": [{"users": receivers}],
+                        "desc": notice_config["message"],
+                        "alert_notice": notice_config["alert_notice"],
+                        "action_notice": notice_config["action_notice"],
+                    }
+                )
+            else:
+                user_group_serializer = UserGroupDetailSlz(
+                    user_group,
+                    data={"duty_arranges": [{"users": receivers}]},
+                    partial=True,
+                )
+
+            user_group_serializer.is_valid(raise_exception=True)
+            user_group_serializer.save()
+
+    @transaction.atomic
     def perform_request(self, validated_request_data: dict[str, Any]) -> None:
         bk_biz_id: int = validated_request_data["bk_biz_id"]
         app_name: str = validated_request_data["app_name"]
         service_name: str = validated_request_data["service_name"]
+        application: Application = Application.objects.get(bk_biz_id=bk_biz_id, app_name=app_name)
 
         # 对 labels 单独作处理
         if "labels" in validated_request_data:
@@ -557,11 +738,19 @@ class ServiceConfigResource(Resource):
                 update_relation(relation_type, relation_data)
 
         # 下发修改后的配置
-        application = Application.objects.filter(bk_biz_id=bk_biz_id, app_name=app_name).get()
-        from apm_web.tasks import update_application_config
+        transfer_config: dict[str, Any] = {"service_configs": application.get_service_transfer_config()}
 
-        update_application_config.delay(
-            application.bk_biz_id, application.app_name, {"service_configs": application.get_service_transfer_config()}
+        # 仅显式提交 owners（包括空列表）才覆盖通知组；服务配置处理完成后再更新通知组。
+        if "owners" in validated_request_data:
+            self.update_notice_group(bk_biz_id, app_name, service_name, validated_request_data["owners"])
+
+        transaction.on_commit(
+            functools.partial(
+                update_application_config.delay,
+                application.bk_biz_id,
+                application.app_name,
+                transfer_config,
+            )
         )
 
 
@@ -924,65 +1113,8 @@ class GetCodeRemarksResource(Resource):
       - 传 service_name（服务配置场景）：按 kind + service_name 过滤全局/服务级备注，返回 code → remark 字典
     """
 
-    APM_CODE_REMARK_CONFIG_KEY = "code_remarks"
-
     class RequestSerializer(BaseCodeRedefinedRequestSerializer):
         pass
-
-    TRPC_DEFAULT_CODE_REMARK = {
-        "1": _("服务端解码错误"),
-        "2": _("服务端编码错误"),
-        "11": _("服务端无对应 Service 实现"),
-        "12": _("服务端无对应接口实现"),
-        "21": _("服务端处理超时"),
-        "22": _("服务端过载保护丢弃请求"),
-        "23": _("服务端限流"),
-        "24": _("服务端全链路超时"),
-        "31": _("服务端系统错误"),
-        "41": _("服务端鉴权失败"),
-        "51": _("服务端请求参数校验失败"),
-        "101": _("客户端调用超时"),
-        "102": _("客户端全链路超时"),
-        "111": _("客户端连接错误"),
-        "121": _("客户端编码错误"),
-        "122": _("客户端解码错误"),
-        "123": _("客户端限流"),
-        "124": _("客户端过载保护丢弃请求"),
-        "131": _("客户端路由错误"),
-        "141": _("客户端网络错误"),
-        "151": _("客户端响应参数校验失败"),
-        "161": _("上游主动取消请求"),
-        "171": _("客户端读取 Frame 错误"),
-        "201": _("服务端流式网络错误"),
-        "211": _("服务端流消息超限"),
-        "221": _("服务端流式编码错误"),
-        "222": _("服务端流式解码错误"),
-        "231": _("服务端流写结束"),
-        "232": _("服务端流写溢出"),
-        "233": _("服务端流写关闭"),
-        "234": _("服务端流写超时"),
-        "251": _("服务端流读结束"),
-        "252": _("服务端流读关闭"),
-        "253": _("服务端流读空数据"),
-        "254": _("服务端流读超时"),
-        "255": _("服务端流空闲超时"),
-        "301": _("客户端流式网络错误"),
-        "311": _("客户端流消息超限"),
-        "321": _("客户端流式编码错误"),
-        "322": _("客户端流式解码错误"),
-        "331": _("客户端流写结束"),
-        "332": _("客户端流写溢出"),
-        "333": _("客户端流写关闭"),
-        "334": _("客户端流写超时"),
-        "351": _("客户端流读结束"),
-        "352": _("客户端流读关闭"),
-        "353": _("客户端流读空数据"),
-        "354": _("客户端流读超时"),
-        "355": _("客户端流空闲超时"),
-        "361": _("客户端流初始化错误"),
-        "999": _("未明确错误"),
-        "1000": _("未明确流式错误"),
-    }
 
     def perform_request(self, validated_request_data: dict[str, Any]):
         bk_biz_id: int = validated_request_data["bk_biz_id"]
@@ -990,35 +1122,15 @@ class GetCodeRemarksResource(Resource):
         service_name: str | None = validated_request_data.get("service_name")
         kind: str | None = validated_request_data.get("kind")
 
-        app = Application.objects.filter(bk_biz_id=bk_biz_id, app_name=app_name).first()
-        if not app:
-            raise serializers.ValidationError(_("应用不存在"))
-
-        config_obj = ApmMetaConfig.get_application_config_value(app.application_id, self.APM_CODE_REMARK_CONFIG_KEY)
-
-        # 应用配置场景直接返回用户显式配置的备注
-        remark_configs: list[dict[str, Any]] = ((config_obj and config_obj.config_value) or {}).get("remarks", [])
+        remark_configs: list[dict[str, Any]] = CodeRemarkHandler.get_app_remark_configs(bk_biz_id, app_name)
         if not service_name:
             return remark_configs
 
-        # 服务配置场景返回字典数据结构，全局配置优先级低于服务级配置，通过排序保证服务级后写入覆盖全局
-        service_config: dict[str, str] = {
-            **self.TRPC_DEFAULT_CODE_REMARK,
-            # 基于 TRPC_DEFAULT_CODE_REMARK 另外派生 err_{code}: {default_remark} 的备注规则。
-            **{f"err_{code}": remark for code, remark in self.TRPC_DEFAULT_CODE_REMARK.items()},
-        }
-        for remark_dict in sorted(remark_configs, key=lambda x: not x.get("is_global")):
-            if remark_dict.get("kind") != kind:
-                continue
-            if not remark_dict.get("is_global") and service_name not in remark_dict.get("service_names", []):
-                continue
-            service_config[remark_dict.get("code", "")] = remark_dict.get("remark", "")
-
-        return service_config
+        return CodeRemarkHandler.build_service_code_remark_config(remark_configs, service_name, kind or "")
 
 
 class SetCodeRemarkResource(Resource):
-    APM_CODE_REMARK_CONFIG_KEY = "code_remarks"
+    APM_CODE_REMARK_CONFIG_KEY = CodeRemarkHandler.APM_CODE_REMARK_CONFIG_KEY
     RequestSerializer = SetCodeRemarkRequestSerializer
 
     @classmethod

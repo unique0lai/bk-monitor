@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from rest_framework.exceptions import ValidationError
 
 from bkmonitor.models import StrategyModel
+from bkmonitor.utils.shield import format_dimension_conditions_display
 from bkmonitor.utils.time_tools import localtime, now
 from bkmonitor.views import serializers
 from constants.shield import (
@@ -164,6 +165,7 @@ class FrontendShieldListResource(Resource):
                         "id": shield["id"],
                         "bk_biz_id": shield["bk_biz_id"],
                         "category": shield["category"],
+                        "end_policy": shield["end_policy"],
                         "category_name": manager.get_category_name(shield),
                         "status": shield["status"],
                         "status_name": self.get_status_name(shield["status"]),
@@ -271,21 +273,35 @@ class FrontendShieldDetailResource(Resource):
                 }
             )
         elif shield["category"] == ShieldCategory.EVENT:
+            event_conditions = shield["dimension_config"].get("dimension_conditions") or []
             dimension_config.update(
                 {
                     "level": shield["dimension_config"]["_level"],
                     "event_message": shield["dimension_config"]["_event_message"],
-                    "dimensions": shield["dimension_config"]["_dimensions"],
+                    "dimensions": (
+                        format_dimension_conditions_display(event_conditions)
+                        if event_conditions
+                        else shield["dimension_config"]["_dimensions"]
+                    ),
                 }
             )
+            if event_conditions:
+                dimension_config["dimension_conditions"] = event_conditions
         elif shield["category"] == ShieldCategory.ALERT:
+            alert_conditions = shield["dimension_config"].get("dimension_conditions") or []
             dimension_config.update(
                 {
                     "level": shield["dimension_config"]["_severity"],
                     "event_message": shield["dimension_config"].get("_alert_message", ""),
-                    "dimensions": shield["dimension_config"]["_dimensions"],
+                    "dimensions": (
+                        format_dimension_conditions_display(alert_conditions)
+                        if alert_conditions
+                        else shield["dimension_config"]["_dimensions"]
+                    ),
                 }
             )
+            if alert_conditions:
+                dimension_config["dimension_conditions"] = alert_conditions
         elif shield["category"] == ShieldCategory.DIMENSION:
             dimension_config.update(
                 {

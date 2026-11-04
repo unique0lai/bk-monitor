@@ -139,7 +139,8 @@ export const HOST_COLLECTION_CONFIG = {
 export const initContainerConfig = (type = 'container_log_config') => {
   return {
     // bcs_cluster_id: 'BCS-K8S-15854',
-    bcs_cluster_id: 'BCS-K8S-90000',
+    // bcs_cluster_id: 'BCS-K8S-90000',
+    bcs_cluster_id: '',
     add_pod_label: false,
     add_pod_annotation: false,
     extra_labels: [
@@ -222,6 +223,8 @@ export const initContainerConfig = (type = 'container_log_config') => {
           multiline_pattern: '', // 行首正则, char
           multiline_max_lines: '50', // 最多匹配行数, int
           multiline_timeout: '2', // 最大耗时, int
+          // 采集范围：true-仅采集下发后的日志，false-采集全量日志
+          tail_files: true,
           winlog_name: [], // windows事件名称
           winlog_level: [], // windows事件等级
           winlog_event_id: [], // windows事件id

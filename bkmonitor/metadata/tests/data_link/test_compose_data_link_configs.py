@@ -8,11 +8,13 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
+import datetime
 import json
 
 import pytest
 from django.conf import settings
 
+from core.errors.api import BKAPIError
 from metadata import models
 from metadata.models.data_link import utils
 from metadata.models.data_link.constants import DataLinkKind
@@ -23,6 +25,7 @@ from metadata.models.data_link.data_link_configs import (
     ResultTableConfig,
     VMStorageBindingConfig,
 )
+from metadata.models.data_link.service import apply_data_id_v2
 from metadata.tests.common_utils import consul_client
 
 
@@ -44,6 +47,31 @@ def create_or_delete_records(mocker):
     mocker.patch("bkmonitor.utils.consul.BKConsul", side_effect=consul_client)
     data_source.delete()
     result_table.delete()
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_generate_result_table_field_list_maps_flattened_to_object():
+    table_id = "1001_bklog.flattened"
+    models.ResultTableField.objects.create(
+        table_id=table_id,
+        bk_tenant_id="system",
+        field_name="labels",
+        field_type="flattened",
+        tag=models.ResultTableField.FIELD_TAG_DIMENSION,
+        is_config_by_user=True,
+        creator="admin",
+        last_modify_user="admin",
+    )
+
+    assert utils.generate_result_table_field_list(table_id=table_id, bk_tenant_id="system") == [
+        {
+            "field_name": "labels",
+            "field_alias": "labels",
+            "field_type": models.ResultTableField.FIELD_TYPE_OBJECT,
+            "is_dimension": True,
+            "field_index": 0,
+        }
+    ]
 
 
 @pytest.mark.django_db(databases="__all__")
@@ -82,6 +110,108 @@ def test_compose_data_id_config(create_or_delete_records):
     assert json.dumps(content) == expected_config
 
 
+def test_compose_data_source_config(mocker):
+    mocker.patch("bkmonitor.utils.tenant.get_tenant_default_biz_id", return_value=2)
+    data_id_config = DataIdConfig(
+        name="bkm_data_link_test",
+        namespace="bkmonitor",
+        bk_biz_id=111,
+        bk_tenant_id="system",
+    )
+
+    settings.ENABLE_MULTI_TENANT_MODE = False
+    assert data_id_config.compose_data_source_config(
+        data_source_alias="data_link_test",
+        description="test description",
+        created_by="creator",
+        created_at=datetime.datetime(2026, 9, 3, 12, 6, 34, tzinfo=datetime.timezone.utc),
+        updated_by="updater",
+        updated_at=datetime.datetime(2026, 9, 4, 2, 0, tzinfo=datetime.timezone.utc),
+    ) == {
+        "kind": "DataSource",
+        "metadata": {
+            "namespace": "bkmonitor",
+            "name": "bkm_data_link_test",
+            "labels": {},
+        },
+        "spec": {
+            "basic_info": {
+                "data_source_name": "bkm_data_link_test",
+                "data_source_alias": "data_link_test",
+                "data_encoding": "UTF-8",
+                "bk_biz_id": 2,
+                "time_zone": "Asia/Shanghai",
+                "tags": [],
+                "description": "test description",
+                "access_channel": "bkbase",
+                "access_channel_alias": "计算平台",
+            },
+            "report_config": {"type": "custom"},
+            "data_id": {
+                "kind": "DataId",
+                "namespace": "bkmonitor",
+                "name": "bkm_data_link_test",
+            },
+            "data_conn": None,
+            "created_by": "creator",
+            "created_at": "2026-09-03 20:06:34",
+            "updated_by": "updater",
+            "updated_at": "2026-09-04 10:00:00",
+            "desired_status": "Running",
+        },
+    }
+
+    settings.ENABLE_MULTI_TENANT_MODE = True
+    content = data_id_config.compose_data_source_config()
+    assert content["metadata"]["tenant"] == "system"
+    assert content["spec"]["data_id"]["tenant"] == "system"
+    assert content["spec"]["basic_info"]["bk_biz_id"] == 111
+    assert content["spec"]["desired_status"] == "Running"
+
+    data_id_config.bk_data_id = 525323
+    content = data_id_config.compose_data_source_config()
+    assert content["metadata"]["labels"] == {"raw_data_id": "525323"}
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_apply_data_id_v2_applies_data_id_then_data_source(mocker):
+    mocker.patch("bkmonitor.utils.tenant.get_tenant_default_biz_id", return_value=2)
+    apply_mock = mocker.patch("metadata.models.data_link.service.api.bkdata.apply_data_link")
+
+    assert apply_data_id_v2(
+        bk_tenant_id="system",
+        data_name="test_data_source",
+        bk_biz_id=111,
+    )
+
+    assert apply_mock.call_count == 2
+    data_id_call, data_source_call = apply_mock.call_args_list
+    assert data_id_call.kwargs["config"][0]["kind"] == "DataId"
+    assert data_id_call.kwargs["config"][0]["metadata"]["name"] == "bkm_test_data_source"
+    assert data_source_call.kwargs["config"][0]["spec"]["data_id"] == {
+        "kind": "DataId",
+        "namespace": "bkmonitor",
+        "name": "bkm_test_data_source",
+    }
+    assert all(call.kwargs["bk_tenant_id"] == "system" for call in apply_mock.call_args_list)
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_apply_data_id_v2_ignores_data_source_failure(mocker):
+    mocker.patch("bkmonitor.utils.tenant.get_tenant_default_biz_id", return_value=2)
+    apply_mock = mocker.patch(
+        "metadata.models.data_link.service.api.bkdata.apply_data_link",
+        side_effect=[None, BKAPIError(system_name="bkdata", result="unknown variant DataSource")],
+    )
+
+    assert apply_data_id_v2(
+        bk_tenant_id="system",
+        data_name="test_data_source_failure",
+        bk_biz_id=111,
+    )
+    assert apply_mock.call_count == 2
+
+
 @pytest.mark.django_db(databases="__all__")
 def test_compose_vm_result_table_config(create_or_delete_records):
     """
@@ -102,7 +232,7 @@ def test_compose_vm_result_table_config(create_or_delete_records):
     expect_config = (
         '{"kind":"ResultTable","metadata":{"name":"bkm_1001_bkmonitor_time_series_50010",'
         '"namespace":"bkmonitor","labels":{"bk_biz_id":"111"}},"spec":{'
-        '"alias":"bkm_1001_bkmonitor_time_series_50010","bizId":2,'
+        '"fields":null,"alias":"bkm_1001_bkmonitor_time_series_50010","bizId":2,'
         '"dataType":"metric","description":"bkm_1001_bkmonitor_time_series_50010","maintainers":['
         '"admin"]}}'
     )
@@ -118,7 +248,7 @@ def test_compose_vm_result_table_config(create_or_delete_records):
     expect_config = (
         '{"kind":"ResultTable","metadata":{"name":"bkm_1001_bkmonitor_time_series_50010",'
         '"namespace":"bkmonitor","tenant":"system","labels":{"bk_biz_id":"111"}},'
-        '"spec":{"alias":"bkm_1001_bkmonitor_time_series_50010","bizId":111,"dataType":"metric",'
+        '"spec":{"fields":null,"alias":"bkm_1001_bkmonitor_time_series_50010","bizId":111,"dataType":"metric",'
         '"description":"bkm_1001_bkmonitor_time_series_50010","maintainers":["admin"]}}'
     )
 
@@ -154,11 +284,15 @@ def test_compose_vm_storage_binding_config(create_or_delete_records):
         '{"kind":"VmStorageBinding","metadata":{"name":"bkm_1001_bkmonitor_time_series_50010",'
         '"namespace":"bkmonitor","labels":{"bk_biz_id":"111"}},"spec":{"data":{"kind":"ResultTable",'
         '"name":"bkm_1001_bkmonitor_time_series_50010","namespace":"bkmonitor"},"maintainers":['
-        '"admin"],"storage":{"kind":"VmStorage","name":"vm-plat","namespace":"bkmonitor"}}}'
+        '"admin"],"filter":null,"metricGroupDimensions":null,"ddVersion":null,'
+        '"storage":{"kind":"VmStorage","name":"vm-plat","namespace":"bkmonitor"}}}'
     )
 
     content = vm_storage_ins.compose_config()
     assert json.dumps(content) == expect_config
+    assert content["spec"]["filter"] is None
+    assert content["spec"]["metricGroupDimensions"] is None
+    assert content["spec"]["ddVersion"] is None
 
     # 多租户模式
     settings.ENABLE_MULTI_TENANT_MODE = True
@@ -167,12 +301,25 @@ def test_compose_vm_storage_binding_config(create_or_delete_records):
         '{"kind":"VmStorageBinding","metadata":{"name":"bkm_1001_bkmonitor_time_series_50010",'
         '"tenant":"system","namespace":"bkmonitor","labels":{"bk_biz_id":"111"}},"spec":{"data":{'
         '"kind":"ResultTable","name":"bkm_1001_bkmonitor_time_series_50010","tenant":"system",'
-        '"namespace":"bkmonitor"},"maintainers":["admin"],"storage":{"kind":"VmStorage",'
+        '"namespace":"bkmonitor"},"maintainers":["admin"],"filter":null,'
+        '"metricGroupDimensions":null,"ddVersion":null,"storage":{"kind":"VmStorage",'
         '"name":"vm-plat","tenant":"system","namespace":"bkmonitor"}}}'
     )
 
     content = vm_storage_ins.compose_config()
     assert json.dumps(content) == expect_config
+
+    content = vm_storage_ins.compose_config(
+        whitelist={"metrics": ["cpu_usage"], "tags": ["bk_target_ip"]},
+        metric_group_dimensions=[{"key": "service_name", "default_value": "unknown_service"}],
+    )
+    assert content["spec"]["filter"] == {
+        "kind": "Whitelist",
+        "metrics": ["cpu_usage"],
+        "tags": ["bk_target_ip"],
+    }
+    assert content["spec"]["metricGroupDimensions"] == ["service_name|unknown_service"]
+    assert content["spec"]["ddVersion"] == "v2"
 
 
 @pytest.mark.django_db(databases="__all__")
@@ -396,6 +543,7 @@ def test_compose_es_storage_binding_config(create_or_delete_records):
         es_cluster_name="es_default",
         bk_biz_id=1,
         data_link_name="base_1_agent_event",
+        table_id="base_system_1_event",
     )
 
     expected_config = {
@@ -403,9 +551,11 @@ def test_compose_es_storage_binding_config(create_or_delete_records):
         "metadata": {"labels": {"bk_biz_id": "1"}, "name": "base_1_agent_event", "namespace": "bkmonitor"},
         "spec": {
             "data": {"kind": "ResultTable", "name": "base_1_agent_event", "namespace": "bkmonitor"},
+            "doc_type": "base_system_1_event",
             "maintainers": ["admin"],
             "storage": {"kind": "ElasticSearch", "name": "es_default", "namespace": "bkmonitor"},
             "unique_field_list": ["event", "target", "dimensions", "event_name", "time"],
+            "json_field_list": [],
             "write_alias": {"TimeBased": {"format": "write_%Y%m%d_base_system_1_event", "timezone": 0}},
         },
     }
@@ -415,6 +565,22 @@ def test_compose_es_storage_binding_config(create_or_delete_records):
         unique_field_list=["event", "target", "dimensions", "event_name", "time"],
     )
     assert actual_result == expected_config
+
+    actual_result = es_storage_ins.compose_config(
+        storage_cluster_name="es_default",
+        write_alias_format="write_%Y%m%d_base_system_1_event",
+        unique_field_list=["event", "target", "dimensions", "event_name", "time"],
+        json_field_list=[],
+    )
+    assert actual_result["spec"]["json_field_list"] == []
+
+    actual_result = es_storage_ins.compose_config(
+        storage_cluster_name="es_default",
+        write_alias_format="write_%Y%m%d_base_system_1_event",
+        unique_field_list=["event", "target", "dimensions", "event_name", "time"],
+        json_field_list=["dimensions"],
+    )
+    assert actual_result["spec"]["json_field_list"] == ["dimensions"]
 
     # 多租户模式
     settings.ENABLE_MULTI_TENANT_MODE = True
@@ -428,9 +594,11 @@ def test_compose_es_storage_binding_config(create_or_delete_records):
         },
         "spec": {
             "data": {"kind": "ResultTable", "name": "base_1_agent_event", "tenant": "system", "namespace": "bkmonitor"},
+            "doc_type": "base_system_1_event",
             "maintainers": ["admin"],
             "storage": {"kind": "ElasticSearch", "tenant": "system", "name": "es_default", "namespace": "bkmonitor"},
             "unique_field_list": ["event", "target", "dimensions", "event_name", "time"],
+            "json_field_list": [],
             "write_alias": {"TimeBased": {"format": "write_%Y%m%d_base_system_1_event", "timezone": 0}},
         },
     }
@@ -485,6 +653,7 @@ def test_compose_data_bus_config(create_or_delete_records):
 
     content = data_bus_ins.compose_config(sinks)
     assert json.dumps(content) == expect_config
+    assert "consumerGroup" not in content["spec"]
 
     # 多租户模式
     settings.ENABLE_MULTI_TENANT_MODE = True
@@ -510,6 +679,74 @@ def test_compose_data_bus_config(create_or_delete_records):
 
     content = data_bus_ins.compose_config(sinks)
     assert json.dumps(content) == expect_config
+    assert "consumerGroup" not in content["spec"]
+
+
+@pytest.mark.django_db(databases="__all__")
+def test_compose_databus_config_with_consumer_group(create_or_delete_records):
+    """
+    测试DataBusConfig配置consumer group时能否正确生成
+    """
+    settings.ENABLE_MULTI_TENANT_MODE = False
+    ds = models.DataSource.objects.get(bk_data_id=50010)
+    rt = models.ResultTable.objects.get(table_id="1001_bkmonitor_time_series_50010.__default__")
+
+    bkbase_data_name = utils.compose_bkdata_data_id_name(ds.data_name)
+    bkbase_vmrt_name = utils.compose_bkdata_table_id(rt.table_id)
+    consumer_group = "bkmonitorv3_transfer0bkmonitor_15757830"
+
+    sinks = [
+        {
+            "kind": DataLinkKind.VMSTORAGEBINDING.value,
+            "name": bkbase_vmrt_name,
+            "namespace": settings.DEFAULT_VM_DATA_LINK_NAMESPACE,
+        }
+    ]
+
+    data_bus_ins, _ = DataBusConfig.objects.get_or_create(
+        name=bkbase_vmrt_name,
+        data_id_name=bkbase_data_name,
+        data_link_name=bkbase_data_name,
+        namespace="bkmonitor",
+        bk_biz_id=111,
+    )
+    data_bus_ins.consumer_group = consumer_group
+    content = data_bus_ins.compose_config(sinks)
+    assert content["spec"]["consumerGroup"] == consumer_group
+
+    log_databus_ins, _ = models.DataBusConfig.objects.get_or_create(
+        bk_tenant_id="system",
+        bk_biz_id=1,
+        name="base_1_agent_event_consumer",
+        namespace="bkmonitor",
+        data_link_name="base_1_agent_event_consumer",
+        data_id_name="base_1_agent_event_consumer",
+    )
+    log_databus_ins.consumer_group = consumer_group
+    log_sinks = [{"kind": "ElasticSearchBinding", "name": "base_1_agent_event_consumer", "namespace": "bkmonitor"}]
+    assert log_databus_ins.compose_log_config(sinks=log_sinks, rules=[])["spec"]["consumerGroup"] == consumer_group
+    assert log_databus_ins.compose_base_event_config()["spec"]["consumerGroup"] == consumer_group
+
+
+@pytest.mark.parametrize("multi_tenant", [False, True])
+def test_databus_options_do_not_affect_rendering(mocker, settings, multi_tenant):
+    settings.ENABLE_MULTI_TENANT_MODE = multi_tenant
+    mocker.patch("bkmonitor.utils.tenant.get_tenant_default_biz_id", return_value=2)
+    databus = DataBusConfig(name="options_databus", data_id_name="options_data_id", namespace="bkmonitor", bk_biz_id=2)
+    sinks = [{"kind": "VmStorageBinding", "name": "options_binding", "namespace": "bkmonitor"}]
+    expected = [
+        databus.compose_config(sinks),
+        databus.compose_log_config(sinks=sinks, rules=[]),
+        databus.compose_base_event_config(),
+    ]
+
+    databus.options = {"subTaskNum": 4, "batch": None, "preferCluster": {"name": "databus-cluster"}}
+
+    assert [
+        databus.compose_config(sinks),
+        databus.compose_log_config(sinks=sinks, rules=[]),
+        databus.compose_base_event_config(),
+    ] == expected
 
 
 @pytest.mark.django_db(databases="__all__")
@@ -539,6 +776,7 @@ def test_compose_log_databus_config(create_or_delete_records):
     }
     actual_result = log_databus_ins.compose_base_event_config()
     assert actual_result == expected_config
+    assert "consumerGroup" not in actual_result["spec"]
 
     # 多租户模式
     settings.ENABLE_MULTI_TENANT_MODE = True
@@ -566,6 +804,7 @@ def test_compose_log_databus_config(create_or_delete_records):
     }
     actual_result = log_databus_ins.compose_base_event_config()
     assert actual_result == expected_config
+    assert "consumerGroup" not in actual_result["spec"]
 
 
 @pytest.mark.django_db(databases="__all__")

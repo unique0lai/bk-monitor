@@ -12,6 +12,7 @@ import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -35,6 +36,15 @@ from metadata.models.space.constants import (
 from metadata.utils.redis_tools import RedisTools
 
 logger = logging.getLogger("metadata")
+
+
+@dataclass(frozen=True)
+class DataLinkMetadataTarget:
+    """QueryDataLinkMetadataResource 内部使用的真实租户目标."""
+
+    bk_tenant_id: str
+    bk_data_id: int
+    table_id: str
 
 
 class AddBkDataTableIdsResource(Resource):
@@ -613,6 +623,28 @@ class QueryDataLinkMetadataResource(Resource):
     _MAX_RUNTIME_WORKERS = 16
     # P3 联邦集群策略 (用于 bcs_federal_info 填充)
     _BCS_FEDERAL_STRATEGIES = ("bcs_federal_subset_time_series", "bcs_federal_proxy_time_series")
+    # BKBase ``GET /v4/meta/datalink/metadata/`` → ``branches[]`` 字段含义见 ``_BKBASE_BRANCH_FIELD_LABELS``
+    # 多数 branch 字段 runtime 加 ``v4_`` 前缀; ``kafka_shipper_*`` 三字段仅 V3 链路返回, 保持原名
+    _V3_RUNTIME_BRANCH_FIELDS: frozenset[str] = frozenset(
+        {
+            "kafka_shipper_cluster_name",
+            "kafka_shipper_host",
+            "kafka_shipper_topic_name",
+        }
+    )
+    _BKBASE_BRANCH_FIELD_LABELS: dict[str, str] = {
+        "result_table_id": "结果表 ID",
+        "kafka_host": "入口 Kafka/Pulsar 地址",
+        "dispatch_cluster": "分发集群名称",
+        "dispatch_cluster_count": "分发集群数量",
+        "dispatch_cluster_task_name": "分发任务名称",
+        "dispatch_task_count": "分发任务数量",
+        "kafka_shipper_cluster_name": "inner Kafka 集群名称",
+        "kafka_shipper_host": "inner Kafka 地址",
+        "kafka_shipper_topic_name": "inner Kafka Topic 名称",
+        "doris_cluster_domain": "Doris 集群地址",
+        "doris_table_name": "Doris 物理表名",
+    }
 
     class RequestSerializer(serializers.Serializer):
         bk_tenant_id = TenantIdField(label="租户ID")
@@ -648,38 +680,52 @@ class QueryDataLinkMetadataResource(Resource):
         if not targets:
             return []
 
-        # Step 2: 批量预取上下文
-        ctx = self._prefetch_context(bk_tenant_id, targets)
-
-        # Step 3: 遍历组装扁平行
+        # Step 2: 按真实租户分组预取上下文, 避免跨租户 table_id/data_id 缓存互相覆盖
         rows: list[dict[str, Any]] = []
-        for data_id, table_id in targets:
+        targets_by_tenant: dict[str, list[DataLinkMetadataTarget]] = {}
+        for target in targets:
+            targets_by_tenant.setdefault(target.bk_tenant_id, []).append(target)
+
+        for real_tenant_id, tenant_targets in targets_by_tenant.items():
+            # Step 3: 批量预取上下文
+            ctx = self._prefetch_context(real_tenant_id, tenant_targets)
+
+            # Step 4: 遍历组装扁平行
+            tenant_rows: list[dict[str, Any]] = []
+            for target in tenant_targets:
+                try:
+                    tenant_rows.append(self._build_row(real_tenant_id, target.bk_data_id, target.table_id, ctx))
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        "QueryDataLinkMetadataResource: failed to build row "
+                        "(bk_tenant_id=%s, data_id=%s, table_id=%s): %s",
+                        real_tenant_id,
+                        target.bk_data_id,
+                        target.table_id,
+                        e,
+                    )
+                    tenant_rows.append(
+                        {
+                            "bk_tenant_id": real_tenant_id,
+                            "data_id": target.bk_data_id,
+                            "result_table_id": target.table_id,
+                            "error": f"Failed to build row: {e}",
+                        }
+                    )
+
+            # Step 5: 并发拉取 runtime 字段 (BKBase V4 API + ES live + 组件 status)
             try:
-                rows.append(self._build_row(bk_tenant_id, data_id, table_id, ctx))
+                self._enrich_with_runtime(tenant_rows, ctx)
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(
-                    "QueryDataLinkMetadataResource: failed to build row (data_id=%s, table_id=%s): %s",
-                    data_id,
-                    table_id,
+                    "QueryDataLinkMetadataResource: runtime enrich failed (bk_tenant_id=%s, non-fatal): %s",
+                    real_tenant_id,
                     e,
                 )
-                rows.append(
-                    {
-                        "data_id": data_id,
-                        "result_table_id": table_id,
-                        "error": f"Failed to build row: {e}",
-                    }
-                )
+            rows.extend(tenant_rows)
 
-        # Step 4: 并发拉取 runtime 字段 (BKBase V4 API + ES live + 组件 status)
-        try:
-            self._enrich_with_runtime(rows, ctx)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning("QueryDataLinkMetadataResource: runtime enrich failed (non-fatal): %s", e)
-
-        # Step 5: 清理行内的临时引用 (_instance / _databus_link_name 等), 避免序列化问题
+        # Step 6: 清理行内的临时引用 (_instance 等), 避免序列化问题
         for row in rows:
-            row.pop("_databus_link_name", None)
             comps = row.get("bkbase_components")
             if isinstance(comps, list):
                 for comp in comps:
@@ -698,7 +744,7 @@ class QueryDataLinkMetadataResource(Resource):
         result_table_id: str | None,
         vm_result_table_id: str | None,
         component_name: str | None,
-    ) -> list[tuple[int, str]]:
+    ) -> list[DataLinkMetadataTarget]:
         """优先级 bk_data_id > result_table_id > vm_result_table_id > component_name."""
         if bk_data_id:
             return self._resolve_by_data_id(bk_tenant_id, bk_data_id)
@@ -710,34 +756,58 @@ class QueryDataLinkMetadataResource(Resource):
             return self._resolve_by_component_name(bk_tenant_id, component_name)
         return []
 
-    def _resolve_by_data_id(self, bk_tenant_id: str, bk_data_id: str) -> list[tuple[int, str]]:
+    def _resolve_by_data_id(self, bk_tenant_id: str, bk_data_id: str) -> list[DataLinkMetadataTarget]:
         try:
             data_id_int = int(bk_data_id)
         except (TypeError, ValueError):
             return []
-        if not models.DataSource.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id=data_id_int).exists():
-            return []
-        table_ids = list(
-            models.DataSourceResultTable.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id=data_id_int).values_list(
-                "table_id", flat=True
+        data_sources = list(models.DataSource.objects.filter(bk_data_id=data_id_int))
+        if len(data_sources) > 1:
+            logger.warning(
+                "QueryDataLinkMetadataResource: bk_data_id %s matched multiple tenants: %s",
+                data_id_int,
+                [ds.bk_tenant_id for ds in data_sources],
             )
-        )
-        return [(data_id_int, t) for t in table_ids]
+        targets: list[DataLinkMetadataTarget] = []
+        for ds in data_sources:
+            table_ids = list(
+                models.DataSourceResultTable.objects.filter(
+                    bk_tenant_id=ds.bk_tenant_id, bk_data_id=data_id_int
+                ).values_list("table_id", flat=True)
+            )
+            targets.extend(DataLinkMetadataTarget(ds.bk_tenant_id, data_id_int, t) for t in table_ids)
+        return targets
 
-    def _resolve_by_table_id(self, bk_tenant_id: str, table_id: str) -> list[tuple[int, str]]:
-        dsrt = models.DataSourceResultTable.objects.filter(bk_tenant_id=bk_tenant_id, table_id=table_id).first()
-        if not dsrt:
-            return []
-        return [(int(dsrt.bk_data_id), table_id)]
+    def _resolve_by_table_id(self, bk_tenant_id: str, table_id: str) -> list[DataLinkMetadataTarget]:
+        dsrts = list(models.DataSourceResultTable.objects.filter(table_id=table_id))
+        if len(dsrts) > 1:
+            logger.warning(
+                "QueryDataLinkMetadataResource: table_id %s matched multiple tenants: %s",
+                table_id,
+                [dsrt.bk_tenant_id for dsrt in dsrts],
+            )
+        return [DataLinkMetadataTarget(dsrt.bk_tenant_id, int(dsrt.bk_data_id), table_id) for dsrt in dsrts]
 
-    def _resolve_by_vm_rt_id(self, bk_tenant_id: str, vm_rt_id: str) -> list[tuple[int, str]]:
-        vm_rec = models.AccessVMRecord.objects.filter(bk_tenant_id=bk_tenant_id, vm_result_table_id=vm_rt_id).first()
-        if not vm_rec:
-            return []
-        return self._resolve_by_table_id(bk_tenant_id, vm_rec.result_table_id)
+    def _resolve_by_vm_rt_id(self, bk_tenant_id: str, vm_rt_id: str) -> list[DataLinkMetadataTarget]:
+        vm_records = list(models.AccessVMRecord.objects.filter(vm_result_table_id=vm_rt_id))
+        if len(vm_records) > 1:
+            logger.warning(
+                "QueryDataLinkMetadataResource: vm_result_table_id %s matched multiple tenants: %s",
+                vm_rt_id,
+                [vm.bk_tenant_id for vm in vm_records],
+            )
+        targets: list[DataLinkMetadataTarget] = []
+        for vm_rec in vm_records:
+            dsrt = models.DataSourceResultTable.objects.filter(
+                bk_tenant_id=vm_rec.bk_tenant_id, table_id=vm_rec.result_table_id
+            ).first()
+            if not dsrt:
+                continue
+            targets.append(DataLinkMetadataTarget(vm_rec.bk_tenant_id, int(dsrt.bk_data_id), vm_rec.result_table_id))
+        return targets
 
-    def _resolve_by_component_name(self, bk_tenant_id: str, component_name: str) -> list[tuple[int, str]]:
-        """V4 BKBase 资源名反查 (DataLink-first + 7 ``*Config`` fallback).
+    def _resolve_by_component_name(self, bk_tenant_id: str, component_name: str) -> list[DataLinkMetadataTarget]:
+        """V4 BKBase 资源名反查 (DataLink-first + ``*Config`` fallback).
 
         格式 ``{namespace}-{name}``:
             - ``bklog-bklog_301_xxx``   → ns=bklog, name=bklog_301_xxx
@@ -764,6 +834,7 @@ class QueryDataLinkMetadataResource(Resource):
         config_models = (
             models.DataIdConfig,
             models.ResultTableConfig,
+            models.ChannelBindingConfig,
             models.VMStorageBindingConfig,
             models.ESStorageBindingConfig,
             models.DorisStorageBindingConfig,
@@ -771,29 +842,61 @@ class QueryDataLinkMetadataResource(Resource):
             models.ConditionalSinkConfig,
         )
 
-        for ns in namespaces:
-            link = models.DataLink.objects.filter(bk_tenant_id=bk_tenant_id, namespace=ns, data_link_name=name).first()
-
-            if not link:
-                for cfg_cls in config_models:
-                    try:
-                        cfg = cfg_cls.objects.filter(bk_tenant_id=bk_tenant_id, namespace=ns, name=name).first()
-                    except Exception as e:  # pylint: disable=broad-except
-                        logger.warning("scan %s for component_name failed: %s", cfg_cls.__name__, e)
-                        continue
-                    if cfg and getattr(cfg, "data_link_name", None):
-                        link = models.DataLink.objects.filter(
-                            bk_tenant_id=bk_tenant_id, namespace=ns, data_link_name=cfg.data_link_name
-                        ).first()
-                        if link:
-                            break
-
-            if link:
+        def _targets_from_links(links: list[Any]) -> list[DataLinkMetadataTarget]:
+            targets: list[DataLinkMetadataTarget] = []
+            for link in links:
                 try:
                     data_id = int(link.bk_data_id)
                 except (TypeError, ValueError):
                     data_id = link.bk_data_id
-                return [(data_id, tid) for tid in (link.table_ids or [])]
+                targets.extend(
+                    DataLinkMetadataTarget(link.bk_tenant_id, data_id, tid) for tid in (link.table_ids or [])
+                )
+            return targets
+
+        for ns in namespaces:
+            links = list(models.DataLink.objects.filter(namespace=ns, data_link_name=name))
+            if len(links) > 1:
+                logger.warning(
+                    "QueryDataLinkMetadataResource: component_name %s matched multiple DataLink tenants: %s",
+                    component_name,
+                    [link.bk_tenant_id for link in links],
+                )
+            direct_targets = _targets_from_links(links)
+            if direct_targets:
+                return direct_targets
+
+            fallback_targets: list[DataLinkMetadataTarget] = []
+            for cfg_cls in config_models:
+                try:
+                    configs = list(cfg_cls.objects.filter(namespace=ns, name=name))
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning("scan %s for component_name failed: %s", cfg_cls.__name__, e)
+                    continue
+                if len(configs) > 1:
+                    logger.warning(
+                        "QueryDataLinkMetadataResource: component_name %s matched multiple %s tenants: %s",
+                        component_name,
+                        cfg_cls.__name__,
+                        [cfg.bk_tenant_id for cfg in configs],
+                    )
+                for cfg in configs:
+                    if not getattr(cfg, "data_link_name", None):
+                        continue
+                    links = list(
+                        models.DataLink.objects.filter(
+                            bk_tenant_id=cfg.bk_tenant_id, namespace=ns, data_link_name=cfg.data_link_name
+                        )
+                    )
+                    if len(links) > 1:
+                        logger.warning(
+                            "QueryDataLinkMetadataResource: config %s/%s matched multiple DataLinks",
+                            cfg_cls.__name__,
+                            cfg.data_link_name,
+                        )
+                    fallback_targets.extend(_targets_from_links(links))
+            if fallback_targets:
+                return fallback_targets
 
         return []
 
@@ -801,10 +904,10 @@ class QueryDataLinkMetadataResource(Resource):
     # Step 2: 批量预取
     # ============================================================
 
-    def _prefetch_context(self, bk_tenant_id: str, targets: list[tuple[int, str]]) -> dict[str, Any]:
+    def _prefetch_context(self, bk_tenant_id: str, targets: list[DataLinkMetadataTarget]) -> dict[str, Any]:
         """批量预取所有依赖对象到 dict, 避免逐行 N+1 查询."""
-        data_ids = list({d for d, _ in targets})
-        table_ids = list({t for _, t in targets})
+        data_ids = list({target.bk_data_id for target in targets})
+        table_ids = list({target.table_id for target in targets})
 
         # ---- DataSource ----
         data_sources = {
@@ -854,23 +957,22 @@ class QueryDataLinkMetadataResource(Resource):
             if data_link_names
             else {}
         )
-        databus_configs = (
-            {
-                dc.data_link_name: dc
-                for dc in models.DataBusConfig.objects.filter(
-                    bk_tenant_id=bk_tenant_id, data_link_name__in=data_link_names
-                )
-            }
-            if data_link_names
-            else {}
-        )
+        databus_configs = {}
+        if data_link_names:
+            for dc in models.DataBusConfig.objects.filter(
+                bk_tenant_id=bk_tenant_id, data_link_name__in=data_link_names
+            ).order_by("data_link_name", "id"):
+                # VM 自定义格式包含 clean/shipper 两条 Databus，链路入口应展示 clean。
+                if dc.data_link_name not in databus_configs or dc.role == "clean":
+                    databus_configs[dc.data_link_name] = dc
 
-        # 组件清单: 扫 7 个 *Config, 按 data_link_name group
+        # 组件清单: 扫全部受管 *Config, 按 data_link_name group
         components_by_link: dict[str, list[dict[str, Any]]] = {}
         if data_link_names:
             v4_config_models = (
                 (models.DataIdConfig, "DataId"),
                 (models.ResultTableConfig, "ResultTable"),
+                (models.ChannelBindingConfig, "ChannelBinding"),
                 (models.VMStorageBindingConfig, "VmStorageBinding"),
                 (models.ESStorageBindingConfig, "ElasticSearchBinding"),
                 (models.DorisStorageBindingConfig, "DorisBinding"),
@@ -956,25 +1058,27 @@ class QueryDataLinkMetadataResource(Resource):
                 if bid:
                     candidate_sub_clusters.add(bid)
 
-        fed_by_table_id: dict[str, Any] = {}
-        fed_by_sub_cluster_id: dict[str, Any] = {}
+        fed_by_table_id: dict[str, list[Any]] = {}
+        fed_by_sub_cluster_id: dict[str, list[Any]] = {}
         if table_ids or candidate_sub_clusters:
             try:
-                fed_q = Q(is_deleted=False)
+                fed_q = Q(bk_tenant_id=bk_tenant_id, is_deleted=False)
                 fed_or = Q()
                 if table_ids:
                     fed_or |= Q(fed_builtin_metric_table_id__in=table_ids)
                     fed_or |= Q(fed_builtin_event_table_id__in=table_ids)
                 if candidate_sub_clusters:
                     fed_or |= Q(sub_cluster_id__in=list(candidate_sub_clusters))
-                qs = models.BcsFederalClusterInfo.objects.filter(fed_q & fed_or)
+                qs = models.BcsFederalClusterInfo.objects.filter(fed_q & fed_or).order_by(
+                    "fed_cluster_id", "sub_cluster_id"
+                )
                 for fed in qs:
                     if fed.fed_builtin_metric_table_id:
-                        fed_by_table_id[fed.fed_builtin_metric_table_id] = fed
+                        fed_by_table_id.setdefault(fed.fed_builtin_metric_table_id, []).append(fed)
                     if fed.fed_builtin_event_table_id:
-                        fed_by_table_id[fed.fed_builtin_event_table_id] = fed
+                        fed_by_table_id.setdefault(fed.fed_builtin_event_table_id, []).append(fed)
                     if fed.sub_cluster_id:
-                        fed_by_sub_cluster_id[fed.sub_cluster_id] = fed
+                        fed_by_sub_cluster_id.setdefault(fed.sub_cluster_id, []).append(fed)
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning("prefetch BcsFederalClusterInfo failed: %s", e)
 
@@ -1022,7 +1126,6 @@ class QueryDataLinkMetadataResource(Resource):
         row.update(self._build_kafka_frontend_block(ds, ctx))
         row.update(self._build_transfer_block(ds))
         row.update(self._build_kafka_backend_block(table_id, ctx))
-        row.update(self._build_shipper_runtime_block())  # P2: 全 null 占位
         row.update(self._build_v4_databus_block(table_id, ds, ctx))
         row.update(self._build_vm_block(table_id, ctx))
         row.update(self._build_es_block(table_id, ctx))
@@ -1125,7 +1228,6 @@ class QueryDataLinkMetadataResource(Resource):
         out = {
             "kafka_instance_id": None,
             "kafka_inner_cluster_name": None,
-            "kafka_app": None,  # BKBase 职责, 恒 null
             "kafka_host": None,
             "topic_name": None,
             "current_partition_num": None,
@@ -1144,7 +1246,6 @@ class QueryDataLinkMetadataResource(Resource):
     def _build_transfer_block(self, ds: Any) -> dict[str, Any]:
         return {
             "transfer_cluster": ds.transfer_cluster_id or None,
-            "transfer_cluster_pod_num": None,  # 占位 null
         }
 
     def _build_kafka_backend_block(self, table_id: str, ctx: dict[str, Any]) -> dict[str, Any]:
@@ -1168,31 +1269,15 @@ class QueryDataLinkMetadataResource(Resource):
         )
         return out
 
-    def _build_shipper_runtime_block(self) -> dict[str, Any]:
-        """V3 内部 Kafka shipper, 5 个字段都是 P2 runtime, P1 全 null."""
-        return {
-            "shipper_kafka_instance_id": None,
-            "kafka_shipper_cluster_name": None,
-            "kafka_shipper_host": None,
-            "kafka_shipper_topic_name": None,
-            "kafka_shipper_topic_partition_num": None,
-        }
-
     def _build_v4_databus_block(self, table_id: str, ds: Any, ctx: dict[str, Any]) -> dict[str, Any]:
-        """V4 Databus 块: 17 字段; P1 本地, P2 补 runtime."""
+        """V4 Databus 本地块.
+
+        BKBase runtime 字段在 ``_apply_bkbase_metadata`` 中写入:
+        V4 branch 加 ``v4_*`` 前缀; V3 独有 ``kafka_shipper_*`` 保持原名.
+        含义见 ``_BKBASE_BRANCH_FIELD_LABELS``.
+        """
         out = {
             "databus_name": None,
-            "databus_v4_cluster_name": None,
-            "databus_v4_subtask_name": None,  # P2
-            "databus_v4_kafka_instance_id": None,  # P2
-            "databus_kafka_host": None,  # P2
-            "databus_topic_name": None,  # P2
-            "databus_topic_partition_num": None,  # P2
-            "databus_vm_cluster_domain": None,  # P2
-            "dispatch_cluster": None,  # P2
-            "dispatch_cluster_count": None,  # P2
-            "dispatch_cluster_task_name": None,  # P2
-            "dispatch_task_count": None,  # P2
             "bkbase_status": None,
             "bkbase_table_id": None,
             "bkbase_rt_name": None,
@@ -1202,7 +1287,6 @@ class QueryDataLinkMetadataResource(Resource):
             return out
         br = ctx["bkbase_rts"].get(table_id)
         if not br:
-            # V3→V4 迁移场景, 本地无 BkBaseResultTable; P2 通过远端 API 拼装
             return out
 
         out["bkbase_status"] = br.status or None
@@ -1212,10 +1296,6 @@ class QueryDataLinkMetadataResource(Resource):
         dc = ctx["databus_configs"].get(br.data_link_name) if br.data_link_name else None
         if dc:
             out["databus_name"] = dc.name or None
-            # ``databus_v4_cluster_name`` 来自 ``DataBusConfig.component_config.spec.preferCluster.name``,
-            # ``component_config`` 是 @property 触发远端调用, 在 P2 ``_enrich_with_runtime`` 中并发拉取.
-            # 暂存 link_name 到行内 (传递给 runtime 阶段), 输出前会 pop 掉.
-            out["_databus_link_name"] = br.data_link_name
 
         comps = ctx["components_by_link"].get(br.data_link_name, [])
         out["bkbase_components"] = comps or None
@@ -1258,7 +1338,6 @@ class QueryDataLinkMetadataResource(Resource):
             "es_cluster_id": None,
             "es_cluster_domain": None,
             "es_cluster_name": None,
-            "es_app": None,  # BKBase 职责
             "es_index_name": None,
             "es_index_shard_num": None,
             "es_retention_days": None,
@@ -1297,11 +1376,9 @@ class QueryDataLinkMetadataResource(Resource):
             "doris_cluster_id": None,
             "doris_cluster_domain": None,
             "doris_cluster_name": None,
-            "doris_app": None,  # BKBase 职责
             "doris_table_name": None,
             "doris_table_type": None,
             "doris_expire_days": None,
-            "doris_bucket_size": None,  # P2: 主源 BKBase API
         }
         doris = ctx["doris_storages"].get(table_id)
         if not doris:
@@ -1363,22 +1440,39 @@ class QueryDataLinkMetadataResource(Resource):
 
         if not matched:
             return None
-        return {
-            "fed_cluster_id": getattr(matched, "fed_cluster_id", None),
-            "host_cluster_id": getattr(matched, "host_cluster_id", None),
-            "sub_cluster_id": getattr(matched, "sub_cluster_id", None),
-            "fed_namespaces": list(getattr(matched, "fed_namespaces", None) or []),
-            "fed_builtin_metric_table_id": getattr(matched, "fed_builtin_metric_table_id", None) or None,
-            "fed_builtin_event_table_id": getattr(matched, "fed_builtin_event_table_id", None) or None,
-        }
+
+        # 兼容历史测试和潜在调用方传入单个模型对象；新预取结构始终使用列表，
+        # 以完整表达同一子集群按不同 namespace 分属多个联邦的关系。
+        matched_records = list(matched) if isinstance(matched, list | tuple | set) else [matched]
+        matched_records.sort(
+            key=lambda record: (
+                getattr(record, "fed_cluster_id", ""),
+                getattr(record, "sub_cluster_id", ""),
+            )
+        )
+
+        def _serialize(record: Any) -> dict[str, Any]:
+            return {
+                "bk_tenant_id": getattr(record, "bk_tenant_id", None),
+                "fed_cluster_id": getattr(record, "fed_cluster_id", None),
+                "host_cluster_id": getattr(record, "host_cluster_id", None),
+                "sub_cluster_id": getattr(record, "sub_cluster_id", None),
+                "fed_namespaces": sorted(set(getattr(record, "fed_namespaces", None) or [])),
+                "fed_builtin_metric_table_id": getattr(record, "fed_builtin_metric_table_id", None) or None,
+                "fed_builtin_event_table_id": getattr(record, "fed_builtin_event_table_id", None) or None,
+            }
+
+        primary = _serialize(matched_records[0])
+        primary["federation_routes"] = [_serialize(record) for record in matched_records]
+        return primary
 
     def _build_placeholder_block(self) -> dict[str, Any]:
-        """占位字段, 恒 null."""
         return {
-            "kafka_broker_num": None,
-            "es_node_num": None,
-            "doris_node_num": None,
-            "collect_config_id": None,  # P4 待 bklog 反查
+            "collect_config_id": None,  # 待确认用途
+            # V3 BKBase runtime: inner Kafka shipper (P2 拉取, 仅 V3 链路有值)
+            "kafka_shipper_cluster_name": None,
+            "kafka_shipper_host": None,
+            "kafka_shipper_topic_name": None,
         }
 
     def _build_runtime_error_fields(self) -> dict[str, Any]:
@@ -1502,8 +1596,7 @@ class QueryDataLinkMetadataResource(Resource):
         """对所有行并发执行 runtime 字段拉取.
 
         三类外部调用:
-            - BKBase V4 元数据 API (拼装 ``branches[]`` → ``dispatch_* / kafka_shipper_* / databus_kafka_host`` 等)
-            - DataBus ``component_config.spec.preferCluster.name`` (远端 @property)
+            - BKBase 元数据 API (``GET /v4/meta/datalink/metadata/`` → ``v4_*`` + V3 ``kafka_shipper_*``)
             - ES live 索引信息 (``ESStorage.current_index_info / get_index_info / _should_create_index``)
             - 各 ``*Config.component_status`` (远端 @property)
 
@@ -1517,27 +1610,24 @@ class QueryDataLinkMetadataResource(Resource):
             if row.get("error"):
                 continue
 
-            # BKBase 元数据 (V4 + V3→V4 迁移都可尝试; 仅在有 ID 时才发)
-            if row.get("bk_base_data_id") or row.get("vm_rt_name"):
-                tasks.append(
-                    (
-                        row,
-                        "bkbase_metadata",
-                        {
-                            "bk_base_data_id": row.get("bk_base_data_id"),
-                            "vm_rt_name": row.get("vm_rt_name"),
-                        },
-                    )
+            # BKBase 元数据: 所有非 error 行均尝试
+            # 查询 ID 优先级: bk_base_data_id > vm_rt_name > 监控侧 data_id (纯 V3 本地链路)
+            tasks.append(
+                (
+                    row,
+                    "bkbase_metadata",
+                    {
+                        "bk_tenant_id": row.get("bk_tenant_id"),
+                        "bk_base_data_id": row.get("bk_base_data_id"),
+                        "vm_rt_name": row.get("vm_rt_name"),
+                        "monitor_data_id": row.get("data_id"),
+                    },
                 )
+            )
 
             # ES live (任何有 ES 存储的行)
             if row.get("es_cluster_id"):
                 tasks.append((row, "es_runtime", {"table_id": row.get("result_table_id")}))
-
-            # DataBus preferCluster (仅 V4 链路)
-            link_name = row.get("_databus_link_name")
-            if link_name:
-                tasks.append((row, "databus_prefer_cluster", {"data_link_name": link_name}))
 
             # 各组件 status (仅 V4 链路有 bkbase_components)
             comps = row.get("bkbase_components") or []
@@ -1575,10 +1665,12 @@ class QueryDataLinkMetadataResource(Resource):
         """线程池任务入口. 按 kind 分发到具体 fetcher; 单 fetch 失败返回 ``{"_error": ...}``."""
         try:
             if kind == "bkbase_metadata":
-                return self._fetch_bkbase_metadata(args.get("bk_base_data_id"), args.get("vm_rt_name"))
-            if kind == "databus_prefer_cluster":
-                dc = ctx.get("databus_configs", {}).get(args["data_link_name"])
-                return self._fetch_databus_prefer_cluster(dc)
+                return self._fetch_bkbase_metadata(
+                    args.get("bk_base_data_id"),
+                    args.get("vm_rt_name"),
+                    args.get("monitor_data_id"),
+                    args.get("bk_tenant_id"),
+                )
             if kind == "es_runtime":
                 es_storage = ctx.get("es_storages", {}).get(args["table_id"])
                 return self._fetch_es_runtime(es_storage)
@@ -1596,10 +1688,28 @@ class QueryDataLinkMetadataResource(Resource):
             except Exception:  # pylint: disable=broad-except
                 pass
 
-    def _fetch_bkbase_metadata(self, bk_base_data_id: int | None, vm_rt_name: str | None) -> dict[str, Any] | None:
-        """调 BKBase V4 元数据 API. 返回 dict 含 ``branches[]``; 失败返回 ``{"_error": ...}``."""
-        if not (bk_base_data_id or vm_rt_name):
-            return None
+    def _fetch_bkbase_metadata(
+        self,
+        bk_base_data_id: int | None,
+        vm_rt_name: str | None,
+        monitor_data_id: int | None = None,
+        bk_tenant_id: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        """调 BKBase ``GET /v4/meta/datalink/metadata/``.
+
+        入参 (二选一, 不可同传):
+            - ``bk_data_id``: BKBase ``raw_data_id / bk_base_data_id``; 纯 V3 本地链路 fallback 监控侧 ``data_id``
+            - ``vm_result_table_id``: BKBase 侧 ``result_table_id``
+
+        成功时返回 ``{"branches": [...]}`` (或外层 ``data.branches`` 已解包); 失败返回 ``{"_error": ...}``.
+        每个 ``branches[]`` 元素字段: ``result_table_id`` 结果表 ID; ``kafka_host`` 入口 Kafka/Pulsar 地址;
+        ``dispatch_cluster`` 分发集群名称; ``dispatch_cluster_count`` 分发集群数量;
+        ``dispatch_cluster_task_name`` 分发任务名称; ``dispatch_task_count`` 分发任务数量;
+        ``kafka_shipper_cluster_name`` inner Kafka 集群名称; ``kafka_shipper_host`` inner Kafka 地址;
+        ``kafka_shipper_topic_name`` inner Kafka Topic 名称; ``doris_cluster_domain`` Doris 集群地址;
+        ``doris_table_name`` Doris 物理表名.
+        """
         params: dict[str, Any] = {}
         if bk_base_data_id:
             try:
@@ -1608,26 +1718,22 @@ class QueryDataLinkMetadataResource(Resource):
                 return {"_error": f"invalid bk_base_data_id: {bk_base_data_id}"}
         elif vm_rt_name:
             params["vm_result_table_id"] = vm_rt_name
+        elif monitor_data_id is not None:
+            try:
+                params["bk_data_id"] = int(monitor_data_id)
+            except (TypeError, ValueError):
+                return {"_error": f"invalid monitor_data_id: {monitor_data_id}"}
+        else:
+            return None
+        if bk_tenant_id:
+            params["bk_tenant_id"] = bk_tenant_id
+        if timeout is not None:
+            params["timeout"] = timeout
         try:
             return api.bkdata.get_data_link_metadata(**params)
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("fetch bkbase metadata failed, params=%s: %s", params, e)
             return {"_error": str(e)}
-
-    def _fetch_databus_prefer_cluster(self, dc: Any) -> Any:
-        """读 ``DataBusConfig.component_config.spec.preferCluster.name`` (远端调用)."""
-        if not dc:
-            return None
-        try:
-            cc = dc.component_config
-        except Exception as e:  # pylint: disable=broad-except
-            return {"_error": f"component_config fetch failed: {e}"}
-        if not isinstance(cc, dict):
-            return None
-        spec = cc.get("spec") or {}
-        pc = spec.get("preferCluster") or {}
-        name = pc.get("name")
-        return name if isinstance(name, str) and name else None
 
     def _fetch_es_runtime(self, es_storage: Any) -> dict[str, Any] | None:
         """ES live: ``current_index_info`` + ``get_index_info`` + ``_should_create_index``."""
@@ -1693,9 +1799,6 @@ class QueryDataLinkMetadataResource(Resource):
 
         if kind == "bkbase_metadata":
             self._apply_bkbase_metadata(row, result)
-        elif kind == "databus_prefer_cluster":
-            if isinstance(result, str):
-                row["databus_v4_cluster_name"] = result
         elif kind == "es_runtime":
             self._apply_es_runtime(row, result)
         elif kind == "component_status":
@@ -1704,45 +1807,61 @@ class QueryDataLinkMetadataResource(Resource):
             comp["status"] = status
             comp["message"] = message
 
-    def _apply_bkbase_metadata(self, row: dict[str, Any], result: Any) -> None:
-        """从 BKBase V4 API 响应 (``branches[]``) 抽取字段写入 row."""
+    @staticmethod
+    def _normalize_bkbase_metadata_payload(result: Any) -> dict[str, Any] | None:
+        """兼容 ``{branches}`` 与 ``{data: {branches}}`` 两种响应包装."""
         if not isinstance(result, dict):
+            return None
+        if isinstance(result.get("branches"), list):
+            return result
+        data = result.get("data")
+        if isinstance(data, dict) and isinstance(data.get("branches"), list):
+            return data
+        return None
+
+    @staticmethod
+    def _pick_bkbase_branch(branches: list[Any], row: dict[str, Any]) -> dict[str, Any] | None:
+        """按 ``branches[].result_table_id`` 匹配当前行; 单分支时直接取唯一元素."""
+        valid = [b for b in branches if isinstance(b, dict)]
+        if not valid:
+            return None
+        if len(valid) == 1:
+            return valid[0]
+        for key in (row.get("vm_rt_name"), row.get("bkbase_table_id")):
+            if not key:
+                continue
+            for branch in valid:
+                if branch.get("result_table_id") == key:
+                    return branch
+        return valid[0]
+
+    def _apply_bkbase_metadata(self, row: dict[str, Any], result: Any) -> None:
+        """BKBase ``branches[]`` 匹配当前行后写入 row; 多数字段加 ``v4_`` 前缀, V3 独有字段保持原名.
+
+        写入字段:
+            v4_result_table_id            结果表 ID
+            v4_kafka_host                 入口 Kafka/Pulsar 地址
+            v4_dispatch_cluster           分发集群名称
+            v4_dispatch_cluster_count     分发集群数量
+            v4_dispatch_cluster_task_name 分发任务名称
+            v4_dispatch_task_count        分发任务数量
+            kafka_shipper_cluster_name    inner Kafka 集群名称 (仅 V3, 无前缀)
+            kafka_shipper_host            inner Kafka 地址 (仅 V3)
+            kafka_shipper_topic_name      inner Kafka Topic 名称 (仅 V3)
+            v4_doris_cluster_domain       Doris 集群地址
+            v4_doris_table_name           Doris 物理表名
+        """
+        payload = self._normalize_bkbase_metadata_payload(result)
+        if not payload:
             return
-        branches = result.get("branches") or []
-        if not branches or not isinstance(branches[0], dict):
+        branch = self._pick_bkbase_branch(payload.get("branches") or [], row)
+        if not branch:
             return
-        b = branches[0]
-
-        # V4 Databus runtime
-        mapping = {
-            "dispatch_cluster": "dispatch_cluster",
-            "dispatch_cluster_count": "dispatch_cluster_count",
-            "dispatch_task_count": "dispatch_task_count",
-            "kafka_shipper_cluster_name": "kafka_shipper_cluster_name",
-            "kafka_shipper_host": "kafka_shipper_host",
-            "kafka_shipper_topic_name": "kafka_shipper_topic_name",
-            "kafka_shipper_topic_partition_num": "kafka_shipper_topic_partition_num",
-        }
-        for branch_key, row_key in mapping.items():
-            val = b.get(branch_key)
-            if val is not None:
-                row[row_key] = val
-
-        # 双写: dispatch_cluster_task_name → databus_v4_subtask_name
-        task_name = b.get("dispatch_cluster_task_name")
-        if task_name is not None:
-            row["dispatch_cluster_task_name"] = task_name
-            row["databus_v4_subtask_name"] = task_name
-
-        # branches 命名转换
-        if b.get("kafka_host") is not None:
-            row["databus_kafka_host"] = b.get("kafka_host")
-        if b.get("kafka_topic_name") is not None:
-            row["databus_topic_name"] = b.get("kafka_topic_name")
-        if b.get("kafka_topic_partition_num") is not None:
-            row["databus_topic_partition_num"] = b.get("kafka_topic_partition_num")
-        if b.get("vm_cluster_domain") is not None:
-            row["databus_vm_cluster_domain"] = b.get("vm_cluster_domain")
+        for key, val in branch.items():
+            if key in self._V3_RUNTIME_BRANCH_FIELDS:
+                row[key] = val
+            else:
+                row[f"v4_{key}"] = val
 
     def _apply_es_runtime(self, row: dict[str, Any], result: Any) -> None:
         if not isinstance(result, dict):
@@ -1765,7 +1884,7 @@ class QueryDataLinkMetadataResource(Resource):
     ) -> None:
         """记录 runtime 错误信息. 不阻断行返回."""
         msg_short = f"[{kind}] {msg}"
-        if kind in ("bkbase_metadata", "databus_prefer_cluster"):
+        if kind == "bkbase_metadata":
             prev = row.get("bkbase_remote_error") or ""
             row["bkbase_remote_error"] = (prev + msg_short + "; ").strip()
         elif kind == "es_runtime":

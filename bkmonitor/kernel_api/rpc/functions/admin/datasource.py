@@ -11,7 +11,7 @@ specific language governing permissions and limitations under the License.
 from typing import Any
 
 from django.conf import settings
-from django.db.models import Q
+from django.db.models import Count, Exists, OuterRef, Q
 
 from core.drf_resource import api
 from core.drf_resource.exceptions import CustomException
@@ -19,12 +19,19 @@ from kernel_api.rpc import KernelRPCRegistry
 from kernel_api.rpc.functions.admin.common import (
     build_response,
     count_by_field,
-    get_bk_tenant_id,
+    count_by_tenant_and_field,
+    filter_by_bk_tenant_id,
+    filter_by_tenant_resource_pairs,
+    get_page_list_bk_tenant_id,
+    get_scoped_map_value,
     normalize_include,
+    normalize_int_list_filter,
     normalize_ordering,
     normalize_optional_bool,
     normalize_pagination,
+    normalize_string_list_filter,
     paginate_queryset,
+    require_bk_tenant_id,
     serialize_model,
     serialize_option,
     serialize_value,
@@ -301,34 +308,52 @@ def _get_kafka_topic(datasource: models.DataSource) -> models.KafkaTopicInfo | N
     return models.KafkaTopicInfo.objects.filter(bk_data_id=datasource.bk_data_id).first()
 
 
-def _build_datasource_queryset(params: dict[str, Any], bk_tenant_id: str):
-    queryset = models.DataSource.objects.filter(bk_tenant_id=bk_tenant_id)
+def _active_result_table_relations():
+    enabled_tables = models.ResultTable.objects.filter(
+        bk_tenant_id=OuterRef("bk_tenant_id"), table_id=OuterRef("table_id"), is_enable=True
+    )
+    return models.DataSourceResultTable.objects.filter(Exists(enabled_tables))
 
-    if params.get("bk_data_id") not in (None, ""):
-        queryset = queryset.filter(bk_data_id=_normalize_bk_data_id(params.get("bk_data_id")))
+
+def _build_datasource_queryset(params: dict[str, Any], bk_tenant_id: str | None):
+    queryset = filter_by_bk_tenant_id(models.DataSource.objects.all(), bk_tenant_id)
+
+    bk_data_ids = normalize_int_list_filter(params, "bk_data_id", "bk_data_ids", positive=True)
+    if bk_data_ids:
+        queryset = queryset.filter(bk_data_id__in=bk_data_ids)
     if params.get("data_name"):
         queryset = queryset.filter(data_name__contains=str(params["data_name"]).strip())
-    if params.get("etl_config"):
-        queryset = queryset.filter(etl_config=str(params["etl_config"]).strip())
-    for field in ["created_from", "source_label", "type_label", "space_uid"]:
-        if params.get(field) not in (None, ""):
-            queryset = queryset.filter(**{field: params[field]})
-    if params.get("transfer_cluster_id") not in (None, ""):
-        queryset = queryset.filter(transfer_cluster_id=str(params["transfer_cluster_id"]).strip())
-    if params.get("mq_cluster_id") not in (None, ""):
-        try:
-            queryset = queryset.filter(mq_cluster_id=int(params["mq_cluster_id"]))
-        except (TypeError, ValueError) as error:
-            raise CustomException(message="mq_cluster_id 必须是整数") from error
+    string_filters = [
+        ("etl_config", "etl_configs"),
+        ("created_from", "created_froms"),
+        ("source_label", "source_labels"),
+        ("type_label", "type_labels"),
+        ("space_uid", "space_uids"),
+        ("transfer_cluster_id", "transfer_cluster_ids"),
+    ]
+    for singular_field, plural_field in string_filters:
+        values = normalize_string_list_filter(params, singular_field, plural_field)
+        if values:
+            queryset = queryset.filter(**{f"{singular_field}__in": values})
+    mq_cluster_ids = normalize_int_list_filter(params, "mq_cluster_id", "mq_cluster_ids", positive=True)
+    if mq_cluster_ids:
+        queryset = queryset.filter(mq_cluster_id__in=mq_cluster_ids)
     for field in ["is_enable", "is_custom_source", "is_platform_data_id"]:
         field_value = normalize_optional_bool(params.get(field), field)
         if field_value is not None:
             queryset = queryset.filter(**{field: field_value})
-    if params.get("table_id"):
-        bk_data_ids = models.DataSourceResultTable.objects.filter(
-            bk_tenant_id=bk_tenant_id, table_id=str(params["table_id"]).strip()
-        ).values_list("bk_data_id", flat=True)
-        queryset = queryset.filter(bk_data_id__in=bk_data_ids)
+    table_ids = normalize_string_list_filter(params, "table_id", "table_ids")
+    if table_ids:
+        relation_queryset = models.DataSourceResultTable.objects.filter(table_id__in=table_ids)
+        if bk_tenant_id:
+            bk_data_ids = relation_queryset.filter(bk_tenant_id=bk_tenant_id).values_list("bk_data_id", flat=True)
+            queryset = queryset.filter(bk_data_id__in=bk_data_ids)
+        else:
+            queryset = filter_by_tenant_resource_pairs(
+                queryset,
+                "bk_data_id",
+                relation_queryset.values_list("bk_tenant_id", "bk_data_id"),
+            )
 
     return queryset
 
@@ -338,28 +363,44 @@ def _build_datasource_queryset(params: dict[str, Any], bk_tenant_id: str):
     summary="Admin 查询 DataSource 列表",
     description="只读查询 DataSource，支持受控过滤、白名单排序和分页；不会返回 token 明文。",
     params_schema={
-        "bk_tenant_id": "可选，租户 ID",
+        "bk_tenant_id": "可选，租户 ID；缺省或空表示全租户查询",
         "bk_data_id": "可选，数据源 ID",
+        "bk_data_ids": "可选，数据源 ID 数组，最多 100 个",
         "data_name": "可选，数据源名称包含匹配",
         "etl_config": "可选，清洗配置精确匹配",
+        "etl_configs": "可选，清洗配置数组，最多 100 个",
         "created_from": "可选，数据源来源",
+        "created_froms": "可选，数据源来源数组，最多 100 个",
         "source_label": "可选，数据源标签",
+        "source_labels": "可选，数据源标签数组，最多 100 个",
         "type_label": "可选，数据类型标签",
+        "type_labels": "可选，数据类型标签数组，最多 100 个",
         "is_enable": "可选，是否启用",
         "is_custom_source": "可选，是否自定义数据源",
         "is_platform_data_id": "可选，是否平台级 ID",
         "space_uid": "可选，所属空间 UID",
+        "space_uids": "可选，所属空间 UID 数组，最多 100 个",
         "mq_cluster_id": "可选，Kafka 集群 ID 精确匹配",
+        "mq_cluster_ids": "可选，Kafka 集群 ID 数组，最多 100 个",
         "transfer_cluster_id": "可选，传输集群 ID 精确匹配",
+        "transfer_cluster_ids": "可选，传输集群 ID 数组，最多 100 个",
         "table_id": "可选，通过 DataSourceResultTable 关联过滤",
+        "table_ids": "可选，通过 DataSourceResultTable 关联过滤的结果表 ID 数组，最多 100 个",
         "page": "可选，默认 1",
         "page_size": "可选，默认 20，最大 100",
         "ordering": f"可选，白名单字段: {', '.join(sorted(ORDERING_FIELDS))}",
     },
-    example_params={"bk_tenant_id": "system", "page": 1, "page_size": 20, "ordering": "-last_modify_time"},
+    example_params={
+        "bk_tenant_id": "system",
+        "bk_data_ids": [50010, 50011],
+        "source_labels": ["bk_monitor", "custom"],
+        "page": 1,
+        "page_size": 20,
+        "ordering": "-last_modify_time",
+    },
 )
 def list_datasources(params: dict[str, Any]) -> dict[str, Any]:
-    bk_tenant_id = get_bk_tenant_id(params)
+    bk_tenant_id = get_page_list_bk_tenant_id(params)
     page, page_size = normalize_pagination(params)
     ordering = normalize_ordering(params.get("ordering"), ORDERING_FIELDS, default="-last_modify_time")
 
@@ -367,28 +408,50 @@ def list_datasources(params: dict[str, Any]) -> dict[str, Any]:
     datasources, total = paginate_queryset(queryset, page=page, page_size=page_size)
 
     bk_data_ids = [datasource.bk_data_id for datasource in datasources]
-    result_table_count_map = count_by_field(
-        models.DataSourceResultTable, group_field="bk_data_id", values=bk_data_ids, bk_tenant_id=bk_tenant_id
+    count_func = count_by_field if bk_tenant_id else count_by_tenant_and_field
+    result_table_count_map = count_func(
+        models.DataSourceResultTable,
+        group_field="bk_data_id",
+        values=bk_data_ids,
+        **({"bk_tenant_id": bk_tenant_id} if bk_tenant_id else {}),
     )
-    space_count_map = count_by_field(
-        models.SpaceDataSource, group_field="bk_data_id", values=bk_data_ids, bk_tenant_id=bk_tenant_id
-    )
-    option_count_map = count_by_field(
-        models.DataSourceOption, group_field="bk_data_id", values=bk_data_ids, bk_tenant_id=bk_tenant_id
-    )
-    data_id_config_ids = set(
-        models.DataIdConfig.objects.filter(bk_tenant_id=bk_tenant_id, bk_data_id__in=bk_data_ids).values_list(
-            "bk_data_id", flat=True
+    active_relations = _active_result_table_relations().filter(bk_data_id__in=bk_data_ids)
+    active_relations = filter_by_bk_tenant_id(active_relations, bk_tenant_id)
+    active_result_table_count_map = {
+        (row["bk_tenant_id"], row["bk_data_id"]): row["total"]
+        for row in active_relations.values("bk_tenant_id", "bk_data_id").annotate(
+            total=Count("table_id", distinct=True)
         )
+    }
+    space_count_map = count_func(
+        models.SpaceDataSource,
+        group_field="bk_data_id",
+        values=bk_data_ids,
+        **({"bk_tenant_id": bk_tenant_id} if bk_tenant_id else {}),
     )
+    option_count_map = count_func(
+        models.DataSourceOption,
+        group_field="bk_data_id",
+        values=bk_data_ids,
+        **({"bk_tenant_id": bk_tenant_id} if bk_tenant_id else {}),
+    )
+    data_id_config_queryset = models.DataIdConfig.objects.filter(bk_data_id__in=bk_data_ids)
+    if bk_tenant_id:
+        data_id_config_ids = set(
+            data_id_config_queryset.filter(bk_tenant_id=bk_tenant_id).values_list("bk_data_id", flat=True)
+        )
+    else:
+        data_id_config_ids = set(data_id_config_queryset.values_list("bk_tenant_id", "bk_data_id"))
     mq_cluster_ids = [datasource.mq_cluster_id for datasource in datasources]
+    kafka_cluster_queryset = models.ClusterInfo.objects.filter(
+        cluster_id__in=mq_cluster_ids,
+        cluster_type=models.ClusterInfo.TYPE_KAFKA,
+    )
+    if bk_tenant_id:
+        kafka_cluster_queryset = kafka_cluster_queryset.filter(bk_tenant_id=bk_tenant_id)
     kafka_cluster_map = {
-        cluster.cluster_id: cluster
-        for cluster in models.ClusterInfo.objects.filter(
-            bk_tenant_id=bk_tenant_id,
-            cluster_id__in=mq_cluster_ids,
-            cluster_type=models.ClusterInfo.TYPE_KAFKA,
-        )
+        (cluster.cluster_id if bk_tenant_id else (cluster.bk_tenant_id, cluster.cluster_id)): cluster
+        for cluster in kafka_cluster_queryset
     }
 
     items = []
@@ -396,11 +459,29 @@ def list_datasources(params: dict[str, Any]) -> dict[str, Any]:
         item = _serialize_datasource(datasource)
         item.update(
             {
-                "result_table_count": result_table_count_map.get(datasource.bk_data_id, 0),
-                "space_count": space_count_map.get(datasource.bk_data_id, 0),
-                "option_count": option_count_map.get(datasource.bk_data_id, 0),
-                "has_data_id_config": datasource.bk_data_id in data_id_config_ids,
-                "kafka_cluster": _serialize_kafka_cluster(kafka_cluster_map.get(datasource.mq_cluster_id)),
+                "result_table_count": get_scoped_map_value(
+                    result_table_count_map, datasource.bk_tenant_id, datasource.bk_data_id
+                )
+                or 0,
+                "active_result_table_count": active_result_table_count_map.get(
+                    (datasource.bk_tenant_id, datasource.bk_data_id), 0
+                ),
+                "space_count": get_scoped_map_value(space_count_map, datasource.bk_tenant_id, datasource.bk_data_id)
+                or 0,
+                "option_count": get_scoped_map_value(option_count_map, datasource.bk_tenant_id, datasource.bk_data_id)
+                or 0,
+                "has_data_id_config": (
+                    datasource.bk_data_id in data_id_config_ids
+                    if bk_tenant_id
+                    else (datasource.bk_tenant_id, datasource.bk_data_id) in data_id_config_ids
+                ),
+                "kafka_cluster": _serialize_kafka_cluster(
+                    kafka_cluster_map.get(
+                        datasource.mq_cluster_id
+                        if bk_tenant_id
+                        else (datasource.bk_tenant_id, datasource.mq_cluster_id)
+                    )
+                ),
             }
         )
         items.append(item)
@@ -418,14 +499,14 @@ def list_datasources(params: dict[str, Any]) -> dict[str, Any]:
     summary="Admin 查询 DataSource 详情",
     description="只读查询 DataSource 详情，include 支持 options、spaces、result_tables、data_id_config；不会返回 token 明文。",
     params_schema={
-        "bk_tenant_id": "可选，租户 ID",
+        "bk_tenant_id": "必填，租户 ID",
         "bk_data_id": "必填，数据源 ID",
         "include": f"可选，展开范围: {', '.join(sorted(INCLUDE_VALUES))}",
     },
     example_params={"bk_tenant_id": "system", "bk_data_id": 50010, "include": ["spaces", "result_tables"]},
 )
 def get_datasource_detail(params: dict[str, Any]) -> dict[str, Any]:
-    bk_tenant_id = get_bk_tenant_id(params)
+    bk_tenant_id = require_bk_tenant_id(params)
     bk_data_id = _normalize_bk_data_id(params.get("bk_data_id"))
     includes = normalize_include(params.get("include"), INCLUDE_VALUES, default=DEFAULT_DETAIL_INCLUDE)
     warnings_list: list[dict[str, Any]] = []
@@ -520,14 +601,14 @@ def get_datasource_detail(params: dict[str, Any]) -> dict[str, Any]:
         "created_from=bkdata 时 KafkaTopic 可能不准确，应以 route 中的 topic 为准。"
     ),
     params_schema={
-        "bk_tenant_id": "可选，租户 ID",
+        "bk_tenant_id": "必填，租户 ID",
         "bk_data_id": "必填，数据源 ID",
         "include_stream_to_config": "可选，兼容参数，当前固定查询 stream_to 实际配置",
     },
     example_params={"bk_tenant_id": "system", "bk_data_id": 1600250, "include_stream_to_config": True},
 )
 def get_datasource_gse_route(params: dict[str, Any]) -> dict[str, Any]:
-    bk_tenant_id = get_bk_tenant_id(params)
+    bk_tenant_id = require_bk_tenant_id(params)
     bk_data_id = _normalize_bk_data_id(params.get("bk_data_id"))
     warnings_list: list[dict[str, Any]] = []
 
@@ -574,7 +655,7 @@ def get_datasource_gse_route(params: dict[str, Any]) -> dict[str, Any]:
     summary="Admin 查询单个 DataIdConfig 的 ComponentConfig",
     description="根据 bk_tenant_id、namespace、name 查询单个 DataIdConfig 的 component_config。",
     params_schema={
-        "bk_tenant_id": "可选，租户 ID",
+        "bk_tenant_id": "必填，租户 ID",
         "namespace": "必填，数据链路命名空间",
         "name": "必填，数据源名称",
     },
@@ -585,7 +666,7 @@ def get_datasource_gse_route(params: dict[str, Any]) -> dict[str, Any]:
     },
 )
 def get_data_id_config_component_config(params: dict[str, Any]) -> dict[str, Any]:
-    bk_tenant_id = get_bk_tenant_id(params)
+    bk_tenant_id = require_bk_tenant_id(params)
 
     namespace = params.get("namespace")
     if not namespace:

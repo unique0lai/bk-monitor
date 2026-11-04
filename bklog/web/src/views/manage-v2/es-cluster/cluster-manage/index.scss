@@ -6,7 +6,10 @@
 
   .main-operator-container {
     margin-bottom: 20px;
+    overflow: hidden;
   }
+
+
 
   .king-table {
     .state-container {
@@ -35,9 +38,9 @@
       padding: 4px 15px;
     }
 
-    .filter-column {
-      .cell {
-        display: flex;
+    .bk-table-header-wrapper {
+      th.filter-column > .cell {
+        display: inline-flex;
       }
     }
   }

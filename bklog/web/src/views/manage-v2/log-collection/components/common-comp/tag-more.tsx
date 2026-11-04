@@ -23,14 +23,15 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-/** biome-ignore-all lint/style/useForOf: 需要使用索引进行精确控制 */
-import { defineComponent, nextTick, onBeforeUnmount, onMounted, ref, watch, computed } from 'vue';
+import { computed, defineComponent, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref, type VNode } from 'vue';
 
 import tippy, { type Instance, type SingleTarget } from 'tippy.js';
 
 import $http from '@/api';
+import useStore from '@/hooks/use-store';
 import { showMessage } from '../../utils';
 
+import 'tippy.js/dist/tippy.css';
 import './tag-more.scss';
 import { t } from '@/hooks/use-locale';
 
@@ -46,6 +47,22 @@ export type ITagItem = {
   [key: string]: unknown;
 };
 
+export type ITagMoreContentBounds = {
+  height: number;
+  left: number;
+  top: number;
+  width: number;
+};
+
+export type ITagMoreTriggerSlotData = {
+  content: VNode[];
+  contentBounds: ITagMoreContentBounds | null;
+  disabled: boolean;
+  isEmpty: boolean;
+  isOpen: boolean;
+  triggerRef: Ref<HTMLDivElement | undefined>;
+};
+
 /**
  * 标签组件属性定义
  */
@@ -54,8 +71,12 @@ export type ITagMoreProps = {
   className?: string;
   /** tag之间的间距，默认8px */
   gap?: number;
+  /** 是否至少展示首个标签，默认true；false时允许全部折叠为+n */
+  keepFirstTag?: boolean;
   /** 每个tag的最大宽度，默认128px */
   maxTagWidth: number;
+  /** 最大展示行数，默认1行 */
+  maxRows?: number;
   /** 模式：index-set（所属索引集）| label（标签） */
   mode?: 'index-set' | 'label';
   /** 行数据，标签模式下需要 index_set_id 和 status */
@@ -64,6 +85,10 @@ export type ITagMoreProps = {
   selectLabelList?: ITagItem[];
   /** 是否显示tooltip，默认true */
   showTooltip?: boolean;
+  /** tooltip显示模式：默认允许悬浮提示，overflow仅在出现+n时允许 */
+  tooltipMode?: 'always' | 'overflow';
+  /** tooltip触发节点：默认外层容器，more仅由+n触发 */
+  tooltipTarget?: 'container' | 'more';
   /** 标签列表 */
   tags: ITagItem[];
   /** tooltip标题 */
@@ -91,8 +116,16 @@ export default defineComponent({
       default: 8,
       type: Number,
     },
+    keepFirstTag: {
+      default: true,
+      type: Boolean,
+    },
     maxTagWidth: {
       default: 128,
+      type: Number,
+    },
+    maxRows: {
+      default: 1,
       type: Number,
     },
     mode: {
@@ -111,6 +144,14 @@ export default defineComponent({
       default: true,
       type: Boolean,
     },
+    tooltipMode: {
+      default: 'always',
+      type: String as () => 'always' | 'overflow',
+    },
+    tooltipTarget: {
+      default: 'container',
+      type: String as () => 'container' | 'more',
+    },
     tags: {
       default: () => [],
       type: Array as () => ITagItem[],
@@ -123,28 +164,47 @@ export default defineComponent({
 
   emits: ['refresh-label-list', 'update-tags'],
 
-  setup(props: ITagMoreProps, { emit }) {
+  setup(props: ITagMoreProps, { emit, slots }) {
+    const store = useStore();
+
     // DOM引用
     const containerRef = ref<HTMLDivElement>(); // 主容器引用
     const measureRef = ref<HTMLDivElement>(); // 隐藏的测量容器引用
     const tipsPanelRef = ref<HTMLDivElement>(); // tooltip内容面板引用
+    const indicatorRef = ref<HTMLSpanElement>(); // +n触发节点引用
+    const tooltipTriggerTarget = computed(() =>
+      props.tooltipTarget === 'more' ? indicatorRef.value : containerRef.value,
+    );
 
     // 状态管理
     const visibleTags = ref<ITagItem[]>([]); // 当前可见的标签列表
     const hiddenCount = ref(0); // 隐藏的标签数量
+    const canShowTooltip = computed(
+      () =>
+        props.showTooltip &&
+        !!tooltipTriggerTarget.value &&
+        (props.tooltipMode !== 'overflow' || hiddenCount.value > 0),
+    );
+    const contentBounds = ref<ITagMoreContentBounds | null>(null);
     let resizeObserver: ResizeObserver | undefined; // 容器尺寸监听器
+    let contentResizeObserver: ResizeObserver | undefined;
+    let measureAnimationFrame: number | undefined;
+    let shouldRefreshObservedElements = false;
 
     // 标签模式相关状态
     const isHover = ref(false); // 鼠标是否悬停在容器上
     const isSelectOpen = ref(false); // select弹窗是否打开
     const isShowNewGroupInput = ref(false); // 是否显示新增标签输入框
     const verifyData = ref({ labelEditName: '' }); // 新增标签表单数据
+    const selectedLabelId = ref<number | string>(''); // 标签选择器的临时选中值
     const tagSelectRef = ref(null); // Select组件引用
     const checkInputFormRef = ref(null); // Form组件引用
     const labelEditInputRef = ref(null); // 新增标签输入框引用
 
     /** 是否为标签模式 */
     const isLabelMode = computed(() => props.mode === 'label');
+    /** 是否由调用方提供选择器触发者 */
+    const hasCustomTrigger = computed(() => !!slots.trigger);
 
     /** 是否禁用添加标签（terminated 状态） */
     const isDisabledAddNewTag = computed(() => props.rowData?.status === 'terminated');
@@ -215,6 +275,9 @@ export default defineComponent({
             emit('update-tags', updatedTags);
           }
           showMessage(t('操作成功'), 'success');
+        })
+        .finally(() => {
+          selectedLabelId.value = '';
         });
     };
 
@@ -228,6 +291,7 @@ export default defineComponent({
         .then(() => {
           const updatedTags = (props.tags || []).filter(item => item.tag_id !== tagID);
           emit('update-tags', updatedTags);
+          selectedLabelId.value = '';
           showMessage(t('操作成功'), 'success');
         });
     };
@@ -239,7 +303,7 @@ export default defineComponent({
           () => {
             $http
               .request('unionSearch/unionCreateLabel', {
-                data: { name: verifyData.value.labelEditName.trim() },
+                data: { name: verifyData.value.labelEditName.trim(), space_uid: store.state.spaceUid },
               })
               .then(res => {
                 emit('refresh-label-list');
@@ -343,15 +407,31 @@ export default defineComponent({
       return measureSpans.indicator.offsetWidth;
     };
 
+    /** 按顺序模拟 flex 换行，判断所有元素是否能在限定行数内放下 */
+    const canFitInRows = (itemWidths: number[], rowWidth: number, maxRows: number) => {
+      let currentRowWidth = 0;
+      let rowCount = 1;
+
+      for (const itemWidth of itemWidths) {
+        if (itemWidth > rowWidth) {
+          return false;
+        }
+        if (currentRowWidth + itemWidth <= rowWidth) {
+          currentRowWidth += itemWidth;
+          continue;
+        }
+        rowCount += 1;
+        currentRowWidth = itemWidth;
+        if (rowCount > maxRows) {
+          return false;
+        }
+      }
+      return true;
+    };
+
     /**
-     * 计算可见标签数量和隐藏标签数量
-     * 使用贪心算法：尽可能多地显示标签，同时确保指示器能够放下
-     *
-     * 算法流程：
-     * 1. 快速路径：如果所有标签的最小宽度总和小于容器宽度，全部显示
-     * 2. 测量每个标签的实际宽度
-     * 3. 贪心算法：尽可能多地放置标签
-     * 4. 调整：如果放不下指示器，减少可见标签数量
+     * 计算可见标签数量和隐藏标签数量。
+     * 从“全部展示”开始逐步减少标签，直到标签、+N 和标签模式操作按钮能够在限定行数内放下。
      */
     const calculateVisibleTags = () => {
       // 标签模式下使用过滤后的标签列表
@@ -364,77 +444,117 @@ export default defineComponent({
         return;
       }
 
-      // 标签模式下需要预留添加按钮的空间（按钮24px + select margin-left 4px）
-      // 以及删除按钮空间（icon 18px + margin-left 2px）
-      const addBtnReserved = isLabelMode.value ? 28 : 0;
-      const closeBtnWidth = isLabelMode.value ? 20 : 0;
-      const containerWidth = containerRef.value.offsetWidth - addBtnReserved - closeBtnWidth;
+      const containerStyle = window.getComputedStyle(containerRef.value);
+      const horizontalPadding =
+        Number.parseFloat(containerStyle.paddingLeft) + Number.parseFloat(containerStyle.paddingRight);
+      const containerWidth = Math.max(0, containerRef.value.clientWidth - horizontalPadding);
+      const maxRows = Math.max(1, Math.floor(props.maxRows || 1));
       const gap = props.gap;
-
-      // 快速路径：计算所有标签的最小宽度总和（使用maxTagWidth）
-      // 如果这个总和小于容器宽度，说明所有标签都能放下
-      const totalMinWidth = tagList.length * props.maxTagWidth + (tagList.length - 1) * gap;
-      if (totalMinWidth <= containerWidth) {
-        visibleTags.value = tagList;
-        hiddenCount.value = 0;
-        return;
-      }
-
-      // 预先测量每个标签的实际宽度（受maxTagWidth限制）
       const tagWidths = tagList.map(tag => measureItemWidth(tag.name));
+      const minVisibleCount = props.keepFirstTag ? 1 : 0;
 
-      // 贪心算法：尽可能多地放置标签
-      let usedWidth = 0; // 已使用的宽度
-      let visibleCount = 0; // 可见标签数量
+      for (let visibleCount = tagList.length; visibleCount >= minVisibleCount; visibleCount -= 1) {
+        const remainingCount = tagList.length - visibleCount;
+        const itemWidths = tagWidths.slice(0, visibleCount).map((width, index) => {
+          const hasNextTagOrIndicator = index < visibleCount - 1 || remainingCount > 0;
+          return width + (hasNextTagOrIndicator ? gap : 0);
+        });
 
-      for (let i = 0; i < tagWidths.length; i++) {
-        // 计算放置当前标签所需的总宽度（包括间距）
-        const spacing = visibleCount > 0 ? gap : 0; // 第一个标签不需要左边距
-        const requiredWidth = usedWidth + spacing + tagWidths[i];
+        if (remainingCount > 0) {
+          itemWidths.push(measureIndicatorWidth(remainingCount));
+        }
+        // 标签模式始终将添加按钮作为最后一个布局项（24px + 4px 左间距）。
+        if (isLabelMode.value && !hasCustomTrigger.value) {
+          itemWidths.push(28);
+        }
 
-        if (requiredWidth <= containerWidth) {
-          usedWidth = requiredWidth;
-          visibleCount += 1;
-        } else {
-          // 当前标签放不下，停止循环
-          break;
+        if (canFitInRows(itemWidths, containerWidth, maxRows)) {
+          visibleTags.value = tagList.slice(0, visibleCount);
+          hiddenCount.value = remainingCount;
+          return;
         }
       }
 
-      // 如果所有标签都能放下，直接返回
-      if (visibleCount >= tagList.length) {
-        visibleTags.value = tagList;
-        hiddenCount.value = 0;
+      // 极窄容器下按配置保留首个标签，或将所有标签折叠为 +n。
+      visibleTags.value = tagList.slice(0, minVisibleCount);
+      hiddenCount.value = tagList.length - minVisibleCount;
+    };
+
+    /** 获取参与触发框视觉区域测量的可见内容节点。 */
+    const getVisibleContentElements = () => {
+      if (!containerRef.value || !hasCustomTrigger.value) {
+        return [];
+      }
+      return Array.from(
+        containerRef.value.querySelectorAll<HTMLElement>('.tag-item, .tag-more-indicator, .tag-more-empty'),
+      ).filter(element => !element.closest('.measure-box') && element.getClientRects().length > 0);
+    };
+
+    /** 根据浏览器实际布局结果更新标签内容区域，不参与可见标签数量计算。 */
+    const updateContentBounds = () => {
+      const container = containerRef.value;
+      const elements = getVisibleContentElements();
+      if (!container || elements.length === 0) {
+        contentBounds.value = null;
         return;
       }
 
-      // 确保至少显示1个标签
-      visibleCount = Math.max(1, visibleCount);
-      let remainingCount = tagList.length - visibleCount;
-      let indicatorWidth = measureIndicatorWidth(remainingCount);
-
-      // 计算放置指示器所需的总宽度
-      let totalRequired = usedWidth + gap + indicatorWidth;
-
-      // 如果放不下指示器，需要减少可见标签数量
-      // 循环调整直到能够放下指示器，或只剩下1个可见标签
-      while (visibleCount > 1 && totalRequired > containerWidth) {
-        visibleCount -= 1;
-        remainingCount = tagList.length - visibleCount;
-
-        // 重新计算已使用宽度（基于实际可见的标签）
-        usedWidth = tagWidths
-          .slice(0, visibleCount)
-          .reduce((sum, width, index) => sum + width + (index > 0 ? gap : 0), 0);
-
-        // 重新测量指示器宽度（因为隐藏数量变化了）
-        indicatorWidth = measureIndicatorWidth(remainingCount);
-        totalRequired = usedWidth + gap + indicatorWidth;
+      const containerRect = container.getBoundingClientRect();
+      const elementRects = elements.map(element => element.getBoundingClientRect());
+      const left = Math.min(...elementRects.map(rect => rect.left));
+      const top = Math.min(...elementRects.map(rect => rect.top));
+      const right = Math.max(...elementRects.map(rect => rect.right));
+      const bottom = Math.max(...elementRects.map(rect => rect.bottom));
+      const nextBounds = {
+        height: bottom - top,
+        left: left - containerRect.left,
+        top: top - containerRect.top,
+        width: right - left,
+      };
+      const currentBounds = contentBounds.value;
+      if (
+        !currentBounds ||
+        Object.keys(nextBounds).some(key => {
+          const name = key as keyof ITagMoreContentBounds;
+          return Math.abs(nextBounds[name] - currentBounds[name]) > 0.1;
+        })
+      ) {
+        contentBounds.value = nextBounds;
       }
+    };
 
-      // 最终赋值
-      visibleTags.value = tagList.slice(0, visibleCount);
-      hiddenCount.value = remainingCount;
+    /** 同步监听标签节点尺寸，覆盖删除图标显示等不改变外层尺寸的场景。 */
+    const observeContentElements = () => {
+      if (!contentResizeObserver) {
+        return;
+      }
+      contentResizeObserver.disconnect();
+      getVisibleContentElements().forEach(element => contentResizeObserver?.observe(element));
+    };
+
+    const scheduleContentBoundsMeasure = (refreshObservedElements = false) => {
+      if (!hasCustomTrigger.value) {
+        return;
+      }
+      shouldRefreshObservedElements = shouldRefreshObservedElements || refreshObservedElements;
+      nextTick(() => {
+        if (measureAnimationFrame !== undefined) {
+          window.cancelAnimationFrame(measureAnimationFrame);
+        }
+        measureAnimationFrame = window.requestAnimationFrame(() => {
+          updateContentBounds();
+          if (shouldRefreshObservedElements) {
+            observeContentElements();
+            shouldRefreshObservedElements = false;
+          }
+          measureAnimationFrame = undefined;
+        });
+      });
+    };
+
+    const calculateAndMeasure = () => {
+      calculateVisibleTags();
+      scheduleContentBoundsMeasure(true);
     };
 
     /**
@@ -449,7 +569,7 @@ export default defineComponent({
           window.clearTimeout(timeout);
         }
         timeout = window.setTimeout(() => {
-          calculateVisibleTags();
+          calculateAndMeasure();
           timeout = null;
         }, DEBOUNCE_DELAY);
       };
@@ -467,18 +587,60 @@ export default defineComponent({
      * 使用tippy.js创建交互式提示框，显示所有标签列表
      */
     const initActionPop = () => {
-      if (!(props.showTooltip && containerRef.value)) {
+      if (
+        tippyInstance ||
+        !(props.showTooltip && containerRef.value && tipsPanelRef.value && tooltipTriggerTarget.value) ||
+        (hasCustomTrigger.value && isDisabledAddNewTag.value)
+      ) {
         return;
       }
 
       tippyInstance = tippy(containerRef.value as SingleTarget, {
         content: tipsPanelRef.value as HTMLElement,
+        triggerTarget: tooltipTriggerTarget.value,
         placement: props.tooltipPlacement,
         interactive: true, // 允许用户与tooltip交互
         hideOnClick: true, // 点击后隐藏
         appendTo: () => document.body, // 挂载到body，避免被父容器裁剪
+        onShow: () => {
+          if (!canShowTooltip.value) return false;
+        },
+        // more 模式对齐 +n；容器模式沿用调用方触发框或外层容器定位。
+        getReferenceClientRect: () => {
+          if (props.tooltipTarget === 'more' && indicatorRef.value) {
+            return indicatorRef.value.getBoundingClientRect();
+          }
+          const container = containerRef.value as HTMLElement;
+          const frameRect = container?.querySelector('.tag-more-trigger-frame')?.getBoundingClientRect();
+          if (frameRect && frameRect.width > 0 && frameRect.height > 0) {
+            return frameRect;
+          }
+          return container.getBoundingClientRect();
+        },
       });
     };
+
+    watch(canShowTooltip, canShow => {
+      if (!canShow) {
+        tippyInstance?.hide();
+        return;
+      }
+      nextTick(initActionPop);
+    });
+
+    // +n 随折叠状态挂载或移除，等待 DOM 提交后切换事件目标，避免回退到容器触发。
+    watch(
+      tooltipTriggerTarget,
+      target => {
+        if (tippyInstance) {
+          tippyInstance.hide();
+          tippyInstance.setProps({ triggerTarget: target || [] });
+        } else if (target) {
+          initActionPop();
+        }
+      },
+      { flush: 'post' },
+    );
 
     /**
      * 组件挂载后的初始化
@@ -491,14 +653,16 @@ export default defineComponent({
       nextTick(() => {
         initMeasureElements();
         initActionPop();
-        calculateVisibleTags();
+        calculateAndMeasure();
 
         // 使用ResizeObserver监听容器尺寸变化，自动重新计算可见标签
         if (window.ResizeObserver) {
           resizeObserver = new ResizeObserver(debouncedCalculate);
+          contentResizeObserver = new ResizeObserver(() => scheduleContentBoundsMeasure());
           if (containerRef.value) {
             resizeObserver.observe(containerRef.value);
           }
+          observeContentElements();
         }
       });
     });
@@ -515,6 +679,14 @@ export default defineComponent({
       if (resizeObserver) {
         resizeObserver.disconnect();
         resizeObserver = undefined;
+      }
+      if (contentResizeObserver) {
+        contentResizeObserver.disconnect();
+        contentResizeObserver = undefined;
+      }
+      if (measureAnimationFrame !== undefined) {
+        window.cancelAnimationFrame(measureAnimationFrame);
+        measureAnimationFrame = undefined;
       }
 
       // 清理tippy实例
@@ -549,9 +721,9 @@ export default defineComponent({
 
     /**
      * 监听影响布局的属性变化
-     * gap和maxTagWidth的变化会影响标签布局，需要重新计算
+     * 间距、宽度、行数和首个标签保留策略变化时需要重新计算
      */
-    watch([() => props.gap, () => props.maxTagWidth], () => {
+    watch([() => props.gap, () => props.maxTagWidth, () => props.maxRows, () => props.keepFirstTag], () => {
       nextTick(debouncedCalculate);
     });
 
@@ -566,7 +738,7 @@ export default defineComponent({
           if (!tippyInstance) {
             initActionPop();
           }
-          calculateVisibleTags();
+          calculateAndMeasure();
           if (window.ResizeObserver && resizeObserver && newVal) {
             resizeObserver.observe(newVal);
           }
@@ -574,12 +746,45 @@ export default defineComponent({
       }
     });
 
+    /** 外置 trigger 时内容面板可能晚于 trigger 挂载，需要在面板就绪后初始化或更新 tooltip */
+    watch(tipsPanelRef, newVal => {
+      if (!newVal || !containerRef.value) {
+        return;
+      }
+      nextTick(() => {
+        if (tippyInstance) {
+          tippyInstance.setContent(newVal);
+        } else {
+          initActionPop();
+        }
+      });
+    });
+
     /**
-     * 监听标签模式下展示标签列表变化
-     * 有标签 → 无标签时，销毁 tippy 并清理状态
+     * tooltip 源标签数量：label 模式取过滤后的展示列表，索引集模式取原始 tags。
+     * 按数量监听，避免 tags 数组引用变化（内容不变）导致 tippy 被误销毁。
      */
-    watch(showLabelList, (newList) => {
-      if (isLabelMode.value && newList.length === 0) {
+    const tooltipTagCount = computed(() =>
+      isLabelMode.value ? showLabelList.value.length : (props.tags || []).length,
+    );
+
+    /**
+     * 监听 tooltip 源标签数量变化
+     * 有标签 → 无标签时，销毁 tippy 并清理状态；无标签 → 有标签时重建
+     */
+    watch(tooltipTagCount, newCount => {
+      if (hasCustomTrigger.value) {
+        nextTick(() => {
+          if (newCount > 0 && !tippyInstance) {
+            initActionPop();
+          } else if (newCount === 0 && tippyInstance) {
+            tippyInstance.destroy();
+            tippyInstance = null;
+          }
+        });
+        return;
+      }
+      if (isLabelMode.value && newCount === 0) {
         // 销毁 tippy 实例
         if (tippyInstance) {
           tippyInstance.destroy();
@@ -595,36 +800,43 @@ export default defineComponent({
     /**
      * 渲染标签模式下的添加按钮（Select 弹出层）
      */
-    const renderLabelSelect = () => {
+    const renderLabelSelect = (trigger?: () => VNode) => {
       if (!isLabelMode.value) return null;
       return (
         <bk-select
           ref={tagSelectRef}
+          class={{ 'tag-more-cell-select': hasCustomTrigger.value }}
           scopedSlots={{
-            trigger: () => (
-              <div
-                class={[
-                  'tag-more-add-btn',
-                  { disabled: isDisabledAddNewTag.value },
-                ]}
-                v-bk-tooltips={{
-                  disabled: !isDisabledAddNewTag.value,
-                  content: t('停用状态下无法添加标签'),
-                  delay: 300,
-                }}
-              >
-                <i class='bk-icon icon-plus-line' />
-              </div>
-            ),
+            trigger:
+              trigger ||
+              (() => (
+                <div
+                  class={['tag-more-add-btn', { disabled: isDisabledAddNewTag.value }]}
+                  v-bk-tooltips={{
+                    disabled: !isDisabledAddNewTag.value,
+                    content: t('停用状态下无法添加标签'),
+                    delay: 300,
+                  }}
+                >
+                  <i class='bk-icon icon-plus-line' />
+                </div>
+              )),
           }}
           disabled={isDisabledAddNewTag.value}
           popover-min-width={240}
-          popover-options={{ boundary: 'window', distance: 30 }}
+          popover-options={{ boundary: 'window' }}
           searchable
+          value={selectedLabelId.value}
+          onInput={(value: number | string) => {
+            selectedLabelId.value = value;
+          }}
           on-selected={addLabelToIndexSet}
-          on-toggle={toggleSelect}
+          onToggle={toggleSelect}
         >
-          <div class='new-label-container' slot='extension'>
+          <div
+            class='new-label-container'
+            slot='extension'
+          >
             {isShowNewGroupInput.value ? (
               <div class='new-label-input'>
                 <bk-form
@@ -710,15 +922,21 @@ export default defineComponent({
     );
 
     /** 渲染隐藏的测量容器 */
-    const renderMeasureBox = () => <div ref={measureRef} class='measure-box' />;
+    const renderMeasureBox = () => (
+      <div
+        ref={measureRef}
+        class='measure-box'
+      />
+    );
 
     /** 渲染可见标签列表 */
-    const renderTagList = () => visibleTags.value.map((tag, index) => (
+    const renderTagList = () =>
+      visibleTags.value.map((tag, index) => (
         <span
           key={tag.tag_id || tag.id || index}
           style={{
             maxWidth: `${props.maxTagWidth}px`,
-            marginRight: index < visibleTags.value.length - 1 ? `${props.gap}px` : '0',
+            marginRight: index < visibleTags.value.length - 1 || hiddenCount.value > 0 ? `${props.gap}px` : '0',
           }}
           class={['tag-item', { 'tag-item-label': isLabelMode.value }]}
         >
@@ -727,28 +945,74 @@ export default defineComponent({
                 <span class='tag-item-name'>{tag.name}</span>,
                 <i
                   class='bk-icon icon-close tag-item-close'
-                  onClick={() => tag.tag_id && handleDeleteTag(tag.tag_id)}
+                  onMousedown={(event: MouseEvent) => event.stopPropagation()}
+                  onClick={(event: MouseEvent) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (tag.tag_id) {
+                      handleDeleteTag(tag.tag_id);
+                    }
+                  }}
                 />,
-            ]
+              ]
             : tag.name}
         </span>
-    ));
+      ));
 
     /** 渲染隐藏标签数量指示器 */
-    const renderIndicator = () => hiddenCount.value > 0 && (
+    const renderIndicator = () =>
+      hiddenCount.value > 0 && (
         <span
-          style={{ marginLeft: visibleTags.value.length > 0 ? `${props.gap}px` : '0' }}
+          ref={indicatorRef}
+          style={{ marginLeft: '0' }}
           class='tag-more-indicator'
         >
           +{hiddenCount.value}
         </span>
-    );
+      );
 
     /**
      * 渲染函数
      * 返回组件的JSX结构
      */
     return () => {
+      const maxRows = Math.max(1, Math.floor(props.maxRows || 1));
+      const containerClass = {
+        'tag-more-multi-line': maxRows > 1,
+      };
+      const containerStyle = maxRows > 1 ? { maxHeight: `${maxRows * 22 + (maxRows - 1) * 4}px` } : undefined;
+
+      if (hasCustomTrigger.value) {
+        const renderCustomTrigger = () => {
+          const tagList = isLabelMode.value ? showLabelList.value : props.tags;
+          const content: VNode[] = [];
+          if (tagList.length > 0) {
+            content.push(renderTipsPanel(tagList));
+          }
+          content.push(renderMeasureBox());
+          if (tagList.length > 0) {
+            content.push(...renderTagList());
+          } else {
+            content.push(<span class='tag-more-empty'>--</span>);
+          }
+          const indicator = renderIndicator();
+          if (indicator) {
+            content.push(indicator);
+          }
+
+          const triggerNode = slots.trigger?.({
+            content,
+            contentBounds: contentBounds.value,
+            disabled: isDisabledAddNewTag.value,
+            isEmpty: tagList.length === 0,
+            isOpen: isSelectOpen.value,
+            triggerRef: containerRef,
+          } as ITagMoreTriggerSlotData);
+          return triggerNode?.[0] as VNode;
+        };
+        return isLabelMode.value ? renderLabelSelect(renderCustomTrigger) : renderCustomTrigger();
+      }
+
       // 标签模式下：无标签数据时显示 -- 和添加按钮（hover切换显示）
       if (isLabelMode.value && showLabelList.value.length === 0) {
         const showAdd = isHover.value || isSelectOpen.value;
@@ -764,9 +1028,7 @@ export default defineComponent({
             }}
           >
             {!showAdd && <span class='tag-more-empty'>--</span>}
-            <span class={['tag-more-add-wrap', { 'is-visible': showAdd }]}>
-              {renderLabelSelect()}
-            </span>
+            <span class={['tag-more-add-wrap', { 'is-visible': showAdd }]}>{renderLabelSelect()}</span>
           </div>
         );
       }
@@ -777,7 +1039,8 @@ export default defineComponent({
           <div
             key='label-has-tags'
             ref={containerRef}
-            class={['tag-more-container tag-more-label-mode', props.className]}
+            class={['tag-more-container tag-more-label-mode', containerClass, props.className]}
+            style={containerStyle}
           >
             {renderTipsPanel(showLabelList.value)}
             {renderMeasureBox()}
@@ -792,7 +1055,8 @@ export default defineComponent({
       return (
         <div
           ref={containerRef}
-          class={['tag-more-container', props.className]}
+          class={['tag-more-container', containerClass, props.className]}
+          style={containerStyle}
         >
           {renderTipsPanel(props.tags)}
           {renderMeasureBox()}

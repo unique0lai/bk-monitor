@@ -47,6 +47,8 @@ import HistoryDialog from '../../../components/history-dialog/history-dialog';
 import AlarmGroupDetail from '../../alarm-group/alarm-group-detail/alarm-group-detail';
 import CommonNavBar from '../../monitor-k8s/components/common-nav-bar';
 import { handleSetTargetDesc, isRecoveryDisable, isStatusSetterNoData } from '../common';
+import { type PromqlSourceData, createPromqlSourceData } from '../strategy-config-common/promql-query/model';
+import PromqlQueryEditor from '../strategy-config-common/promql-query/promql-query-editor';
 import { signalNames } from '../strategy-config-set-new/alarm-handling/alarm-handling-list';
 import { RecoveryConfigStatusSetter } from '../strategy-config-set-new/judging-condition/judging-condition';
 import AiopsMonitorData from '../strategy-config-set-new/monitor-data/aiops-monitor-data';
@@ -117,8 +119,6 @@ interface IBaseInfo {
 @Component({
   components: {
     StrategyTargetTable,
-    PromqlMonacoEditor: () =>
-      import(/* webpackChunkName: 'PromqlMonacoEditor' */ '../../../components/promql-editor/promql-editor'),
   },
 })
 export default class StrategyConfigDetailCommon extends tsc<object> {
@@ -278,7 +278,7 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
         { signal: 'closed', message_tmpl: '', title_tmpl: '' },
         { signal: 'ack', message_tmpl: '', title_tmpl: '' },
       ],
-      voice_notice: 'serial',
+      voice_notice: 'parallel',
     },
   };
 
@@ -341,7 +341,7 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
   /** 关联日历可选项列表 */
   calendarList = [];
   /* source数据 此数据与指标数据隔离 */
-  sourceData = {
+  sourceData: PromqlSourceData = {
     /* promql */
     sourceCode: '',
     /* agg_interval */
@@ -355,7 +355,8 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
     refreshKey: '',
   };
 
-  targetDetailLoading = false;
+  /** 监控目标独立异步加载，初始即展示骨架屏，避免阻塞详情主流程 */
+  targetDetailLoading = true;
   /* issue聚合 */
   issueConfig: IIssueConfig = null;
 
@@ -470,7 +471,6 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
     Promise.all(promiseList)
       .then(() => {
         this.handleDisplaybackDetail();
-        this.getTargetsTableData();
       })
       .catch(err => {
         console.log(err);
@@ -564,7 +564,8 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
    * @returns
    */
   async handleQueryConfigData(srcData = this.detailData) {
-    const [{ expression, query_configs: queryConfigs, functions = [], algorithms }] = srcData.items;
+    const [{ expression, origin_sql: originSql, query_configs: queryConfigs, functions = [], algorithms }] =
+      srcData.items;
     if (
       algorithms?.[0]?.type === MetricType.MultivariateAnomalyDetection ||
       algorithms?.[0]?.type === MetricType.HostAnomalyDetection
@@ -584,10 +585,10 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
     const { metric_type } = srcData;
     const isPromql = queryConfigs?.[0]?.data_source_label === 'prometheus';
     if (isPromql) {
-      const queryConfig = queryConfigs[0];
       this.editMode = 'Source';
-      this.sourceData.sourceCode = queryConfig.promql;
-      this.sourceData.step = queryConfig.agg_interval;
+      this.sourceData = createPromqlSourceData(queryConfigs, expression, originSql);
+      this.expression = expression || this.sourceData.queryConfigs[0].alias;
+      this.expFunctions = functions;
       return;
     }
     this.expression = expression;
@@ -618,20 +619,23 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
         custom_event_name,
         bkmonitor_strategy_id,
       }) => {
-        const curMetric = metricList?.find(set => set.metric_id === metric_id) || {
-          data_source_label,
-          data_type_label,
-          metric_field,
-          metric_field_name: metric_field,
-          metric_id,
-          result_table_id,
-          unit,
-          index_set_id,
-          query_string,
-          custom_event_name,
-          bkmonitor_strategy_id,
-          dimensions: [],
-        };
+        // strategy 存的 metric_id 可能与 get_metric_list 返回不一致（如 data_label 别名），
+        // 按 metric_id 查询有结果但精确匹配失败时，使用返回的第一条指标补齐 dimensions 等元信息
+        const curMetric = metricList?.find(set => set.metric_id === metric_id) ||
+          metricList?.[0] || {
+            data_source_label,
+            data_type_label,
+            metric_field,
+            metric_field_name: metric_field,
+            metric_id,
+            result_table_id,
+            unit,
+            index_set_id,
+            query_string,
+            custom_event_name,
+            bkmonitor_strategy_id,
+            dimensions: [],
+          };
 
         this.dataMode =
           agg_method === 'REAL_TIME' || (data_type_label === 'event' && data_source_label === 'bk_monitor')
@@ -690,12 +694,18 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
   }
 
   async getTargetsTableData() {
-    // 获取策略目标详情
+    if (!this.strategyId) {
+      this.targetDetailLoading = false;
+      return;
+    }
+    // 获取策略目标详情（独立异步，失败不影响详情页其他内容）
     this.targetDetailLoading = true;
     const targetDetail =
-      (await getTargetDetail({ strategy_ids: [this.strategyId] }).finally(() => {
-        this.targetDetailLoading = false;
-      })) || {};
+      (await getTargetDetail({ strategy_ids: [this.strategyId] })
+        .catch(() => ({}))
+        .finally(() => {
+          this.targetDetailLoading = false;
+        })) || {};
     const strategyTarget = targetDetail[this.strategyId] || {};
 
     // 提取目标列表和字段名称，提供默认值
@@ -764,9 +774,9 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
     this.detailData = strategyDetail;
     this.detectionConfig.data = strategyDetail?.items?.[0]?.algorithms?.filter(item => !!item.type) || [];
     this.detectionConfig.unit = strategyDetail?.items?.[0]?.algorithms?.[0]?.unit_prefix || '';
-    // const targetList = strategyDetail?.items?.[0]?.target?.[0]?.[0]?.value || [];
-    // this.targetDetail = { target_detail: targetList };
     await this.handleQueryConfigData();
+    // 监控目标单独请求，不 await，避免阻塞详情主流程与整页 loading
+    this.getTargetsTableData();
     await this.handleProcessData({
       ...strategyDetail,
       targetDetail: this.targetDetail,
@@ -1173,43 +1183,11 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
                           ];
                         }
                         return (
-                          <div class='promql-content'>
-                            <div class='edit-wrap'>
-                              <promql-monaco-editor
-                                minHeight={160}
-                                readonly={true}
-                                value={this.sourceData.sourceCode}
-                              />
-                              {/* <PromqlEditor
-                                class='promql-editor'
-                                readonly={true}
-                                value={this.sourceData.sourceCode}
-                              ></PromqlEditor> */}
-                            </div>
-                            <div class='step-wrap'>
-                              <bk-input
-                                class='step-input'
-                                min={10}
-                                type='number'
-                                value={this.sourceData.step}
-                                disabled
-                              >
-                                <div
-                                  class='step-input-prepend'
-                                  slot='prepend'
-                                >
-                                  <span>{'Step'}</span>
-                                  <span
-                                    class='icon-monitor icon-hint'
-                                    v-bk-tooltips={{
-                                      content: this.$t('数据步长'),
-                                      placements: ['top'],
-                                    }}
-                                  />
-                                </div>
-                              </bk-input>
-                            </div>
-                          </div>
+                          <PromqlQueryEditor
+                            expression={this.expression}
+                            readonly={true}
+                            sourceData={this.sourceData}
+                          />
                         );
                       })()}
                     </div>
@@ -1548,11 +1526,12 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
                       <div class='user-groups-container mb10'>
                         <div class='user-notice-item'>
                           <span class='groups-title-warp'>{this.$t('告警组')}：</span>
-                          <span>
+                          <div class='notice-user-list'>
                             {this.noticeData?.user_group_list?.map((item, index) => (
                               <span
                                 key={index}
                                 class='user-group'
+                                title={item.name}
                                 onClick={(e: Event) => {
                                   e.stopPropagation();
                                   this.handleSelcetAlarmGroup(item.id);
@@ -1561,35 +1540,31 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
                                 {item.name}
                               </span>
                             ))}
-                          </span>
+                          </div>
                         </div>
-                        {this.noticeData?.user_group_list?.length > 1 && !!this.noticeData?.config?.voice_notice ? (
+                        {this.noticeData?.user_group_list?.length > 1 && this.noticeData?.config?.voice_notice ? (
                           <div class='user-notice-item'>
                             <span class='groups-title-warp'>{this.$t('语音拨打顺序')}：</span>
-                            {this.voiceNoticeText[this.noticeData.config.voice_notice]}
+                            <span>{this.voiceNoticeText[this.noticeData.config.voice_notice]}</span>
                           </div>
                         ) : undefined}
                         <div class='user-notice-item'>
                           <span class='groups-title-warp'>{this.$t('通知升级')}：</span>
                           {this.noticeData?.options?.upgrade_config?.is_enabled ? (
-                            [
-                              <span key='1'>
-                                <i18n
-                                  class='text'
-                                  path='当告警持续时长每超过{0}分种，将逐个按告警组升级通知'
-                                >
-                                  <span>{this.noticeData?.options?.upgrade_config?.upgrade_interval || 0}</span>
-                                </i18n>
-                              </span>,
-                              <div
-                                key='2'
-                                class='ml10 notice-user-list'
+                            <div class='notice-upgrade-body'>
+                              <i18n
+                                class='notice-upgrade-text'
+                                path='当告警持续时长每超过{0}分种，将逐个按告警组升级通知'
                               >
+                                <span>{this.noticeData?.options?.upgrade_config?.upgrade_interval || 0}</span>
+                              </i18n>
+                              <div class='notice-user-list'>
                                 {this.noticeData?.options?.upgrade_config?.user_groups?.map((alarm, index) =>
                                   !this.alarmGroupLoading ? (
                                     <span
                                       key={index}
                                       class='user-group'
+                                      title={this.getAlarmGroupByID(alarm)}
                                       onClick={(e: Event) => {
                                         e.stopPropagation();
                                         this.handleSelcetAlarmGroup(alarm);
@@ -1604,16 +1579,15 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
                                     />
                                   )
                                 )}
-                              </div>,
-                            ]
+                              </div>
+                            </div>
                           ) : (
                             <span>{this.$t('关闭')}</span>
                           )}
                         </div>
                       </div>
                     </div>,
-                    {},
-                    { width: '100%' }
+                    {}
                   )}
                   {commonItem(
                     this.$t('通知间隔'),
@@ -1700,7 +1674,10 @@ export default class StrategyConfigDetailCommon extends tsc<object> {
                         <pre>{this.templateData.message_tmpl}</pre>
                       </div>
                       <StrategyTemplatePreview
+                        bkBizId={this.detailData.bk_biz_id}
                         dialogShow={this.isShowTemplate}
+                        previewItem={this.detailData?.items?.[0]}
+                        strategyId={this.strategyId}
                         template={this.templateData.message_tmpl}
                         {...{
                           on: {

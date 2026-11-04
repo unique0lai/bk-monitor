@@ -31,19 +31,31 @@ import { useJSONP } from 'monitor-api/jsonp';
 import { LANGUAGE_COOKIE_KEY } from 'monitor-common/utils/constant';
 import bus from 'monitor-common/utils/event-bus';
 import { docCookies } from 'monitor-common/utils/utils';
+import authorityStore from 'monitor-pc/store/modules/authority';
 
 import LogVersion from '../components/log-version/intex';
 import LogVersionMixin from '../components/log-version/log-version-mixin';
+import { getDefaultTimezone } from '../i18n/dayjs';
 import DocumentLinkMixin from '../mixins/documentLinkMixin';
 import { GLOBAL_FEATURE_LIST, setLocalStoreRoute } from '../router/router-config';
 import enIcon from '../static/images/svg/en.svg';
 import zhIcon from '../static/images/svg/zh.svg';
 import type { IMenuItem } from '../types';
+import { resolveRedisManagementAccess } from './redis-management/route-model';
+
+const REDIS_MANAGEMENT_MENU = {
+  id: 'redis-management',
+  name: 'Redis 节点管理',
+  icon: 'icon-monitor icon-mc-redis',
+};
 
 // #if APP !== 'external'
 // import GlobalSearchModal from './global-search-modal-new';
+import BkLoginUserinfo from '@blueking/login-userinfo/vue2';
 import HomeSelect from 'monitor-pc/pages/home/new-home/components/home-select';
 import SettingModal from './setting-modal';
+
+import '@blueking/login-userinfo/vue2/vue2.css';
 // #endif
 
 import './nav-tools.scss';
@@ -62,6 +74,7 @@ interface INavToolsProps {
   mixins: [LogVersionMixin],
   // #if APP !== 'external'
   components: {
+    BkLoginUserinfo,
     GlobalConfig: () => import(/* webpackChunkName: "global-config" */ '../pages/global-config'),
     HealthZ: () => import(/* webpackChunkName: "healthz" */ '../pages/healthz-new/healthz-alarm'),
     MigrateDashboard: () =>
@@ -80,6 +93,7 @@ class NavTools extends DocumentLinkMixin {
   // 帮助列表
   helpList: IMenuItem[] = [];
   setList: IMenuItem[] = [];
+  redisManagementAllowed = false;
   languageList: IMenuItem[] = [];
   logShow = false;
   globalSearchShow = false;
@@ -92,6 +106,54 @@ class NavTools extends DocumentLinkMixin {
 
   get isHomePage() {
     return this.$route.name && this.$route.name === 'home';
+  }
+
+  get settingModalList() {
+    return this.setList.filter(item => item.id !== 'redis-management');
+  }
+
+  /** 上云环境（内部版），该环境下不展示「个人设置」 */
+  get isCloudEnv() {
+    return !!window.platform?.te;
+  }
+
+  /** 多租户企业空间，仅多租户模式下展示，取值为租户 id */
+  get enterpriseSpace() {
+    return window.enable_multi_tenant_mode ? window.bk_tenant_id || '' : '';
+  }
+
+  /** 用户信息组件展示数据：企业空间、默认时区均为只读展示 */
+  get userInfoData() {
+    return {
+      name: window.user_name || window.username,
+      organization: this.enterpriseSpace,
+      timezone: getDefaultTimezone(),
+    };
+  }
+
+  /** 用户信息面板操作项 */
+  get userActionList() {
+    const actionList = [
+      {
+        text: this.$t('权限中心').toString(),
+        icon: 'icon-monitor icon-mc-iam',
+        handle: this.handleGoToPermissionCenter,
+      },
+    ];
+    // 上云环境不展示「个人设置」
+    if (!this.isCloudEnv && window.bk_user_site_url) {
+      actionList.push({
+        text: this.$t('个人设置').toString(),
+        icon: 'icon-monitor icon-mc-user',
+        handle: this.handleGoToPersonalCenter,
+      });
+    }
+    actionList.push({
+      text: this.$t('退出登录').toString(),
+      icon: 'icon-monitor icon-mc-login-out',
+      handle: this.handleQuit,
+    });
+    return actionList;
   }
 
   // 全局弹窗在路由变化时需要退出
@@ -130,12 +192,8 @@ class NavTools extends DocumentLinkMixin {
         href: window.ce_url,
       },
     ];
-    this.setList = GLOBAL_FEATURE_LIST.filter(item =>
-      window.bk_tenant_id === 'system' ? true : !['healthz', 'global-config'].includes(item.id)
-    ).map(({ name, ...args }) => ({
-      name: `route-${name}`,
-      ...args,
-    }));
+    this.setList = this.buildSettingList(false);
+    this.loadRedisManagementPermission();
     this.languageList = [
       {
         id: 'zh-cn',
@@ -146,6 +204,28 @@ class NavTools extends DocumentLinkMixin {
         name: 'English',
       },
     ];
+  }
+
+  buildSettingList(showRedisManagement: boolean) {
+    const featureList = showRedisManagement ? [...GLOBAL_FEATURE_LIST, REDIS_MANAGEMENT_MENU] : GLOBAL_FEATURE_LIST;
+    return featureList
+      .filter(item => {
+        return window.bk_tenant_id === 'system' ? true : !['healthz', 'global-config'].includes(item.id);
+      })
+      .map(({ name, ...args }) => ({
+        name: `route-${name}`,
+        ...args,
+      }));
+  }
+
+  async loadRedisManagementPermission() {
+    const allowed = await resolveRedisManagementAccess(window.is_superuser, () =>
+      authorityStore.checkAllowedByActionIds({ action_ids: ['manage_global_setting'] })
+    );
+    if (allowed) {
+      this.redisManagementAllowed = true;
+      this.setList = this.buildSettingList(true);
+    }
   }
   mounted() {
     document.addEventListener('keydown', this.handleKeyupSearch);
@@ -218,8 +298,16 @@ class NavTools extends DocumentLinkMixin {
    * @return {*}
    */
   handleSet(item: IMenuItem) {
-    setLocalStoreRoute(item.id);
+    if (!this.setList.some(setting => setting.id === item.id)) return;
     this.hidePopoverSetOrHelp();
+    if (item.id === 'redis-management') {
+      if (this.show) this.handleSettingShowChange(false);
+      if (this.$route.name !== item.id) {
+        this.$router.push({ name: 'redis-management' });
+      }
+      return;
+    }
+    setLocalStoreRoute(item.id);
     this.activeSetting = item.id;
     this.settingTitle = item.name;
     this.handleSettingShowChange(true);
@@ -229,7 +317,6 @@ class NavTools extends DocumentLinkMixin {
     (this.$refs.popoverset as any)?.hideHandler();
     (this.$refs.popoverhelp as any)?.hideHandler();
     (this.$refs.popoverlanguage as any)?.hideHandler();
-    (this.$refs.popoveruser as any)?.hideHandler();
   }
   /**
    * @description: 设置显示
@@ -282,6 +369,7 @@ class NavTools extends DocumentLinkMixin {
     location.reload();
   }
   handleMenuChange(item: IMenuItem) {
+    if (!this.settingModalList.some(setting => setting.id === item.id)) return;
     this.activeSetting = item.id;
     this.settingTitle = item.name;
   }
@@ -327,8 +415,24 @@ class NavTools extends DocumentLinkMixin {
     this.hidePopoverSetOrHelp();
     window.open(`${base}/personal-center`, '_blank');
   }
+  /** 权限中心入口 */
+  handleGoToPermissionCenter() {
+    // 去掉尾部 /，避免 bk_iam_url 已带斜杠时拼成 //my-perm
+    const base = (window.bk_iam_url || '').replace(/\/$/, '');
+    if (!base) return;
+    this.hidePopoverSetOrHelp();
+    window.open(`${base}/my-perm`, '_blank', 'noopener,noreferrer');
+  }
   handleQuit() {
-    location.href = `${site_url}logout`;
+    location.href = `${window.site_url}logout`;
+  }
+  renderUserName(h) {
+    return [
+      h('bk-user-display-name', {
+        class: 'header-user-text',
+        'user-id': window.user_name || window.username,
+      }),
+    ];
   }
   render() {
     return (
@@ -467,67 +571,23 @@ class NavTools extends DocumentLinkMixin {
             'is-external': process.env.APP === 'external',
           }}
         >
-          <bk-popover
-            ref='popoveruser'
-            tippy-options={{
-              trigger: 'click',
-            }}
-            arrow={false}
-            disabled={process.env.APP === 'external'}
-            offset='0, 4'
-            placement='bottom'
-            theme='light common-monitor'
-          >
+          {
+            // #if APP !== 'external'
+            <bk-login-userinfo
+              actionList={this.userActionList}
+              renderSlot={this.renderUserName}
+              userinfo={this.userInfoData}
+            />
+            // #endif
+          }
+          {/* {
+            // #if APP === 'external'
             <bk-user-display-name
               class='header-user-text'
               user-id={window.user_name || window.username}
             />
-            <i class='bk-icon icon-down-shape' />
-            <div slot='content'>
-              {process.env.APP !== 'external' && (
-                <ul class='monitor-navigation-help'>
-                  {!!window.bk_user_site_url && (
-                    <li
-                      class='nav-item'
-                      onClick={this.handleGoToPersonalCenter}
-                    >
-                      {this.$t('个人中心')}
-                    </li>
-                  )}
-                  {/* <li
-                    class='nav-item'
-                    onClick={() => {
-                      this.isShowMyReportModal = false;
-                      this.isShowMyApplyModal = true;
-                      this.$nextTick(() => {
-                        (this.$refs.popoveruser as any)?.hideHandler?.();
-                      });
-                    }}
-                  >
-                    {this.$t('我申请的')}
-                  </li>
-                  <li
-                    class='nav-item'
-                    onClick={() => {
-                      this.isShowMyApplyModal = false;
-                      this.isShowMyReportModal = true;
-                      this.$nextTick(() => {
-                        (this.$refs.popoveruser as any)?.hideHandler?.();
-                      });
-                    }}
-                  >
-                    {this.$t('我的订阅')}
-                  </li> */}
-                  <li
-                    class='nav-item'
-                    onClick={this.handleQuit}
-                  >
-                    {this.$t('退出登录')}
-                  </li>
-                </ul>
-              )}
-            </div>
-          </bk-popover>
+            // #endif
+          } */}
         </div>
         <LogVersion
           on={{
@@ -543,7 +603,7 @@ class NavTools extends DocumentLinkMixin {
             <SettingModal
               key='setting-modal'
               activeMenu={this.activeSetting}
-              menuList={this.setList}
+              menuList={this.settingModalList}
               show={this.show}
               title={this.settingTitle}
               zIndex={2000}

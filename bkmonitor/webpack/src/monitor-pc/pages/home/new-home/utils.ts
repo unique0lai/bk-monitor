@@ -39,6 +39,8 @@ export enum ESearchType {
   alert = 'alert',
   // apm_application: APM应用
   apm_application = 'apm_application',
+  // APM服务
+  apm_service = 'apm_service',
   // bcs集群
   bcs_cluster = 'bcs_cluster',
   // host: 主机
@@ -47,9 +49,6 @@ export enum ESearchType {
   strategy = 'strategy',
   // trace: Trace
   trace = 'trace',
-}
-export interface IDataItem {
-  [key: string]: any;
 }
 /* status */
 export const EStatusType = {
@@ -121,22 +120,38 @@ export function handleYAxisLabelFormatter(num: number): string {
   return (num / si[i].value).toFixed(3).replace(rx, '$1') + si[i].symbol;
 }
 
-/**
- * @description 输入字段匹配字段高亮
- * @param searchValue 输入的字段
- * @param listData
- * @param dataKeys 需要匹配的key列表
- * @returns
- */
-export function highLightContent(searchValue: string, listData: IDataItem[], dataKeys: string[]) {
-  const searchKey = searchValue.trim().split(' ');
-  return listData.map(data => {
-    const copyData = JSON.parse(JSON.stringify(data));
-    dataKeys.map(key => {
-      copyData[`${key}Search`] = searchKey[0]
-        ? data[key].replace(new RegExp(`(${searchKey.join('|')})`, 'gi'), `<span class="highlight">$1</span>`)
-        : data[key];
+interface IHighlightFragment {
+  highlight: boolean;
+  start: number;
+  text: string;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** 将搜索结果拆分为可直接渲染的文本片段 */
+export function splitHighlightFragments(content: string, searchValue: string): IHighlightFragment[] {
+  const keywords = searchValue.trim().split(/\s+/).filter(Boolean).map(escapeRegExp);
+  if (!keywords.length) {
+    return [{ text: content, start: 0, highlight: false }];
+  }
+
+  const keywordPattern = keywords.join('|');
+  const splitRegExp = new RegExp(`(${keywordPattern})`, 'gi');
+  const exactMatchRegExp = new RegExp(`^(?:${keywordPattern})$`, 'i');
+  let start = 0;
+
+  return content
+    .split(splitRegExp)
+    .filter(Boolean)
+    .map(text => {
+      const fragment = {
+        text,
+        start,
+        highlight: exactMatchRegExp.test(text),
+      };
+      start += text.length;
+      return fragment;
     });
-    return copyData;
-  });
 }

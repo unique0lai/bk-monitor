@@ -15,6 +15,7 @@ import re
 import string
 import time
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from django.conf import settings
@@ -22,6 +23,7 @@ from pypinyin import lazy_pinyin
 from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
 
 from core.drf_resource import api
+from constants.apm import BUILTIN_PROFILING_APP_NAME, normalize_app_name
 from metadata.models.data_link.constants import (
     DataLinkKind,
     DataLinkResourceStatus,
@@ -124,15 +126,19 @@ PROFILING_DORIS_CLEAN_RULES = [
 
 
 def _sanitize_name(raw: str) -> str:
-    """清洗名称：中文原地转拼音、剔除特殊字符、去空格、减号转下划线、合并连续下划线"""
+    """清洗名称：中文原地转拼音、剔除特殊字符、去空格、点/减号转下划线、大写转小写、合并连续下划线"""
     parts = []
     for char in raw:
         if "\u4e00" <= char <= "\u9fff":
             parts.append(lazy_pinyin(char)[0])
+        elif char == ".":
+            # 点号保留为下划线，与 constants.apm.normalize_app_name 一致
+            parts.append("_")
         elif not re.match(MATCH_DATA_NAME_PATTERN, char):
             parts.append(char)
     refine = "".join(parts)
-    refine = refine.replace(" ", "").replace("-", "_")
+    # 统一小写化，与 constants.apm.normalize_app_name 一致
+    refine = refine.replace(" ", "").replace("-", "_").lower()
     return re.sub(r"_+", "_", refine)
 
 
@@ -144,30 +150,30 @@ def compose_profile_data_id_name(bk_biz_id: int, app_name: str) -> str:
     正常格式：profile_{bk_biz_id}_{sanitized_app_name}
     截断格式：profile_{bk_biz_id}_{truncated_app_name}_{random}
 
-    @param bk_biz_id: 业务 ID
+    @param bk_biz_id: 业务ID
     @param app_name: 应用名称
     @return: DataId 资源名称，长度 ≤ 50
     """
-    _PREFIX = "profile_"
     _MAX_LENGTH = 50
     _RANDOM_LENGTH = 5
 
     sanitized = _sanitize_name(app_name)
+    prefix = f"profile_space_{abs(bk_biz_id)}" if bk_biz_id < 0 else f"profile_{bk_biz_id}"
     # profile_{bk_biz_id}_{sanitized}
-    name = f"{_PREFIX}{bk_biz_id}_{sanitized}"
+    name = f"{prefix}_{sanitized}"
 
     if len(name) <= _MAX_LENGTH:
         return name
 
     # 截断：profile_{bk_biz_id}_{truncated}_{random}
-    # 固定部分 = 前缀 + bk_biz_id + 2个下划线 + random下划线 + random
-    fixed_len = len(_PREFIX) + len(str(bk_biz_id)) + 2 + 1 + _RANDOM_LENGTH
+    # 固定部分 = 前缀 + random下划线 + random
+    fixed_len = len(prefix) + 1 + _RANDOM_LENGTH
     truncated_max = _MAX_LENGTH - fixed_len
     if truncated_max < 1:
         truncated_max = 1
     truncated = sanitized[:truncated_max].rstrip("_")
     random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=_RANDOM_LENGTH))
-    return f"{_PREFIX}{bk_biz_id}_{truncated}_{random_suffix}"
+    return f"{prefix}_{truncated}_{random_suffix}"
 
 
 def compose_profile_resource_name(app_name: str, bk_data_id: int) -> str:
@@ -245,15 +251,17 @@ class BkDataDorisProvider:
         cls, obj: "ProfileDataSource", maintainer: str, operator: str, name_stuffix: str = None
     ) -> "BkDataDorisProvider":
         """从数据源实例中创建数据源提供者"""
+        # 保持与 constants.apm.normalize_app_name 一致：
+        # `-`、`.` 均转为 `_`，并统一小写化（放开 app_name 大小写后仍保持下游命名规范）
+        raw_name = obj.app_name if not name_stuffix else f"{obj.app_name}{name_stuffix}"
+        pure_app_name = normalize_app_name(raw_name)
         return cls(
             bk_biz_id=obj.profile_bk_biz_id,
             app_name=obj.app_name,
             maintainer=maintainer,
             operator=operator,
             _obj=obj,
-            pure_app_name=obj.app_name.replace("-", "_")
-            if not name_stuffix
-            else f"{obj.app_name}{name_stuffix}".replace("-", "_"),
+            pure_app_name=pure_app_name,
         )
 
     def provider(self) -> dict:
@@ -581,12 +589,14 @@ class BkDataDorisV4Provider:
       2. 用 bk_data_id 构建 ResultTable / DorisBinding / Databus 并提交
     """
 
-    bk_biz_id: int  # profile_bk_biz_id，用于 BkBase API 请求中的 bizId / labels / db 命名
+    bk_biz_id: int  # 真实业务 ID，用于区分业务/空间及 DataId 命名
+    bkbase_biz_id: int  # BKBase 资源归属业务 ID，用于 bizId / labels / db 命名
     app_name: str
     bk_tenant_id: str
     maintainer: str
     operator: str
-    data_biz_id: int = 0  # 仅用于 DataId 命名（通过 get_tenant_datalink_biz_id 获取）
+    # DataId.spec.preferCluster.name，来自默认 Kafka 集群的 cluster_name（ClusterInfo）。
+    prefer_kafka_cluster_name: str | None = None
 
     config: DorisStorageConfig = field(default_factory=DorisStorageConfig.read)
     _obj: Optional["ProfileDataSource"] = None
@@ -598,19 +608,18 @@ class BkDataDorisV4Provider:
         bk_tenant_id: str,
         maintainer: str,
         operator: str,
+        prefer_kafka_cluster_name: str | None = None,
     ) -> "BkDataDorisV4Provider":
         """从 ProfileDataSource 实例构造 V4 Provider"""
-        from bkmonitor.utils.tenant import get_tenant_datalink_biz_id
-
-        datalink_biz_ids = get_tenant_datalink_biz_id(bk_tenant_id, obj.profile_bk_biz_id)
 
         return cls(
-            bk_biz_id=obj.profile_bk_biz_id,
+            bk_biz_id=obj.bk_biz_id,
+            bkbase_biz_id=obj.profile_bk_biz_id,
             app_name=obj.app_name,
             bk_tenant_id=bk_tenant_id,
             maintainer=maintainer,
             operator=operator,
-            data_biz_id=datalink_biz_ids.data_biz_id,
+            prefer_kafka_cluster_name=prefer_kafka_cluster_name,
             _obj=obj,
         )
 
@@ -619,7 +628,7 @@ class BkDataDorisV4Provider:
     def _data_id_name(self) -> str:
         """DataId 资源名称，优先使用已存储的名称"""
         stored = self._obj.bkdata_datalink_config.get("v4_resource_names", {}) if self._obj else {}
-        return stored.get("data_id_name") or compose_profile_data_id_name(self.data_biz_id, self.app_name)
+        return stored.get("data_id_name") or compose_profile_data_id_name(self.bk_biz_id, self.app_name)
 
     def _result_table_name(self, bk_data_id: int) -> str:
         """ResultTable 资源名称，优先使用已存储的名称"""
@@ -651,7 +660,22 @@ class BkDataDorisV4Provider:
 
     def _metadata_labels(self) -> dict:
         """V4 资源的 metadata.labels，与指标链路保持一致"""
-        return {"bk_biz_id": str(self.bk_biz_id)}
+        return {"bk_biz_id": str(self.bkbase_biz_id)}
+
+    @cached_property
+    def _tenant_kwargs(self) -> dict:
+        """
+        多租户模式下附加 tenant 字段。
+
+        用于两类场景：
+          1. 资源自身的 metadata（标识资源归属的租户）；
+          2. spec 中对其他资源的引用（name + namespace + kind），标识被引用资源所属的租户。
+
+        bk_tenant_id 与 ENABLE_MULTI_TENANT_MODE 在实例生命周期内不会变化，缓存为属性避免重复计算。
+        """
+        if settings.ENABLE_MULTI_TENANT_MODE and self.bk_tenant_id:
+            return {"tenant": self.bk_tenant_id}
+        return {}
 
     # ── 资源配置构建 ──────────────────────────
 
@@ -662,14 +686,21 @@ class BkDataDorisV4Provider:
             "metadata": {
                 "namespace": _V4_NAMESPACE,
                 "name": name,
+                **self._tenant_kwargs,
                 "labels": self._metadata_labels(),
                 "annotations": {},
             },
             "spec": {
                 "description": f"App<{self.app_name}> profiling data id",
                 "alias": name,
-                "bizId": self.bk_biz_id,
+                "bizId": self.bkbase_biz_id,
                 "maintainers": self._maintainers_list(),
+                "preferCluster": {
+                    "kind": "KafkaChannel",
+                    **self._tenant_kwargs,
+                    "namespace": _V4_NAMESPACE,
+                    "name": self.prefer_kafka_cluster_name,
+                },
                 "eventType": "log",
             },
         }
@@ -681,12 +712,13 @@ class BkDataDorisV4Provider:
             "metadata": {
                 "namespace": _V4_NAMESPACE,
                 "name": rt_name,
+                **self._tenant_kwargs,
                 "labels": self._metadata_labels(),
                 "annotations": {},
             },
             "spec": {
                 "description": f"App<{self.app_name}> profiling result table",
-                "bizId": self.bk_biz_id,
+                "bizId": self.bkbase_biz_id,
                 "alias": rt_name,
                 "maintainers": self._maintainers_list(),
                 "dataType": "log",
@@ -786,6 +818,12 @@ class BkDataDorisV4Provider:
             },
         }
 
+    def _flush_timeout(self) -> int:
+        """主动 Profiling 内置数据源缩短刷盘等待，其余 Profiling 使用 60 秒。"""
+        if self.app_name == BUILTIN_PROFILING_APP_NAME:
+            return 30
+        return 60
+
     def _build_doris_binding_config(self, bk_data_id: int) -> dict:
         dorisbinding_name = self._doris_binding_name(bk_data_id)
         rt_name = self._result_table_name(bk_data_id)
@@ -802,24 +840,30 @@ class BkDataDorisV4Provider:
                 "labels": self._metadata_labels(),
                 "name": dorisbinding_name,
                 "namespace": _V4_NAMESPACE,
+                **self._tenant_kwargs,
             },
             "spec": {
-                "data": {"name": rt_name, "namespace": _V4_NAMESPACE, "kind": "ResultTable"},
-                "storage": {"name": storage_cluster, "namespace": _V4_NAMESPACE, "kind": "Doris"},
+                "data": {"name": rt_name, "namespace": _V4_NAMESPACE, "kind": "ResultTable", **self._tenant_kwargs},
+                "storage": {
+                    "name": storage_cluster,
+                    "namespace": _V4_NAMESPACE,
+                    "kind": "Doris",
+                    **self._tenant_kwargs,
+                },
                 "storage_config": {
                     "table_type": "duplicate_table",
                     "is_profiling": True,
                     "unique_partition_table": False,
-                    "db": f"mapleleaf_{self.bk_biz_id}",
+                    "db": f"mapleleaf_{self.bkbase_biz_id}",
                     "table": dorisbinding_name,
                     "storage_keys": [],
                     "json_fields": [],
                     "original_json_fields": [],
                     "field_config_group": {},
                     "expires": self.config.expires,
-                    "sample_table_name": f"{rt_name}_sample_{self.bk_biz_id}",
-                    "label_table_name": f"{rt_name}_label_{self.bk_biz_id}",
-                    "flush_timeout": 300,
+                    "sample_table_name": f"{rt_name}_sample_{self.bkbase_biz_id}",
+                    "label_table_name": f"{rt_name}_label_{self.bkbase_biz_id}",
+                    "flush_timeout": self._flush_timeout(),
                 },
             },
         }
@@ -835,11 +879,21 @@ class BkDataDorisV4Provider:
                 "name": bus_name,
                 "labels": self._metadata_labels(),
                 "annotations": {},
+                **self._tenant_kwargs,
             },
             "spec": {
                 "maintainers": self._maintainers_list(),
-                "sources": [{"kind": "DataId", "name": data_id_name, "namespace": _V4_NAMESPACE}],
-                "sinks": [{"kind": "DorisBinding", "name": dorisbinding_name, "namespace": _V4_NAMESPACE}],
+                "sources": [
+                    {"kind": "DataId", "name": data_id_name, "namespace": _V4_NAMESPACE, **self._tenant_kwargs}
+                ],
+                "sinks": [
+                    {
+                        "kind": "DorisBinding",
+                        "name": dorisbinding_name,
+                        "namespace": _V4_NAMESPACE,
+                        **self._tenant_kwargs,
+                    }
+                ],
                 "transforms": [
                     {
                         "kind": "Clean",
@@ -850,12 +904,6 @@ class BkDataDorisV4Provider:
                 "subTaskNum": 1,
             },
         }
-        if settings.APM_PROFILE_V4_DATABUS_PREFER_CLUSTER:
-            config["spec"]["preferCluster"] = {
-                "kind": "DatabusCluster",
-                "namespace": _V4_NAMESPACE,
-                "name": settings.APM_PROFILE_V4_DATABUS_PREFER_CLUSTER,
-            }
         return config
 
     def _build_step1_configs(self) -> list:
@@ -953,25 +1001,47 @@ class BkDataDorisV4Provider:
         向 BkBase V4 提交 Profile Doris 链路配置，轮询 DataId 就绪后返回数据源信息。
         分两步提交：第一步提交 DataId，第二步提交其余资源。
         返回格式与 V3 BkDataDorisProvider.provider() 保持一致。
-        """
-        # 第一步：提交 DataId
-        step1_configs = self._build_step1_configs()
-        logger.info(
-            "[ProfileDatasource] apply V4 data link step 1 (DataId), name=%s, config_count=%d",
-            self._data_id_name(),
-            len(step1_configs),
-        )
-        try:
-            self._apply_data_link_with_retry(step1_configs)
-        except RetryError as e:
-            logger.error(
-                "[ProfileDatasource] apply V4 data link step 1 retry exhausted, name=%s",
-                self._data_id_name(),
-            )
-            raise e.__cause__ if e.__cause__ else e
 
-        # 轮询 DataId 就绪，获取 bk_data_id
-        bk_data_id = self._wait_for_data_id()
+        幂等设计：
+          - 若 _obj.bk_data_id 已存在（> 0），说明第一步已成功，直接跳过进入第二步。
+          - 第一步成功后立即将 bk_data_id 持久化到 _obj，防止第二步失败后重试时重复创建 DataId。
+        """
+        # 幂等：bk_data_id 已存在则跳过第一步
+        existing_bk_data_id = self._obj.bk_data_id if self._obj else -1
+        if existing_bk_data_id and existing_bk_data_id > 0:
+            bk_data_id = existing_bk_data_id
+            logger.info(
+                "[ProfileDatasource] V4 provider skip step 1, bk_data_id already exists: %d",
+                bk_data_id,
+            )
+        else:
+            # 第一步：提交 DataId
+            step1_configs = self._build_step1_configs()
+            logger.info(
+                "[ProfileDatasource] apply V4 data link step 1 (DataId), name=%s, config_count=%d",
+                self._data_id_name(),
+                len(step1_configs),
+            )
+            try:
+                self._apply_data_link_with_retry(step1_configs)
+            except RetryError as e:
+                logger.error(
+                    "[ProfileDatasource] apply V4 data link step 1 retry exhausted, name=%s",
+                    self._data_id_name(),
+                )
+                raise e.__cause__ if e.__cause__ else e
+
+            # 轮询 DataId 就绪，获取 bk_data_id
+            bk_data_id = self._wait_for_data_id()
+
+            # 第一步成功后立即持久化 bk_data_id，防止第二步失败后重试时重复创建 DataId
+            if self._obj:
+                self._obj.bk_data_id = bk_data_id
+                self._obj.save(update_fields=["bk_data_id"])
+                logger.info(
+                    "[ProfileDatasource] V4 provider step 1 done, bk_data_id=%d saved",
+                    bk_data_id,
+                )
 
         # 第二步：用 bk_data_id 构建并提交其余资源
         step2_configs = self._build_step2_configs(bk_data_id)
@@ -989,9 +1059,9 @@ class BkDataDorisV4Provider:
             )
             raise e.__cause__ if e.__cause__ else e
 
-        # result_table_id 格式：{bk_biz_id}_{rt_name}
+        # result_table_id 格式：{bkbase_biz_id}_{rt_name}
         rt_name = self._result_table_name(bk_data_id)
-        result_table_id = f"{self.bk_biz_id}_{rt_name}"
+        result_table_id = f"{self.bkbase_biz_id}_{rt_name}"
 
         # 过期天数：从 config.expires 中提取（格式如 "3d"）
         retention = int(self.config.expires.rstrip("d"))
@@ -1006,33 +1076,37 @@ class BkDataDorisV4Provider:
 
     def apply(self):
         """
-        DataId 和 ResultTable 在 delete 时不会被删除，启动时只需重新 apply DorisBinding 和 Databus。
-        使用 bkdata_datalink_config.v4_resource_names 中存储的资源名称。
+        启动 V4 链路：复用 provider() 的幂等流程。
+
+        provider() 负责：
+          - bk_data_id 已存在时跳过第一步；
+          - bk_data_id 不存在时提交 DataId，轮询成功后立即持久化 bk_data_id；
+          - 提交 ResultTable / DorisBinding / Databus。
+
+        apply() 负责：provider() 成功后补全 result_table_id / retention / bkdata_datalink_config 并持久化。
         """
-        v4_names = self._obj.bkdata_datalink_config.get("v4_resource_names", {}) if self._obj else {}
-        if not self._obj or not v4_names.get("doris_binding_name"):
-            raise ValueError("[ProfileDatasource] cannot apply V4 data link without stored resource names")
-        bk_data_id = self._obj.bk_data_id
-        # 只提交 DorisBinding 和 Databus
-        configs = [
-            self._build_doris_binding_config(bk_data_id),
-            self._build_databus_config(bk_data_id),
-        ]
-        logger.info(
-            "[ProfileDatasource] apply V4 data link (start), doris_binding_name=%s, databus_name=%s, bk_data_id=%d",
-            self._doris_binding_name(bk_data_id),
-            self._databus_name(bk_data_id),
-            bk_data_id,
-        )
-        try:
-            self._apply_data_link_with_retry(configs)
-        except RetryError as e:
-            logger.error(
-                "[ProfileDatasource] apply V4 data link (start) retry exhausted, doris_binding_name=%s, databus_name=%s",
-                self._doris_binding_name(bk_data_id),
-                self._databus_name(bk_data_id),
-            )
-            raise e.__cause__ if e.__cause__ else e
+        if not self._obj:
+            raise ValueError("[ProfileDatasource] cannot apply V4 data link without datasource instance")
+
+        essentials = self.provider()
+        bk_data_id = essentials["bk_data_id"]
+
+        # 提交成功后补全并持久化（兼容第二步之前失败导致字段未写入的情况）
+        resource_names = self.get_resource_names(bk_data_id=bk_data_id)
+        self._obj.bk_data_id = bk_data_id
+        self._obj.result_table_id = essentials["result_table_id"]
+        self._obj.retention = essentials["retention"]
+        self._obj.bkdata_datalink_config = {
+            "version": 4,
+            "namespace": self._obj.bkdata_datalink_config.get("namespace", ""),
+            "v4_resource_names": {
+                "data_id_name": resource_names["data_id_name"],
+                "result_table_name": resource_names["result_table_name"],
+                "doris_binding_name": resource_names["doris_binding_name"],
+                "databus_name": resource_names["databus_name"],
+            },
+        }
+        self._obj.save(update_fields=["bk_data_id", "result_table_id", "retention", "bkdata_datalink_config"])
 
     def delete(self):
         """

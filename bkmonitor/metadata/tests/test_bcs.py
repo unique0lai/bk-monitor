@@ -30,7 +30,11 @@ from metadata.models import (
 from metadata.models.influxdb_cluster import InfluxDBProxyStorage
 from metadata.models.bcs.resource import BCSClusterInfo
 from metadata.models.storage import ClusterInfo, StorageClusterRecord, ESStorage
-from metadata.task.bcs import discover_bcs_clusters, update_bcs_cluster_cloud_id_config
+from metadata.task.bcs import (
+    discover_bcs_clusters,
+    is_discover_managed_cluster,
+    update_bcs_cluster_cloud_id_config,
+)
 from metadata.models.result_table import ResultTable
 from metadata.tests.common_utils import consul_client
 from constants.common import DEFAULT_TENANT_ID
@@ -281,6 +285,68 @@ def test_discover_bcs_clusters(
     ]
 
 
+def test_discover_bcs_clusters_skip_biz_black_list(
+    monkeypatch,
+    monkeypatch_cluster_management_fetch_clusters,
+    monkeypatch_k8s_node_list_by_cluster,
+    monkeypatch_cmdb_get_info_by_ip,
+):
+    """测试黑名单业务下的新集群不会被 discover 任务自动接入。"""
+    monkeypatch.setattr(settings, "BCS_CLUSTER_SOURCE", "cluster-manager")
+    monkeypatch.setattr(settings, "BCS_API_GATEWAY_TOKEN", "token")
+    monkeypatch.setattr(settings, "NEW_ENV_CLUSTER_BLACK_LIST", ["2"])
+    monkeypatch.setattr(FetchK8sClusterListResource, "cache_type", None)
+
+    BCSClusterInfo.objects.filter(cluster_id="BCS-K8S-00000").delete()
+
+    discover_bcs_clusters()
+
+    assert not BCSClusterInfo.objects.filter(cluster_id="BCS-K8S-00000").exists()
+
+
+def test_discover_bcs_clusters_biz_black_list_prevent_delete(
+    monkeypatch,
+    monkeypatch_cluster_management_fetch_clusters,
+    monkeypatch_k8s_node_list_by_cluster,
+    monkeypatch_cmdb_get_info_by_ip,
+    add_bcs_cluster_info,
+):
+    """测试黑名单业务下的既有集群不会被 discover 删除链标记为 deleted。"""
+    monkeypatch.setattr(settings, "BCS_CLUSTER_SOURCE", "cluster-manager")
+    monkeypatch.setattr(settings, "BCS_API_GATEWAY_TOKEN", "token")
+    monkeypatch.setattr(settings, "NEW_ENV_CLUSTER_BLACK_LIST", [2])
+    monkeypatch.setattr(FetchK8sClusterListResource, "cache_type", None)
+
+    discover_bcs_clusters()
+
+    cluster_info_model = BCSClusterInfo.objects.get(cluster_id="BCS-K8S-00001")
+    assert cluster_info_model.status in [
+        BCSClusterInfo.CLUSTER_STATUS_RUNNING,
+        BCSClusterInfo.CLUSTER_RAW_STATUS_RUNNING,
+    ]
+
+
+def test_is_discover_managed_cluster_white_list_exempts_threshold(monkeypatch):
+    """测试白名单业务豁免起始集群阈值：后缀不大于阈值的集群仍被接管。"""
+    monkeypatch.setattr(settings, "NEW_ENV_CLUSTER_BLACK_LIST", [])
+    monkeypatch.setattr(settings, "NEW_ENV_CLUSTER_WHITE_LIST", ["2"])
+    cluster_id_ranges = [{"start": 5, "end": None}]
+
+    # 阈值后缀为 5，集群后缀为 1（不大于阈值）：非白名单业务不接管
+    assert is_discover_managed_cluster("BCS-K8S-00001", cluster_id_ranges=cluster_id_ranges, bk_biz_id=3) is False
+    # 业务命中白名单：豁免阈值，接管
+    assert is_discover_managed_cluster("BCS-K8S-00001", cluster_id_ranges=cluster_id_ranges, bk_biz_id=2) is True
+
+
+def test_is_discover_managed_cluster_black_list_overrides_white_list(monkeypatch):
+    """测试黑名单优先级高于白名单：业务同时命中黑白名单时不接管。"""
+    monkeypatch.setattr(settings, "NEW_ENV_CLUSTER_BLACK_LIST", [2])
+    monkeypatch.setattr(settings, "NEW_ENV_CLUSTER_WHITE_LIST", [2])
+    cluster_id_ranges = [{"start": 5, "end": None}]
+
+    assert is_discover_managed_cluster("BCS-K8S-00001", cluster_id_ranges=cluster_id_ranges, bk_biz_id=2) is False
+
+
 BCS_CLUSTER_ID = "BCS-K8S-00000"
 BK_TENANT_ID = "system"
 
@@ -337,29 +403,16 @@ def mock_settings(monkeypatch):
 
 @pytest.fixture
 def mock_funcs(monkeypatch):
-    def get_data_id(data_name, *args, **kwargs):
-        if data_name == f"bcs_{BCS_CLUSTER_ID}_k8s_metric":
-            return 100
-        elif data_name == f"bcs_{BCS_CLUSTER_ID}_k8s_event":
-            return 200
-        elif data_name == f"bcs_{BCS_CLUSTER_ID}_custom_metric":
-            return 300
-        raise ValueError("获取数据源失败")
-
     with (
         patch("bkmonitor.utils.tenant.get_tenant_datalink_biz_id") as mock_get_tenant_datalink_biz_id,
-        patch(
-            "metadata.models.data_source.DataSource.apply_for_data_id_from_bkdata"
-        ) as mock_apply_for_data_id_from_bkdata,
         patch("metadata.models.data_source.DataSource.apply_for_data_id_from_gse") as mock_apply_for_data_id_from_gse,
+        patch.object(api.bkdata, "apply_data_link"),
         patch("metadata.task.tasks.refresh_custom_report_config") as mock_refresh_custom_report_config,
     ):
         # mock 获取业务ID
         mock_get_tenant_datalink_biz_id.return_value = 2
         # mock 获取数据源
-        mock_apply_for_data_id_from_gse.side_effect = [400, 500, 600]
-
-        mock_apply_for_data_id_from_bkdata.side_effect = get_data_id
+        mock_apply_for_data_id_from_gse.side_effect = [100, 200, 300, 400, 500, 600]
         mock_refresh_custom_report_config.return_value = MagicMock()
 
         # mock 同步数据库
@@ -580,6 +633,99 @@ def test_check_bcs_clusters_status(
     command.output_summary_report(result)
     # import json
     # print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+
+
+def test_check_vm_datalink_dependencies_uses_bkbase_result_table_relation():
+    """DataId 注册名变化后，Checker 仍应通过 BkBaseResultTable 找到真实 V4 链路。"""
+    from metadata.management.commands.check_bcs_cluster_status import Command
+
+    bk_tenant_id = "system"
+    bk_data_id = 990001
+    table_id = "990001_bkmonitor_time_series_990001.__default__"
+    data_link_name = "historical_vm_data_link"
+    data_source = models.DataSource.objects.create(
+        bk_data_id=bk_data_id,
+        bk_tenant_id=bk_tenant_id,
+        data_name="checker_data_id_name_drift",
+        data_description="",
+        mq_cluster_id=0,
+        mq_config_id=0,
+        etl_config="bk_standard_v2_time_series",
+        is_custom_source=False,
+        creator="pytest",
+        last_modify_user="pytest",
+    )
+    models.DataSourceResultTable.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        bk_data_id=bk_data_id,
+        table_id=table_id,
+        creator="pytest",
+    )
+    models.ResultTable.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        table_id=table_id,
+        table_name_zh="checker",
+        is_custom_table=False,
+        schema_type=models.ResultTable.SCHEMA_TYPE_FIXED,
+        default_storage=models.ClusterInfo.TYPE_INFLUXDB,
+        creator="pytest",
+        last_modify_user="pytest",
+    )
+    vm_cluster = models.ClusterInfo.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        cluster_id=990001,
+        cluster_name="checker_vm_data_link_cluster",
+        cluster_type=models.ClusterInfo.TYPE_VM,
+        domain_name="vm.example.com",
+        port=8428,
+        is_default_cluster=False,
+    )
+    models.AccessVMRecord.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        result_table_id=table_id,
+        vm_cluster_id=vm_cluster.cluster_id,
+        storage_cluster_id=vm_cluster.cluster_id,
+        bk_base_data_id=bk_data_id,
+        bk_base_data_name="historical_data_id_name",
+        vm_result_table_id="2_bkm_checker",
+    )
+    models.DataIdConfig.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        namespace="bkmonitor",
+        name="latest_data_id_name",
+        bk_biz_id=2,
+        bk_data_id=bk_data_id,
+    )
+    DataLink.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        data_link_name=data_link_name,
+        namespace="bkmonitor",
+        data_link_strategy=DataLink.BK_STANDARD_V2_TIME_SERIES,
+        bk_data_id=bk_data_id,
+        table_ids=[table_id],
+    )
+    BkBaseResultTable.objects.create(
+        bk_tenant_id=bk_tenant_id,
+        data_link_name=data_link_name,
+        bkbase_data_name="historical_data_id_name",
+        monitor_table_id=table_id,
+        bkbase_rt_name="bkm_checker",
+        bkbase_table_id="2_bkm_checker",
+        storage_cluster_id=vm_cluster.cluster_id,
+    )
+
+    command = Command()
+    command.bk_tenant_id = bk_tenant_id
+    command._data_sources = {bk_data_id: data_source}
+    result = command.check_vm_datalink_dependencies(BCSClusterInfo(cluster_id="BCS-K8S-CHECKER"))
+
+    assert result["details"]["data_link"]["links"] == [
+        {
+            "data_link_name": data_link_name,
+            "data_link_strategy": DataLink.BK_STANDARD_V2_TIME_SERIES,
+        }
+    ]
+    assert not any("识别为 V2 链路接入" in warning for warning in result["warnings"])
 
 
 def test_update_bcs_cluster_cloud_id_config(

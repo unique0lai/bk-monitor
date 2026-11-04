@@ -30,6 +30,7 @@ import { Component as tsc } from 'vue-tsx-support';
 import { checkAllowedByActionIds } from 'monitor-api/modules/iam';
 import { formatWithTimezone } from 'monitor-common/utils/timezone';
 import { random } from 'monitor-common/utils/utils';
+import { resolveLegacyHostHash } from 'monitor-pc/common/legacy-host-url';
 import authorityStore from 'monitor-pc/store/modules/authority';
 import { transformLogUrlQuery } from 'monitor-pc/utils';
 
@@ -844,7 +845,9 @@ export default class EventTable extends tsc<IEventTableProps, IEventTableEvent> 
           extendInfo.bk_host_id ??
           `${extendInfo.ip}-${extendInfo.bk_cloud_id === undefined ? 0 : extendInfo.bk_cloud_id}`;
         window.open(
-          `${origin}${location.pathname.toString().replace('fta/', '')}?bizId=${bizId}#/performance/detail/${detailId}`,
+          `${origin}${location.pathname.toString().replace('fta/', '')}?bizId=${bizId}${resolveLegacyHostHash({
+            id: String(detailId),
+          })}`,
           '_blank'
         );
         return;
@@ -896,26 +899,23 @@ export default class EventTable extends tsc<IEventTableProps, IEventTableEvent> 
   }
   /** 关联信息提示信息 */
   handleExtendInfoEnter(e, info) {
-    let tplStr = '--';
+    let content = '--';
     switch (info.type) {
       case 'host':
-        tplStr = `<div class="extend-content">${this.$t('主机名:')}${info.hostname || '--'}</div>
-            <div class="extend-content">
-              <span class="extend-content-message">${this.$t('节点信息:')}${info.topo_info || '--'}</span>
-            </div>
-          `;
+        content = [
+          `${this.$t('主机名:')}${info.hostname || '--'}`,
+          `${this.$t('节点信息:')}${info.topo_info || '--'}`,
+        ].join('\n');
         break;
       case 'log_search':
       case 'custom_event':
       case 'bkdata':
-        tplStr = `<span class="extend-content-link">
-            ${this.extendInfoMap[info.type] || '--'}
-          </span>`;
+        content = `${this.extendInfoMap[info.type] || '--'}`;
         break;
       default:
         break;
     }
-    this.handlePopoverShow(e, tplStr);
+    this.handlePopoverShow(e, content);
   }
   /**
    * @description: 关联信息组件
@@ -994,14 +994,14 @@ export default class EventTable extends tsc<IEventTableProps, IEventTableEvent> 
     this.handlePopoverShow(
       e,
       [
-        `<div class="dimension-desc">${this.$t('维度信息')}：${
+        `${this.$t('维度信息')}：${
           dimensions?.map?.(item => `${item.display_key || item.key}(${item.display_value || item.value})`).join('-') ||
           '--'
-        }</div>`,
-        `<div class="description-desc">${this.$t('告警内容')}：${description || '--'}</div>`,
+        }`,
+        `${this.$t('告警内容')}：${description || '--'}`,
       ]
         .filter(Boolean)
-        .join('')
+        .join('\n')
     );
   }
   handleOverflowEnter(e: MouseEvent) {
@@ -1019,6 +1019,7 @@ export default class EventTable extends tsc<IEventTableProps, IEventTableEvent> 
   handlePopoverShow(e: MouseEvent, content: string) {
     this.popoverInstance = this.$bkPopover(e.target, {
       content,
+      allowHTML: false,
       maxWidth: 320,
       arrow: true,
       boundary: 'window',
@@ -1114,7 +1115,8 @@ export default class EventTable extends tsc<IEventTableProps, IEventTableEvent> 
     const { clientWidth, scrollWidth } = e.target as HTMLDivElement;
     if (scrollWidth > clientWidth) {
       this.metricPopoverIns = this.$bkPopover(e.target, {
-        content: `${data.map(item => `<div>${item.name || item.id}</div>`).join('')}`,
+        content: data.map(item => item.name || item.id).join('\n'),
+        allowHTML: false,
         maxWidth: 320,
         placement: 'top',
         boundary: 'window',
@@ -1408,13 +1410,13 @@ export default class EventTable extends tsc<IEventTableProps, IEventTableEvent> 
             return (
               <bk-table-column
                 key={`${this.searchType}_${column.id}`}
+                width={column.props.width}
                 scopedSlots={{
                   default: props => overflowGroupDom(props, column.id),
                 }}
                 formatter={row => (!row[column.id] && row[column.id] !== 0 ? '--' : row[column.id])}
                 label={column.name}
                 prop={column.id}
-                width={column.props.width}
               />
             );
           }
@@ -1639,6 +1641,9 @@ export default class EventTable extends tsc<IEventTableProps, IEventTableEvent> 
       params: { id },
     });
 
-    window.open(`${location.origin}${location.pathname}?bizId=${bizId}/${href}`, '_blank');
+    window.open(
+      `${location.origin}${location.pathname}?bizId=${bizId}${href.startsWith('#') ? href : `#${href}`}`,
+      '_blank'
+    );
   }
 }

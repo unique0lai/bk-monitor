@@ -23,14 +23,39 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-import { Component, InjectReactive, Inject } from 'vue-property-decorator';
+import { Component, Inject, InjectReactive, Prop } from 'vue-property-decorator';
 import { Component as tsc } from 'vue-tsx-support';
 
-import type { IViewOptions } from '../../typings';
 import TraceExplore from './trace-explore';
+
+import type { IViewOptions } from '../../typings';
 import type { TimeRangeType } from 'trace/components/time-range/utils';
 
 import './index.scss';
+
+function parseRouteJson<T>(val: unknown, fallback: T): T {
+  if (val == null || val === '') return fallback;
+  if (Array.isArray(val) || (typeof val === 'object' && val !== null)) return val as T;
+  if (typeof val !== 'string') return fallback;
+  try {
+    return JSON.parse(val) as T;
+  } catch {
+    try {
+      return JSON.parse(decodeURIComponent(val)) as T;
+    } catch {
+      return fallback;
+    }
+  }
+}
+
+function stringifyRouteJson(val: unknown) {
+  // 只序列化；编码交给 vue-router。再 encodeURIComponent 会和 $route.query 对不上，触发 CommonPage 换 key 死循环。
+  return JSON.stringify(val ?? []);
+}
+
+function routeJsonUnchanged(current: unknown, nextVal: unknown) {
+  return JSON.stringify(parseRouteJson(current, [])) === JSON.stringify(nextVal ?? []);
+}
 
 const APM_TRACE_EXPLORE_STYLE_ID = 'apm-trace-explore-runtime-style';
 const APM_TRACE_EXPLORE_STYLE_TEXT = `
@@ -47,25 +72,98 @@ body .tippy-box[data-placement^='right'] .tippy-arrow {
 export default class ApmTraceHome extends tsc<any, any> {
   @InjectReactive('viewOptions') readonly viewOptions!: IViewOptions;
   @InjectReactive('timeRange') readonly timeRange: [string, string];
+  @InjectReactive('timezone') readonly timezone: string;
   @InjectReactive('refreshInterval') readonly panelRefreshInterval: number;
   @InjectReactive('refreshImmediate') readonly panelRefreshImmediate: string;
   // 处理时间范围变化
   @Inject('handleTimeRangeChange') handleTimeRangeChange: (v: TimeRangeType) => void;
+  @Inject({ from: 'handleCustomRouteQueryChange', default: () => {} }) handleCustomRouteQueryChange: (
+    customRouteQuery: Record<string, number | string>
+  ) => void;
+
+  @Prop({ type: Object, default: null }) readonly slideDetail: null | {
+    appName: string;
+    bizId?: number;
+    traceId: string;
+  };
+
   runtimeStyleEl: HTMLStyleElement | null = null;
+
+  get exploreQuery() {
+    try {
+      const query = this.$route.query || {};
+      return {
+        hasUrlWhere: 'traceWhere' in query,
+        where: parseRouteJson(query.traceWhere, []),
+        queryString: typeof query.traceQueryString === 'string' ? query.traceQueryString : '',
+        filterMode: typeof query.traceFilterMode === 'string' ? query.traceFilterMode : 'ui',
+        commonWhere: parseRouteJson(query.traceCommonWhere, []),
+        selectedType: parseRouteJson(query.traceSelectedType, []),
+      };
+    } catch {
+      return {
+        hasUrlWhere: false,
+        where: [],
+        queryString: '',
+        filterMode: 'ui',
+        commonWhere: [],
+        selectedType: [],
+      };
+    }
+  }
 
   get v3Props() {
     return {
       viewOptions: this.viewOptions,
       timeRange: this.timeRange,
+      timezone: this.timezone,
       refreshInterval: this.panelRefreshInterval,
       refreshImmediate: this.panelRefreshImmediate,
+      slideDetail: this.slideDetail,
+      exploreQuery: this.exploreQuery,
     };
+  }
+
+  syncExploreQueryToRoute(query: {
+    commonWhere?: unknown[];
+    filterMode?: string;
+    queryString?: string;
+    selectedType?: unknown[];
+    where?: unknown[];
+  }) {
+    const nextQuery = {
+      traceWhere: stringifyRouteJson(query.where || []),
+      traceQueryString: query.queryString || '',
+      traceFilterMode: query.filterMode || 'ui',
+      traceCommonWhere: stringifyRouteJson(query.commonWhere || []),
+      traceSelectedType: stringifyRouteJson(query.selectedType || []),
+    };
+    const currentQuery = this.$route.query || {};
+    if (
+      routeJsonUnchanged(currentQuery.traceWhere, query.where || []) &&
+      String(currentQuery.traceQueryString || '') === nextQuery.traceQueryString &&
+      String(currentQuery.traceFilterMode || 'ui') === nextQuery.traceFilterMode &&
+      routeJsonUnchanged(currentQuery.traceCommonWhere, query.commonWhere || []) &&
+      routeJsonUnchanged(currentQuery.traceSelectedType, query.selectedType || [])
+    ) {
+      return;
+    }
+    this.handleCustomRouteQueryChange(nextQuery);
   }
 
   handleV3EventChange(eventName: string, params: any) {
     if (eventName === 'exploreChartZoomChange') {
       this.handleTimeRangeChange(params as TimeRangeType);
       return;
+    }
+
+    if (eventName === 'exploreQueryChange') {
+      this.syncExploreQueryToRoute(params || {});
+      return;
+    }
+
+    if (eventName === 'sliderClose') {
+      this.$emit('sliderClose');
     }
   }
 

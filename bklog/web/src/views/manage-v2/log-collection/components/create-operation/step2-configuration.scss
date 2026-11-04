@@ -144,7 +144,7 @@
       .log-type-box {
         width: 100%;
         .bk-form-checkbox {
-          width: 146px;
+          width: 180px;
           display: block;
           margin-top: 8px;
           margin-bottom: 12px;
@@ -163,6 +163,10 @@
           bottom: -6px;
         }
       }
+    }
+
+    .tail-files-radio-wrap {
+      flex: none !important;
     }
   }
 }

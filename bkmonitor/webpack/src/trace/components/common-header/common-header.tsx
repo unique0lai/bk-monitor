@@ -24,11 +24,11 @@
  * IN THE SOFTWARE.
  */
 
-import { defineComponent, type PropType } from 'vue';
-import { useI18n } from 'vue-i18n';
+import { type PropType, defineComponent } from 'vue';
 
 import { Badge } from 'bkui-vue';
 import { random } from 'monitor-common/utils';
+import { useI18n } from 'vue-i18n';
 
 import RefreshRate from '../refresh-rate/refresh-rate';
 import SelectMenu, { type ISelectMenuOption } from '../select-menu/select-menu';
@@ -67,6 +67,10 @@ export default defineComponent({
       type: Array as PropType<ISelectMenuOption[]>,
       default: () => [],
     },
+    timeRangeDisabledTip: {
+      type: String,
+      default: '',
+    },
   },
   emits: [
     'timeRangeChange',
@@ -76,7 +80,7 @@ export default defineComponent({
     'menuSelect',
     'gotoOld',
   ],
-  setup(props, { emit }) {
+  setup(_props, { emit }) {
     const { t } = useI18n();
 
     const handleTimeRangeChange = (value: TimeRangeType) => {
@@ -119,8 +123,10 @@ export default defineComponent({
         <div class='header-left'>{this.$slots.left?.()}</div>
         <div class='header-center'>{this.$slots.center?.()}</div>
         <div class='header-tools'>
+          {this.$slots.accessGuide?.()}
           {!this.hideFeature.includes('timeRange') && (
             <TimeRange
+              disabledTip={this.timeRangeDisabledTip}
               modelValue={this.timeRange}
               timezone={this.timezone}
               onUpdate:modelValue={this.handleTimeRangeChange}

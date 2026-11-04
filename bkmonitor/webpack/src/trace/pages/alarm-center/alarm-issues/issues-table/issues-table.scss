@@ -7,13 +7,15 @@
   height: 100%;
 
   --td-text-color-primary: #4e5e7a;
+  --issues-primary-color: #3974ff;
+  --issues-primary-color-hover: #5594fa;
 
   %btn-hover {
-    color: #3974ff;
+    color: var(--issues-primary-color);
     cursor: pointer;
 
     &:hover {
-      color: #5594fa;
+      color: var(--issues-primary-color-hover);
     }
   }
 
@@ -27,43 +29,32 @@
     }
   }
 
+  .issues-trend-col.is-refreshing {
+    opacity: 0.5;
+  }
+
   // ===================== Issues 名称列 =====================
   .issues-name-col {
     min-width: 0;
 
     .issues-name-title {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      height: 24px;
       font-size: 13px;
       font-weight: 500;
       line-height: 24px;
-      color: #3974ff;
-
-      .issues-name-title-text {
-        @extend %btn-hover;
-      }
-    }
-
-    .issues-name-exception {
-      margin-top: 2px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      font-size: 12px;
-      white-space: nowrap;
-    }
-
-    .issues-name-meta {
-      display: flex;
-      gap: 4px;
-      align-items: center;
-      margin-top: 6px;
 
       .issues-type-tag {
         display: inline-flex;
+        flex-shrink: 0;
         align-items: center;
         justify-content: center;
         width: 18px;
         height: 18px;
-        color: var(--issues-type-color, #21a380);
-        background-color: var(--issues-type-bg, #e1f5f0);
+        color: var(--issues-type-color, #fff);
+        background-color: var(--issues-type-bg, #78ab89);
         border-radius: 4px;
 
         .icon-monitor {
@@ -71,20 +62,68 @@
         }
       }
 
+      .issues-merge-badge {
+        display: inline-flex;
+        flex-shrink: 0;
+        gap: 2px;
+        align-items: center;
+        height: 18px;
+        padding: 0 2px 0 4px;
+        font-size: 11px;
+        color: #3a84ff;
+        cursor: pointer;
+        background: #e1ecff;
+        border-radius: 4px;
+
+        .icon-a-ziIssue {
+          font-size: 11px;
+        }
+
+        .issues-merge-badge-count {
+          font-weight: 700;
+        }
+      }
+    }
+
+    .issues-name-description {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 2px;
+      font-size: 12px;
+
       .issues-alert-count {
         display: inline-flex;
+        flex-shrink: 0;
         gap: 2px;
         align-items: center;
         height: 18px;
         padding: 3px 4px;
         font-size: 11px;
-        color: #8f9fbd;
+        color: #4e5e7a;
         background: #f0f4fa;
         border-radius: 4px;
 
-        .icon-shijianjiansuo {
+        .icon-alert-line {
           font-size: 11px;
         }
+
+        .issues-alert-count-number {
+          font-weight: 700;
+        }
+      }
+
+      .issues-name-exception-text {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .issues-log-skeleton {
+        flex: 1;
+        max-width: 280px;
+        height: 12px;
+        border-radius: 2px;
       }
     }
   }
@@ -98,8 +137,52 @@
   }
 
   // ===================== 趋势列 =====================
+  .issues-trend-header {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+
+    .bk-radio-capsule {
+      padding: 3px;
+      border-radius: 4px;
+
+      .bk-radio-button-label {
+        width: 28px;
+        height: 18px;
+        padding: 0;
+        font-weight: 500;
+        line-height: 18px;
+        border-radius: 2px;
+      }
+    }
+
+    .issues-trend-header-text {
+      flex-shrink: 0;
+      font-size: 12px;
+      color: #111214;
+    }
+  }
+
   .issues-trend-col {
-    padding: 0 10px 0 0;
+    &.is-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 40px;
+      border-bottom: 1px solid #e4e9f2;
+
+      .empty-text {
+        font-size: 12px;
+        color: #c1cde6;
+      }
+    }
+
+    &.is-loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 40px;
+    }
   }
 
   // ===================== 影响范围列 =====================
@@ -121,6 +204,8 @@
         white-space: nowrap;
 
         &.is-number {
+          font-weight: 700;
+
           @extend %btn-hover;
         }
       }
@@ -192,12 +277,23 @@
 
   // ===================== 负责人列 =====================
   .issues-assignee-cell {
-    .issues-assignee-unassigned-col {
+    .issues-assignee-col {
       display: flex;
       flex-wrap: wrap;
       gap: 4px;
       align-items: center;
       cursor: pointer;
+
+      .explore-user-tags-col {
+        height: 32px;
+
+        .item-tags {
+          .bk-tag {
+            cursor: unset;
+            border-radius: 4px !important;
+          }
+        }
+      }
 
       .assignee-tag-wrapper {
         display: inline-flex;
@@ -205,12 +301,12 @@
         align-items: center;
         height: 32px;
         padding: 0 6px 0 8px;
+        color: #8f9fbd;
         border-radius: 4px;
         transition: background-color 0.2s ease;
 
         .icon-mc-arrow-down {
           font-size: 12px;
-          color: #8f9fbd;
         }
       }
 
@@ -218,12 +314,6 @@
         .assignee-tag-wrapper {
           background-color: #f0f4fa;
         }
-      }
-    }
-
-    .explore-user-tags-col {
-      .bk-tag {
-        border-radius: 4px !important;
       }
     }
   }
@@ -244,6 +334,30 @@
         color: #c1cde6;
         cursor: not-allowed;
       }
+    }
+  }
+
+  // ===================== 结束状态行样式（通过 rowClassName 添加 is-ended） =====================
+  .is-split-highlighted {
+    background-color: #ebfaf0;
+  }
+
+  .is-ended {
+    /** 结束状态 ISSUE：内容 80% + 行底色，便于和未结束单据区分 */
+    $ended-opacity: 0.8;
+
+    // TDesign 单元格 background-color: inherit，必须写到 td 上底色才会画出来
+    &:not(.is-split-highlighted, .t-table__row--active) > td {
+      background-color: #f5f7fa;
+    }
+
+    // 单元格内容统一 80%；勾选列 / 操作列保持 100%
+    & > td:not(.t-table__cell-check, :has(.issues-operation-col)) > * {
+      opacity: $ended-opacity;
+    }
+
+    .issues-trend-col.is-loading {
+      opacity: 1;
     }
   }
 }

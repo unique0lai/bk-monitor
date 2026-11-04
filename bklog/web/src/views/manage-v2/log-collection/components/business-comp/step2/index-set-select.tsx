@@ -89,13 +89,19 @@ export default defineComponent({
     return () => (
       <bk-select
         class='index-set-select-box'
+        ext-popover-cls='managev2-index-set-checkbox-popover'
         loading={indexGroupLoading.value}
         value={props.value}
         display-tag
         multiple
         searchable
+        selected-style='checkbox'
         onChange={val => handleSelect(val)}
-        onToggle={isOpen => { if (!isOpen) isAdd.value = false; }}
+        onToggle={isOpen => {
+          if (!isOpen) {
+            isAdd.value = false;
+          }
+        }}
       >
         {(list.value || []).map((option: IListItemData) => (
           <bk-option
@@ -117,7 +123,10 @@ export default defineComponent({
               on-submit={handleSubmit}
             />
           ) : (
-            <span class='add-index-set-btn' onClick={handleAdd}>
+            <span
+              class='add-index-set-btn'
+              onClick={handleAdd}
+            >
               <i class='bk-icon icon-plus-circle' />
               {t('新增索引集')}
             </span>

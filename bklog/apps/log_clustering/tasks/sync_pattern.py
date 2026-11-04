@@ -19,6 +19,8 @@ We undertake not to change the open source license (MIT license) applicable to t
 the project delivered to anyone in the future.
 """
 
+from itertools import islice
+
 from blueapps.contrib.celery_tools.periodic import periodic_task
 from celery.schedules import crontab
 
@@ -36,49 +38,62 @@ from apps.log_clustering.models import AiopsSignatureAndPattern, ClusteringConfi
 from apps.log_search.models import LogIndexSet
 from apps.utils.task import high_priority_task
 
+# signature__in 的 IN 参数上限，决定单批查询的内存上界与 SQL 语句长度
+SIGNATURE_QUERY_BATCH_SIZE = 500
+# bulk_create / bulk_update 的语句分片大小，决定单条写入语句的体积
+SIGNATURE_WRITE_BATCH_SIZE = 500
+# 从模型文件同步到库表的字段，创建与更新共用同一集合，避免两处定义漂移
+SIGNATURE_SYNC_FIELDS = ("pattern", "origin_pattern", "origin_log")
+
 
 @periodic_task(run_every=crontab(minute="*/10"))
 def sync_pattern():
     clustering_configs = ClusteringConfig.objects.filter(signature_enable=True, signature_pattern_rt="").values(
-        "model_id", "model_output_rt", "index_set_id"
+        "model_id", "model_output_rt", "index_set_id", "bk_biz_id"
     )
-    index_set_ids = set()
-    for clustering_config in clustering_configs:
-        index_set_ids.add(clustering_config["index_set_id"])
+    index_set_ids = {clustering_config["index_set_id"] for clustering_config in clustering_configs}
 
-    index_set_id_list = LogIndexSet.objects.filter(is_active=True, index_set_id__in=index_set_ids).values_list(
-        "index_set_id", flat=True
+    active_index_set_ids = set(
+        LogIndexSet.objects.filter(is_active=True, index_set_id__in=index_set_ids).values_list(
+            "index_set_id", flat=True
+        )
     )
-    model_ids = set()
-    model_output_rts = set()
+    model_keys = set()
+    model_output_keys = set()
     for clustering_config in clustering_configs:
-        if clustering_config["index_set_id"] not in index_set_id_list:
+        if clustering_config["index_set_id"] not in active_index_set_ids:
             continue
+        bk_biz_id = clustering_config["bk_biz_id"]
         model_id = clustering_config["model_id"]
         model_output_rt = clustering_config["model_output_rt"]
-        if model_output_rt and model_output_rt not in model_output_rts:
-            model_output_rts.add(model_output_rt)
-            sync.delay(model_output_rt=model_output_rt)
-        elif not model_output_rt and model_id and model_id not in model_ids:
-            model_ids.add(model_id)
-            sync.delay(model_id=model_id)
+        model_output_key = (model_output_rt, bk_biz_id)
+        model_key = (model_id, bk_biz_id)
+        if model_output_rt and model_output_key not in model_output_keys:
+            model_output_keys.add(model_output_key)
+            sync.delay(model_output_rt=model_output_rt, bk_biz_id=bk_biz_id)
+        elif not model_output_rt and model_id and model_key not in model_keys:
+            model_keys.add(model_key)
+            sync.delay(model_id=model_id, bk_biz_id=bk_biz_id)
 
 
 @high_priority_task(ignore_result=True)
-def sync(model_id=None, model_output_rt=None):
+def sync(model_id=None, model_output_rt=None, bk_biz_id=None):
+    handler = AiopsModelHandler()
     if model_id:
         try:
-            release_id = AiopsModelHandler().get_latest_released_id(model_id=model_id)
+            release_id = handler.get_latest_released_id(model_id=model_id, bk_biz_id=bk_biz_id)
         except ModelReleaseNotFoundException:
             return
 
-        content = AiopsModelHandler().aiops_release_model_release_id_model_file(
-            model_id=model_id, model_release_id=release_id
+        content = handler.aiops_release_model_release_id_model_file(
+            model_id=model_id, model_release_id=release_id, bk_biz_id=bk_biz_id
         )["file_content"]
 
     elif model_output_rt:
         model_id = model_output_rt
-        content = AiopsModelHandler().model_output_rt_model_file(model_output_rt=model_output_rt)["file_content"]
+        content = handler.model_output_rt_model_file(model_output_rt=model_output_rt, bk_biz_id=bk_biz_id)[
+            "file_content"
+        ]
 
     else:
         return
@@ -87,10 +102,14 @@ def sync(model_id=None, model_output_rt=None):
     content = AiopsModelHandler.pickle_decode(content=content)
 
     patterns = get_pattern(content)
+    # 模型文件解码结果通常远大于后续构造的 signature 数据，取完 pattern 后立即释放，
+    # 避免与写库阶段同时驻留导致峰值内存叠加
+    del content
+
     objects_to_create, objects_to_update = make_signature_objects(patterns=patterns, model_id=model_id)
-    AiopsSignatureAndPattern.objects.bulk_create(objects_to_create, batch_size=500)
+    AiopsSignatureAndPattern.objects.bulk_create(objects_to_create, batch_size=SIGNATURE_WRITE_BATCH_SIZE)
     AiopsSignatureAndPattern.objects.bulk_update(
-        objects_to_update, fields=["pattern", "origin_pattern", "origin_log"], batch_size=500
+        objects_to_update, fields=list(SIGNATURE_SYNC_FIELDS), batch_size=SIGNATURE_WRITE_BATCH_SIZE
     )
 
 
@@ -181,34 +200,48 @@ def get_pattern(content) -> list:
 def make_signature_objects(patterns, model_id) -> [list[AiopsSignatureAndPattern], list[AiopsSignatureAndPattern]]:
     """
     生成 signature 对象
+
+    已有记录按 signature 分片查询（只取 SIGNATURE_SYNC_FIELDS），避免按 model 全量加载历史数据；
+    内容未发生变化的记录不进入 objects_to_update，避免每轮重复写入。
     :param patterns:
     :param model_id:
     :return:
     """
     origin_signature_map = {pattern["signature"]: pattern for pattern in patterns}
-    existed_signature_map = {obj.signature: obj for obj in AiopsSignatureAndPattern.objects.filter(model_id=model_id)}
-
     objects_to_create = []
     objects_to_update = []
 
-    for origin_signature, origin_pattern in origin_signature_map.items():
-        if origin_signature not in existed_signature_map:
-            # 不存在的，创建一个新对象
-            objects_to_create.append(
-                AiopsSignatureAndPattern(
-                    model_id=model_id,
-                    signature=origin_signature,
-                    pattern=origin_pattern["pattern"],
-                    origin_pattern=origin_pattern["origin_pattern"],
-                    origin_log=origin_pattern["origin_log"],
-                )
+    signature_items_iterator = iter(origin_signature_map.items())
+    while True:
+        # 使用 islice 分片，避免额外复制一份与 signature 总量同规模的分片列表
+        signature_items = list(islice(signature_items_iterator, SIGNATURE_QUERY_BATCH_SIZE))
+        if not signature_items:
+            break
+
+        signatures = [signature for signature, _ in signature_items]
+        existed_signature_map = {
+            obj.signature: obj
+            for obj in AiopsSignatureAndPattern.objects.filter(model_id=model_id, signature__in=signatures).only(
+                "id", "signature", *SIGNATURE_SYNC_FIELDS
             )
-        else:
-            # 已经存在的，只更新对象中的 pattern 字段
-            signature_obj = existed_signature_map[origin_signature]
-            signature_obj.pattern = origin_pattern["pattern"]
-            # 保留原始pattern 用于不同索引之间的数据同步
-            signature_obj.origin_pattern = origin_pattern["origin_pattern"]
-            signature_obj.origin_log = origin_pattern["origin_log"]
+        }
+
+        for origin_signature, origin_pattern in signature_items:
+            signature_obj = existed_signature_map.get(origin_signature)
+            if signature_obj is None:
+                objects_to_create.append(
+                    AiopsSignatureAndPattern(
+                        model_id=model_id,
+                        signature=origin_signature,
+                        **{field: origin_pattern[field] for field in SIGNATURE_SYNC_FIELDS},
+                    )
+                )
+                continue
+
+            if all(getattr(signature_obj, field) == origin_pattern[field] for field in SIGNATURE_SYNC_FIELDS):
+                continue
+
+            for field in SIGNATURE_SYNC_FIELDS:
+                setattr(signature_obj, field, origin_pattern[field])
             objects_to_update.append(signature_obj)
     return objects_to_create, objects_to_update

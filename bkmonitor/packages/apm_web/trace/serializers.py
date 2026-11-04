@@ -12,8 +12,8 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 
 from apm_web.constants import QueryMode
-from apm_web.trace.constants import EnabledStatisticsDimension
 from constants.apm import OperatorGroupRelation
+from constants.otel_query import EnabledStatisticsDimension
 
 
 class FilterSerializer(serializers.Serializer):
@@ -80,7 +80,7 @@ class TraceStatisticsFieldSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         if attrs["field_type"] not in [dimension.value for dimension in EnabledStatisticsDimension]:
-            raise ValueError(_("不支持的字段类型"))
+            raise serializers.ValidationError(_("不支持的字段类型"))
         return attrs
 
 
@@ -94,10 +94,11 @@ class TraceFieldStatisticsGraphRequestSerializer(BaseTraceRequestSerializer, Bas
     def validate(self, attrs):
         attrs = super().validate(attrs)
         field = attrs["field"]
-        if field["field_type"] == EnabledStatisticsDimension.KEYWORD.value:
+
+        if not EnabledStatisticsDimension.from_value(field["field_type"]).is_numeric():
             return attrs
         if len(field["values"]) < 4:
-            raise ValueError(_("数值类型查询条件不足"))
+            raise serializers.ValidationError(_("数值类型查询条件不足"))
         return attrs
 
 
@@ -106,3 +107,19 @@ class TraceGenerateQueryStringRequestSerializer(serializers.Serializer):
         value = serializers.ListSerializer(label=_("查询值"), child=serializers.JSONField(), allow_empty=True)
 
     filters = serializers.ListSerializer(label=_("查询条件"), child=QueryStringFilterSerializer(), default=[])
+
+
+class ListLinkRequestSerializer(serializers.Serializer):
+    """Links 反向关联查询请求序列化器"""
+
+    bk_biz_id = serializers.IntegerField(label=_("业务 ID"))
+    app_name = serializers.CharField(label=_("应用名称"))
+    trace_id = serializers.CharField(label=_("Trace ID"), required=False, allow_null=True, allow_blank=True)
+    span_id = serializers.CharField(label=_("Span ID"), required=False, allow_null=True, allow_blank=True)
+
+    def validate(self, attrs: dict[str, object]) -> dict[str, object]:
+        attrs["trace_id"] = attrs.get("trace_id") or None
+        attrs["span_id"] = attrs.get("span_id") or None
+        if not attrs["trace_id"] and not attrs["span_id"]:
+            raise serializers.ValidationError(_("TraceID 和 SpanID 至少提供一个"))
+        return attrs

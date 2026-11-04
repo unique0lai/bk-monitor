@@ -87,6 +87,7 @@ export default {
   '对该配置增/删目标,成功{0}个实例,失败{1}个实例':
     'adding/deleting targets to this configuration, {0} instances succeeded, failed{ 1} instances',
   '即将上线，敬请期待': 'Coming soon, stay tuned',
+  敬请期待: 'Coming soon',
   '组合策略功能暂未开放，敬请期待！': 'The combined rule function is not yet open, please look forward to it!',
   '邮件任务已生成，请一分钟后到邮箱查看': 'The email task has been generated, please check your mailbox in one minute',
   '迁移完成，请确认迁移结果': 'Migration completed, please confirm the migration result',
@@ -160,6 +161,8 @@ export default {
     'The current space does not support this function. If you need to use it, please contact the administrator',
   '当前空间未开启故障诊断功能, 请联系': 'The current space does not support this function. please contact',
   BK助手: 'BK Assistant',
+  'BK 助手': 'BK Assistant',
+  产品白皮书: 'Product White Paper',
   当前告警关联故障: 'Current alarm associated fault',
   当前告警无关联故障: 'The current alarm has no associated faults',
   当前无异常事件: 'Currently no abnormal events',
@@ -167,8 +170,8 @@ export default {
     'Abnormal event acquisition source\n1. events.attributes.exception_stacktrace field\n2. status.message field',
   '已折叠 {count} 个相同"Service + Span name + status"的 Span':
     "Collapsed {count} Spans with the same 'Service+Span name+status'",
-  '处理套餐中使用了电话语音通知，拨打的顺序是按通知对象顺序依次拨打，用户组内无法保证顺序':
-    'Telephone voice notifications were used in the processing of the package, and the order of calls is based on the order of the notification objects. The order cannot be guaranteed within the user group',
+  '处理套餐中使用了电话语音通知，拨打的顺序是按通知对象顺序依次拨打':
+    'Telephone voice notifications were used in the processing of the package, and the order of calls is based on the order of the notification objects',
   '不监控，就是不进行告警策略判断。可在{0}进行设置。':
     'Not monitoring means not judging the alarm strategy. Can be set in {0}.',
   '目前仅支持{0}切换PromQL': 'Currently, only {0} is supported to switch PromQL',
@@ -182,8 +185,10 @@ export default {
   对比的TraceID相同: 'The compared TraceID is the same',
   '打开后，除了采集启用的指标还会采集未来新增的指标。':
     'After opening, in addition to collecting enabled indicators, future new indicators will also be collected.',
-  '因为当前是旧的存储模式，开启采集新增指标后会切换成新的存储模式，旧的历史数据会丢失，请确认是否继续。':
-    'Because the current storage mode is old, after enabling the collection of new indicators, it will switch to the new storage mode, and the old historical data will be lost. Please confirm whether to continue.',
+  '开启自动发现，已有数据不会丢失，但可能会导致维度爆炸问题，请确认维度数据':
+    'After opening automatic discovery, existing data will not be lost, but it may cause dimension explosion problems, please confirm the dimension data',
+  '关闭自动发现，将以手动维护的指标和维度为准，其他数据将被丢弃':
+    'After closing automatic discovery, the indicators and dimensions maintained manually will be used as the standard, and other data will be discarded',
   '添加新的屏蔽范围将会覆盖之前的屏蔽内容，确定覆盖？':
     'Adding a new blocking range will overwrite the previous blocked content, are you sure to proceed?',
   '批量粘贴请使用;进行分隔': 'Please use bulk pasting; Separate',
@@ -198,6 +203,8 @@ export default {
   去检索: 'To retrieve',
   '监控数据维度未配置("目标IP"和"云区域ID")，监控目标无法命中目标':
     'The monitoring data dimensions are not configured ("target IP" and "cloud region ID"), and the monitoring target cannot hit the target',
+  '每次检测任务出现新的维度值 {dimensions} 时，都会倒推过去 {window} 内是否出现过相同维度值，如果没有则告警，出现过则不告警。':
+    'Whenever new dimension values ({dimensions}) appear in a detection task, the system retroactively checks whether the same dimension values occurred within the past {window}. If not, an alert is triggered; otherwise, no alert is issued.',
   '监控数据维度未配置("服务实例")， 监控目标无法命中目标':
     'The monitoring data dimension is not configured ("service instance"), and the monitoring target cannot hit the target',
   存在关联的告警组: 'There is an associated alarm group',
@@ -206,9 +213,10 @@ export default {
   取消反馈根因: 'Cancel feedback root cause',
   反馈根因: 'Feedback root cause',
   '共 {slot0} 条边': 'There are {slot0} edges',
-  '共 {slot0} 个 {type}节点': 'There are {slot0} {type} nodes in total',
-  '共 {slot0} 个 {type}节点，其中 {slot1} 个异常':
+  '共 {slot0} 个 {type} 节点': 'There are {slot0} {type} nodes in total',
+  '共 {slot0} 个 {type} 节点，其中 {slot1} 个异常':
     'There are {slot0} {type} nodes in total, of which {slot1} are abnormal.',
+  '共 {0} 个 {1} 节点，其中 {2} 个异常': 'There are {0} {1} nodes in total, of which {2} are abnormal.',
   '10分钟内无数据': 'No data within 10 minutes',
   '直接进行 精准查询，定位到 Trace 详情': 'Directly perform precise queries and locate Trace details',
   '查看关联 Trace': 'View associated Trace',
@@ -266,6 +274,10 @@ export default {
   边图例: 'Edge Legend',
   从属关系: 'Subordinate',
   调用关系: 'Call',
+  传播关系: 'Propagation',
+  未知关系: 'Unknown relationship',
+  '从属／未知关系': 'Subordinate / unknown relationship',
+  '有向关系（调用／传播）': 'Directed relationship (call / propagation)',
   故障传播: 'Incident Spread',
   无故障传播: 'No Incident Spread',
   指向性: 'Directional',
@@ -387,6 +399,11 @@ export default {
   调试数据范围取当前时间窗口前1000条数据:
     'The debugging data range takes the previous 1000 entries from the current time window',
   只有数值类型的字段可作为监控指标: 'Only fields of numeric type can be used as monitoring indicators',
+  '尚未开放自主接入，请联系管理员': 'Self-service access is not yet open, please contact the administrator',
+  '当前选择，包含 {0} 个空间未开启故障分析功能，':
+    'The currently selected {0} spaces have not enabled the fault analysis function,',
+  查看相关接入指引: 'View related access guidelines',
+  打开故障功能: 'open fault function',
 
   // 查询模板
   无法删除: 'Cannot delete',
@@ -453,9 +470,9 @@ export default {
   '输入 $ 可以插入变量': 'Input $ to insert variables',
 
   // ISSUES
-  新问题: 'New Issue',
+  新类问题: 'New Issue',
   回归问题: 'Regression Issue',
-  新: 'New',
+  新类: 'New',
   回归: 'Regression',
   待审核: 'Pending Review',
   归档: 'Archived',
@@ -470,9 +487,89 @@ export default {
   标记为已解决成功: 'Mark as resolved successfully',
   已配置issue聚合: 'Issue aggregation already configured',
   '该服务已关联{0}个告警策略': 'This service has been associated with{0}alarm policies',
+
+  '启用后数据将重新上报至该应用，若无数据，请检查上报配置':
+    'After enabling, the data will be reported to this application. If there is no data, please check the reporting configuration',
+  '停用后将不会有数据上报，请谨慎操作': 'After disabling, there will be no data reporting. Please operate carefully.',
+  '删除后无法恢复，请谨慎操作！': 'After deletion, it cannot be recovered. Please operate carefully!',
+  '设置系统可承受的 qps 峰值，每秒最多处理 X 条请求，超出可以造成数据丢弃。':
+    'Set the system-acceptable qps peak value, which can process up to X requests per second, and exceeding which can cause data to be discarded.',
   归档成功: 'Archive successfully',
   恢复成功: 'Restore successfully',
   重新打开成功: 'Reopen successfully',
-  请选择Issue聚合维度: 'Please select Issue aggregation dimension',
   请选择Issue聚合生效告警级别: 'Please select effective alert level for Issue aggregation',
+  '请先选择 Issue': 'Please select Issue first',
+  '请至少选择 2 个 Issue': 'Please select at least 2 Issues',
+  '请先勾选需要拆分的 Issue': 'Please check the Issues to be split first',
+  '单次最多拆分 {n} 个 Issue': 'Up to {n} Issues can be split at a time',
+  '主 Issue 不支持再并入其他主 Issue': 'The main Issue does not support being merged into other main Issues',
+  '合并了 {n} 个 Issue，点击查看合并明细': 'Merged {n} Issues, click to view merge details',
+  拆分: 'Split',
+
+  '选择或填写拆分依据后，再确认拆分为新 Issue。':
+    'After selecting or filling in the split basis, confirm the split as a new Issue.',
+  合并后保留: 'After merging, retain',
+  合并后隐藏: 'After merging, hide',
+  '由执行合并的用户指定，合并后会沉淀到主 Issue 的合并来源种，便于后续复盘。':
+    'Specified by the user who performs the merge, and will be retained as the merge source in the main Issue.',
+  '只能继续作为主 Issue，不支持再合并入其他 Issue；':
+    'Only continue as the main Issue, and cannot be merged into other Issues.',
+  '合并后作为展示主体；被合入的主 Issue 及其子 Issue 会打平并入，不保留嵌套；':
+    'After merging it remains the display subject; merged main Issues and their children will be flattened in, without nesting;',
+  'issue合并成功，本次合并同时并入了 {n} 个来源子 Issue':
+    'Issue merged successfully. {n} source child Issues were also merged in.',
+  随合并平移: 'Moved with merge',
+  '该 Issue 原挂在 {id} 下，随其合并平移而来':
+    'This Issue was originally under {id} and was moved here when that Issue was merged.',
+  '事件数、影响范围会并入主 Issue；': 'Event count and impact scope will be merged into the main Issue.',
+  '默认保留第 1 条选中的 Issue 作为主 Issue，也可以在下方表单切换；':
+    'By default, the first selected Issue is retained as the main Issue, and can be switched in the form below.',
+
+  '已授权 TAPD 项目列表 · 已关联 {count} 个项目': 'Authorized TAPD Project List · {count} Projects Associated',
+
+  '开启后，当本单据在外部平台进入{0}类状态{1}时，本 Issue 将自动流转为{2}。':
+    'After enabling, when this document enters the {0} status {1} in the external platform, this Issue will automatically transition to {2}.',
+  '未勾选，则仅保留关联，不因单据关闭而自动关 Issue。':
+    'If not checked, only the association is retained, and the issue is not automatically closed due to document closure.',
+  '请选择有权限的项目，完成蓝鲸监控关联项目的应用授权。':
+    'Please select a project with permission, and complete the application authorization of the BK-Monitor project.',
+  '页面主要内容完成渲染的耗时第 75 分位值，数值越低体验越好。':
+    'The page main content is rendered in 75th percentile, the lower the better.',
+  '页面运行中发生 JSt异常比例，数值越高稳定性越差。':
+    'The page runs into JSt exceptions in 75th percentile, the higher the worse.',
+  '接口请求失败比例，包含 HTTP 非成功状态码、请求超时或网络异常等情况。':
+    'The proportion of failed API requests, including HTTP non-success status codes, request timeouts, or network exceptions.',
+  'JS 错误的View数 / 总View数 × 100%': 'JS Error View Count / Total View Count × 100%',
+  '失败接口请求次数 / 接口请求总次数 × 100%': 'Failed API Request Count / Total API Request Count × 100%',
+
+  '触发规则：仅当新增维度值数量大于{threshold}时触发告警':
+    'Trigger rule: alarm is triggered only when the number of new dimension values is greater than {threshold}',
+  '分组删除后，相关指标将被移动到 <{name}>':
+    'After the group is deleted, the related metrics will be moved to <{name}>',
+  '触发规则：仅当对应数据值大于 {threshold} 时触发告警':
+    'Trigger rule: alarm is triggered only when the corresponding data value is greater than {threshold}',
+
+  '暂未关联蓝盾项目 & 源码仓库，{0}': 'No BK-DevOps project & source code repository has been associated yet, {0}',
+  '已关联蓝盾项目 & 源码仓库，{0}': 'BK-DevOps project & source code repository has been associated, {0}',
+
+  // AI 设置
+  暂无关联知识库: 'No knowledge base associated',
+  可绑定本空间有使用权限的知识库: 'You can bind knowledge bases with usage permissions in this space',
+  暂无关联Skill: 'No Skill associated',
+  '可绑定本空间有使用权限的 Skill': 'You can bind Skills with usage permissions in this space',
+  暂无关联智能体: 'No agent associated',
+  可绑定本空间有使用权限的智能体: 'You can bind agents with usage permissions in this space',
+  数据未变更: 'Data has not changed',
+  '数据未就绪，请稍后重试': 'Data is not ready, please try again later',
+  优先级不能为空: 'Priority cannot be empty',
+  匹配条件不能为空: 'Matching conditions cannot be empty',
+  请添加告警策略匹配规则: 'Please add alarm strategy matching rules',
+  请选择智能体: 'Please select an agent',
+  请选择知识库: 'Please select a knowledge base',
+  请选择Skill: 'Please select a Skill',
+  请输入优先级: 'Please enter the priority',
+  '优先级需在1-10000之间': 'The priority must be between 1 and 10000',
+  '正在拉取来源构建、提交历史与 Blame 信息': 'Pulling source build, commit history, and blame information',
+  '重新分析将基于最新告警重新触发 AI 源码分析，是否继续？':
+    'Re-analysis will trigger AI source code analysis based on the latest alerts. Do you want to continue?',
 };

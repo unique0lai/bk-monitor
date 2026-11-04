@@ -78,20 +78,24 @@ export default defineComponent({
       type: [Number, String],
       default: undefined,
     },
+    maxHeight: {
+      type: [Number, String],
+      default: undefined,
+    },
     pagination: {
       type: Object as PropType<IPaginationInfo>,
       default: () => {},
     },
     sortConfig: {
       type: Object as PropType<ISortConfig>,
-      default: () => {},
+      default: () => ({}),
     },
     emptyType: {
       type: String,
       default: 'empty',
     },
     filterValue: {
-      type: Object as PropType<Record<string, string>>,
+      type: Object as PropType<Record<string, string | (string | number)[]>>,
       default: () => {},
     },
     skeletonConfig: {
@@ -112,6 +116,10 @@ export default defineComponent({
       type: Boolean,
       default: false,
     },
+    resizable: {
+      type: Boolean,
+      default: false,
+    },
     colKeyMap: {
       type: Object as PropType<Record<string, string>>,
       default: () => ({}),
@@ -124,8 +132,25 @@ export default defineComponent({
       type: Number,
       default: 32,
     },
+    /** 可见列 colKey 数组 */
+    visibleColKeys: {
+      type: Array as PropType<string[]>,
+      default: undefined,
+    },
+    rowKey: {
+      type: String,
+      default: 'key',
+    },
   },
-  emits: ['sort-change', 'page-change', 'filter-change', 'empty-click', 'cell-click'],
+  emits: [
+    'sort-change',
+    'page-change',
+    'filter-change',
+    'empty-click',
+    'cell-click',
+    'setting-change',
+    'column-resize-change',
+  ],
   setup(props, { emit }) {
     const { t } = useLocale();
     const globalLocale = {
@@ -147,6 +172,26 @@ export default defineComponent({
     // 用户选择的可见列（初始值为所有列）
     const visibleColumns = ref<string[]>(columnConfigFields.value.map(field => props.colKeyMap[field.id] || field.id));
 
+    /** 是否为受控模式 */
+    const isControlledVisible = computed(() => Array.isArray(props.visibleColKeys));
+
+    /** 生效的可见列：受控模式下以 props.visibleColKeys 为准 */
+    const effectiveVisibleColumns = computed(() => {
+      return isControlledVisible.value ? props.visibleColKeys : visibleColumns.value;
+    });
+
+    // 监听 settingFields 变化，更新列配置
+    watch(
+      () => props.settingFields,
+      newFields => {
+        columnConfigFields.value = [...newFields];
+        // 受控模式下可见列由父组件驱动
+        if (!isControlledVisible.value) {
+          visibleColumns.value = columnConfigFields.value.map(field => props.colKeyMap[field.id] || field.id);
+        }
+      },
+    );
+
     const isNeedSetting = computed(() => {
       return Object.keys(props.colKeyMap || {}).length > 0 && (props.settingFields || []).length > 0;
     });
@@ -154,7 +199,10 @@ export default defineComponent({
      * 是否有过滤内容
      */
     const hasValidIFilterConditions = computed(() => {
-      return Object.values(props.filterValue || {}).some(value => value !== '');
+      return Object.values(props.filterValue || {}).some(value => {
+        if (Array.isArray(value)) return value.length > 0;
+        return value !== '';
+      });
     });
     // 默认显示的列（disabled: true 的列）
     const defaultVisibleColumns = computed(() => {
@@ -168,9 +216,9 @@ export default defineComponent({
      */
     const filteredColumnKeys = computed(() => {
       return Object.keys(props.filterValue || {}).filter((key: string) => {
-        if (props.filterValue[key] !== '') {
-          return key;
-        }
+        const value = props.filterValue[key];
+        if (Array.isArray(value)) return value.length > 0;
+        return value !== '';
       });
     });
     // 根据可见列过滤后的列配置
@@ -185,8 +233,8 @@ export default defineComponent({
         if (col.colKey === 'operation') return false; // 操作列单独处理
         // 默认列始终显示
         if (defaultVisibleColumns.value.includes(col.colKey)) return true;
-        // 其他列根据 visibleColumns 决定
-        return visibleColumns.value.includes(col.colKey);
+        // 其他列根据生效可见列决定
+        return effectiveVisibleColumns.value.includes(col.colKey);
       });
       // 将操作列添加到末尾
       return operationCol ? [...filteredColumns, operationCol] : filteredColumns;
@@ -208,7 +256,7 @@ export default defineComponent({
       // 初始化临时选择为当前可见列，确保包含默认列
       const allCurrentColumns = [
         ...defaultVisibleColumns.value,
-        ...visibleColumns.value.filter(key => !defaultVisibleColumns.value.includes(key)),
+        ...effectiveVisibleColumns.value.filter(key => !defaultVisibleColumns.value.includes(key)),
       ];
       tempVisibleColumns.value = [...allCurrentColumns];
     };
@@ -242,6 +290,8 @@ export default defineComponent({
         ...tempVisibleColumns.value.filter(key => !defaultVisibleColumns.value.includes(key)),
       ];
       visibleColumns.value = finalColumns;
+      // 上抛字段设置结果，供父组件持久化
+      emit('setting-change', finalColumns);
       isShowColumnConfig.value = false;
       columnConfigTippyInstance?.hide();
     };
@@ -373,6 +423,14 @@ export default defineComponent({
       emit('sort-change', sortInfo);
     };
 
+    /**
+     * 处理列宽拖拽变化（TTable resizable 触发）
+     * @param context - 列宽上下文，包含各列最新宽度
+     */
+    const handleColumnResizeChange = (context: { columnsWidth: Record<string, number> }) => {
+      emit('column-resize-change', context?.columnsWidth || {});
+    };
+
     const handlePageChange = (pageInfo: IPaginationInfo) => {
       emit('page-change', pageInfo);
     };
@@ -398,7 +456,7 @@ export default defineComponent({
      * 处理表格过滤变化
      * @param filters - 过滤对象
      */
-    const handleFilterChange = (filters: Record<string, string>) => {
+    const handleFilterChange = (filters: Record<string, string | (string | number)[]>) => {
       emit('filter-change', filters);
     };
 
@@ -495,6 +553,7 @@ export default defineComponent({
             {/* @ts-ignore - TTable type definition issue */}
             <TTable
               bordered={props.bordered}
+              resizable={props.resizable}
               cellEmptyContent={'--'}
               columns={showColumns.value}
               data={props.data}
@@ -503,11 +562,13 @@ export default defineComponent({
               loading-props={{ indicator: false }}
               on-page-change={handlePageChange}
               pagination={props.pagination}
-              row-key='key'
+              row-key={props.rowKey}
               height={props.height}
+              maxHeight={props.maxHeight}
               rowHeight={props.rowHeight}
               scroll={{ type: 'lazy', bufferSize: 10 }}
               on-sort-change={sortChange}
+              on-column-resize-change={handleColumnResizeChange}
               on-filter-change={handleFilterChange}
               filterValue={props.filterValue}
               on-cell-click={handleCellClick}

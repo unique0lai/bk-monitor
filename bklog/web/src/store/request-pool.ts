@@ -32,7 +32,7 @@ class RequestPool {
   }
 
   getCancelToken(key: string) {
-    return new axios.CancelToken((c) => {
+    return new axios.CancelToken(c => {
       this.setCancelToken(key, c);
     });
   }
@@ -46,6 +46,11 @@ class RequestPool {
       this.cancelStore.get(key)?.();
       this.cancelStore.delete(key);
     }
+  }
+
+  cancelAll() {
+    this.cancelStore.forEach(cancel => cancel?.());
+    this.cancelStore.clear();
   }
 }
 

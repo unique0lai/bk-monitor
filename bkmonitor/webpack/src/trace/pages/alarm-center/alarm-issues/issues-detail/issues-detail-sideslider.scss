@@ -1,5 +1,6 @@
 .issues-detail-sidesSlider {
   .bk-sideslider-title {
+    overflow: hidden;
     padding-left: 8px;
 
     .time-range-date-picker {
@@ -14,6 +15,7 @@
   }
 
   .issues-detail-side-slider-content {
+    position: relative;
     height: calc(100vh - 52px);
   }
 }

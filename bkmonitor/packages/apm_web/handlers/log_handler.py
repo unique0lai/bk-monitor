@@ -8,29 +8,52 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
-import itertools
+import logging
 import time
 from collections import defaultdict
+from typing import TYPE_CHECKING, Any
 
-from apm_web.constants import DataStatus, ServiceRelationLogTypeChoices
+from django.conf import settings
+from django.core.cache import caches
+
+from apm_web.constants import ApmCacheKey, ServiceRelationLogTypeChoices
 from apm_web.handlers.host_handler import HostHandler
 from apm_web.models import LogServiceRelation
-from apm_web.topo.handle.relation.define import (
-    SourceDatasource,
-    SourceK8sPod,
-    SourceService,
-    SourceSystem,
-)
-from apm_web.topo.handle.relation.query import RelationQ
-from bkmonitor.utils.thread_backend import ThreadPool
 from bkmonitor.utils.cache import CacheType, using_cache
+from bkmonitor.utils.common_utils import deserialize_and_decompress
+from bkmonitor.utils.request import get_request_tenant_id
+from bkmonitor.utils.thread_backend import ThreadPool
 from constants.apm import FIVE_MIN_SECONDS
 from core.drf_resource import api
 
+if TYPE_CHECKING:
+    from apm_web.models import Application
 
-@using_cache(CacheType.APM(FIVE_MIN_SECONDS))
-def get_biz_index_sets_with_cache(bk_biz_id):
-    return api.log_search.search_index_set(bk_biz_id=bk_biz_id)
+logger = logging.getLogger("apm")
+
+
+def deserialize_service_related_log_indexes(cached_data: bytes) -> dict[str, list[dict[str, Any]]]:
+    """反序列化并校验服务关联日志索引缓存。"""
+    service_indexes: Any = deserialize_and_decompress(cached_data)
+    if not isinstance(service_indexes, dict):
+        raise TypeError("invalid service related log indexes cache structure")
+
+    for service_name, indexes in service_indexes.items():
+        if not isinstance(service_name, str) or not isinstance(indexes, list):
+            raise TypeError("invalid service related log indexes cache structure")
+
+        if any(not isinstance(index, dict) or index.get("index_set_id") is None for index in indexes):
+            raise TypeError("invalid service related log indexes cache structure")
+
+    return service_indexes
+
+
+@using_cache(
+    CacheType.APM(FIVE_MIN_SECONDS),
+    func_key_generator=lambda func: f"{func.__module__}.{func.__name__}:{get_request_tenant_id(peaceful=True)}",
+)
+def get_biz_index_sets_with_cache(bk_biz_id: int) -> list[dict[str, Any]]:
+    return api.log_search.search_index_set(bk_biz_id=bk_biz_id, bk_tenant_id=get_request_tenant_id(peaceful=True))
 
 
 class ServiceLogHandler:
@@ -44,89 +67,72 @@ class ServiceLogHandler:
 
     # ES 查询最大的服务数量
     SERVICE_MAX_SIZE = 1000
-    # 通过 unifyquery 接口关联日志索引集的最大数量
-    LOG_RELATION_BY_UNIFY_QUERY = 10
     # log 默认查询语句最大 value 数量
     LOG_DEFAULT_QUERY_CONDITION_MAX_SIZE = 20
 
-    ONE_HOUR_SECONDS = 3600
+    @staticmethod
+    def get_cached_k8s_related_indexes(bk_biz_id: int, app_name: str) -> dict[str, list[dict[str, Any]]]:
+        """读取后台发现的 K8S 日志关联关系。"""
+        if "redis" not in caches:
+            return {}
+
+        cache_key = ApmCacheKey.APP_SERVICE_K8S_RELATED_LOG_INDEXES_KEY.format(bk_biz_id=bk_biz_id, app_name=app_name)
+        try:
+            cached_data: bytes | None = caches["redis"].get(cache_key)
+            return deserialize_service_related_log_indexes(cached_data) if cached_data else {}
+        except Exception:  # noqa
+            logger.exception("[GET_CACHED_K8S_RELATED_INDEXES] cache read failed: %s-%s", bk_biz_id, app_name)
+            return {}
 
     @classmethod
-    def get_log_count_mapping(cls, bk_biz_id, app_name, start_time, end_time):
-        """获取所有服务的关联日志的数据量"""
+    def list_available_related_services(cls, app: "Application", service_names: list[str]) -> set[str]:
+        """按当前关联关系与后台索引状态快照，获取存在可用日志关联的服务。"""
+        all_service_names = set(service_names)
+        if not all_service_names or "redis" not in caches:
+            return set()
 
-        # Step1: 找到此应用所有服务关联的日志
-        service_mapping = defaultdict(dict)
-        relations = LogServiceRelation.get_relation_qs(bk_biz_id, app_name)
-        for i in relations:
-            if i.log_type == ServiceRelationLogTypeChoices.BK_LOG:
-                service_mapping[i.service_name][i.related_bk_biz_id] = {
-                    int(val) for val in (i.value_list + [i.value]) if val
+        index_services: defaultdict[tuple[int, str], set[str]] = defaultdict(set)
+        for relation in cls.get_log_relations(app.bk_biz_id, app.app_name, service_names, include_global=True):
+            related_services = all_service_names if relation.is_global else {relation.service_name}
+            for index_set_id in [*relation.value_list, relation.value]:
+                if index_set_id:
+                    index_services[(relation.related_bk_biz_id, str(index_set_id))].update(related_services)
+
+        service_indexes = cls.get_cached_k8s_related_indexes(app.bk_biz_id, app.app_name)
+        for service_name in all_service_names:
+            for index in service_indexes.get(service_name, []):
+                if index.get("bk_biz_id") is not None:
+                    index_services[(index["bk_biz_id"], str(index["index_set_id"]))].add(service_name)
+
+        if not index_services:
+            return set()
+
+        earliest_checked_at = time.time() - settings.APM_RELATED_LOG_INDEX_STATUS_CACHE_TTL
+        available_services: set[str] = set()
+        for bk_biz_id in {key[0] for key in index_services}:
+            cache_key = ApmCacheKey.APM_RELATED_LOG_INDEX_STATUS_KEY.format(
+                bk_tenant_id=app.bk_tenant_id, bk_biz_id=bk_biz_id
+            )
+            try:
+                snapshot = caches["redis"].get(cache_key)
+                if not snapshot or snapshot["checked_at"] <= earliest_checked_at:
+                    continue
+
+                available_index_ids = {
+                    str(index["index_set_id"]) for index in snapshot["indexes"] if index["available"] is True
                 }
-
-        # Step2: 查询业务的所有索引集 (避免每个 relation 都单独查询)
-        pool = ThreadPool()
-        futures = []
-        for i in service_mapping.values():
-            for related_biz_id in i.keys():
-                futures.append(pool.apply_async(get_biz_index_sets_with_cache, kwds={"bk_biz_id": related_biz_id}))
-        index_set = list(itertools.chain(*[i.get() for i in futures]))
-
-        # Step3: 根据 index_set_id 进行匹配
-        res = {}
-        for service_name, info in service_mapping.items():
-            info_index_set_ids = {item for value_set in info.values() for item in value_set}
-            index_info = next((i for i in index_set if i.get("index_set_id") in info_index_set_ids), None)
-            if index_info:
-                # tag_id == 4 为无数据 (bk_log 固定值)
-                if all(i.get("tag_id") != 4 for i in index_info.get("tags", [])):
-                    res[service_name] = DataStatus.NORMAL
-
-        # Step4: 对没有数据的服务进行自定义上报查询
-        log_datasource = cls.get_log_datasource(bk_biz_id, app_name)
-        if log_datasource:
-            table_id = log_datasource["result_table_id"].replace("-", "_").replace(".", "_")
-            futures = []
-            service_name_field_list = ["resource.service.name", "resource.server"]
-            for label in service_name_field_list:
-                futures.append(
-                    pool.apply_async(cls.get_label_values_in_table, args=(table_id, label, start_time, end_time))
+            except Exception:  # noqa
+                logger.exception(
+                    "[LIST_AVAILABLE_RELATED_SERVICES] snapshot read failed: bk_tenant_id=%s bk_biz_id=%s",
+                    app.bk_tenant_id,
+                    bk_biz_id,
                 )
-            has_data_service_list = list(itertools.chain(*[f.get() for f in futures]))
-            res.update({s: DataStatus.NORMAL for s in has_data_service_list})
+                continue
 
-        return res
+            for index_set_id in available_index_ids:
+                available_services.update(index_services.get((bk_biz_id, index_set_id), ()))
 
-    @classmethod
-    def get_label_values_in_table(cls, table_id, label, start_time, end_time) -> list:
-        response = api.log_search.es_query_dsl(
-            indices=f"{table_id}*",
-            body={
-                "size": 0,
-                "query": {
-                    "range": {
-                        "time": {
-                            "format": "epoch_second",
-                            "gte": start_time,
-                            "lte": end_time,
-                        }
-                    }
-                },
-                "aggs": {
-                    "service_names": {
-                        "terms": {
-                            "field": label,
-                        }
-                    }
-                },
-            },
-        )
-
-        ret = []
-        if response:
-            for svr in response.get("aggregations", {}).get("service_names", {}).get("buckets", []):
-                ret.append(svr["key"])
-        return ret
+        return available_services
 
     @classmethod
     def get_and_check_datasource_index_set_id(cls, bk_biz_id, app_name, full_indexes=None):
@@ -207,65 +213,31 @@ class ServiceLogHandler:
         )
 
     @classmethod
-    def list_indexes_by_relation(cls, bk_biz_id, app_name, service_name, start_time=None, end_time=None):
-        """
-        通过关联查询获取服务的 dataId 关联并拼接默认查询
-        """
+    def list_indexes_by_relation(
+        cls,
+        bk_biz_id: int,
+        app_name: str,
+        service_name: str | None,
+    ) -> list[dict[str, Any]]:
+        """从缓存获取服务关联的 K8S 日志索引集。"""
         if not service_name:
             return []
 
-        if not start_time or not end_time:
-            end_time = int(time.time())
-            start_time = end_time - cls.ONE_HOUR_SECONDS
+        return cls.get_cached_k8s_related_indexes(bk_biz_id, app_name).get(service_name, [])
 
-        datasource_infos = defaultdict(list)
-        data_ids = set()
-        paths = [(SourceK8sPod, (SourceDatasource, SourceK8sPod)), (SourceSystem, (SourceDatasource, SourceSystem))]
-        relation_qs = []
-        for path_item in paths:
-            relation_qs += RelationQ.generate_q(
-                bk_biz_id=bk_biz_id,
-                source_info=SourceService(
-                    apm_application_name=app_name,
-                    apm_service_name=service_name,
-                ),
-                target_type=SourceDatasource,
-                start_time=start_time,
-                end_time=end_time,
-                path_resource=[path_item[0]],
-            )
-        relations = RelationQ.query(relation_qs, fill_with_empty=True)
-        for index, r in enumerate(relations):
-            if not r:
-                continue
-            for n in r.nodes:
-                source_info = n.source_info.to_source_info()
-                bk_data_id = source_info.get("bk_data_id")
-                if bk_data_id and bk_data_id not in data_ids and len(data_ids) <= cls.LOG_RELATION_BY_UNIFY_QUERY:
-                    datasource_infos[paths[index][-1]].append(SourceDatasource(bk_data_id=bk_data_id))
-                    data_ids.add(bk_data_id)
-
-        if not datasource_infos:
-            return []
-
-        res = []
-        table_id_list = cls.list_tables_by_data_ids(list(data_ids))
-        full_indexes = get_biz_index_sets_with_cache(bk_biz_id=bk_biz_id)  # 这里也会返回业务下关联项目的索引集
-        for index in full_indexes:
-            indices = index.get("indices") or []
-            if indices and len(indices) == 1 and indices[0].get("result_table_id") in table_id_list:
-                res.append({"index_set_id": index["index_set_id"], "addition": []})
-        return res
-
-    @classmethod
-    def list_tables_by_data_ids(cls, data_ids: list[int | str]) -> list[str]:
-        """通过 data_id 列表获取对应的 result_table_id 列表"""
+    @staticmethod
+    def get_data_id_rt_map(data_ids: list[int]) -> dict[int, set[str]]:
+        """获取 data_id 与 result_table_id 的映射。"""
 
         # 这里直接从 metadata 查询，是为了解决跨业务关联的场景
         # data_id -> table_id -> index_set_id
         # 这里待 metadata 有相关接口后，需要改为走 api 形式查询，去掉模块之间的依赖
         from metadata import models
 
-        return list(
-            models.DataSourceResultTable.objects.filter(bk_data_id__in=data_ids).values_list("table_id", flat=True)
-        )
+        data_id_rt_map: defaultdict[int, set[str]] = defaultdict(set)
+        for data_id, result_table_id in models.DataSourceResultTable.objects.filter(  # pyright: ignore[reportAttributeAccessIssue]
+            bk_data_id__in=data_ids
+        ).values_list("bk_data_id", "table_id"):
+            data_id_rt_map[data_id].add(result_table_id)
+
+        return dict(data_id_rt_map)

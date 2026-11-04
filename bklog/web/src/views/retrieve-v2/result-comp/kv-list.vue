@@ -54,9 +54,9 @@
         >
           <div class="field-label">
             <span
-              v-if="hiddenFieldsSet.has(field)"
+              v-if="hiddenFieldsSet.has(field.field_name)"
+              v-bk-tooltips="{ content: $t('展示') }"
               class="field-eye-icon bklog-icon bklog-eye-slash"
-              v-bk-tooltips="{ content: $t('隐藏') }"
               @click="
                 e => {
                   e.stopPropagation();
@@ -66,8 +66,8 @@
             ></span>
             <span
               v-else
+              v-bk-tooltips="{ content: $t('隐藏') }"
               class="field-eye-icon bklog-icon bklog-eye"
-              v-bk-tooltips="{ content: $t('展示') }"
               @click="
                 e => {
                   e.stopPropagation();
@@ -76,15 +76,30 @@
               "
             ></span>
             <span
+              v-bk-tooltips="{ content: $t('复制') }"
+              class="field-copy-icon bklog-icon bklog-data-copy"
+              @click="
+                e => {
+                  e.stopPropagation();
+                  handleCopyFieldValue(field);
+                }
+              "
+            ></span>
+            <span
+              v-bk-tooltips="fieldTypePopover(field.field_name)"
               :style="{
                 backgroundColor: getFieldIconColor(field.field_type),
                 color: getFieldIconTextColor(field.field_type),
               }"
               class="field-type-icon mr5"
-              v-bk-tooltips="fieldTypePopover(field.field_name)"
               :class="getFieldIcon(field.field_name)"
             ></span>
-            <span class="field-text">{{ getFieldName(field) }}</span>
+            <!-- eslint-disable vue/no-v-html -- Raw field names are escaped before controlled highlight markup is added. -->
+            <span
+              class="field-text"
+              v-html="getHighlightedFieldNameHtml(field)"
+            ></span>
+            <!-- eslint-enable vue/no-v-html -->
           </div>
           <div class="field-value">
             <span
@@ -97,7 +112,8 @@
             </span>
             <JsonFormatter
               :fields="getFieldItem(field.field_name)"
-              :json-value="listData"
+              :json-value="getFieldValue(field)"
+              :render-meta="renderMeta"
               @menu-click="agrs => handleJsonSegmentClick(agrs, field.field_name)"
             ></JsonFormatter>
           </div>
@@ -107,7 +123,7 @@
           class="load-more-btn"
           @click="handleLoadMore"
         >
-          <span class='bklog-icon bklog-more'></span>
+          <span class="bklog-icon bklog-more"></span>
           <span>{{ $t('点击加载更多') }}</span>
         </div>
       </template>
@@ -117,14 +133,46 @@
 
 <script>
   // import { getTextPxWidth, TABLE_FOUNT_FAMILY } from '@/common/util';
+  import { copyMessage, getRowFieldValue } from '@/common/util';
   import JsonFormatter from '@/global/json-formatter.vue';
   import { getFieldNameByField } from '@/hooks/use-field-name';
   import tableRowDeepViewMixin from '@/mixins/table-row-deep-view-mixin';
+  import { retrieveRowCacheService } from '@/storage';
   import _escape from 'lodash/escape';
   import { mapGetters, mapState } from 'vuex';
 
   // import TextSegmentation from '../search-result-panel/log-result/text-segmentation';
   import { BK_LOG_STORAGE } from '@/store/store.type';
+  import RetrieveHelper, { RetrieveEvent } from '@/views/retrieve-helper';
+  import { buildHighlightHtml, pageHighlightState } from '@/views/retrieve-core/page-highlight';
+
+  const stripMarkTags = value =>
+    String(value)
+      .replace(/<mark>/gi, '')
+      .replace(/<\/mark>/gi, '');
+
+  const stripMarkFromCopyValue = value => {
+    if (typeof value === 'string') return stripMarkTags(value);
+    if (Array.isArray(value)) return value.map(item => stripMarkFromCopyValue(item));
+    if (value && Object.prototype.toString.call(value) === '[object Object]') {
+      return Object.keys(value).reduce((output, key) => {
+        output[key] = stripMarkFromCopyValue(value[key]);
+        return output;
+      }, {});
+    }
+    return value;
+  };
+
+  const stringifyCopyValue = value => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'bigint') return value.toString();
+    try {
+      return JSON.stringify(value, (_key, val) => (typeof val === 'bigint' ? val.toString() : val));
+    } catch {
+      return String(value);
+    }
+  };
 
   export default {
     components: {
@@ -133,6 +181,11 @@
     },
     mixins: [tableRowDeepViewMixin],
     inheritAttrs: false,
+    inject: {
+      handleRelatedTraceClick: {
+        default: null,
+      },
+    },
     props: {
       data: {
         type: Object,
@@ -163,6 +216,14 @@
         default: () => {},
       },
       searchKeyword: {
+        type: String,
+        default: '',
+      },
+      renderMeta: {
+        type: Object,
+        default: null,
+      },
+      rowKey: {
         type: String,
         default: '',
       },
@@ -204,6 +265,7 @@
         batchThreshold: 100, // 启用分批渲染的字段数量阈值（超过此值才分批处理）
         skeletonStartTime: null, // 骨架屏开始显示的时间
         skeletonMinDuration: 200, // 骨架屏最小显示时长（ms），避免闪烁
+        isMonitorApm: window.__IS_MONITOR_APM__,
       };
     },
     computed: {
@@ -216,6 +278,9 @@
         showFieldAlias: state => state.storage[BK_LOG_STORAGE.SHOW_FIELD_ALIAS],
         isAllowEmptyField: state => state.storage[BK_LOG_STORAGE.TABLE_ALLOW_EMPTY_FIELD],
       }),
+      pageHighlightVersion() {
+        return pageHighlightState.version;
+      },
       apmRelation() {
         return this.$store.state.indexSetFieldConfig.apm_relation;
       },
@@ -234,17 +299,30 @@
         }
         return map;
       },
+      /** 存在子字段的父路径集合，例如 meta.platform_tags.account_channel → meta / meta.platform_tags */
+      fieldsWithChildrenSet() {
+        const set = new Set();
+        const fields = this.totalFields || [];
+        for (let i = 0; i < fields.length; i++) {
+          const name = fields[i]?.field_name;
+          if (!name || name.indexOf('.') === -1) continue;
+          let idx = -1;
+          while ((idx = name.indexOf('.', idx + 1)) !== -1) {
+            set.add(name.slice(0, idx));
+          }
+        }
+        return set;
+      },
       fieldKeyMap() {
-        return this.totalFields
-          .filter(item => this.kvShowFieldsSet.has(item.field_name))
-          .map(el => el.field_name);
+        return this.totalFields.filter(item => this.kvShowFieldsSet.has(item.field_name)).map(el => el.field_name);
       },
 
       hiddenFields() {
-        return this.fieldList.filter(item => !this.visibleFields.some(visibleItem => item === visibleItem));
+        const visibleFieldNames = new Set(this.visibleFields.map(item => item.field_name));
+        return this.fieldList.filter(item => !visibleFieldNames.has(item.field_name));
       },
       hiddenFieldsSet() {
-        return new Set(this.hiddenFields);
+        return new Set(this.hiddenFields.map(item => item.field_name));
       },
       filedSettingConfigID() {
         // 当前索引集的显示字段ID
@@ -278,25 +356,25 @@
     mounted() {
       // 根据预估字段数量决定处理策略
       const estimatedFieldCount = this.kvShowFieldsList ? this.kvShowFieldsList.length : this.totalFields.length;
-      
+
       if (estimatedFieldCount < this.batchThreshold) {
         // 字段数量 < 100，数据量小，直接同步处理，避免异步导致的闪烁
         this.isCalculating = false; // 不显示骨架屏
         // 直接同步执行计算和渲染
         this.showFieldListCache = this.calcShowFieldList();
         this.renderList = this.showFieldListCache.slice(0, this.initialRenderCount);
-        } else {
-          // 字段数量 >= 100，使用异步处理，避免阻塞主线程
-          // 记录骨架屏开始显示的时间
-          this.skeletonStartTime = Date.now();
-          // 先渲染容器和骨架屏，然后异步执行计算
-          // 使用 nextTick 确保 Vue 完成首次渲染
-          this.$nextTick(() => {
+      } else {
+        // 字段数量 >= 100，使用异步处理，避免阻塞主线程
+        // 记录骨架屏开始显示的时间
+        this.skeletonStartTime = Date.now();
+        // 先渲染容器和骨架屏，然后异步执行计算
+        // 使用 nextTick 确保 Vue 完成首次渲染
+        this.$nextTick(() => {
           // 使用双重异步确保真正不阻塞主线程
           // 第一层：setTimeout 确保脱离当前执行栈
           setTimeout(() => {
             // 第二层：requestIdleCallback 在浏览器空闲时执行（如果支持）
-            const scheduleCalculation = (callback) => {
+            const scheduleCalculation = callback => {
               if (typeof requestIdleCallback !== 'undefined') {
                 // 优先使用 requestIdleCallback，在浏览器空闲时执行
                 requestIdleCallback(callback, { timeout: 50 });
@@ -333,7 +411,7 @@
         const kvShowFieldsSet = this.kvShowFieldsSet;
         const emptyValues = ['--', '{}', '[]'];
         const totalFields = this.totalFields;
-        
+
         // 步骤1：快速过滤出候选字段
         const candidateFields = [];
         for (let i = 0; i < totalFields.length; i++) {
@@ -341,40 +419,43 @@
             candidateFields.push(totalFields[i]);
           }
         }
-        
-        // 如果允许空字段，直接返回候选字段列表
+
+        // 如果允许空字段，仍需隐藏可展开 Object 父字段，再按搜索关键字过滤
         if (this.isAllowEmptyField) {
-          let result = candidateFields;
-          // 根据搜索关键字过滤（不区分大小写）
-          if (this.searchKeyword) {
-            const keyword = this.searchKeyword.toLowerCase();
-            const filteredList = [];
-            for (let i = 0; i < candidateFields.length; i++) {
-              const item = candidateFields[i];
-              if (item.field_name.toLowerCase().includes(keyword)) {
-                filteredList.push(item);
-              }
+          const filteredList = [];
+          const keyword = this.searchKeyword ? this.searchKeyword.toLowerCase() : '';
+          for (let i = 0; i < candidateFields.length; i++) {
+            const item = candidateFields[i];
+            if (this.isExpandableObjectField(item.field_name)) {
+              continue;
             }
-            result = filteredList;
+            if (keyword && !item.field_name.toLowerCase().includes(keyword)) {
+              continue;
+            }
+            filteredList.push(item);
           }
-          return result;
+          return filteredList;
         }
-        
+
         // 步骤2：检查空值（需要调用 formatterStr）
         const list = [];
         const rowData = this.listData;
-        
         for (let i = 0; i < candidateFields.length; i++) {
           const item = candidateFields[i];
           const fieldName = item.field_name;
-          
+
+          // 可解析 Object 父字段直接隐藏，避免与子字段重复，也避免与空字段 -- 歧义
+          if (this.isExpandableObjectField(fieldName)) {
+            continue;
+          }
+
           // 性能优化：先快速检查字段是否为空，避免调用 formatterStr
           let shouldSkip = false;
-          
+
           if (fieldName.indexOf('.') === -1 && fieldName.indexOf('[') === -1) {
             // 简单字段：直接检查原始值
             const rawValue = rowData[fieldName];
-            
+
             // 快速检查：如果是明显的空值，直接跳过
             if (rawValue === null || rawValue === undefined || rawValue === '') {
               shouldSkip = true;
@@ -393,7 +474,7 @@
             if (firstDotIndex > 0) {
               const firstPart = fieldName.substring(0, firstDotIndex);
               const firstValue = rowData[firstPart];
-              
+
               // 如果第一层就是空值，直接跳过
               if (firstValue === null || firstValue === undefined || firstValue === '') {
                 shouldSkip = true;
@@ -424,14 +505,17 @@
                       }
                       // 如果成功访问到最终值，检查是否为空
                       if (shouldSkip === false && currentValue !== undefined) {
-                        if (currentValue === null || currentValue === '' || 
-                            (typeof currentValue === 'object' && 
-                             ((Array.isArray(currentValue) && currentValue.length === 0) ||
-                              (!Array.isArray(currentValue) && Object.keys(currentValue).length === 0)))) {
+                        if (
+                          currentValue === null ||
+                          currentValue === '' ||
+                          (typeof currentValue === 'object' &&
+                            ((Array.isArray(currentValue) && currentValue.length === 0) ||
+                              (!Array.isArray(currentValue) && Object.keys(currentValue).length === 0)))
+                        ) {
                           shouldSkip = true;
                         }
                       }
-                    } catch (e) {
+                    } catch {
                       // 访问失败，需要调用 formatterStr
                     }
                   }
@@ -439,11 +523,11 @@
               }
             }
           }
-          
+
           if (shouldSkip) {
             continue;
           }
-          
+
           // 使用缓存，避免重复计算
           let formattedValue;
           if (this.formattedValueCache.has(fieldName)) {
@@ -458,7 +542,7 @@
                 const pathParts = fieldName.split('.');
                 let currentValue = rowData;
                 let canAccess = true;
-                
+
                 for (let j = 0; j < pathParts.length && canAccess; j++) {
                   const part = pathParts[j];
                   if (currentValue === null || currentValue === undefined) {
@@ -491,31 +575,34 @@
                     break;
                   }
                 }
-                
+
                 // 如果成功访问到最终值，检查是否为空
                 if (canAccess && currentValue !== undefined) {
-                  if (currentValue === null || currentValue === '' || 
-                      (typeof currentValue === 'object' && 
-                       ((Array.isArray(currentValue) && currentValue.length === 0) ||
-                        (!Array.isArray(currentValue) && Object.keys(currentValue).length === 0)))) {
+                  if (
+                    currentValue === null ||
+                    currentValue === '' ||
+                    (typeof currentValue === 'object' &&
+                      ((Array.isArray(currentValue) && currentValue.length === 0) ||
+                        (!Array.isArray(currentValue) && Object.keys(currentValue).length === 0)))
+                  ) {
                     isDefinitelyEmpty = true;
                   }
                 }
-              } catch (e) {
+              } catch {
                 // 检查失败，需要调用 formatterStr
               }
             }
-            
+
             if (isDefinitelyEmpty) {
               formattedValue = '--';
               this.formattedValueCache.set(fieldName, formattedValue);
               continue; // 直接跳过，不加入列表
             }
-            
+
             formattedValue = this.formatterStr(this.data, fieldName);
             this.formattedValueCache.set(fieldName, formattedValue);
           }
-          
+
           if (!emptyValues.includes(formattedValue)) {
             list.push(item);
           }
@@ -543,13 +630,13 @@
           clearTimeout(this.batchProcessingTimer);
           this.batchProcessingTimer = null;
         }
-        
+
         // 根据预估字段数量决定处理策略
         const estimatedFieldCount = this.kvShowFieldsList ? this.kvShowFieldsList.length : this.totalFields.length;
-        
+
         this.renderCount = this.initialRenderCount; // 重置为首屏数量
         this.processedCount = 0; // 重置已处理数量
-        
+
         if (estimatedFieldCount < this.batchThreshold) {
           // 字段数量 < 100，数据量小，直接同步处理，避免异步导致的闪烁
           this.isCalculating = false; // 不显示骨架屏
@@ -563,7 +650,7 @@
           this.skeletonStartTime = Date.now();
           // 异步重新计算字段列表，使用 setTimeout 确保真正异步
           setTimeout(() => {
-            const scheduleCalculation = (callback) => {
+            const scheduleCalculation = callback => {
               if (typeof requestIdleCallback !== 'undefined') {
                 requestIdleCallback(callback, { timeout: 50 });
               } else {
@@ -582,7 +669,7 @@
       // 开始分批处理初始渲染
       startBatchProcessing() {
         const totalFields = this.showFieldListCache.length;
-        
+
         // 如果字段数量 <= 阈值，直接渲染，不需要分批处理
         if (totalFields <= this.batchThreshold) {
           this.renderList = this.showFieldListCache.slice(0, this.initialRenderCount);
@@ -592,7 +679,7 @@
           });
           return;
         }
-        
+
         // 字段数量 > 阈值，执行分批渲染逻辑
         this.processedCount = 0;
         // 处理第一批次，立即显示并停止骨架屏
@@ -602,13 +689,13 @@
       processBatch(isFirstBatch = false) {
         const targetCount = Math.min(this.initialRenderCount, this.showFieldListCache.length);
         const endIndex = Math.min(this.processedCount + this.batchSize, targetCount);
-        
+
         // 更新已处理的数量
         this.processedCount = endIndex;
-        
+
         // 更新渲染列表
         this.renderList = this.showFieldListCache.slice(0, endIndex);
-        
+
         // 如果是第一批次，立即显示并停止骨架屏
         if (isFirstBatch) {
           this.$nextTick(() => {
@@ -631,9 +718,12 @@
       continueBatchProcessing() {
         // 使用 requestIdleCallback 或 setTimeout 在空闲时处理下一批次
         if (typeof requestIdleCallback !== 'undefined') {
-          this.batchProcessingTimer = requestIdleCallback(() => {
-            this.processBatch(false);
-          }, { timeout: 50 });
+          this.batchProcessingTimer = requestIdleCallback(
+            () => {
+              this.processBatch(false);
+            },
+            { timeout: 50 },
+          );
         } else {
           this.batchProcessingTimer = setTimeout(() => {
             this.processBatch(false);
@@ -647,10 +737,10 @@
           if (callback) callback();
           return;
         }
-        
+
         const elapsed = Date.now() - this.skeletonStartTime;
         const remaining = Math.max(0, this.skeletonMinDuration - elapsed);
-        
+
         if (remaining > 0) {
           // 如果显示时间不足200ms，延迟隐藏
           setTimeout(() => {
@@ -675,14 +765,14 @@
       },
       formatterStr(row, field) {
         let result;
-        
+
         // 性能优化：对于简单字段（无嵌套），直接访问，避免调用 parseTableRowData
         // 这样可以显著提升性能，特别是当字段数量很大时
         if (field.indexOf('.') === -1 && field.indexOf('[') === -1) {
           // 简单字段：直接访问
           const rowData = this.listData;
           const value = rowData[field];
-          
+
           // 快速检查空值（与 parseTableRowData 的逻辑保持一致）
           if (value === null || value === undefined || value === '') {
             result = '--';
@@ -711,8 +801,62 @@
           const rowData = this.listData;
           result = this.tableRowDeepView(rowData, field, fieldType) ?? '--';
         }
-        
+
         return result;
+      },
+      /**
+       * 获取 KV 字段原始值（不做 Object -> JSON.stringify）
+       * 与 parseTableRowData 路径解析保持一致，保留 Object 类型用于判断是否隐藏父字段
+       */
+      getKvRawValue(fieldName) {
+        const row = this.listData;
+        if (!row || !fieldName) return undefined;
+
+        // 优先兼容扁平 dotted key（与 parseTableRowData 一致）
+        if (Object.prototype.hasOwnProperty.call(row, fieldName)) {
+          return row[fieldName];
+        }
+
+        if (fieldName.indexOf('.') === -1 && fieldName.indexOf('[') === -1) {
+          return row[fieldName];
+        }
+
+        const keyArr = fieldName.split('.');
+        let data = row;
+        for (let index = 0; index < keyArr.length; index++) {
+          if (data === undefined || data === null) break;
+          // 数组场景交给原有 tableRowDeepView 处理
+          if (Array.isArray(data)) return undefined;
+
+          const item = keyArr[index];
+          if (data?.[item] !== undefined && data?.[item] !== null) {
+            data = data[item];
+          } else {
+            const validKey = keyArr.slice(index).join('.');
+            data = data?.[validKey];
+            break;
+          }
+        }
+        return data;
+      },
+      /** VALUE 为可解析非空 Object（非 JSON 字符串、非数组）时，KV 中隐藏该父字段 */
+      isExpandableObjectValue(value) {
+        return value !== null && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+      },
+      /**
+       * 可展开 Object 父字段：有子字段时隐藏，避免与子字段重复。
+       * flattened 或无子字段的 Object 不隐藏，否则内容会整段丢失（如 body）。
+       */
+      isExpandableObjectField(fieldName) {
+        const fieldType = this.getFieldType(fieldName);
+        if (fieldType === 'flattened') return false;
+        if (!this.fieldsWithChildrenSet.has(fieldName)) return false;
+        return this.isExpandableObjectValue(this.getKvRawValue(fieldName));
+      },
+      getFieldValue(field) {
+        if (!field) return '--';
+
+        return getRowFieldValue(this.listData, field);
       },
       getFieldType(fieldName) {
         return this.fieldItemMapByName[fieldName]?.field_type || '';
@@ -742,12 +886,65 @@
           : '';
       },
       handleJsonSegmentClick({ isLink, option }, fieldName) {
+        if (this.isMonitorApm && isLink && option.operation === 'trace-view') {
+          const { app_name: appName, bk_biz_id: bkBizId } = this.apmRelation.extra;
+          this.handleRelatedTraceClick({
+            appName,
+            bkBizId,
+            traceId: option.value,
+          });
+          return;
+        }
         // 为了兼容旧的逻辑，先这么写吧
         // 找时间梳理下这块，写的太随意了
         const { operation, value, depth, isNestedField } = option;
         const operator = operation === 'not' ? 'is not' : operation;
         const field = this.totalFields.find(f => f.field_name === fieldName);
         this.$emit('value-click', operator, value, isLink, field, depth, isNestedField);
+      },
+
+      /**
+       * @desc 复制字段值（优先取 IndexedDB 原始数据，与整行复制逻辑一致）
+       * @param { Object } field 字段对象
+       */
+      isCopyableFieldValue(value) {
+        return value !== null && value !== undefined && value !== '' && value !== '--';
+      },
+      copyOriginFieldValue(originRow, field) {
+        if (!originRow) return false;
+        const originValue = getRowFieldValue(originRow, field);
+        if (!this.isCopyableFieldValue(originValue)) return false;
+        copyMessage(stringifyCopyValue(originValue));
+        return true;
+      },
+      async handleCopyFieldValue(field) {
+        if (!field) return;
+
+        const includeFields = [
+          field.field_name,
+          field.query_alias,
+          ...(field.is_virtual_alias_field ? field.source_field_names || [] : []),
+        ].filter(Boolean);
+
+        if (this.rowKey) {
+          const [memoryRow] = retrieveRowCacheService.getCopyRowsFromMemory([this.rowKey], { includeFields });
+          if (this.copyOriginFieldValue(memoryRow, field)) return;
+        }
+
+        const fallbackValue = stripMarkFromCopyValue(getRowFieldValue(this.listData, field));
+        if (this.isCopyableFieldValue(fallbackValue)) {
+          copyMessage(stringifyCopyValue(fallbackValue));
+          return;
+        }
+
+        try {
+          if (this.rowKey) {
+            const [originRow] = await retrieveRowCacheService.getCopyRows([this.rowKey], { includeFields });
+            if (this.copyOriginFieldValue(originRow, field)) return;
+          }
+        } catch (error) {
+          console.warn('[kv-list] copy origin field value failed', error);
+        }
       },
 
       /**
@@ -758,7 +955,7 @@
         const key = field.toLowerCase();
         // 提取最后一段字段名，仅用于trace检索的嵌套字段匹配
         const lastSegment = key.includes('.') ? key.split('.').pop() : key;
-        const trace_id = String(this.data[field])
+        const traceId = String(this.data[field])
           .replace(/<mark>/g, '')
           .replace(/<\/mark>/g, '');
         let path = '';
@@ -773,6 +970,14 @@
           if (this.apmRelation.is_active) {
             const { app_name: appName, bk_biz_id: bkBizId } = this.apmRelation.extra;
             path = `/?bizId=${bkBizId}#/trace/home?app_name=${appName}&search_type=accurate&trace_id=${traceIdValue}`;
+            if (this.isMonitorApm) {
+              this.handleRelatedTraceClick({
+                appName,
+                bkBizId,
+                traceId: traceIdValue,
+              });
+              return;
+            }
           } else {
             this.$bkMessage({
               theme: 'warning',
@@ -786,7 +991,7 @@
             case 'ip':
             case 'bk_host_id':
               {
-                const endStr = `${trace_id}${field === 'bk_host_id' && this.isHaveBkHostIDAndHaveValue ? '' : '-0'}`;
+                const endStr = `${traceId}${field === 'bk_host_id' && this.isHaveBkHostIDAndHaveValue ? '' : '-0'}`;
                 path = `/?bizId=${this.bkBizId}#/performance/detail/${endStr}`;
               }
               break;
@@ -802,7 +1007,7 @@
 
         if (path) {
           const url = `${window.__IS_MONITOR_COMPONENT__ ? location.origin : window.MONITOR_URL}${path}`;
-          window.open(url, '_blank');
+          window.open(url, '_blank', 'noopener,noreferrer');
         }
       },
       /**
@@ -831,7 +1036,7 @@
               pre[curKey.toLowerCase()] = curVal;
               return pre;
             }, {});
-            return !!lowerKeyData[key] ? this.$t('主机') : null; // 判断ip和serverIp是否有值 无值则不显示主机
+            return lowerKeyData[key] ? this.$t('主机') : null; // 判断ip和serverIp是否有值 无值则不显示主机
           }
           // 容器
           case 'container_id':
@@ -861,6 +1066,11 @@
       getFieldName(field) {
         return getFieldNameByField(field, this.$store);
       },
+      /** 展开面板字段 KEY 同样应用页面高亮 */
+      getHighlightedFieldNameHtml(field) {
+        void this.pageHighlightVersion;
+        return buildHighlightHtml({ text: String(this.getFieldName(field) ?? '') });
+      },
       // 显示或隐藏字段
       handleShowOrHiddenItem(visible, field) {
         const displayFields = [];
@@ -870,12 +1080,13 @@
           }
         });
 
-        if (visible) {
+        if (visible && !displayFields.includes(field.field_name)) {
           displayFields.push(field.field_name);
         }
         this.$store.dispatch('userFieldConfigChange', { displayFields }).then(() => {
-          this.$store.commit('resetVisibleFields', displayFields);
-          this.$store.commit('updateIsSetDefaultTableColumn');
+          this.$store.commit('resetVisibleFields', { displayFieldNames: displayFields, version: 'v2' });
+          this.$store.commit('updateIsSetDefaultTableColumn', false);
+          RetrieveHelper.fire(RetrieveEvent.VISIBLE_FIELD_COLUMN_LAYOUT_CHANGE);
         });
       },
     },
@@ -885,10 +1096,20 @@
 <style lang="scss" scoped>
   /* stylelint-disable no-descending-specificity */
   .kv-list-wrapper {
-    max-height: 50vh;
+    max-height: 100vh;
     overflow-y: auto;
     font-family: var(--table-fount-family);
     font-size: var(--table-fount-size);
+
+    @keyframes shimmer {
+      0% {
+        background-position: 200% 0;
+      }
+
+      100% {
+        background-position: -200% 0;
+      }
+    }
 
     .log-item:nth-child(even) {
       background-color: #f5f7fa;
@@ -910,6 +1131,7 @@
         align-items: flex-start;
         color: #16171a;
         word-break: break-all;
+
         :deep(.valid-text) {
           &:hover {
             text-decoration: underline; /* 悬停时添加下划线 */
@@ -923,20 +1145,37 @@
         flex-shrink: 0;
         flex-wrap: nowrap;
         align-items: stretch;
+        align-self: flex-start;
+        width: 300px;
         height: 100%;
         margin: 5px 0;
         margin-right: 18px;
-        align-self: flex-start;
-        width: 300px;
 
         .field-eye-icon {
           display: inline-flex;
           align-items: center;
           justify-content: center;
           width: 12px;
-          margin-right: 8px;
+          margin-right: 4px;
           font-size: 12px;
           color: #4d4f56;
+          cursor: pointer;
+          border-radius: 2px;
+
+          &:hover {
+            color: #3a84ff;
+          }
+        }
+
+        .field-copy-icon {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 12px;
+          margin-right: 4px;
+          font-size: 12px;
+          color: #4d4f56;
+          cursor: pointer;
           border-radius: 2px;
 
           &:hover {
@@ -961,10 +1200,15 @@
           display: block;
           width: auto;
           overflow: hidden;
-          font-family: Roboto-Regular;
+          font-family: Roboto-Regular, sans-serif;
           color: #313238;
           word-break: normal;
           word-wrap: break-word;
+
+          :deep(mark.page-highlight) {
+            padding: 0;
+            border-radius: 2px;
+          }
         }
 
         :deep(.bklog-ext) {
@@ -996,11 +1240,11 @@
     .load-more-btn {
       display: flex;
       align-items: center;
-      color: #3a84ff;
       margin-top: 8px;
       margin-left: 4px;
-      cursor: pointer;
       font-size: 12px;
+      color: #3a84ff;
+      cursor: pointer;
 
       span {
         font-size: 12px;
@@ -1045,11 +1289,11 @@
           flex-shrink: 0;
           flex-wrap: nowrap;
           align-items: center;
+          align-self: flex-start;
+          width: 300px;
           height: 100%;
           margin: 5px 0;
           margin-right: 18px;
-          align-self: flex-start;
-          width: 300px;
 
           // 模拟眼睛图标
           .skeleton-icon {
@@ -1062,42 +1306,42 @@
 
           // 模拟字段类型图标
           &::before {
-            content: '';
             display: inline-block;
             width: 16px;
             min-width: 16px;
             height: 16px;
             margin-right: 5px;
-            border-radius: 2px;
+            content: '';
             background: linear-gradient(90deg, #f0f2f5 25%, #e6e9ed 50%, #f0f2f5 70%);
             background-size: 400% 100%;
+            border-radius: 2px;
             animation: shimmer 1.8s infinite linear;
           }
 
           // 模拟字段名称文本
           .skeleton-text {
             flex: 1;
-            height: 14px;
             min-width: 80px;
             max-width: 200px;
+            height: 14px;
             border-radius: 2px;
           }
         }
 
         .skeleton-field-value {
           display: flex;
-          align-items: flex-start;
           flex: 1;
+          align-items: flex-start;
           min-width: 0;
           color: #16171a;
           word-break: break-all;
 
           // 模拟字段值
           .skeleton-value {
-            height: 14px;
             width: 100%;
             min-width: 100px;
             max-width: 500px;
+            height: 14px;
             border-radius: 2px;
           }
         }
@@ -1107,15 +1351,6 @@
           background-size: 400% 100%;
           animation: shimmer 1.8s infinite linear;
         }
-      }
-    }
-
-    @keyframes shimmer {
-      0% {
-        background-position: 200% 0;
-      }
-      100% {
-        background-position: -200% 0;
       }
     }
   }

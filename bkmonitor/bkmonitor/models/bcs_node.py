@@ -8,7 +8,6 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 
-import itertools
 import logging
 import operator
 from functools import reduce
@@ -82,12 +81,22 @@ class BCSNodeManager(BCSBaseManager):
         if not node_list:
             return None
         # ipv6 的 instance 的格式形如：[x:x:x:x:x:x:x:x]:port
-        ip_list = [f"\\\\[{node.ip}\\\\]:" if is_v6(node.ip) else f"{node.ip}:" for node in node_list if node.ip]
+        # 输出拼入双引号 PromQL 字符串字面量内的 instance=~""，正则转义的反斜杠须成对
+        # （文本 \\. / \\[，字符串解码回正则后即 \. / \[）：
+        # IPv4 的 . 不转义会被正则解释为任意字符产生误匹配；单写 \. 则被 PromQL 解析
+        # 报 unknown escape sequence。IP 值域仅含数字/点/冒号，点号替换即完备转义，
+        # 与 monitor_web 侧 escape_promql_regex 的双层转义语义一致。
+        ip_list = [
+            f"\\\\[{node.ip}\\\\]:" if is_v6(node.ip) else node.ip.replace(".", "\\\\.") + ":"
+            for node in node_list
+            if node.ip
+        ]
         instance = "^({})".format("|".join(ip_list))
         return instance
 
 
 class BCSNode(BCSBase, BCSBaseUsageResources):
+    SYNC_IDENTITY_FIELDS = ("bcs_cluster_id", "name")
     name = models.CharField(max_length=128)
     roles = models.CharField(max_length=128, null=True)
     cloud_id = models.CharField(max_length=32)
@@ -303,21 +312,20 @@ class BCSNode(BCSBase, BCSBaseUsageResources):
         Returns:
             BCSNode列表
         """
-        bulk_request_params = [
-            {"bcs_cluster_id": bcs_cluster_id, "bk_tenant_id": bk_tenant_id}
-            for bcs_cluster_id, (bk_tenant_id, _) in params.items()
-        ]
-        api_nodes = api.kubernetes.fetch_k8s_node_list_by_cluster.bulk_request(
-            bulk_request_params, ignore_exceptions=True
-        )
+        from api.kubernetes.default import iter_k8s_nodes_for_sync
+
         # 获得云区域ID
         bcs_cluster_id_list = list(params.keys())
         cloud_info_list = api.kubernetes.fetch_k8s_cloud_id_by_cluster({"bcs_cluster_ids": bcs_cluster_id_list})
         cloud_id_map = {
             cloud_info["bcs_cluster_id"]: cloud_info["bk_cloud_id"] for cloud_info in cloud_info_list if cloud_info
         }
-        nodes = []
-        for n in itertools.chain.from_iterable(item for item in api_nodes if item):
+        api_nodes = (
+            node
+            for cluster_id, (tenant_id, _) in params.items()
+            for node in iter_k8s_nodes_for_sync(tenant_id, cluster_id)
+        )
+        for n in api_nodes:
             bcs_cluster_id = n.get("bcs_cluster_id")
             bk_biz_id = params[bcs_cluster_id][1]
             bcs_node = BCSNode()
@@ -342,9 +350,7 @@ class BCSNode(BCSBase, BCSBaseUsageResources):
             bcs_node.unique_hash = bcs_node.get_unique_hash()
 
             bcs_node.api_labels = n.get("labels", {})
-            nodes.append(bcs_node)
-
-        return nodes
+            yield bcs_node
 
     def render_name(self, bk_biz_id, render_type="list"):
         if render_type == "list":

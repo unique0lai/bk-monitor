@@ -33,17 +33,51 @@
         v-bk-tooltips="queueStatus ? $t('导出') : undefined">
         <span class="icon bklog-icon bklog-xiazai"></span>
       </div> -->
-    <div
-      :class="{ 'operation-icon': true, 'disabled-icon': !queueStatus }"
-      data-test-id="fieldForm_div_exportData"
-      @mouseenter="handleShowAlarmPopover"
+    <BklogPopover
+      ref="downloadProgressPopover"
+      :key="displayTasks.length >= 1 ? 'popover-active' : 'popover-inactive'"
+      :trigger="displayTasks.length >= 1 ? 'hover' : 'manual'"
+      :options="{ placement: 'bottom', arrow: true }"
+      content-class="download-progress-popover"
     >
-      <span
-        class="icon bklog-icon bklog-download"
-        style="font-size: 16px"
-      ></span>
-    </div>
+      <bk-badge
+        :visible="failedTaskCount > 0"
+        :val="failedTaskCount"
+        theme="danger"
+        position="top-right"
+      >
+        <div
+          :class="{ 'operation-icon': true, 'disabled-icon': !queueStatus }"
+          data-test-id="fieldForm_div_exportData"
+          @click="exportLog"
+        >
+          <span
+            class="icon bklog-icon bklog-download"
+            style="font-size: 16px"
+          ></span>
+          <div
+            v-if="totalProgressPercent > 0"
+            class="progress-mask"
+            :style="{ '--progress': totalProgressPercent + '%' }"
+          ></div>
+        </div>
+      </bk-badge>
+      <template #content>
+        <div
+          class="download-progress-content"
+          @click="handleShowHistoryExport"
+        >
+          <TaskItem
+            v-for="task in displayTasks"
+            :key="getExportTaskKey(task)"
+            :item="task"
+            @retry-export="handleRetryExport"
+          />
+        </div>
+      </template>
+    </BklogPopover>
 
+    <!-- 原downloadTips选项弹窗已移除，点击下载按钮直接打开下载日志弹窗
     <div v-show="false">
       <div
         ref="downloadTips"
@@ -53,29 +87,54 @@
         <span @click="downloadTable">{{ $t('下载历史') }}</span>
       </div>
     </div>
+    -->
 
     <export-history
       :index-set-list="indexSetList"
       :show-history-export="showHistoryExport"
+      :tracked-tasks="trackedTasks"
       @handle-close-dialog="handleCloseDialog"
+      @refresh-current-tasks="fetchCurrentTasks(true)"
+      @sync-tracked-tasks="syncTrackedTasks"
     />
 
     <!-- 导出弹窗提示 -->
     <bk-dialog
-      ext-cls="async-export-dialog"
       v-model="isShowExportDialog"
+      ext-cls="async-export-dialog"
       :mask-close="false"
       :ok-text="$t('下载')"
-      :title="$t('日志下载')"
       :width="640"
       header-position="left"
       theme="primary"
       @after-leave="closeExportDialog"
       @confirm="handleClickSubmit"
     >
+      <template #header>
+        <div class="dialog-header-custom">
+          <span>{{ $t('下载日志') }}</span>
+          <span
+            class="view-history-btn"
+            @click="handleViewDownloadHistory"
+            >{{ $t('查看下载历史') }}</span
+          >
+          <div
+            v-if="totalProgressPercent > 0"
+            class="circular-progress"
+            :style="{ '--progress': totalProgressPercent + '%' }"
+          ></div>
+          <div
+            v-if="failedTaskCount > 0"
+            class="failed-task-tip"
+          >
+            <span class="failed-task-count">{{ failedTaskCount }}</span>
+            <span class="failed-task-text">{{ $t('存在下载失败') }}</span>
+          </div>
+        </div>
+      </template>
       <div
-        class="export-container"
         v-bkloading="{ isLoading: exportLoading }"
+        class="export-container"
       >
         <div class="log-num-container">
           <div class="num-box">
@@ -90,8 +149,8 @@
         <div class="filed-select-box">
           <span class="middle-title">{{ $t('下载模式') }}</span>
           <bk-radio-group
-            class="filed-radio-box"
             v-model="downloadType"
+            class="filed-radio-box"
           >
             <bk-radio
               v-for="[key, val] in Object.entries(downloadTypeRadioMap)"
@@ -112,13 +171,13 @@
           </span>
         </div>
         <div
-          class="filed-select-box"
           v-if="downloadType !== 'quick'"
+          class="filed-select-box"
         >
           <span class="middle-title">{{ $t('下载范围') }}</span>
           <bk-radio-group
-            class="filed-radio-box"
             v-model="selectFiledType"
+            class="filed-radio-box"
           >
             <bk-radio
               v-for="[key, val] in Object.entries(radioMap)"
@@ -169,8 +228,8 @@
         >
           <span class="middle-title">{{ $t('日志类型') }}</span>
           <bk-radio-group
-            class="desensitize-radio-box"
             v-model="desensitizeRadioType"
+            class="desensitize-radio-box"
           >
             <bk-radio
               v-for="[key, val] in Object.entries(logTypeMap)"
@@ -187,16 +246,41 @@
 </template>
 
 <script>
+  import axios from 'axios';
   import { blobDownload } from '@/common/util';
   import { mapGetters, mapState } from 'vuex';
+  import { isFeatureToggleOn } from '@/hooks/use-feature-toggle';
   import useFieldNameHook from '@/hooks/use-field-name';
   import exportHistory from './export-history';
   import { axiosInstance } from '@/api';
   import { BK_LOG_STORAGE } from '@/store/store.type';
+  import { getEffectiveSearchTotal } from '@/storage/utils/normalize-search-total';
+  import BklogPopover from '@/components/bklog-popover';
+  import TaskItem from './TaskItem';
+  import {
+    buildExportRetryRequest,
+    EXPORT_SUBMITTED_MESSAGE,
+    getExportDownloadFileName,
+    getExportTaskKey,
+    submitExportWithSortConfirmation,
+  } from './download/exportTask';
+  import { calculateProgressPercent } from '@/views/retrieve-v2/result-comp/download/downloadProgress';
+  import {
+    DOWNLOAD_DATA_DELAY,
+    DOWNLOAD_POLLING_INTERVAL,
+    DOWNLOAD_RECENT_DAYS,
+    MILLISECONDS_PER_DAY,
+  } from '@/views/retrieve-v2/result-comp/download/constants';
+
+  // 需要轮询的状态列表
+  const POLLING_STATUS = ['download_log', 'export_package', 'export_upload', null];
+  const CURRENT_TASK_PAGE_SIZE = 10;
 
   export default {
     components: {
       exportHistory,
+      BklogPopover,
+      TaskItem,
     },
     inheritAttrs: false,
     props: {
@@ -246,18 +330,6 @@
           specify: this.$t('指定字段'),
         },
         downloadType: 'all',
-        downloadTypeRadioMap: {
-          all: this.$t('全文下载'),
-          quick: this.$t('快速下载(提速100%+)'),
-          sampling: this.$t('取样下载(前1万条)'),
-        },
-        typeTipsMap: {
-          quick: this.$t(
-            '该模式下，仅下载您上报的无序日志原文，您可以通过日志时间进行本地排序；日志无法包含平台补充字段：如集群名、模块名等信息。该模式的日志导出上限为500万条',
-          ),
-          all: this.$t('该模式下，下载的日志有序，可包含平台补充字段，但下载时间较长。该模式的日志导出上限为200万条'),
-          sampling: '',
-        },
         timeCalculateMap: {
           all: 200000,
           quick: 400000,
@@ -280,21 +352,33 @@
         ],
         modeHintMap: {},
         // queueStatus: true
+        exportListData: [], // 当前索引集/采集项的下载任务
+        trackedTasks: {}, // 曾符合悬浮窗展示规则的任务，保留终态供历史分页同步
+        exportPollingTimer: null, // 当前任务轮询定时器
+        currentTaskCancelExecutor: null,
+        isComponentUnmounted: false, // 组件是否已卸载
+        popoverHoverTimer: null, // Popover 悬浮延迟隐藏定时器
+        pendingTaskStatus: {}, // 进行中任务状态记录 { [engine:id]: status }
+        failedTaskIds: [],
+        failedTaskTimer: null, // 失败任务定时器
       };
     },
     computed: {
       ...mapState({
         totalCount: state => {
-          if (state.searchTotal > 0) {
-            return state.searchTotal;
+          const effectiveTotal = getEffectiveSearchTotal(state);
+          if (effectiveTotal > 0) {
+            return effectiveTotal;
           }
 
           return state.retrieve.trendDataCount;
         },
         queueStatus: state => state.retrieve.isTotalCountLoaded,
-        totalFields: state => state.indexFieldInfo.fields ?? [],
+        totalFields: (_state, getters) => getters.filteredFieldList,
         visibleFields: state => state.visibleFields ?? [],
         showFieldAlias: state => state.storage[BK_LOG_STORAGE.SHOW_FIELD_ALIAS],
+        retrieveType: state => state.indexItem?.retrieve_type,
+        isLoading: state => state.indexSetQueryResult?.is_loading,
       }),
       ...mapGetters({
         bkBizId: 'bkBizId',
@@ -303,6 +387,33 @@
         unionIndexList: 'unionIndexList',
         isUnionSearch: 'isUnionSearch',
       }),
+      isShardedAsyncExportEnabled() {
+        return isFeatureToggleOn('feature_async_export_sharded', this.bkBizId);
+      },
+      typeTipsMap() {
+        return {
+          quick: this.$t(
+            '该模式下，仅下载您上报的无序日志原文，您可以通过日志时间进行本地排序；日志无法包含平台补充字段：如集群名、模块名等信息。该模式的日志导出上限为500万条',
+          ),
+          all: this.isShardedAsyncExportEnabled
+            ? this.$t('该模式下，下载的日志有序，可包含平台补充字段，但下载时间较长。')
+            : this.$t('该模式下，下载的日志有序，可包含平台补充字段，但下载时间较长。该模式的日志导出上限为200万条'),
+          sampling: '',
+        };
+      },
+      downloadTypeRadioMap() {
+        if (this.isShardedAsyncExportEnabled) {
+          return {
+            all: this.$t('全文下载'),
+            sampling: this.$t('取样下载(前1万条)'),
+          };
+        }
+        return {
+          all: this.$t('全文下载'),
+          quick: this.$t('快速下载(提速100%+)'),
+          sampling: this.$t('取样下载(前1万条)'),
+        };
+      },
       sizDownload() {
         if (this.downloadType === 'sampling') return '< 1';
         return Math.ceil(this.totalCount / this.timeCalculateMap[this.downloadType]);
@@ -314,45 +425,149 @@
         return [];
       },
       routerIndexSet() {
-        return window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$route.params.indexId;
+        return window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$store.state.indexId;
+      },
+      isScene() {
+        return this.$store.getters.isSceneMode;
+      },
+      /** 当前显示的单个下载中任务（最先下载的任务），优先取 download_log 类型 */
+      activeDownloadingTask() {
+        const tasks = this.displayTasks;
+        // 优先查找 download_log 类型的任务
+        const downloadLogTask = tasks.find(row => row.export_type === 'download_log');
+        if (downloadLogTask) return downloadLogTask;
+        // 否则返回第一个任务
+        return tasks[0] || null;
+      },
+      /** 当前下载中任务的进度百分比 */
+      totalProgressPercent() {
+        const task = this.activeDownloadingTask;
+        if (!task) return 0;
+        const total = task.export_total_count || 0;
+        if (total <= 0) return 0;
+        return calculateProgressPercent(task.exported_count || 0, total);
+      },
+      /** 需要显示的任务列表（下载中/未启动任务 + 失败任务） */
+      displayTasks() {
+        return this.exportListData.filter(row => this.shouldDisplayTask(row)).reverse();
+      },
+      /** 失败任务数量 */
+      failedTaskCount() {
+        return this.failedTaskIds.length;
       },
     },
     watch: {
-      totalCount(val) {
-        if (val < 10000) {
+      totalCount() {
+        if (!this.isShardedAsyncExportEnabled) {
+          this.resetDownloadType();
+        }
+      },
+      bkBizId() {
+        this.resetDownloadType();
+      },
+      routerIndexSet: {
+        immediate: true,
+        handler(newVal) {
+          if (newVal) {
+            this.resetComponentState();
+          }
+        },
+      },
+      // 联合查询索引集组变化时重置状态
+      unionIndexList: {
+        handler(newVal) {
+          if (this.isUnionSearch && newVal?.length) {
+            this.resetComponentState();
+          }
+        },
+        immediate: true,
+      },
+      retrieveType(newVal, oldVal) {
+        if (oldVal === 'scene' && newVal !== 'scene') {
+          this.resetComponentState();
+        }
+      },
+      isLoading(newVal, oldVal) {
+        if (this.isScene && oldVal === true && newVal === false) {
+          this.resetComponentState();
+        }
+      },
+      displayTasks() {
+        // 当 displayTasks 为空时，手动关闭 popover
+        if (this.displayTasks.length === 0 && this.$refs.downloadProgressPopover) {
+          this.$refs.downloadProgressPopover.hide();
+        }
+      },
+    },
+
+    beforeDestroy() {
+      // 设置组件卸载标志位
+      this.isComponentUnmounted = true;
+      // 清除轮询定时器和未完成的当前任务请求
+      this.stopStatusPolling();
+      this.cancelCurrentTaskRequest();
+      // 清除 Popover 悬浮定时器
+      clearTimeout(this.popoverHoverTimer);
+      // 清除失败任务定时器
+      this.clearFailedTaskTimer();
+    },
+    methods: {
+      getExportTaskKey,
+      shouldDisplayTask(task) {
+        const currentUser = this.$store.state.userMeta?.username || '';
+        if (task.export_created_by !== currentUser) return false;
+        if (task.export_status === 'failed') {
+          return this.failedTaskIds.includes(getExportTaskKey(task));
+        }
+        return POLLING_STATUS.includes(task.export_status);
+      },
+      resetDownloadType() {
+        if (this.isShardedAsyncExportEnabled) {
+          this.downloadType = 'all';
+        } else if (this.totalCount < 10000) {
           this.downloadType = 'sampling';
-        } else if (val < 2000000) {
+        } else if (this.totalCount < 2000000) {
           this.downloadType = 'all';
         } else {
           this.downloadType = 'quick';
         }
       },
-    },
-    beforeUnmount() {
-      this.popoverInstance = null;
-    },
-    methods: {
-      handleShowAlarmPopover(e) {
-        if (this.popoverInstance || !this.queueStatus) return;
-        this.popoverInstance?.hide();
-        this.popoverInstance?.destroyed();
-        this.popoverInstance = null;
-        this.popoverInstance = this.$bkPopover(e.target, {
-          content: this.$refs.downloadTips,
-          trigger: 'mouseenter',
-          placement: 'top',
-          theme: 'light',
-          offset: '0, -1',
-          interactive: true,
-          hideOnClick: false,
-          extCls: 'download-box',
-          arrow: true,
-        });
-        this.popoverInstance?.show();
+      // 原handleShowAlarmPopover方法已移除，点击下载按钮直接打开下载日志弹窗
+      // handleShowAlarmPopover(e) {
+      //   if (this.popoverInstance || !this.queueStatus) return;
+      //   this.popoverInstance?.hide();
+      //   this.popoverInstance?.destroyed();
+      //   this.popoverInstance = null;
+      //   this.popoverInstance = this.$bkPopover(e.target, {
+      //     content: this.$refs.downloadTips,
+      //     trigger: 'mouseenter',
+      //     placement: 'top',
+      //     theme: 'light',
+      //     offset: '0, -1',
+      //     interactive: true,
+      //     hideOnClick: false,
+      //     extCls: 'download-box',
+      //     arrow: true,
+      //   });
+      //   this.popoverInstance?.show();
+      // },
+      /**
+       * 重置组件状态：清空进行中任务记录、失败任务定时器和记录，重新初始化数据
+       */
+      resetComponentState() {
+        this.stopStatusPolling();
+        // 清空进行中任务状态记录
+        this.pendingTaskStatus = {};
+        this.trackedTasks = {};
+        this.exportListData = [];
+        // 清空失败任务定时器和记录
+        this.clearFailedTaskTimer();
+        this.failedTaskIds = [];
+        // 重新初始化当前范围任务
+        this.fetchCurrentTasks();
       },
       exportLog() {
         if (!this.queueStatus) return;
-        this.popoverInstance.hide(0);
         // 导出数据为空
         if (!this.totalCount) {
           const infoDialog = this.$bkInfo({
@@ -366,11 +581,19 @@
         }
         this.isShowExportDialog = true;
       },
+      handleViewDownloadHistory() {
+        // 关闭当前下载日志弹窗
+        this.isShowExportDialog = false;
+        // 打开下载历史弹窗
+        this.showHistoryExport = true;
+      },
       handleClickSubmit() {
+        if (this.exportLoading) return;
         if (this.downloadType === 'quick') {
           this.quickDownload();
         } else if (this.downloadType === 'all') {
           this.downloadAsync();
+          return;
         } else {
           this.openDownloadUrl();
         }
@@ -379,9 +602,14 @@
       quickDownload() {
         const { timezone, ...rest } = this.retrieveParams;
         const params = Object.assign(rest, { begin: 0, bk_biz_id: this.bkBizId });
-        const downRequestUrl = this.isUnionSearch
-          ? `/search/index_set/union_async_export/`
-          : `/search/index_set/${this.routerIndexSet}/quick_export/`;
+        let downRequestUrl;
+        if (this.isScene) {
+          downRequestUrl = '/search/scene/export/quick/';
+        } else if (this.isUnionSearch) {
+          downRequestUrl = `/search/index_set/union_async_export/`;
+        } else {
+          downRequestUrl = `/search/index_set/${this.routerIndexSet}/quick_export/`;
+        }
         const data = {
           ...params,
           size: this.totalCount,
@@ -410,8 +638,9 @@
               this.$bkMessage({
                 theme: 'success',
                 ellipsisLine: 2,
-                message: this.$t('任务提交成功，下载完成将会收到邮件通知。可前往下载历史查看下载状态'),
+                message: this.$t(EXPORT_SUBMITTED_MESSAGE),
               });
+              this.fetchCurrentTasks(true);
             } else {
               this.$bkMessage({
                 theme: 'error',
@@ -422,20 +651,20 @@
           })
           .catch(err => {
             console.log(err);
-          })
-          .finally(() => {
-            this.isShowExportDialog = false;
-            this.selectFiledList = [];
           });
       },
-      openDownloadUrl() {
+      async openDownloadUrl() {
         const { timezone, ...rest } = this.retrieveParams;
         const params = Object.assign(rest, { begin: 0, bk_biz_id: this.bkBizId });
-        let downRequestUrl = `/search/index_set/${this.routerIndexSet}/export/`;
-        if (this.isUnionSearch) {
+        let downRequestUrl;
+        if (this.isScene) {
+          downRequestUrl = '/search/scene/export/sample/';
+        } else if (this.isUnionSearch) {
           // 判断是否是联合查询 如果是 则加参数
           downRequestUrl = '/search/index_set/union_search/export/';
           Object.assign(params, { index_set_ids: this.unionIndexList });
+        } else {
+          downRequestUrl = `/search/index_set/${this.routerIndexSet}/export/`;
         }
         const data = {
           ...params,
@@ -446,31 +675,29 @@
           file_type: this.documentType,
         };
         axiosInstance
-          .post(downRequestUrl, data)
+          .post(downRequestUrl, data, {
+            responseType: 'blob',
+          })
           .then(res => {
-            if (typeof res !== 'string') {
-              this.$bkMessage({
-                theme: 'error',
-                message: this.$t('导出失败'),
-              });
-              return;
-            }
             const lightName = this.indexSetList.find(item => item.index_set_id === this.routerIndexSet)?.lightenName;
             const downloadName = lightName
               ? `bk_log_search_${lightName.substring(2, lightName.length - 1)}.${this.documentType}`
               : `bk_log_search.${this.documentType}`;
-            blobDownload(res, downloadName);
-          })
-          .finally(() => {
-            this.isShowExportDialog = false;
-            this.selectFiledList = [];
+            blobDownload(res.data, downloadName);
           });
       },
-      downloadAsync() {
+      async downloadAsync() {
         const { timezone, ...rest } = this.retrieveParams;
         const params = Object.assign(rest, { begin: 0, bk_biz_id: this.bkBizId });
         const data = { ...params };
-        let downRequestUrl = this.isUnionSearch ? `retrieve/unionExportAsync` : 'retrieve/exportAsync';
+        let downRequestUrl;
+        if (this.isScene) {
+          downRequestUrl = 'retrieve/getSceneAsyncExport';
+        } else if (this.isUnionSearch) {
+          downRequestUrl = 'retrieve/unionExportAsync';
+        } else {
+          downRequestUrl = 'retrieve/exportAsync';
+        }
         data.size = this.totalCount;
         data.export_fields = this.submitSelectFiledList;
         data.is_desensitize = this.desensitizeRadioType === 'desensitize';
@@ -486,21 +713,22 @@
           });
         }
         this.exportLoading = true;
-        const requestConfig = this.isUnionSearch
-          ? { data }
-          : {
-              params: { index_set_id: this.routerIndexSet },
-              data,
-            };
-        this.$http
-          .request(downRequestUrl, requestConfig)
+        const requestConfig =
+          this.isScene || this.isUnionSearch
+            ? { data }
+            : {
+                params: { index_set_id: this.routerIndexSet },
+                data,
+              };
+        return submitExportWithSortConfirmation(this, downRequestUrl, requestConfig)
           .then(res => {
-            if (res.result) {
+            if (res?.result) {
               this.$bkMessage({
                 theme: 'success',
                 ellipsisLine: 2,
-                message: this.$t('任务提交成功，下载完成将会收到邮件通知。可前往下载历史查看下载状态'),
+                message: this.$t(EXPORT_SUBMITTED_MESSAGE),
               });
+              this.fetchCurrentTasks(true);
             }
           })
           .catch(err => {
@@ -508,17 +736,19 @@
           })
           .finally(() => {
             this.exportLoading = false;
-            this.isShowExportDialog = false;
-            this.selectFiledList = [];
           });
       },
       closeExportDialog() {
         this.selectFiledType = 'all';
         this.selectFiledList = [];
+        // 清空失败任务定时器和记录
+        this.clearFailedTaskTimer();
+        this.failedTaskIds = [];
       },
+      // 原downloadTable方法已修改，不再需要隐藏popover
       downloadTable() {
         this.showHistoryExport = true;
-        this.popoverInstance.hide(0);
+        // this.popoverInstance.hide(0);
       },
       handleCloseDialog() {
         this.showHistoryExport = false;
@@ -526,6 +756,250 @@
       getFieldName(field) {
         const { getQueryAlias } = useFieldNameHook({ store: this.$store });
         return getQueryAlias(field);
+      },
+
+      /**
+       * @desc: 显示下载历史弹窗
+       */
+      handleShowHistoryExport() {
+        // 打开下载历史弹窗
+        this.showHistoryExport = true;
+        // 清空失败任务定时器和记录
+        this.clearFailedTaskTimer();
+        this.failedTaskIds = [];
+      },
+      /**
+       * @desc: 处理重试导出
+       * @param { Object } task 任务对象
+       */
+      async handleRetryExport(task) {
+        try {
+          const request = buildExportRetryRequest(task);
+          if (request.isSync) {
+            const res = await axiosInstance.post(request.url, request.config.data, { responseType: 'blob' });
+            blobDownload(res.data, getExportDownloadFileName(task, this.indexSetList));
+          } else {
+            const res = await submitExportWithSortConfirmation(this, request.url, request.config);
+            if (!res?.result) return;
+            this.$bkMessage({ theme: 'success', message: res.data?.prompt || this.$t(EXPORT_SUBMITTED_MESSAGE) });
+          }
+          const taskKey = getExportTaskKey(task);
+          this.failedTaskIds = this.failedTaskIds.filter(key => key !== taskKey);
+          await this.fetchCurrentTasks(true);
+        } catch (error) {
+          console.error(error);
+        }
+      },
+      /**
+       * @desc: 取消未完成的当前任务请求
+       */
+      cancelCurrentTaskRequest() {
+        if (this.currentTaskCancelExecutor) {
+          this.currentTaskCancelExecutor();
+          this.currentTaskCancelExecutor = null;
+        }
+      },
+      /**
+       * @desc: 轮询
+       */
+      startStatusPolling() {
+        this.stopStatusPolling();
+        this.exportPollingTimer = setInterval(() => {
+          this.fetchCurrentTasks(false, true);
+        }, DOWNLOAD_POLLING_INTERVAL);
+      },
+      stopStatusPolling() {
+        if (this.exportPollingTimer) {
+          clearInterval(this.exportPollingTimer);
+          this.exportPollingTimer = null;
+        }
+      },
+      /**
+       * @desc: 检查是否需要继续轮询
+       * @returns { Boolean } 是否需要继续轮询
+       */
+      shouldContinuePolling() {
+        return this.exportListData.some(item => POLLING_STATUS.includes(item.export_status));
+      },
+      /**
+       * @desc: 清除失败任务定时器
+       */
+      clearFailedTaskTimer() {
+        if (this.failedTaskTimer) {
+          clearTimeout(this.failedTaskTimer);
+          this.failedTaskTimer = null;
+        }
+      },
+      /**
+       * @desc: 处理任务状态记录与变化检测
+       * @param { Array } data 任务列表数据
+       */
+      handleTaskStatus(data) {
+        const currentUser = this.$store.state.userMeta?.username || '';
+        data.forEach(item => {
+          // 只处理当前用户的任务
+          if (item.export_created_by !== currentUser) return;
+
+          const taskKey = getExportTaskKey(item);
+          const oldStatus = this.pendingTaskStatus[taskKey];
+          const currentStatus = item.export_status;
+
+          // 成功或失败状态：检查是否有记录，有记录则提示
+          if (currentStatus === 'success' || currentStatus === 'failed') {
+            if (oldStatus !== undefined) {
+              // 下载成功时显示文件名，失败时显示错误信息
+              const message =
+                currentStatus === 'success'
+                  ? `${item.export_pkg_name || ''}${this.$t('下载成功')}`
+                  : item.error_msg || this.$t('下载任务异常，请查看下载历史');
+              this.$bkMessage({
+                theme: currentStatus === 'success' ? 'success' : 'error',
+                message,
+                closeIcon: true,
+              });
+              // 从记录中移除
+              delete this.pendingTaskStatus[taskKey];
+
+              // 处理失败任务记录
+              if (currentStatus === 'failed') {
+                // 进行中任务失败时，记录到 failedTaskIds
+                if (!this.failedTaskIds.includes(taskKey)) {
+                  this.failedTaskIds.push(taskKey);
+                }
+                // 清除之前的定时器，重新设置20分钟定时器
+                this.clearFailedTaskTimer();
+                this.failedTaskTimer = setTimeout(
+                  () => {
+                    this.failedTaskIds = [];
+                  },
+                  20 * 60 * 1000,
+                );
+              }
+            }
+            if (currentStatus === 'success') {
+              this.failedTaskIds = this.failedTaskIds.filter(key => key !== taskKey);
+            }
+          } else if (POLLING_STATUS.includes(currentStatus)) {
+            // 进行中状态：检查是否已有记录，没有则进行记录
+            if (oldStatus === undefined) {
+              this.pendingTaskStatus[taskKey] = currentStatus;
+            }
+          } else {
+            delete this.pendingTaskStatus[taskKey];
+            this.failedTaskIds = this.failedTaskIds.filter(key => key !== taskKey);
+          }
+        });
+      },
+      /** 外层仅登记符合悬浮窗规则的任务；已登记任务持续同步所有状态。 */
+      mergeTrackedTasks(data, registerTasks = false) {
+        const currentRowMap = new Map(this.exportListData.map(row => [getExportTaskKey(row), row]));
+        const tasks = data
+          .filter(item => registerTasks || this.trackedTasks[getExportTaskKey(item)])
+          .map(item => {
+            const taskKey = getExportTaskKey(item);
+            const row = this.trackedTasks[taskKey] || currentRowMap.get(taskKey) || {};
+            Object.assign(row, item, {
+              progressPercent: calculateProgressPercent(item.exported_count || 0, item.export_total_count || 0),
+            });
+            if (this.trackedTasks[taskKey] || (registerTasks && this.shouldDisplayTask(row))) {
+              this.$set(this.trackedTasks, taskKey, row);
+            }
+            return row;
+          });
+        // 先同步两处展示所用的任务对象，再统一检测状态变化和提示。
+        this.handleTaskStatus(tasks);
+        return tasks;
+      },
+      syncTrackedTasks(data) {
+        this.mergeTrackedTasks(data);
+        if (!this.shouldContinuePolling()) {
+          this.stopStatusPolling();
+        }
+      },
+      /**
+       * @desc: 设置导出列表数据
+       * @param { Array } data 数据
+       * @param { Boolean } isPolling 该次请求是否是轮询
+       */
+      setExportListData(data, isPolling) {
+        const tasks = this.mergeTrackedTasks(data, true);
+        if (!isPolling || !this.exportListData.length) {
+          this.exportListData = tasks;
+          if (this.shouldContinuePolling()) {
+            this.startStatusPolling();
+          }
+        }
+      },
+      /**
+       * @desc: 获取table列表数据
+       * @param { Boolean } isReset 是否从1页开始查询
+       * @param { Boolean } isPolling 该次请求是否是轮询
+       */
+      async fetchCurrentTasks(_isReset = false, isPolling = false) {
+        this.cancelCurrentTaskRequest();
+        const now = Date.now();
+        const startTime = now - MILLISECONDS_PER_DAY * DOWNLOAD_RECENT_DAYS;
+        const endTime = now + DOWNLOAD_DATA_DELAY;
+        const params = {
+          bk_biz_id: this.bkBizId,
+          page: 1,
+          pagesize: CURRENT_TASK_PAGE_SIZE,
+          show_all: false,
+          start_time: startTime,
+          end_time: endTime,
+        };
+        let queryUrl;
+        let requestConfig;
+
+        if (this.isUnionSearch && !this.unionIndexList.length) {
+          this.exportListData = [];
+          this.stopStatusPolling();
+          return;
+        }
+
+        let cancelExecutor;
+        const cancelToken = new axios.CancelToken(executor => {
+          cancelExecutor = executor;
+        });
+        this.currentTaskCancelExecutor = cancelExecutor;
+
+        if (this.isScene) {
+          queryUrl = 'retrieve/getSceneExportHistory';
+          params.space_uid = this.retrieveParams?.space_uid;
+          params.table_id_conditions = this.retrieveParams?.table_id_conditions;
+          params.scene_filter_values = this.retrieveParams?.scene_filter_values;
+          requestConfig = { data: params };
+        } else if (this.isUnionSearch) {
+          queryUrl = 'unionSearch/unionExportHistory';
+          params.index_set_id = window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$store.state.indexId;
+          params.index_set_ids = this.unionIndexList;
+          requestConfig = { params };
+        } else {
+          queryUrl = 'retrieve/getExportHistoryList';
+          params.index_set_id = window.__IS_MONITOR_COMPONENT__ ? this.$route.query.indexId : this.$store.state.indexId;
+          requestConfig = { params };
+        }
+
+        try {
+          const res = await this.$http.request(queryUrl, requestConfig, { cancelToken });
+          if (this.currentTaskCancelExecutor !== cancelExecutor || this.isComponentUnmounted) {
+            return;
+          }
+          if (res.result) {
+            this.setExportListData(res.data.list, isPolling);
+            if (!this.shouldContinuePolling()) {
+              this.stopStatusPolling();
+            }
+          }
+        } catch (error) {
+          if (axios.isCancel(error) || this.currentTaskCancelExecutor !== cancelExecutor || this.isComponentUnmounted) {
+            return;
+          }
+        } finally {
+          if (this.currentTaskCancelExecutor === cancelExecutor) {
+            this.currentTaskCancelExecutor = null;
+          }
+        }
       },
     },
   };
@@ -535,6 +1009,7 @@
   @import '@/scss/mixins/flex.scss';
 
   .operation-icon {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -561,6 +1036,16 @@
       width: 16px;
       font-size: 16px;
       color: #4d4f56;
+    }
+
+    .progress-mask {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      background: conic-gradient(from 0deg, rgba(0, 0, 0, 0) var(--progress, 0%), rgba(0, 0, 0, 0.3) 0);
+      transition: background 0.25s ease;
     }
   }
 
@@ -751,23 +1236,92 @@
         margin-top: 2px;
       }
     }
-  }
 
-  .download-box {
-    display: flex;
-    flex-direction: column;
-    justify-content: space-evenly;
-    min-height: 60px;
-    padding: 4px 0;
-    font-size: 12px;
+    .dialog-header-custom {
+      display: flex;
+      align-items: center;
+      width: 100%;
 
-    span {
-      padding: 2px 6px;
-      cursor: pointer;
-
-      &:hover {
+      .view-history-btn {
+        z-index: 10;
+        padding-left: 12px;
+        margin-left: 16px;
+        font-size: 14px;
         color: #3a84ff;
+        cursor: pointer;
+        border-left: 1px solid #dcdee5;
+
+        &:hover {
+          color: #699df4;
+        }
+      }
+
+      .failed-task-tip {
+        display: flex;
+        align-items: center;
+        margin-left: 8px;
+        font-size: 14px;
+
+        .failed-task-count {
+          width: 20px;
+          height: 20px;
+          margin-right: 4px;
+          font-size: 12px;
+          line-height: 20px;
+          color: #fff;
+          text-align: center;
+          background-color: #ea3636;
+          border-radius: 50%;
+        }
+
+        .failed-task-text {
+          font-weight: 400;
+          color: #ea3636;
+        }
+      }
+
+      .circular-progress {
+        width: 16px;
+        height: 16px;
+        margin-left: 8px;
+        background: conic-gradient(from 0deg, rgba(233, 237, 245, 1) var(--progress, 0%), rgba(0, 0, 0, 0.3) 0);
+        border-radius: 50%;
       }
     }
+  }
+
+  // 原download-box样式已移除，不再需要
+  // .download-box {
+  //   display: flex;
+  //   flex-direction: column;
+  //   justify-content: space-evenly;
+  //   min-height: 60px;
+  //   padding: 4px 0;
+  //   font-size: 12px;
+
+  //   span {
+  //     padding: 2px 6px;
+  //     cursor: pointer;
+
+  //     &:hover {
+  //       color: #3a84ff;
+  //     }
+  //   }
+  // }
+
+  // 下载进度弹窗样式
+  .download-progress-popover {
+    max-width: 320px;
+    padding: 0;
+    border-radius: 2px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  }
+
+  .download-progress-content {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    padding: 16px 0;
+    cursor: pointer;
   }
 </style>

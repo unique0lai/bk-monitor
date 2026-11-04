@@ -9,14 +9,18 @@ specific language governing permissions and limitations under the License.
 """
 
 import logging
+import re
 from collections import defaultdict
 
+from django.conf import settings
+from django.core.cache import caches
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 from bkmonitor.utils.alert_drilling import normalize_histogram_quantile_group_by
+from bkmonitor.utils.common_utils import deserialize_and_decompress
 from bkmonitor.utils.request import get_request_tenant_id
 from constants.data_source import DataSourceLabel, DataTypeLabel
 from core.drf_resource import Resource, api, resource
@@ -53,7 +57,93 @@ class GetCustomTsMetricGroups(Resource):
     class RequestSerializer(CustomMetricBaseRequestSerializer):
         pass
 
+    @classmethod
+    def _get_service_scope_metric_whitelist(cls, params: dict) -> dict[str, set[str]] | None:
+        """
+        APM 场景下，从缓存中获取当前服务下有数据的 (scope_name -> metric_name 集合) 白名单。
+
+        缓存数据结构示意：
+            {
+              "service_name": {
+                "metric_field": {"monitor_name_list": ["scope_a", "scope_b"], "update_at": ...},
+                ...
+              }
+            }
+        其中 monitor_name_list 即为 scope_name 列表，因此需要按 (scope_name, metric_name) 联合过滤。
+
+        缓存缺失时回源实时查询，与 V1（scene_view/builtin/apm.py）保持一致，避免缓存未生成就整页无数据。
+
+        返回值语义：
+            - None: 无需过滤（非 APM 场景 / 缓存与回源均不可用）
+            - {}:  该服务确实没有任何指标，全部过滤
+            - {scope_name: {metric_name, ...}}: 精确白名单
+        """
+        if not params.get("is_apm_scenario"):
+            return None
+
+        apm_app_name = params.get("apm_app_name")
+        apm_service_name = params.get("apm_service_name")
+        bk_biz_id = params.get("bk_biz_id")
+        if not (apm_app_name and apm_service_name and bk_biz_id):
+            return None
+
+        try:
+            from apm_web.constants import ApmCacheKey
+            from apm_web.models import Application
+
+            application = Application.objects.get(bk_biz_id=bk_biz_id, app_name=apm_app_name)
+
+            monitor_info_mapping = {}
+            if "redis" in caches:
+                cache_key = ApmCacheKey.APP_SCOPE_NAME_KEY.format(
+                    bk_biz_id=bk_biz_id, application_id=application.application_id
+                )
+                try:
+                    cached_data = caches["redis"].get(cache_key)
+                    monitor_info_mapping = deserialize_and_decompress(cached_data) if cached_data else {}
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning("[GetCustomTsMetricGroups] read scope_name cache(%s) failed: %s", cache_key, e)
+                    monitor_info_mapping = {}
+
+            if not monitor_info_mapping or not monitor_info_mapping.get(apm_service_name):
+                # 缓存未命中时回源，SDK 映射配置与 V1 取值方式一致
+                from apm_web.handlers.metric_group import MetricHelper
+
+                target_key = f"{bk_biz_id}-{apm_app_name}.{apm_service_name}"
+                metric_config = settings.APM_CUSTOM_METRIC_SDK_MAPPING_CONFIG.get(target_key) or (
+                    settings.APM_CUSTOM_METRIC_SDK_MAPPING_CONFIG.get("default") or {}
+                )
+                monitor_info_mapping = (
+                    MetricHelper.get_monitor_info(
+                        bk_biz_id,
+                        params.get("result_table_id") or application.metric_result_table_id,
+                        service_name=apm_service_name,
+                        **metric_config,
+                    )
+                    or {}
+                )
+
+            service_metric_info = monitor_info_mapping.get(apm_service_name)
+            if not service_metric_info:
+                # 缓存与回源都没有该服务的数据，返回空 dict（该服务下全部过滤）
+                return {}
+
+            # 反转结构：{scope_name: {metric_name, ...}}
+            scope_metric_whitelist: dict[str, set[str]] = defaultdict(set)
+            for metric_name, metric_info in service_metric_info.items():
+                monitor_name_list = (metric_info or {}).get("monitor_name_list") or []
+                for scope_name in monitor_name_list:
+                    scope_metric_whitelist[scope_name].add(metric_name)
+            return dict(scope_metric_whitelist)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning("[GetCustomTsMetricGroups] failed to get service scope metric whitelist: %s", e)
+            return None
+
     def perform_request(self, params: dict) -> dict[str, list]:
+        # APM 场景：获取当前服务下 (scope_name -> metric_name 集合) 的白名单
+        # None 表示无法判定、不做过滤，不能与「白名单为空」混为一谈，否则会把指标全部过滤掉
+        scope_metric_whitelist = self._get_service_scope_metric_whitelist(params)
+
         # 从 metadata 获取指标分组列表
         request_params = {
             "group_id": params["time_series_group_id"],
@@ -69,15 +159,20 @@ class GetCustomTsMetricGroups(Resource):
             metric_list = scope_data.get("metric_list", [])
             dimension_config = scope_data.get("dimension_config", {})
 
+            allowed_metrics_in_scope = (scope_metric_whitelist or {}).get(scope_name, set()) or set()
+
             # 构建指标列表
             metrics = []
             for metric_data in metric_list:
                 metric_name = metric_data.get("metric_name", "")
-                # 过滤内置指标（APM 场景）
-                if params.get("is_apm_scenario") and any(
-                    [str(metric_name).startswith("apm_"), str(metric_name).startswith("bk_apm_")]
-                ):
-                    continue
+                if params.get("is_apm_scenario"):
+                    if any([str(metric_name).startswith("apm_"), str(metric_name).startswith("bk_apm_")]):
+                        # 过滤内置指标（APM 场景）
+                        continue
+
+                    if scope_metric_whitelist is not None and metric_name not in allowed_metrics_in_scope:
+                        # 只展示当前服务、当前 scope 下有数据的指标（APM 场景）
+                        continue
 
                 field_config = metric_data.get("field_config", {})
                 # 如果指标隐藏或禁用，则不展示
@@ -91,6 +186,10 @@ class GetCustomTsMetricGroups(Resource):
                         "alias": field_config.get("alias", ""),
                     }
                 )
+
+            # 如果当前 scope 过滤后无任何指标，则跳过整个分组
+            if len(metrics) == 0:
+                continue
 
             # 构建公共维度列表
             common_dimensions = []
@@ -139,7 +238,11 @@ class GetCustomTsMetricAggInfo(Resource):
         result = api.metadata.query_time_series_metric(**request_params)
         metric_list = result.get("metrics", [])
         scope_ids = list(
-            dict.fromkeys(metric_data.get("scope", {}).get("id") for metric_data in metric_list if metric_data.get("scope", {}).get("id"))
+            dict.fromkeys(
+                metric_data.get("scope", {}).get("id")
+                for metric_data in metric_list
+                if metric_data.get("scope", {}).get("id")
+            )
         )
 
         # 计算维度交集和并集
@@ -171,7 +274,9 @@ class GetCustomTsMetricAggInfo(Resource):
             "common_dimensions": [
                 {"name": d, "alias": dim_alias_map[d] if d in dim_alias_map else d} for d in sorted(common_dims)
             ],
-            "all_dimensions": [{"name": d, "alias": dim_alias_map[d] if d in dim_alias_map else d} for d in sorted(all_dims)],
+            "all_dimensions": [
+                {"name": d, "alias": dim_alias_map[d] if d in dim_alias_map else d} for d in sorted(all_dims)
+            ],
         }
 
 
@@ -189,6 +294,16 @@ class GetCustomTsDimensionValues(Resource):
         start_time = serializers.IntegerField(label=_("开始时间"))
         end_time = serializers.IntegerField(label=_("结束时间"))
         metrics = MetricSerializer(label=_("指标"), many=True, default=list)
+
+    @classmethod
+    def _build_label_match(cls, label: str, values: list[str]) -> str | None:
+        unique_values = list(dict.fromkeys(value for value in values if value))
+        if not unique_values:
+            return None
+        if len(unique_values) == 1:
+            return f'{label}="{unique_values[0]}"'
+        escaped = "|".join(re.escape(value) for value in unique_values)
+        return f'{label}=~"({escaped})"'
 
     def perform_request(self, params: dict) -> list[dict]:
         # 如果指标为空，则返回空列表
@@ -221,6 +336,12 @@ class GetCustomTsDimensionValues(Resource):
         if is_apm_scenario:
             label_filters.append(f'app_name="{params["apm_app_name"]}"')
             label_filters.append(f'service_name="{params["apm_service_name"]}"')
+            # 左边勾选的监控项对应 scope_name，多个监控项可共用同一指标字段（如 metric）
+            scope_match = self._build_label_match(
+                "scope_name", [metric.get("scope_name") or "" for metric in params["metrics"]]
+            )
+            if scope_match:
+                label_filters.append(scope_match)
 
         # 组装完整的 PromQL 匹配表达式
         if label_filters:
@@ -633,7 +754,7 @@ class GetCustomTsGraphConfig(Resource):
         metric_result = api.metadata.query_time_series_metric(
             group_id=params["time_series_group_id"],
             page=1,
-            page_size=-1, # 获取所有指标
+            page_size=-1,  # 获取所有指标
             conditions=conditions,
         )
 

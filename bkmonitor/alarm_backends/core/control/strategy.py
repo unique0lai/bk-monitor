@@ -272,11 +272,25 @@ class Strategy:
 
     @classmethod
     def get_strategy_snapshot_by_key(cls, snapshot_key, strategy_id=None):
+        """读取策略快照。
+
+        写入方 gen_strategy_snapshot 带 strategy_id，落该策略路由到的节点；
+        而调用方拿到的 snapshot_key 常常是从 Kafka 事件里解出的普通字符串，
+        没有 strategy_id，CacheRouter 因此把它路由到默认节点。分片环境下这
+        两个节点不是同一个，读就取不到写下的快照。
+
+        传了 strategy_id 时先读路由节点，取不到再读默认节点：既修掉这个不
+        对应，也让只写默认节点的写入方（例如 Go 侧的 Python 兼容输出）产生
+        的快照能被读到。多出的一次 GET 只在未命中时发生。
+        """
         client = key.STRATEGY_SNAPSHOT_KEY.client
+        snapshot = None
         if strategy_id:
-            snapshot_key = key.SimilarStr(snapshot_key)
-            snapshot_key.strategy_id = strategy_id
-        snapshot = client.get(snapshot_key)
+            routed_key = key.SimilarStr(snapshot_key)
+            routed_key.strategy_id = strategy_id
+            snapshot = client.get(routed_key)
+        if not snapshot:
+            snapshot = client.get(str(snapshot_key))
         if not snapshot:
             return None
 
@@ -318,6 +332,11 @@ class Strategy:
         }
         """
         is_aiops_algorithm = False
+        # 含 NewSeries 算法的 level：每个新维度生命周期只在首次出现时产 1 个异常点，
+        # trigger_count>1 永远凑不满 -> 永不告警，故对这些 level 强制 trigger_count=1。
+        # 触发配置按 level 在全策略共享，故保存层按 strategy 维保证 NewSeries 独占该 level
+        # (跨 item 同 level 冲突也会被拒)，强制 count=1 不会误伤其它 item 的同级算法。
+        new_series_levels = set()
         items = strategy.get("items", [])
         if items:
             is_aiops_list = [
@@ -328,21 +347,32 @@ class Strategy:
             # is_aiops_list不为空时，算法类型全部都是AIOPS算法时，设置is_aiops_algorithm为True
             is_aiops_algorithm = all(is_aiops_list) and len(is_aiops_list) > 0
 
+            new_series_levels = {
+                str(algorithm["level"])
+                for item in items
+                for algorithm in item.get("algorithms") or []
+                if algorithm["type"] == AlgorithmModel.AlgorithmChoices.NewSeries
+            }
+
         trigger_config = {}
         for detect in strategy.get("detects") or []:
+            level = str(detect["level"])
             # 如果只有AIOPS算法，则写死 check_window_size 为 5，trigger_count 为 1
             if is_aiops_algorithm:
-                trigger_config[str(detect["level"])] = {
+                trigger_config[level] = {
                     "check_window_size": 5,
                     "trigger_count": 1,
                     "uptime": detect["trigger_config"].get("uptime"),
                 }
             else:
-                trigger_config[str(detect["level"])] = {
+                trigger_config[level] = {
                     "check_window_size": int(detect["trigger_config"]["check_window"]),
                     "trigger_count": int(detect["trigger_config"]["count"]),
                     "uptime": detect["trigger_config"].get("uptime"),
                 }
+            # NewSeries 每个生命周期只产 1 个异常点：后端强制 count=1(独占 level，不影响同级其它算法)。
+            if level in new_series_levels:
+                trigger_config[level]["trigger_count"] = 1
         return trigger_config
 
     @staticmethod

@@ -1,0 +1,118 @@
+from apps.log_databus.constants import REGISTERED_SYSTEM_DEFAULT
+from apps.log_databus.handlers.storage import StorageHandler
+from apps.log_admin_resource.response_schema import nullable_schema, object_schema, pagination_schema
+
+
+STORAGE_CLUSTER_LIST_PARAMS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "page": {"type": "integer", "minimum": 1},
+        "page_size": {"type": "integer", "minimum": 1},
+        "bk_biz_id": {"type": "integer"},
+        "storage_cluster_id": {"type": "integer", "minimum": 1},
+        "cluster_id": {"type": "integer", "minimum": 1},
+        "keyword": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+STORAGE_CLUSTER_ITEM_SCHEMA = object_schema(
+    "storage_cluster_id",
+    "storage_cluster_name",
+    "cluster_name",
+    "domain_name",
+    "is_active",
+    "is_public",
+    "hot_warm_enabled",
+    properties={
+        "storage_cluster_id": nullable_schema("integer"),
+        "storage_cluster_name": nullable_schema("string"),
+        "cluster_name": nullable_schema("string"),
+        "domain_name": nullable_schema("string"),
+        "is_active": {"type": "boolean"},
+        "is_public": {"type": "boolean"},
+        "hot_warm_enabled": {"type": "boolean"},
+    },
+)
+STORAGE_CLUSTER_LIST_RESPONSE_SCHEMA = pagination_schema(STORAGE_CLUSTER_ITEM_SCHEMA)
+
+
+def list_storage_clusters(params):
+    params = params or {}
+    page = _to_positive_int(params.get("page"), default=1)
+    page_size = _to_positive_int(params.get("page_size"), default=100)
+    bk_biz_id = _to_int(params.get("bk_biz_id"), default=0)
+    cluster_id = _to_int(params.get("storage_cluster_id") or params.get("cluster_id"), default=None)
+    keyword = str(params.get("keyword") or "").strip().lower()
+
+    clusters = StorageHandler().get_cluster_groups(bk_biz_id=bk_biz_id, cluster_id=cluster_id)
+    items = [_serialize_cluster(cluster) for cluster in clusters]
+    if cluster_id:
+        items = [item for item in items if item["storage_cluster_id"] == cluster_id]
+    if keyword:
+        items = [
+            item
+            for item in items
+            if keyword in str(item.get("storage_cluster_id") or "").lower()
+            or keyword in str(item.get("storage_cluster_name") or "").lower()
+            or keyword in str(item.get("cluster_name") or "").lower()
+            or keyword in str(item.get("domain_name") or "").lower()
+        ]
+
+    total = len(items)
+    start = (page - 1) * page_size
+    return {"items": items[start : start + page_size], "page": page, "page_size": page_size, "total": total}
+
+
+def _serialize_cluster(cluster):
+    cluster_config = cluster.get("cluster_config") or {}
+    custom_option = cluster_config.get("custom_option") or {}
+    hot_warm_config = custom_option.get("hot_warm_config") or {}
+    registered_system = _first_not_none(cluster.get("registered_system"), cluster_config.get("registered_system"))
+    cluster_id = _first_not_none(
+        cluster.get("storage_cluster_id"),
+        cluster.get("cluster_id"),
+        cluster_config.get("cluster_id"),
+    )
+    cluster_name = _first_not_none(
+        cluster.get("storage_cluster_name"),
+        cluster.get("display_name"),
+        cluster.get("cluster_name"),
+        cluster_config.get("cluster_name"),
+        cluster_config.get("name"),
+    )
+    return {
+        "storage_cluster_id": cluster_id,
+        "storage_cluster_name": cluster_name,
+        "cluster_name": cluster_name,
+        "domain_name": _first_not_none(cluster.get("domain_name"), cluster_config.get("domain_name")),
+        "is_active": _first_not_none(cluster.get("is_active"), cluster_config.get("is_active"), True),
+        "is_public": registered_system == REGISTERED_SYSTEM_DEFAULT,
+        "hot_warm_enabled": bool(
+            _first_not_none(
+                cluster.get("hot_warm_enabled"),
+                cluster.get("enable_hot_warm"),
+                hot_warm_config.get("is_enabled"),
+                False,
+            )
+        ),
+    }
+
+
+def _to_positive_int(value, default):
+    value = _to_int(value, default)
+    if value < 1:
+        return default
+    return value
+
+
+def _to_int(value, default):
+    if value in (None, ""):
+        return default
+    return int(value)
+
+
+def _first_not_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None

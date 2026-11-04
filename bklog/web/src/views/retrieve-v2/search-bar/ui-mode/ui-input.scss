@@ -1,7 +1,7 @@
 ul.search-items {
   display: inline-flex;
   flex-wrap: wrap;
-  width: 100%;
+  flex: 1;
   max-height: 135px;
   padding: 4px;
   padding-bottom: 0;
@@ -73,6 +73,13 @@ ul.search-items {
             cursor: pointer;
           }
         }
+      }
+
+      &.custom-placeholder-item.is-slot-empty {
+        display: none;
+        height: 0;
+        padding: 0;
+        margin: 0;
       }
     }
 

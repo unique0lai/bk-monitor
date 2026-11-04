@@ -1,3 +1,4 @@
+/* eslint-disable perfectionist/sort-imports */
 /*
  * Tencent is pleased to support the open source community by making
  * 蓝鲸智云PaaS平台 (BlueKing PaaS) available.
@@ -25,6 +26,7 @@
  */
 
 import './public-path';
+import { bkOTInstance } from './open-telemetry';
 import 'monitor-common/polyfill';
 
 import i18n from './i18n/i18n';
@@ -38,8 +40,9 @@ import Api from 'monitor-api/api';
 import Axios from 'monitor-api/axios/axios';
 import { type VueInstance, setVue } from 'monitor-api/utils/index';
 import { immediateRegister } from 'monitor-common/service-worker/service-worker';
-import { getUrlParam, mergeSpaceList, setGlobalBizId } from 'monitor-common/utils';
+import { getUrlParam, mergeSpaceList, parseBizId, setGlobalBizId } from 'monitor-common/utils';
 import { assignWindowField } from 'monitor-common/utils/assign-window';
+import { initIframeBroadcast } from 'monitor-common/utils/iframe-bridge';
 
 import './common/global-login';
 import { userDisplayNameConfigure } from './common/user-display-name';
@@ -62,9 +65,13 @@ window.slimit = 500;
 window.AJAX_URL_PREFIX = '/apm_log_forward/bklog/api/v1';
 Vue.config.ignoredElements = ['custom-incident-detail'];
 setVue(Vue as VueInstance);
+// 被第三方 iframe 嵌入时向父页面广播路由变化；微前端子应用与主壳共享 history，只需在顶层注册一次
+if (!window.__POWERED_BY_BK_WEWEB__) {
+  initIframeBroadcast();
+}
 const hasRouteHash = getUrlParam('routeHash');
 const spaceUid = getUrlParam('space_uid');
-const bizId = getUrlParam('bizId')?.replace(/\//gim, '');
+const bizId = parseBizId(getUrlParam('bizId'));
 if (process.env.NODE_ENV === 'development') {
   window.site_url = '/';
 }
@@ -100,7 +107,10 @@ if (hasRouteHash) {
         window.user_name = window.uin;
         window.username = window.uin;
         window.user_name = window.uin;
-        window.cc_biz_id = +window.bk_biz_id;
+        window.cc_biz_id = parseBizId(window.bk_biz_id);
+        // username 异步就绪后补充到 RUM 上报的 user.id
+        bkOTInstance?.setUser({ id: window.username });
+
         updateTimezone(data.USER_TIME_ZONE);
         window.bk_log_search_url = data.BKLOGSEARCH_HOST;
         const bizId = setGlobalBizId();

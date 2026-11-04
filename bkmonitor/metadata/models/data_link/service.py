@@ -15,11 +15,52 @@ from django.db.transaction import atomic
 from tenacity import RetryError, retry, stop_after_attempt, wait_exponential
 
 from core.drf_resource import api
+from core.errors.api import BKAPIError
 from metadata import config
 from metadata.models.data_link import DataIdConfig, utils
 from metadata.models.data_link.constants import DataLinkKind, DataLinkResourceStatus
 
 logger = logging.getLogger("metadata")
+
+
+def get_data_id_status_by_name(bk_tenant_id: str, namespace: str, name: str, with_detail: bool = False) -> dict:
+    """查询已经登记的资源身份，不参与 DataId 申请时的名称推导。"""
+    instance = DataIdConfig.objects.get(bk_tenant_id=bk_tenant_id, namespace=namespace, name=name)
+    resource = api.bkdata.get_data_link(
+        kind=DataLinkKind.get_choice_value(DataLinkKind.DATAID.value),
+        namespace=namespace,
+        name=instance.name,
+        bk_tenant_id=bk_tenant_id,
+    )
+    phase = resource.get("status", {}).get("phase")
+    data_id = None
+    if phase == DataLinkResourceStatus.OK.value:
+        data_id = int(resource.get("metadata", {}).get("annotations", {}).get("dataId", 0))
+        if instance.bk_data_id and data_id != instance.bk_data_id:
+            raise ValueError(f"DataId({name}) returned unexpected dataId({data_id})")
+    instance.status = phase
+    instance.save(update_fields=["status"])
+    result = {"status": phase, "data_id": data_id}
+    if with_detail:
+        result["data_id_config"] = resource
+    return result
+
+
+def apply_data_source_config(bk_tenant_id: str, data_source_config: dict) -> bool:
+    """尝试下发 DataSource 资源；失败不影响主 DataId 流程。"""
+    try:
+        api.bkdata.apply_data_link(config=[data_source_config], bk_tenant_id=bk_tenant_id)
+    except BKAPIError as error:
+        logger.warning(
+            "apply_data_source_config: apply DataSource failed and ignored, tenant->[%s], "
+            "namespace->[%s], name->[%s], error->[%s]",
+            bk_tenant_id,
+            data_source_config.get("metadata", {}).get("namespace"),
+            data_source_config.get("metadata", {}).get("name"),
+            error,
+        )
+        return False
+    return True
 
 
 @atomic(config.DATABASE_CONNECTION_NAME)
@@ -60,8 +101,10 @@ def apply_data_id_v2(
         event_type=event_type,
         prefer_kafka_cluster_name=prefer_kafka_cluster_name,
     )
+    data_source_config = data_id_config_ins.compose_data_source_config(data_source_alias=data_name)
 
     api.bkdata.apply_data_link(config=[data_id_config], bk_tenant_id=bk_tenant_id)
+    apply_data_source_config(bk_tenant_id=bk_tenant_id, data_source_config=data_source_config)
     logger.info("apply_data_id_v2:apply data_id for data_name: %s success", data_name)
     return True
 

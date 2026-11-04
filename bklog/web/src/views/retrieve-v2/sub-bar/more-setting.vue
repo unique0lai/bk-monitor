@@ -3,7 +3,7 @@
   import useStore from '@/hooks/use-store';
   import useRouter from '@/hooks/use-router';
   import useLocale from '@/hooks/use-locale';
-  import { isFeatureToggleOn } from '@/store/helper';
+  import { isFeatureToggleOn } from '@/hooks/use-feature-toggle';
 
   const emit = defineEmits(['update:is-show-cluster-setting']);
 
@@ -34,18 +34,7 @@
   const bkBizId = computed(() => store.state.bkBizId);
 
   const isAiopsToggle = computed(() => {
-    // 日志聚类总开关
-    const { bkdata_aiops_toggle: bkdataAiopsToggle } = window.FEATURE_TOGGLE;
-    const aiopsBizList = window.FEATURE_TOGGLE_WHITE_LIST?.bkdata_aiops_toggle;
-
-    switch (bkdataAiopsToggle) {
-      case 'on':
-        return true;
-      case 'off':
-        return false;
-      default:
-        return aiopsBizList ? aiopsBizList.some(item => item.toString() === bkBizId.value) : false;
-    }
+    return isFeatureToggleOn('bkdata_aiops_toggle', String(bkBizId.value));
   });
 
   const settingMenuList = ref([
@@ -148,6 +137,10 @@
     initJumpRouteList(setItem?.scenario_id);
   };
 
+  const openRouteWindow = href => {
+    window.open(href, '_blank', 'noopener');
+  };
+
   const handleMenuClick = val => {
     // 不属于新开页面的操作
     if (['index', 'extract', 'clustering'].includes(val)) {
@@ -160,10 +153,10 @@
     const isCustom = currentKey === 'custom';
     const isIndexGroupType = currentKey === 'indexGroup';
 
-    const routeName =
-      val === 'logMasking'
-        ? maskingConfigRoute.value[maskingRouteKey.value]
-        : routeNameList.value[currentKey];
+    let routeName = routeNameList.value[currentKey];
+    if (val === 'logMasking') {
+      routeName = maskingConfigRoute.value[maskingRouteKey.value];
+    }
 
     const params = {};
     const query = {
@@ -175,9 +168,7 @@
     if (isIndexGroupType) {
       query.indexSetId = indexSetItem.value?.index_set_id;
     } else if (isV2Enabled.value && (isBkDataOrEs || isCustom)) {
-      params.collectorId = isBkDataOrEs
-        ? indexSetItem.value?.index_set_id
-        : indexSetItem.value?.collector_config_id;
+      params.collectorId = isBkDataOrEs ? indexSetItem.value?.index_set_id : indexSetItem.value?.collector_config_id;
       query.typeKey = isCustom ? 'custom_report' : currentKey;
     } else {
       params.indexSetId = indexSetItem.value?.index_set_id;
@@ -190,7 +181,7 @@
 
     const { href } = router.resolve({ name: routeName, params, query });
     refTrigger.value?.click?.();
-    window.open(href, '_blank');
+    openRouteWindow(href);
   };
 
   const handlePopShow = val => {
@@ -240,8 +231,8 @@
         >
           <li
             v-for="menu in showSettingMenuList"
-            class="list-menu-item"
             :key="menu.id"
+            class="list-menu-item"
             @click="handleMenuClick(menu.id)"
           >
             {{ menu.name }}

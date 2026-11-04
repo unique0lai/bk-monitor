@@ -102,7 +102,9 @@ class LogExtractUtils:
     ):
         self.task_id = task_id
         self.bk_biz_id = bk_biz_id
+        # 源主机账号由源主机操作系统决定；中转机固定为 Linux，必须使用独立账号。
         self.account = account
+        self.transit_server_account = constants.ACCOUNT["linux"]
         self.username = username
         self.operator = operator
         self.file_path = file_path
@@ -301,6 +303,9 @@ class LogExtractUtils:
         Tasks.objects.filter(task_id=task_id).update(download_status=constants.DownloadStatus.DISTRIBUTING.value)
         task = Tasks.objects.get(task_id=task_id)
         extract_link: ExtractLink = ExtractLink.objects.filter(link_id=task.link_id).first()
+        # 跨租户，需要确保执行人有权限
+        if settings.ENABLE_MULTI_TENANT_MODE:
+            operator = extract_link.operator
         transit_servers, transit_server_packing_file_path, transit_server_file_path = self._get_transit_server(
             extract_link, task_id=task_id
         )
@@ -313,7 +318,7 @@ class LogExtractUtils:
             target_server=[transit_server],
             bk_biz_id=bk_biz_id,
             operator=operator,
-            account=self.account,
+            account=self.transit_server_account,
             task_name=f"[BKLOG] File Distribution By {self.username}",
         )
 
@@ -335,6 +340,10 @@ class LogExtractUtils:
         operator = self.operator
         bk_biz_id = self.bk_biz_id
         Tasks.objects.filter(task_id=task_id).update(download_status=constants.DownloadStatus.DISTRIBUTING.value)
+        if settings.ENABLE_MULTI_TENANT_MODE:
+            task = Tasks.objects.get(task_id=task_id)
+            extract_link: ExtractLink = task.get_link()
+            operator = extract_link.operator
         task_instance_id = self.task_instance_id
         query_result = self._poll_status(
             task_instance_id, operator, bk_biz_id, is_platform=settings.ENABLE_MULTI_TENANT_MODE
@@ -358,7 +367,7 @@ class LogExtractUtils:
         extract_link: ExtractLink = task.get_link()
         bk_biz_id = extract_link.op_bk_biz_id
         operator = extract_link.operator
-        account = self.account
+        account = self.transit_server_account
         transit_server, *_ = self.distribution_ip
         transit_server_file_path, *_ = self.transit_server_file_path
         cos_pack_file_name = get_packed_file_name(task_id)
@@ -417,7 +426,7 @@ class LogExtractUtils:
     def _bkrepo_upload(self):
         # 如果是提取链路bkrepo类型 需要上传bkrepo
         transit_server, *_ = self.distribution_ip
-        cos_pack_file_name = get_packed_file_name(task_id=self.task_id)
+        cos_pack_file_name = self.pack_file_name
         full_file_path = os.path.join(transit_server.target_dir, cos_pack_file_name)
         BKREPOStorage().export_upload(file_path=full_file_path, file_name=cos_pack_file_name)
         os.remove(full_file_path)

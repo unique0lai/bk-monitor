@@ -24,11 +24,11 @@
  * IN THE SOFTWARE.
  */
 
-import { type MaybeRef, shallowRef, watchEffect } from 'vue';
+import { type MaybeRef, shallowRef, watch } from 'vue';
 
 import { get } from '@vueuse/core';
 
-import { getAlertK8sScenarioList, getAlertK8sTarget } from '../services/alarm-detail';
+import { getAlertK8sTarget } from '../services/alarm-detail';
 
 import type { AlertK8sTargetItem, K8sTableColumnKeysEnum, SceneEnum } from '../typings';
 
@@ -62,66 +62,34 @@ export const useAlertK8s = (options: UseAlertK8sOptions) => {
   /** 数据请求加载状态 */
   const loading = shallowRef(false);
 
-  /**
-   * @method hasScene 判断是否已经存在场景
-   * @param scene 场景
-   * @returns {boolean} 是否已经存在场景
-   */
-  const hasScene = (scene: SceneEnum) => {
-    if (!scene) {
-      return false;
-    }
-    return sceneList.value.includes(scene);
-  };
-
-  /**
-   * @method hasTarget 判断是否已经存在目标
-   * @param target 目标
-   * @returns {boolean} 是否已经存在目标
-   */
-  const hasTarget = (target: AlertK8sTargetItem) => {
-    if (!target) {
-      return false;
-    }
-    return targetList.value.some(item => item?.[groupBy.value] === target?.[groupBy.value]);
-  };
-
-  /**
-   * @method getSceneList 获取可选择的场景列表
-   * @returns {Promise<void>}
-   */
-  const getSceneList = async () => {
-    const list = await getAlertK8sScenarioList({ alertId: get(alertId), bizId: get(bizId) });
-    sceneList.value = list;
-  };
-
-  /**
-   * @method getTargetList 获取可选择的关联容器对象列表
-   * @returns {Promise<void>}
-   */
-  const getTargetList = async () => {
-    const result = await getAlertK8sTarget({ alertId: get(alertId), bizId: get(bizId) });
-    targetList.value = result.target_list;
-    groupBy.value = result.resource_type;
-  };
-
-  /**
-   * @method handleRequest 处理请求
-   */
-  const handleRequest = async () => {
+  const error = shallowRef(false);
+  const revision = shallowRef(0);
+  watch([() => get(alertId), () => get(bizId), revision], async (_, __, onCleanup) => {
+    let active = true;
+    onCleanup(() => { active = false; });
     loading.value = true;
-    await Promise.all([getSceneList(), getTargetList()]);
-    if (sceneList.value?.length && !hasScene(scene.value)) {
-      scene.value = sceneList.value[0];
-    }
-    if (targetList.value?.length && !hasTarget(currentTarget.value)) {
+    error.value = false;
+    currentTarget.value = undefined;
+    targetList.value = [];
+    sceneList.value = [];
+    scene.value = undefined;
+    try {
+      const result = await getAlertK8sTarget({ alertId: get(alertId), bizId: get(bizId) });
+      if (!active) return;
+      targetList.value = result.target_list;
+      groupBy.value = result.resource_type;
       currentTarget.value = targetList.value[0];
+      sceneList.value = currentTarget.value?.scenario_list ?? [];
+      scene.value = sceneList.value[0];
+    } catch {
+      if (active) error.value = true;
+    } finally {
+      if (active) loading.value = false;
     }
-    loading.value = false;
-  };
-
-  watchEffect(handleRequest);
+  }, { immediate: true });
   return {
+    error,
+    retry: () => { revision.value++; },
     scene,
     currentTarget,
     sceneList,

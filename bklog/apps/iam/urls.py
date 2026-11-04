@@ -32,6 +32,7 @@ from apps.iam.views.resources import (
     EsSourceResourceProvider,
     IndicesResourceProvider,
 )
+from apps.iam.views.resources_v4 import build_resource_dispatcher
 
 from apps.iam.views import resources
 
@@ -42,10 +43,16 @@ dispatcher.register("collection", CollectionResourceProvider())
 dispatcher.register("es_source", EsSourceResourceProvider())
 dispatcher.register("indices", IndicesResourceProvider())
 
+v4_dispatcher = build_resource_dispatcher()
+
 
 router = routers.DefaultRouter(trailing_slash=True)
 
 router.register(r"meta", meta.MetaViewSet, basename="meta")
 
 
-urlpatterns = [re_path(r"^", include(router.urls)), re_path(r"^resource/$", dispatcher.as_view([login_exempt]))]
+urlpatterns = [
+    re_path(r"^", include(router.urls)),
+    re_path(r"^resource/$", dispatcher.as_view([login_exempt])),
+    re_path(r"^v4/resource/$", v4_dispatcher.as_view([login_exempt])),
+]

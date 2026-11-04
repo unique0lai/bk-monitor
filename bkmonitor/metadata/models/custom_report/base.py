@@ -9,18 +9,19 @@ specific language governing permissions and limitations under the License.
 """
 
 import logging
+import uuid
+
 from typing import Any, ClassVar, Self
 
-from django.conf import settings
 from django.db import models
 from django.db.transaction import atomic
 from django.utils.translation import gettext as _
 
-from bkmonitor.utils.request import get_request_username
 from metadata import config
 from metadata.models.common import Label
-from metadata.models.data_source import DataSourceOption, DataSourceResultTable
+from metadata.models.data_source import DataSource, DataSourceOption, DataSourceResultTable
 from metadata.models.result_table import ResultTable, ResultTableOption
+from metadata.models.space.constants import EtlConfigs
 
 """
 base is base class of:
@@ -56,6 +57,7 @@ class CustomGroupBase(models.Model):
     max_future_time_offset = models.IntegerField(verbose_name="上报最大时间偏移", default=-1)
     # 事件标签，默认是其他类型
     label = models.CharField(verbose_name="事件标签", max_length=128, default=Label.RESULT_TABLE_LABEL_OTHER)
+    token = models.CharField(verbose_name="自定义上报 Token", max_length=256, default="")
     is_enable = models.BooleanField(verbose_name="是否启用", default=True)
     is_delete = models.BooleanField(verbose_name="是否删除", default=False)
     creator = models.CharField(verbose_name="创建者", max_length=255)
@@ -64,6 +66,8 @@ class CustomGroupBase(models.Model):
     last_modify_time = models.DateTimeField("最后更新时间", auto_now=True)
     # 是否需要每个指标组单个结果表处理
     is_split_measurement = models.BooleanField("是否需要单个指标单表存储", default=False)
+    # 是否需要下发 collector 配置
+    is_need_deploy_collector_config = models.BooleanField("是否需要下发 collector 配置", default=True)
 
     DEFAULT_DATASOURCE_OPTIONS = [{"name": "flat_batch_key", "value": "data"}]
 
@@ -95,9 +99,10 @@ class CustomGroupBase(models.Model):
         """
         # 如果结果表存在，则先修改结果表的启用状态
         for table in ResultTable.objects.filter(table_id=self.table_id, bk_tenant_id=self.bk_tenant_id):
-            table.modify(operator=get_request_username(settings.COMMON_USERNAME), is_enable=False)
+            table.modify(operator=self.last_modify_user, is_enable=False)
+            table.is_enable = False
             table.is_deleted = True
-            table.save()
+            table.save(update_fields=["is_enable", "is_deleted", "last_modify_time"])
         logger.info("group->[%s] table->[%s] is disabled now.", self.custom_group_name, self.table_id)
 
     @classmethod
@@ -139,6 +144,28 @@ class CustomGroupBase(models.Model):
         return filter_kwargs
 
     @classmethod
+    def _validate_datasource_result_table_relation(cls, bk_data_id: int, table_id: str, bk_tenant_id: str) -> None:
+        """校验自定义组待创建的 DataSourceResultTable 关系，不自动删除已有关系。"""
+
+        data_source = DataSource.objects.get(bk_data_id=bk_data_id, bk_tenant_id=bk_tenant_id)
+        table_relations = DataSourceResultTable.objects.filter(table_id=table_id, bk_tenant_id=bk_tenant_id)
+        if table_relations.exists():
+            raise ValueError(_("结果表[{}]已经关联数据源，请更换结果表").format(table_id))
+
+        if data_source.etl_config == EtlConfigs.BK_CUSTOM_FORMAT.value:
+            return
+
+        existing_table_ids = list(
+            DataSourceResultTable.objects.filter(bk_data_id=bk_data_id, bk_tenant_id=bk_tenant_id).values_list(
+                "table_id", flat=True
+            )
+        )
+        if existing_table_ids:
+            raise ValueError(
+                _("数据源[{}]已经关联结果表[{}]，不能创建新的自定义组").format(bk_data_id, ",".join(existing_table_ids))
+            )
+
+    @classmethod
     def _create(
         cls,
         table_id: str | None,
@@ -149,6 +176,7 @@ class CustomGroupBase(models.Model):
         operator: str,
         is_split_measurement: bool,
         bk_tenant_id: str,
+        is_need_deploy_collector_config: bool = True,
         max_rate: int = -1,
         **filter_kwargs,
     ) -> tuple[str, Self]:
@@ -164,6 +192,7 @@ class CustomGroupBase(models.Model):
             bk_data_id=bk_data_id,
             bk_biz_id=bk_biz_id,
             label=label,
+            token=uuid.uuid4().hex,
             creator=operator,
             last_modify_user=operator,
             is_delete=False,
@@ -171,6 +200,7 @@ class CustomGroupBase(models.Model):
             table_id=table_id,
             bk_tenant_id=bk_tenant_id,
             is_split_measurement=is_split_measurement,
+            is_need_deploy_collector_config=is_need_deploy_collector_config,
             max_rate=max_rate,
             **filter_kwargs,
         )
@@ -197,10 +227,12 @@ class CustomGroupBase(models.Model):
         table_id: str | None = None,
         is_builtin=False,
         is_split_measurement=False,
+        is_need_deploy_collector_config: bool = True,
         default_storage_config=None,
         additional_options: dict | None = None,
         data_label: str | None = None,
         bk_biz_id_alias: str | None = None,
+        is_sync_db: bool = True,
         **kwargs,
     ):
         """
@@ -214,11 +246,13 @@ class CustomGroupBase(models.Model):
         :param table_id: 需要制定的table_id，否则通过默认规则创建得到
         :param is_builtin: 是否为内置指标
         :param is_split_measurement: 是否需要单指标单表存储，主要针对容器大量指标的情况适配
+        :param is_need_deploy_collector_config: 是否需要下发 collector 配置
         :param default_storage_config: 默认存储的配置
         :param additional_options: 附带创建的 ResultTableOption
         :param data_label: 数据标签
         :param bk_tenant_id: 租户ID
         :param bk_biz_id_alias: 业务ID别名
+        :param is_sync_db: 是否在创建 ResultTable 后立即下发数据链路
         :return: group object
         """
         # 创建流程：pre_check -> _create -> create_result_table -> 配置更新
@@ -244,6 +278,18 @@ class CustomGroupBase(models.Model):
             bk_tenant_id=bk_tenant_id,
         )
 
+        table_id = table_id or cls.make_table_id(
+            bk_biz_id,
+            bk_data_id,
+            bk_tenant_id=bk_tenant_id,
+            table_name=custom_group_name,
+        )
+        cls._validate_datasource_result_table_relation(
+            bk_data_id=bk_data_id,
+            table_id=table_id,
+            bk_tenant_id=bk_tenant_id,
+        )
+
         # 2. 创建group
         table_id, custom_group = cls._create(
             table_id=table_id,
@@ -253,6 +299,7 @@ class CustomGroupBase(models.Model):
             label=label,
             operator=operator,
             is_split_measurement=is_split_measurement,
+            is_need_deploy_collector_config=is_need_deploy_collector_config,
             bk_tenant_id=bk_tenant_id,
             **filter_kwargs,
         )
@@ -271,20 +318,13 @@ class CustomGroupBase(models.Model):
         # 如果是自动分表逻辑，则该表为默认路由表，
         # 如果是旧版自定义上报逻辑，则该表作为该dataid的唯一写入表
 
-        if default_storage_config is not None:
-            default_storage_config.update(cls.DEFAULT_STORAGE_CONFIG)
-        else:
-            default_storage_config = cls.DEFAULT_STORAGE_CONFIG
+        default_storage_config = dict(default_storage_config or {})
+        default_storage_config.update(cls.DEFAULT_STORAGE_CONFIG)
 
         cls.process_default_storage_config(custom_group, default_storage_config)
 
         option = {"is_split_measurement": is_split_measurement}
         option.update(additional_options or {})
-
-        # 4. 清除历史 DataSourceResultTable 数据
-        # 这里无需添加租户过滤条件,因为bk_data_id全局唯一,除1001外不存在跨租户场景
-        if DataSourceResultTable.objects.filter(bk_data_id=bk_data_id).exists():
-            DataSourceResultTable.objects.filter(bk_data_id=bk_data_id).delete()
 
         ResultTable.create_result_table(
             bk_data_id=custom_group.bk_data_id,
@@ -306,6 +346,7 @@ class CustomGroupBase(models.Model):
             data_label=data_label,
             bk_tenant_id=bk_tenant_id,
             bk_biz_id_alias=bk_biz_id_alias,
+            is_sync_db=is_sync_db,
         )
 
         custom_group.update_metrics(metric_info=final_metric_info_list)

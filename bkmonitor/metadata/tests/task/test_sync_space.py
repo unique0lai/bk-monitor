@@ -42,6 +42,12 @@ class LockCacheMock:
         return True
 
 
+@pytest.fixture(autouse=True)
+def mock_cc_search_business(mocker):
+    """同步任务会先刷新 cc 业务列表缓存，统一 mock 掉避免触发真实请求"""
+    return mocker.patch("api.cmdb.client.search_business")
+
+
 def test_sync_bkcc_space(create_and_delete_record, table_id, mocker):
     biz_id = 1
     mocker.patch(
@@ -144,7 +150,7 @@ def test_sync_bkcc_space_soft_disable_conflict_orphan(create_and_delete_record, 
 
 
 def test_sync_bkcc_space_skip_create_below_start_biz_id(create_and_delete_record, mocker, settings):
-    settings.SYNC_BKCC_SPACE_START_BIZ_ID = "10"
+    settings.NEW_ENV_START_BIZ_ID = "10"
     mocker.patch("alarm_backends.core.storage.redis.Cache.__new__", return_value=LockCacheMock())
     mocker.patch("core.drf_resource.api.bk_login.list_tenant", return_value=[{"id": "system"}])
     mocker.patch(
@@ -161,7 +167,7 @@ def test_sync_bkcc_space_skip_create_below_start_biz_id(create_and_delete_record
 
 
 def test_sync_bkcc_space_skip_delete_below_start_biz_id(create_and_delete_record, mocker, settings):
-    settings.SYNC_BKCC_SPACE_START_BIZ_ID = "10"
+    settings.NEW_ENV_START_BIZ_ID = "10"
     mocker.patch("alarm_backends.core.storage.redis.Cache.__new__", return_value=LockCacheMock())
     Space.objects.create(
         creator=SYSTEM_USERNAME,
@@ -186,7 +192,7 @@ def test_sync_bkcc_space_skip_delete_below_start_biz_id(create_and_delete_record
 
 
 def test_sync_bkcc_space_skip_builtin_datalink_for_unmanaged_biz(create_and_delete_record, mocker, settings):
-    settings.SYNC_BKCC_SPACE_START_BIZ_ID = "10"
+    settings.NEW_ENV_START_BIZ_ID = "10"
     mocker.patch("alarm_backends.core.storage.redis.Cache.__new__", return_value=LockCacheMock())
     mocker.patch("core.drf_resource.api.bk_login.list_tenant", return_value=[{"id": "system"}])
     mocker.patch(
@@ -213,7 +219,7 @@ def test_sync_bkcc_space_skip_builtin_datalink_for_unmanaged_biz(create_and_dele
 
 
 def test_sync_bkcc_space_invalid_start_biz_id_warn_once(create_and_delete_record, mocker, settings):
-    settings.SYNC_BKCC_SPACE_START_BIZ_ID = "abc"
+    settings.NEW_ENV_START_BIZ_ID = "abc"
     mocker.patch("alarm_backends.core.storage.redis.Cache.__new__", return_value=LockCacheMock())
     mocker.patch("core.drf_resource.api.bk_login.list_tenant", return_value=[{"id": "system"}])
     mocker.patch(
@@ -230,8 +236,27 @@ def test_sync_bkcc_space_invalid_start_biz_id_warn_once(create_and_delete_record
     sync_bkcc_space()
 
     warning.assert_called_once_with(
-        "sync_bkcc_space: invalid SYNC_BKCC_SPACE_START_BIZ_ID(%s), disable threshold filter", "abc"
+        "sync_bkcc_space: invalid NEW_ENV_START_BIZ_ID(%s), disable threshold filter", "abc"
     )
+
+
+def test_sync_bkcc_space_refresh_cmdb_cache(create_and_delete_record, mocker, mock_cc_search_business):
+    mocker.patch("alarm_backends.core.storage.redis.Cache.__new__", return_value=LockCacheMock())
+    mocker.patch(
+        "core.drf_resource.api.cmdb.get_business",
+        return_value=[Business(bk_biz_id=11, bk_biz_name="managed", time_zone="Asia/Shanghai")],
+    )
+    mocker.patch("metadata.task.sync_space.create_bkcc_spaces")
+    mocker.patch("metadata.task.sync_space.check_bkcc_space_builtin_datalink")
+    mocker.patch("metadata.utils.redis_tools.RedisTools.sadd", return_value=True)
+    mocker.patch("metadata.utils.redis_tools.RedisTools.publish", return_value=True)
+
+    sync_bkcc_space(bk_tenant_id="system")
+
+    # 正常业务与归档业务都必须先刷新 cc 缓存，否则新增业务最长要等 1 小时才能建出空间
+    refresh_kwargs = [single_call.kwargs for single_call in mock_cc_search_business.request.refresh.call_args_list]
+    assert {"bk_tenant_id": "system"} in refresh_kwargs
+    assert {"bk_tenant_id": "system", "condition": {"bk_data_status": "disabled"}} in refresh_kwargs
 
 
 def test_sync_bcs_space(create_and_delete_record, table_id, mocker):
@@ -341,6 +366,7 @@ def test_sync_bcs_space(create_and_delete_record, table_id, mocker):
 
 
 def test_sync_bkcc_space_data_source(create_and_delete_record, table_id, mocker):
+    mocker.patch("alarm_backends.core.storage.redis.Cache.__new__", return_value=LockCacheMock())
     mocker.patch("redis.Redis", side_effect=mock_redis_client)
     mocker.patch("metadata.utils.redis_tools.RedisTools.push_space_to_redis", return_value=True)
 
@@ -351,13 +377,29 @@ def test_sync_bkcc_space_data_source(create_and_delete_record, table_id, mocker)
 
     mocker.patch("metadata.utils.redis_tools.RedisTools.hmset_to_redis", side_effect=mock_hmset_redis)
 
+    # 业务空间必须存在，租户信息从 Space 反查获取
+    test_bk_tenant_id = "tenant_a"
+    Space.objects.create(
+        creator=SYSTEM_USERNAME,
+        updater=SYSTEM_USERNAME,
+        space_type_id=SpaceTypes.BKCC.value,
+        space_id="1",
+        space_name="test",
+        bk_tenant_id=test_bk_tenant_id,
+    )
+
     # 测试新加
     test_create_data_id = 199
     mocker.patch("metadata.task.sync_space.get_biz_data_id", return_value={1: [test_create_data_id]})
 
     sync_bkcc_space_data_source()
 
-    assert SpaceDataSource.objects.filter(space_type_id="bkcc", space_id="1", bk_data_id=test_create_data_id).exists()
+    space_data_source = SpaceDataSource.objects.filter(
+        space_type_id="bkcc", space_id="1", bk_data_id=test_create_data_id
+    ).first()
+    assert space_data_source is not None
+    # 校验租户与对应 Space 一致，而非默认租户
+    assert space_data_source.bk_tenant_id == test_bk_tenant_id
 
 
 def test_sync_bkcc_space_delete_marks_related_bkci_invalid(create_and_delete_record, mocker):

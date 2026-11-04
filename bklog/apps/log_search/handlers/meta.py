@@ -40,6 +40,7 @@ from apps.log_search.models import ProjectInfo, Space, UserMetaConf
 from apps.utils import APIModel
 from apps.utils.local import get_request, get_request_tenant_id, get_request_username
 from apps.utils.log import logger
+from apps.utils.user_info import get_user_info
 from bkm_space.define import SpaceTypeEnum
 from bkm_space.utils import space_uid_to_bk_biz_id
 
@@ -63,11 +64,20 @@ class MetaHandler(APIModel):
         """
         username = get_request_username()
         bk_tenant_id = get_request_tenant_id()
-        # 获取业务列表
-        spaces = Space.get_all_spaces(bk_tenant_id=bk_tenant_id, space_uid=space_uid)
-        allowed_spaces = Permission(username).filter_space_list_by_action(
-            ActionEnum.VIEW_BUSINESS, bk_tenant_id, spaces
-        )
+        permission = Permission(username)
+
+        # has_permission=True 且未指定 space_uid 时，交给 Permission 按鉴权模式加载：
+        # 纯 V4 会 IAM 先查再定向查库，避免先扫全量 Space；V3/union 仍会内部全量加载。
+        if space_uid:
+            spaces = Space.get_all_spaces(bk_tenant_id=bk_tenant_id, space_uid=space_uid)
+            allowed_spaces = permission.filter_space_list_by_action(ActionEnum.VIEW_BUSINESS, bk_tenant_id, spaces)
+        elif has_permission:
+            allowed_spaces = permission.filter_space_list_by_action(ActionEnum.VIEW_BUSINESS, bk_tenant_id)
+            spaces = allowed_spaces
+        else:
+            spaces = Space.get_all_spaces(bk_tenant_id=bk_tenant_id)
+            allowed_spaces = permission.filter_space_list_by_action(ActionEnum.VIEW_BUSINESS, bk_tenant_id, spaces)
+
         allowed_space_mapping = {space["bk_biz_id"] for space in allowed_spaces}
         # 获取置顶空间列表
         # 返回格式： space_uid 的列表
@@ -196,10 +206,10 @@ class MetaHandler(APIModel):
         return module
 
     @classmethod
-    def get_user(cls):
+    def get_user(cls, refresh=False):
         request = get_request()
         username = request.user.username
-        data = request.user_info
+        data = get_user_info(user=username, refresh=True) if refresh else request.user_info
         return {
             "username": username,
             "language": data.get("language", "zh-cn"),

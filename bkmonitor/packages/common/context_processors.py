@@ -11,20 +11,25 @@ specific language governing permissions and limitations under the License.
 import os
 from typing import Any
 
+from blueapps.account.components.bk_token.verification_strategy import TokenVerifier
 from django.conf import settings
 from django.utils.translation import get_language
 from django.utils.translation import gettext as _
+from opentelemetry import context as otel_context
+from opentelemetry.instrumentation.utils import _SUPPRESS_INSTRUMENTATION_KEY
 
 from bkm_space.api import SpaceApi
 from bkm_space.define import Space
 from bkmonitor.commons.tools import is_ipv6_biz
+from bkmonitor.iam.my_perm import get_iam_my_perm_url
 from bkmonitor.utils import time_tools
 from bkmonitor.utils.common_utils import fetch_biz_id_from_request, safe_int
 from bkmonitor.utils.request import get_request_tenant_id
 from common.log import logger
 from constants.common import DEFAULT_TENANT_ID
-from core.drf_resource import api, resource
+from core.drf_resource import resource
 from core.errors.api import BKAPIError
+from fta_web.issue.source_analysis import is_issue_ai_analysis_enabled_for_biz
 
 
 class Platform:
@@ -57,8 +62,7 @@ def get_default_biz_id(request, biz_list: list[dict[str, Any]] | None = None, id
             if biz_id_or_none:
                 biz_id = safe_int(str(biz_id_or_none).strip("/"), dft=None)
             elif biz_list:
-                sorted(biz_list, key=lambda biz: biz[id_key])
-                biz_id = biz_list[0]["bk_biz_id"]
+                biz_id = min(biz_list, key=lambda biz: biz[id_key])["bk_biz_id"]
             else:
                 biz_id = -1
 
@@ -106,11 +110,19 @@ def get_core_context(request):
 
     # 获取用户时区
     user_time_zone = ""
-    if username:
+    bk_token = request.COOKIES.get("bk_token", "")
+    if username and bk_token:
         try:
-            user_time_zone = api.bk_login.get_user_info(id=username).get("time_zone", "")
-        except Exception as e:
-            logger.error(f"Get user {username} time zone failed: {e}")
+            # bk_token 会作为 GET 参数发送，避免自动采集将其记录到请求 URL。
+            context_token = otel_context.attach(otel_context.set_value(_SUPPRESS_INSTRUMENTATION_KEY, True))
+            try:
+                result, user_info = TokenVerifier().get_user_info(bk_token)
+            finally:
+                otel_context.detach(context_token)
+            if result and user_info.get("username") == username:
+                user_time_zone = user_info.get("time_zone", "")
+        except Exception:
+            logger.error(f"Get user {username} time zone failed")
 
     return {
         # healthz 自监控引用
@@ -128,11 +140,16 @@ def get_core_context(request):
         "BK_CC_URL": settings.BK_CC_URL,
         "BK_CI_URL": settings.BK_CI_URL,
         "BK_BCS_URL": settings.BK_BCS_HOST,
+        "BK_IAM_URL": settings.BK_IAM_SAAS_HOST,
+        # 权限中心「我的权限」完整地址：各 IAM 版本路由不同，由后端按版本拼好下发，前端直接打开
+        "BK_IAM_MY_PERM_URL": get_iam_my_perm_url(),
         # 蓝鲸平台URL
         "BK_URL": settings.BK_URL,
         "BK_PAAS_HOST": settings.BK_PAAS_HOST,
         # bkchat 用户管理接口
         "BKCHAT_MANAGE_URL": settings.BKCHAT_MANAGE_URL,
+        # TAPD 前端跳转 / OAuth 基址，由环境变量注入，公开仓不写死主机
+        "TAPD_OAUTH_BASE_URL": getattr(settings, "TAPD_OAUTH_BASE_URL", "") or "",
         "CE_URL": settings.CE_URL,
         "BKLOGSEARCH_HOST": settings.BKLOGSEARCH_HOST,
         "BK_NODEMAN_HOST": settings.BK_NODEMAN_HOST,
@@ -162,6 +179,11 @@ def get_core_context(request):
         # 全局配置资源链接
         "BK_SHARED_RES_URL": settings.BK_SHARED_RES_URL,
         "FOOTER_VERSION": settings.VERSION,
+        # RUM 配置
+        "BKAPP_RUM_SDK": settings.BKAPP_RUM_SDK,
+        "BKAPP_RUM_ENDPOINT": settings.BKAPP_RUM_ENDPOINT,
+        "BKAPP_RUM_TOKEN": settings.BKAPP_RUM_TOKEN,
+        "BKAPP_RUM_ENABLED": str(settings.BKAPP_RUM_ENABLED).lower(),
     }
 
 
@@ -192,13 +214,21 @@ def get_basic_context(request, space_list: list[dict[str, Any]], bk_biz_id: int)
             # K8s v2 是否开启
             "K8S_V2_BIZ_LIST": settings.K8S_V2_BIZ_LIST,
             # 是否开启AI助手
-            "ENABLE_AI_ASSISTANT": "true" if settings.AIDEV_API_BASE_URL else "false",
+            "ENABLE_AI_ASSISTANT": (
+                "true"
+                if settings.AIDEV_API_BASE_URL and os.getenv("ENABLE_AI_ASSISTANT", "enabled") == "enabled"
+                else "false"
+            ),
             # APM 日志转发接口 Url
             "APM_LOG_FORWARD_URL_PREFIX": "/apm_log_forward/bklog/",
             # 是否开启事件中心AIOps功能
             "ENABLE_AIOPS_EVENT_CENTER_BIZ_LIST": settings.ENABLE_AIOPS_EVENT_CENTER_BIZ_LIST,
             # 用户管理网关接口
             "BK_USER_WEB_API_URL": settings.BK_USER_WEB_API_URL,
+            # RUM 是否开启
+            "RUM_BIZ_LIST": settings.RUM_BIZ_LIST,
+            # Profiling 主动采集是否开启
+            "ACTIVE_PROFILING_BIZ_LIST": settings.ACTIVE_PROFILING_BIZ_LIST,
         }
     )
 
@@ -232,6 +262,9 @@ def get_basic_context(request, space_list: list[dict[str, Any]], bk_biz_id: int)
             context["ENABLE_AIOPS"] = "true"
     except Exception as e:
         logger.error(f"Get AIOPS_BIZ_WHITE_LIST Failed: {e}")
+
+    # Issue AI 分析按独立业务白名单灰度
+    context["ENABLE_ISSUE_AI_ANALYSIS"] = is_issue_ai_analysis_enabled_for_biz(context["BK_BIZ_ID"])
 
     # 根因故障定位页面渲染
     context["ENABLE_AIOPS_INCIDENT"] = "false"

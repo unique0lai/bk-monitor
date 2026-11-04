@@ -36,6 +36,10 @@ const { createMonitorConfig } = require('./scripts/create-monitor');
 
 const devPort = 8001;
 
+function isE2eDevSettings() {
+  return ['1', 'true', 'yes'].includes(String(process.env.BKLOG_E2E_DEV || '').toLowerCase());
+}
+
 let devConfig = {
   port: devPort,
   proxy: [{}],
@@ -53,6 +57,7 @@ const logPluginConfig = {
       window.COLLECTOR_GUIDE_URL = '\${COLLECTOR_GUIDE_URL}'
       window.FEATURE_TOGGLE = \${FEATURE_TOGGLE | n}
       window.FEATURE_TOGGLE_WHITE_LIST = \${FEATURE_TOGGLE_WHITE_LIST | n}
+      window.FEATURE_TOGGLE_BLACK_LIST = \${FEATURE_TOGGLE_BLACK_LIST | n}
       window.SPACE_UID_WHITE_LIST = \${SPACE_UID_WHITE_LIST | n}
       window.FIELD_ANALYSIS_CONFIG = \${FIELD_ANALYSIS_CONFIG | n}
       window.REAL_TIME_LOG_MAX_LENGTH = '\${REAL_TIME_LOG_MAX_LENGTH}'
@@ -83,10 +88,25 @@ const logPluginConfig = {
       window.BK_PAAS_API_HOST = '\${BK_PAAS_API_HOST}'
       window.BK_USER_URL = '\${BK_USER_URL}'
       window.BK_IAM_URL = '\${BK_IAM_URL}'
+      window.BK_LOG_ACCESS_GUIDE_URL = '\${BK_LOG_ACCESS_GUIDE_URL}'
+      window.BK_LOG_PERMISSION_GUIDE_URL = '\${BK_LOG_PERMISSION_GUIDE_URL}'
       window.TGPA_SDK_DOC_URL = '\${TGPA_SDK_DOC_URL}'
+      window.SHOW_PERSONAL_SETTINGS = \${SHOW_PERSONAL_SETTINGS}
+      window.BKLOG_RUM = {
+        enabled: \${BKLOG_RUM_ENABLED},
+        sdk: "\${BKLOG_RUM_SDK}",
+        endpoint: "\${BKLOG_RUM_ENDPOINT}",
+        token: "\${BKLOG_RUM_TOKEN}",
+      }
     </script>`,
 };
-if (fs.existsSync(path.resolve(__dirname, './local.settings.js'))) {
+if (isE2eDevSettings()) {
+  const e2eSettingsPath = path.resolve(__dirname, './local.settings.e2e.js');
+  if (!fs.existsSync(e2eSettingsPath)) {
+    throw new Error('BKLOG_E2E_DEV is set but local.settings.e2e.js is missing');
+  }
+  devConfig = Object.assign({}, devConfig, require(e2eSettingsPath));
+} else if (fs.existsSync(path.resolve(__dirname, './local.settings.js'))) {
   const localConfig = require('./local.settings');
   devConfig = Object.assign({}, devConfig, localConfig);
 }
@@ -118,6 +138,13 @@ module.exports = (baseConfig, { app, mobile, production, fta, log: _log, email =
       host: '0.0.0.0',
       allowedHosts: 'all',
       open: false,
+      client: {
+        ...(config.devServer?.client || {}),
+        overlay: {
+          errors: true,
+          warnings: false,
+        },
+      },
       static: [
         // 开发环境：优先直接从 node_modules 提供 log-web1-dll 资源
         // 只有当目录存在时才添加此配置
@@ -128,6 +155,18 @@ module.exports = (baseConfig, { app, mobile, production, fta, log: _log, email =
               publicPath: '/static/dist/log-web1-dll',
               serveIndex: false, // 禁用目录索引
               watch: false, // 不监听文件变化
+            },
+            {
+              directory: logWebDistPath,
+              publicPath: '/log-web1-dll',
+              serveIndex: false,
+              watch: false,
+            },
+            {
+              directory: path.resolve(logWebDistPath, './fonts'),
+              publicPath: '/fonts',
+              serveIndex: false,
+              watch: false,
             },
           ]
           : []),
@@ -142,7 +181,7 @@ module.exports = (baseConfig, { app, mobile, production, fta, log: _log, email =
       headers: {
         'Access-Control-Allow-Origin': '*',
       },
-      proxy: [...devConfig.proxy],
+      proxy: Array.isArray(devConfig.proxy) ? [...devConfig.proxy] : devConfig.proxy,
     });
     config.plugins.push(
       new webpack.DefinePlugin({
@@ -211,6 +250,13 @@ module.exports = (baseConfig, { app, mobile, production, fta, log: _log, email =
   });
   return {
     ...config,
+    ignoreWarnings: [
+      ...(config.ignoreWarnings || []),
+      {
+        module: /@protobufjs\/inquire/,
+        message: /Critical dependency: the request of a dependency is an expression/,
+      },
+    ],
     output: {
       ...config.output,
       path: distUrl,

@@ -24,9 +24,11 @@
  * IN THE SOFTWARE.
  */
 
+export * from './ai-analysis';
 export * from './common';
 export * from './constants';
 export * from './detail';
 export * from './dialog';
+export * from './issues-merge-split';
 export * from './service';
 export * from './table';

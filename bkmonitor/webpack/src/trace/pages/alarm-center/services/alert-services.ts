@@ -45,6 +45,7 @@ import {
   AlarmStatusIconMap,
 } from '../typings';
 import { type RequestOptions, AlarmService } from './base';
+import { withEmbedQuery } from '@/common/embed-context';
 import { type IFilterField, EFieldType } from '@/components/retrieval-filter/typing';
 const ALERT_TABLE_COLUMNS = [
   {
@@ -766,6 +767,7 @@ export class AlertService extends AlarmService {
   }
   get analysisFields(): string[] {
     return [
+      'bk_biz_id',
       'alert_name',
       'metric',
       'duration',
@@ -783,6 +785,7 @@ export class AlertService extends AlarmService {
   }
   get analysisFieldsMap() {
     return {
+      bk_biz_id: window.i18n.t('项目空间'),
       alert_name: window.i18n.t('告警名称'),
       metric: window.i18n.t('指标ID'),
       duration: window.i18n.t('持续时间'),
@@ -807,17 +810,7 @@ export class AlertService extends AlarmService {
     isAll = false,
     options?: RequestOptions
   ): Promise<AnalysisTopNDataResponse<AnalysisFieldAggItem>> {
-    const paramsClone = _.cloneDeep(params);
-    // #if IS_APM_MONITOR
-    paramsClone.bk_biz_ids = [Number(window.bk_biz_id)];
-    if (paramsClone.query_string) {
-      // 语句模式
-      paramsClone.query_string = `(${paramsClone.query_string}) AND ${window.APM_QUERY_STRING || ''}`;
-    } else {
-      // ui 模式
-      paramsClone.query_string = window.APM_QUERY_STRING || '';
-    }
-    // #endif
+    const paramsClone = withEmbedQuery(_.cloneDeep(params));
     const data = await alertTopN(
       {
         ...paramsClone,
@@ -834,24 +827,15 @@ export class AlertService extends AlarmService {
     params: Partial<CommonFilterParams>,
     options?: RequestOptions
   ): Promise<FilterTableResponse<T>> {
-    const paramsClone = _.cloneDeep(params);
-    // #if IS_APM_MONITOR
-    paramsClone.bk_biz_ids = [Number(window.bk_biz_id)];
-    if (paramsClone.query_string) {
-      // 语句模式
-      paramsClone.query_string = `(${paramsClone.query_string}) AND ${window.APM_QUERY_STRING || ''}`;
-    } else {
-      // ui 模式
-      paramsClone.query_string = window.APM_QUERY_STRING || '';
-    }
-    // #endif
+    const { throwOnError, ...requestOptions } = options || {};
+    const paramsClone = withEmbedQuery(_.cloneDeep(params));
     const data = await searchAlert(
       {
         ...paramsClone,
         show_overview: false, // 是否展示概览
         show_aggs: false, // 是否展示聚合
       },
-      options
+      requestOptions
     )
       .then(({ alerts, total }) => {
         // 将后端queryConfig相关数转换组装为前端定义统一的 QueryConfig 格式
@@ -892,25 +876,15 @@ export class AlertService extends AlarmService {
           data: alerts || [],
         };
       })
-      .catch(() => ({
-        total: 0,
-        data: [],
-      }));
+      .catch(error => {
+        if (throwOnError) throw error;
+        return { total: 0, data: [] };
+      });
     return data;
   }
 
   async getQuickFilterList(params: Partial<CommonFilterParams>, options?: RequestOptions): Promise<QuickFilterItem[]> {
-    const paramsClone = _.cloneDeep(params);
-    // #if IS_APM_MONITOR
-    paramsClone.bk_biz_ids = [Number(window.bk_biz_id)];
-    if (paramsClone.query_string) {
-      // 语句模式
-      paramsClone.query_string = `(${paramsClone.query_string}) AND ${window.APM_QUERY_STRING || ''}`;
-    } else {
-      // ui 模式
-      paramsClone.query_string = window.APM_QUERY_STRING || '';
-    }
-    // #endif
+    const paramsClone = withEmbedQuery(_.cloneDeep(params));
     const data = await searchAlert(
       {
         ...paramsClone,
@@ -989,17 +963,7 @@ export class AlertService extends AlarmService {
     return data;
   }
   async getRetrievalFilterValues(params: Partial<CommonFilterParams>, config = {}) {
-    const paramsClone = _.cloneDeep(params);
-    // #if IS_APM_MONITOR
-    paramsClone.bk_biz_ids = [Number(window.bk_biz_id)];
-    if (paramsClone.query_string) {
-      // 语句模式
-      paramsClone.query_string = `(${paramsClone.query_string}) AND ${window.APM_QUERY_STRING || ''}`;
-    } else {
-      // ui 模式
-      paramsClone.query_string = window.APM_QUERY_STRING || '';
-    }
-    // #endif
+    const paramsClone = withEmbedQuery(_.cloneDeep(params));
     const data = await alertTopN(
       {
         ...paramsClone,

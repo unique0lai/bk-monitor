@@ -51,6 +51,7 @@ export default {
   时间: 'Time',
   事件时间: 'Event Time',
   过期时间: 'Expire Time',
+  过期天数: 'Expiration Days',
   副本数: 'Replicas',
   分片数: 'Shards',
   索引切分大小: 'Split Size',
@@ -147,6 +148,7 @@ export default {
   语音拨打顺序: 'Voice Call Order',
   串行: 'Serial',
   并行: 'Parallel',
+  检测周期: 'Detection Cycle',
 
   // 专业表单 - 图表相关
   已选图表: 'Selected charts',
@@ -453,6 +455,7 @@ export default {
   周: 'Week',
   年: 'Year',
   天: 'Day',
+  维度组合: 'Dimension combinations',
   昨天: 'Yesterday',
   一: 'One',
   二: 'Two',
@@ -806,6 +809,7 @@ export default {
   英文名称: 'English Name',
   'Tracing 的插件': 'Tracing plugin',
   基础信息: 'Basic Information',
+  'LLM 观测': 'LLM Observation',
   Apdex设置: 'Apdex Setting',
   采样比例: 'Sampling Ratio',
   尾部采样: 'Tail Sampling',
@@ -1666,6 +1670,10 @@ export default {
   告警恢复时通知: 'Notify When Alarm Recovers',
   告警接收业务: 'Alarm receiving business',
   告警模板预览: 'Alarm Template Preview',
+  '预览使用固定示例数据，不是当前策略的查询值。':
+    'This preview uses fixed sample data, not values queried by the current strategy.',
+  模板渲染失败: 'Template rendering failed',
+  '模板预览失败，请稍后重试': 'Template preview failed. Please try again later',
   告警确认时: 'Acknowledged',
   日志关键字事件: 'Log Keyword Event',
   日志关键字采集: 'Log keyword collection',
@@ -1712,6 +1720,8 @@ export default {
   // '采集配置名称/ID': 'Collection configuration name/ID',
   '搜素 ID、名称': 'Search ID, Name',
   '主机&云平台': 'Host & Cloud Platform',
+  '前端监控 - RUM': 'Frontend Monitoring - RUM',
+  RUM: 'RUM',
   指标选择器: 'Metric Selector',
 
   // 日历
@@ -1946,6 +1956,8 @@ export default {
   容器场景页: 'Container scene page',
   复制节点名: 'Copy node name',
   关联边: 'Associated edges',
+  继承自应用: 'Inherited from application',
+  去修改: 'Go to modify',
 
   // K8s 容器场景
   图表: 'Chart',
@@ -2008,7 +2020,49 @@ export default {
   数据后保留小数位: 'Data decimal places',
   '{0} 位': '{0} decimal places',
   Y轴最小值自适应: 'Y-axis minimum value adaptive',
+
+  // RUM
+  页面加载: 'Page load',
+  'API 请求': 'API request',
   动作: 'Action',
   Issue聚合: 'Issue aggregation',
   生效告警级别: 'Effective alarm level',
+  操作时间: 'Operation time',
+  影响范围维度: 'Impact scope dimension',
+
+  单据类型: 'Ticket type',
+
+  // 主机
+  对比方法: 'Comparison method',
+  节点: 'Node',
+  ID: 'ID',
+  启动命令: 'Start command',
+
+  已就绪: 'Ready',
+  绑定智能体: 'Bind smart body',
+  '绑定 skill': 'Bind skill',
+  绑定知识库: 'Bind knowledge base',
+  指派对象: 'Assignee',
+  调用参数: 'Call parameters',
+  返回结果: 'Return result',
+  工具描述: 'Tool description',
+  可用工具: 'Available tools',
+  工具调用记录: 'Tool call record',
+  用户消息: 'User message',
+  模型消息: 'Model message',
+  '系统 Prompts': 'System Prompts',
+  推理过程: 'Reasoning process',
+  复制信息: 'Copy information',
+  原地展开: 'Expand in place',
+  未命名工具: 'Unnamed tool',
+  规划的工具调用: 'Planned tool calls',
+  模型输出: 'Model output',
+
+  // RUM 检索--详情
+  会话: 'Session',
+  用户: 'User',
+  环境: 'Environment',
+  'View 详情': 'View Details',
+  请求: 'Request',
+  停留时长: 'duration',
 };

@@ -1,20 +1,17 @@
-# -*- coding: utf-8 -*-
 """
 分隔符特有分支测试
 split_str, index mapping, 跳过索引
 """
+
 from unittest import TestCase
 
 from apps.log_databus.handlers.etl_storage.bk_log_delimiter import BkLogDelimiterEtlStorage
 from apps.tests.log_databus.v4_clean.helpers import (
     find_rules_by_output,
-    find_rules_by_type,
-    find_rules_by_input,
-    get_output_ids,
     assert_rule_exists,
     assert_rule_absent,
 )
-from apps.tests.log_databus.v4_clean.testdata.built_in_configs import get_fresh_config
+from apps.tests.log_databus.v4_clean.testdata.built_in_configs import build_test_field_list, get_fresh_config
 from apps.tests.log_databus.v4_clean.testdata.field_fixtures import make_field
 
 
@@ -28,7 +25,8 @@ class TestDelimiterSplitStr(TestCase):
         """应生成 iter_string → bk_separator_object 的 split_str 规则"""
         etl_params = {"separator": "|", "retain_original_text": True}
         fields = [make_field("ip", field_index=1)]
-        result = self.storage.build_log_v4_data_link(fields, etl_params, get_fresh_config())
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
         sep_rules = find_rules_by_output(rules, "bk_separator_object")
         self.assertEqual(len(sep_rules), 1)
@@ -40,7 +38,8 @@ class TestDelimiterSplitStr(TestCase):
         """逗号分隔符"""
         etl_params = {"separator": ",", "retain_original_text": False}
         fields = [make_field("name", field_index=1)]
-        result = self.storage.build_log_v4_data_link(fields, etl_params, get_fresh_config())
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
         sep_rules = find_rules_by_output(rules, "bk_separator_object")
         self.assertEqual(sep_rules[0]["operator"]["delimiter"], ",")
@@ -60,7 +59,8 @@ class TestDelimiterIndexMapping(TestCase):
             make_field("method", field_index=2),
             make_field("cost", "double", field_index=3),
         ]
-        result = self.storage.build_log_v4_data_link(fields, etl_params, get_fresh_config())
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
 
         ip_rules = find_rules_by_output(rules, "ip")
@@ -78,7 +78,8 @@ class TestDelimiterIndexMapping(TestCase):
             make_field("name", field_index=1),
             make_field("value", "int", field_index=5),
         ]
-        result = self.storage.build_log_v4_data_link(fields, etl_params, get_fresh_config())
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
 
         name_rules = find_rules_by_output(rules, "name")
@@ -94,7 +95,8 @@ class TestDelimiterIndexMapping(TestCase):
             make_field("unused", field_index=3, is_delete=True),
             make_field("value", "int", field_index=5),
         ]
-        result = self.storage.build_log_v4_data_link(fields, etl_params, get_fresh_config())
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
         assert_rule_absent(self, rules, "unused")
         assert_rule_exists(self, rules, "name")
@@ -102,20 +104,45 @@ class TestDelimiterIndexMapping(TestCase):
 
 
 class TestDelimiterLogField(TestCase):
-    """log 字段始终输出"""
+    """log 字段按 retain_original_text / enable_retain_content 条件输出，与 JSON 对齐"""
 
     def setUp(self):
         self.storage = BkLogDelimiterEtlStorage()
 
-    def test_log_always_generated(self):
-        """分隔符类型 log assign 规则始终生成"""
+    def test_log_not_generated_when_discard_original_and_failure(self):
+        """丢弃原文且未保留失败日志时，不应生成 log assign"""
         etl_params = {"separator": "|", "retain_original_text": False}
         fields = [make_field("ip", field_index=1)]
-        result = self.storage.build_log_v4_data_link(fields, etl_params, get_fresh_config())
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
+        rules = result["clean_rules"]
+        assert_rule_absent(self, rules, "log")
+        # 切分链路仍需要 iter_string
+        assert_rule_exists(self, rules, "iter_string", operator_type="get")
+
+    def test_log_generated_when_retain_original_text(self):
+        """retain_original_text=True 时应生成 log assign"""
+        etl_params = {"separator": "|", "retain_original_text": True}
+        fields = [make_field("ip", field_index=1)]
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
         log_rules = find_rules_by_output(rules, "log")
         self.assertEqual(len(log_rules), 1)
         self.assertEqual(log_rules[0]["input_id"], "iter_item")
+
+    def test_log_not_generated_when_enable_retain_content_without_original_text(self):
+        """retain_original_text=False 时 enable_retain_content 失效，不应生成 log assign"""
+        etl_params = {
+            "separator": "|",
+            "retain_original_text": False,
+            "enable_retain_content": True,
+        }
+        fields = [make_field("ip", field_index=1)]
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
+        rules = result["clean_rules"]
+        assert_rule_absent(self, rules, "log")
 
 
 class TestDelimiterStructure(TestCase):
@@ -127,9 +154,9 @@ class TestDelimiterStructure(TestCase):
     def test_first_rule_is_json_de(self):
         """第一条规则应为 json_de"""
         etl_params = {"separator": "|", "retain_original_text": True}
-        result = self.storage.build_log_v4_data_link(
-            [make_field("ip", field_index=1)], etl_params, get_fresh_config()
-        )
+        fields = [make_field("ip", field_index=1)]
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
         self.assertEqual(rules[0]["operator"]["type"], "json_de")
         self.assertEqual(rules[0]["input_id"], "__raw_data")
@@ -138,7 +165,8 @@ class TestDelimiterStructure(TestCase):
         """用户字段从 bk_separator_object 提取"""
         etl_params = {"separator": "|", "retain_original_text": True}
         fields = [make_field("ip", field_index=1)]
-        result = self.storage.build_log_v4_data_link(fields, etl_params, get_fresh_config())
+        config = get_fresh_config()
+        result = self.storage.build_log_v4_data_link(fields, etl_params, config, build_test_field_list(fields, config))
         rules = result["clean_rules"]
         ip_rules = find_rules_by_output(rules, "ip")
         self.assertEqual(ip_rules[0]["input_id"], "bk_separator_object")

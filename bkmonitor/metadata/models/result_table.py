@@ -15,13 +15,14 @@ import logging
 import re
 import time
 import traceback
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import pydantic
 from django.conf import settings
-from django.db import models, transaction
+from django.db import models
 from django.db.models import sql
 from django.db.transaction import atomic, on_commit
+from django.utils import timezone as django_timezone
 from django.utils.translation import gettext as _
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -30,7 +31,8 @@ from core.drf_resource import api
 from metadata import config
 from metadata.models.bkdata.result_table import BkBaseResultTable
 from metadata.models.constants import BULK_CREATE_BATCH_SIZE, DataIdCreatedFromSystem
-from metadata.models.data_link.constants import BKBASE_NAMESPACE_BK_MONITOR
+from metadata.models.data_link.constants import BKBASE_NAMESPACE_BK_MONITOR, DataLinkResourceStatus
+from metadata.models.data_link.utils import compose_transfer_consumer_group
 from metadata.utils.basic import getitems
 
 from .common import BaseModel, Label, OptionBase
@@ -47,6 +49,8 @@ from .storage import (
     InfluxDBStorage,
     KafkaStorage,
     RedisStorage,
+    StorageClusterRecord,
+    SurrealDBStorage,
 )
 
 logger = logging.getLogger("metadata")
@@ -74,6 +78,7 @@ class ResultTable(models.Model):
         ClusterInfo.TYPE_INFLUXDB: InfluxDBStorage,
         ClusterInfo.TYPE_REDIS: RedisStorage,
         ClusterInfo.TYPE_KAFKA: KafkaStorage,
+        ClusterInfo.TYPE_SURREALDB: SurrealDBStorage,
         ClusterInfo.TYPE_BKDATA: BkDataStorage,
         ClusterInfo.TYPE_ARGUS: ArgusStorage,
     }
@@ -246,7 +251,9 @@ class ResultTable(models.Model):
         logger.info("get_table_id_cutter: table_ids->[%s],bk_tenant_id->[%s]", table_ids, bk_tenant_id)
         table_id_data_id_map = {
             dr["table_id"]: dr["bk_data_id"]
-            for dr in DataSourceResultTable.objects.filter(table_id__in=table_ids).values("table_id", "bk_data_id")
+            for dr in DataSourceResultTable.objects.filter(table_id__in=table_ids, bk_tenant_id=bk_tenant_id).values(
+                "table_id", "bk_data_id"
+            )
         }
         data_id_option_map = {
             dso["bk_data_id"]: dso["value"]
@@ -564,7 +571,7 @@ class ResultTable(models.Model):
         return result_table
 
     def delete_datalink(self) -> None:
-        """删除数据链路及对应的关联记录"""
+        """删除链路的 Databus，保留结果表和存储等关联记录。"""
         from metadata.models.data_link.data_link import DataLink
 
         # 查询结果表对应的Datalink
@@ -573,23 +580,25 @@ class ResultTable(models.Model):
             logger.info("delete_datalink: tenant(%s) %s no bkbase record found", self.bk_tenant_id, self.table_id)
             return
 
-        # 删除数据链路及对应的关联记录
+        # 只清理 Databus，保留链路及结果表映射。
         for record in records:
             data_link_name = record.data_link_name
-            DataLink.objects.get(bk_tenant_id=self.bk_tenant_id, data_link_name=data_link_name).delete_data_link()
-            record.delete()
+            datalink = DataLink.objects.filter(bk_tenant_id=self.bk_tenant_id, data_link_name=data_link_name).first()
+            if datalink:
+                datalink.delete_data_link()
+            record.status = DataLinkResourceStatus.TERMINATING.value
+            record.save()
 
-    def apply_datalink(self, force_update: bool = False) -> None:
+    def apply_datalink(self, force_update: bool = False, delay: bool = True) -> None:
         """创建数据链路"""
         from metadata.models.space.constants import ENABLE_V4_DATALINK_ETL_CONFIGS
-        from metadata.task.datalink import apply_event_group_datalink, apply_log_datalink
+        from metadata.task.datalink import (
+            apply_custom_format_datalink,
+            apply_event_group_datalink,
+            apply_graph_relation_v4_datalink,
+            apply_log_datalink,
+        )
         from metadata.task.tasks import access_bkdata_vm
-
-        # 获取数据源ID
-        datasource = self.get_related_datasource()
-
-        # 获取目标业务ID
-        target_bk_biz_id = self.get_target_bk_biz_id()
 
         # 获取结果表配置项
         options = {
@@ -597,7 +606,47 @@ class ResultTable(models.Model):
             for option in ResultTableOption.objects.filter(bk_tenant_id=self.bk_tenant_id, table_id=self.table_id)
         }
 
-        if self.default_storage == ClusterInfo.TYPE_INFLUXDB:
+        # 获取数据源ID
+        datasource = self.get_related_datasource()
+
+        # 获取目标业务ID
+        target_bk_biz_id = self.get_target_bk_biz_id()
+
+        if datasource.etl_config == EtlConfigs.BK_CUSTOM_FORMAT.value:
+            enable_option_name = ResultTableOption.OPTION_ENABLE_CUSTOM_FORMAT_V4_DATA_LINK
+            if not options.get(enable_option_name, False):
+                # 未配置开关不申请；显式关闭时仅清理该 ResultTable 对应的 Databus。
+                if enable_option_name in options:
+                    self.delete_datalink()
+                return
+            if ResultTableOption.OPTION_CUSTOM_FORMAT_V4_DATA_LINK not in options:
+                raise ValueError(_("开启自定义格式 V4 数据链路时必须配置 custom_format_v4_data_link"))
+            custom_option = CustomFormatV4DataLinkOption.from_option_value(
+                options[ResultTableOption.OPTION_CUSTOM_FORMAT_V4_DATA_LINK]
+            )
+            is_influxdb_vm_compatible = (
+                self.default_storage == ClusterInfo.TYPE_INFLUXDB
+                and custom_option.target_storage_type == ClusterInfo.TYPE_VM
+            )
+            if self.default_storage != custom_option.target_storage_type and not is_influxdb_vm_compatible:
+                raise ValueError(_("自定义格式 ResultTable 的 default_storage 必须与 target_storage_type 一致"))
+            if delay:
+                on_commit(
+                    func=lambda: apply_custom_format_datalink.delay(self.bk_tenant_id, self.table_id),
+                    using=config.DATABASE_CONNECTION_NAME,
+                )
+            else:
+                apply_custom_format_datalink(bk_tenant_id=self.bk_tenant_id, table_id=self.table_id)
+            return
+
+        if ResultTableOption.OPTION_GRAPH_RELATION_V4_DATA_LINK in options:
+            # Graph Relation V4 与日志链路一样由专用 option 独立选择。
+            # 校验通过后直接同步应用并返回，不进入普通自定义指标的 VM 接入判断。
+            GraphRelationV4DataLinkOption.from_option_value(
+                options[ResultTableOption.OPTION_GRAPH_RELATION_V4_DATA_LINK]
+            )
+            apply_graph_relation_v4_datalink(bk_tenant_id=self.bk_tenant_id, table_id=self.table_id)
+        elif self.default_storage == ClusterInfo.TYPE_INFLUXDB:
             # 1. 如果influxdb被禁用，说明只能使用vm存储，此时需要使用bkbase v3链路
             # 2. 如果启用了新版数据链路，且etcl_config在启用的列表中，则使用vm存储，
             # NOTE:
@@ -609,16 +658,22 @@ class ResultTable(models.Model):
                 and datasource.etl_config in ENABLE_V4_DATALINK_ETL_CONFIGS
             )
 
-            # 如果是插件清洗类型，并且单独开启插件V4链路，则使用V4链路
-            is_plugin_v4_datalink = options.get(
+            # 如果存在指标组维度配置或开启插件V4链路，则强制将数据链路更新为V4链路
+            consumer_group = None
+            if ResultTableOption.OPTION_METRIC_GROUP_DIMENSIONS in options or options.get(
                 ResultTableOption.OPTION_ENABLE_PLUGIN_V4_DATA_LINK, False
-            ) and datasource.etl_config in [EtlConfigs.BK_EXPORTER.value, EtlConfigs.BK_STANDARD.value]
-            if is_plugin_v4_datalink and not is_v4_datalink_etl_config:
+            ):
                 is_v4_datalink_etl_config = True
 
-            if (is_v4_datalink_etl_config and settings.ENABLE_V2_VM_DATA_LINK) or not settings.ENABLE_INFLUXDB_STORAGE:
-                # 插件类型额外判定,如果数据源是GSE创建的，则需要注册到BKBASE
-                if is_plugin_v4_datalink and datasource.created_from == DataIdCreatedFromSystem.BKGSE.value:
+            if not settings.ENABLE_INFLUXDB_STORAGE or (settings.ENABLE_V2_VM_DATA_LINK and is_v4_datalink_etl_config):
+                # 如果datasource是gse创建的，则需要注册到BKBASE并且设置consumer_group
+                if datasource.created_from == DataIdCreatedFromSystem.BKGSE.value and is_v4_datalink_etl_config:
+                    logger.info(
+                        "apply_datalink: datasource created_from is BKGSE, register to bkbase, bk_data_id->[%s], table_id->[%s]",
+                        datasource.bk_data_id,
+                        self.table_id,
+                    )
+                    consumer_group = compose_transfer_consumer_group(datasource)
                     datasource.register_to_bkbase(bk_biz_id=target_bk_biz_id, namespace=BKBASE_NAMESPACE_BK_MONITOR)
 
                 # NOTE: 使用 on_commit 确保事务提交后再执行异步任务，避免事务未提交但异步任务先执行的情况
@@ -626,25 +681,37 @@ class ResultTable(models.Model):
                 bk_data_id = datasource.bk_data_id
                 bk_tenant_id = self.bk_tenant_id
                 table_id = self.table_id
-                try:
-                    on_commit(
-                        func=lambda: access_bkdata_vm.delay(
-                            bk_tenant_id,
-                            target_bk_biz_id,
-                            table_id,
-                            bk_data_id,
-                            is_v4_datalink_etl_config,
-                            force_update=force_update,
-                        ),
-                        using=config.DATABASE_CONNECTION_NAME,
+                if delay:
+                    try:
+                        on_commit(
+                            func=lambda: access_bkdata_vm.delay(
+                                bk_tenant_id,
+                                target_bk_biz_id,
+                                table_id,
+                                bk_data_id,
+                                is_v4_datalink_etl_config,
+                                force_update=force_update,
+                                consumer_group=consumer_group,
+                            ),
+                            using=config.DATABASE_CONNECTION_NAME,
+                        )
+                    except Exception as e:  # pylint: disable=broad-except
+                        logger.error("create_result_table: access vm error: %s", e)
+                else:
+                    access_bkdata_vm(
+                        bk_tenant_id,
+                        target_bk_biz_id,
+                        table_id,
+                        bk_data_id,
+                        is_v4_datalink_etl_config,
+                        force_update=force_update,
+                        consumer_group=consumer_group,
                     )
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.error("create_result_table: access vm error: %s", e)
         elif self.default_storage in [ClusterInfo.TYPE_ES, ClusterInfo.TYPE_DORIS]:
-            # 如果存在日志V4数据链路配置，则创建日志V4数据链路
+            # 日志 V4 数据链路
             if options and options.get(ResultTableOption.OPTION_ENABLE_V4_LOG_DATA_LINK, False):
                 apply_log_datalink(bk_tenant_id=self.bk_tenant_id, table_id=self.table_id)
-            # 如果存在事件组V4数据链路配置或默认启用事件组V4数据链路，则创建事件组V4数据链路
+            # 事件组 V4 数据链路
             elif datasource.etl_config == EtlConfigs.BK_STANDARD_V2_EVENT.value:
                 apply_event_group_datalink(bk_tenant_id=self.bk_tenant_id, table_id=self.table_id)
         else:
@@ -666,6 +733,13 @@ class ResultTable(models.Model):
         default_storage_config: dict | None = None,
     ) -> None:
         """检测并创建存储"""
+
+        # 自定义格式 VM 目标只依赖已有的空间 VM 路由和集群，不创建 Metadata Storage 记录。
+        if (
+            self.default_storage == ClusterInfo.TYPE_VM
+            and self.get_related_datasource().etl_config == EtlConfigs.BK_CUSTOM_FORMAT.value
+        ):
+            return
 
         # 如果是influxdb类型的存储，并且禁止了influxdb存储，则不创建
         if self.default_storage == ClusterInfo.TYPE_INFLUXDB and not settings.ENABLE_INFLUXDB_STORAGE:
@@ -933,8 +1007,15 @@ class ResultTable(models.Model):
                     )
                     raise ValueError(_("存储[{}]暂不支持，请确认后重试").format(ex_storage_type))
 
+                ex_storage_config = dict(ex_storage_config)
+                if ex_storage_type in (
+                    ClusterInfo.TYPE_ES,
+                    ClusterInfo.TYPE_DORIS,
+                    ClusterInfo.TYPE_SURREALDB,
+                ):
+                    ex_storage_config["create_storage_cluster_record"] = False
                 if ex_storage_type == ClusterInfo.TYPE_ES:
-                    storage_config["enable_create_index"] = False
+                    ex_storage_config["enable_create_index"] = False
                 ex_storage.create_table(
                     self.table_id, bk_tenant_id=bk_tenant_id, is_sync_db=is_sync_db, **ex_storage_config
                 )
@@ -1124,6 +1205,71 @@ class ResultTable(models.Model):
         storage_class = self.REAL_STORAGE_DICT[storage_type]
         return storage_class.objects.get(table_id=self.table_id, bk_tenant_id=self.bk_tenant_id)
 
+    def _get_storage_cluster_id(self, storage_type: str) -> int | None:
+        """获取 ES/Doris 存储配置中的集群 ID，不存在时返回 None。"""
+
+        if storage_type not in (ClusterInfo.TYPE_ES, ClusterInfo.TYPE_DORIS):
+            return None
+        storage_class = self.REAL_STORAGE_DICT[storage_type]
+        return (
+            storage_class.objects.filter(table_id=self.table_id, bk_tenant_id=self.bk_tenant_id)
+            .values_list("storage_cluster_id", flat=True)
+            .first()
+        )
+
+    def _get_and_validate_default_cluster_storage(self):
+        """获取并校验当前默认 ES/Doris 存储配置。"""
+
+        storage_class = self.REAL_STORAGE_DICT[self.default_storage]
+        try:
+            storage = storage_class.objects.get(table_id=self.table_id, bk_tenant_id=self.bk_tenant_id)
+        except storage_class.DoesNotExist:
+            raise ValueError(_("结果表[{}]不存在默认存储类型[{}]的配置").format(self.table_id, self.default_storage))
+
+        try:
+            ClusterInfo.objects.get(
+                cluster_id=storage.storage_cluster_id,
+                bk_tenant_id=self.bk_tenant_id,
+                cluster_type=self.default_storage,
+            )
+        except ClusterInfo.DoesNotExist:
+            raise ValueError(
+                _("默认存储集群[{}]不存在、租户不匹配或类型不是[{}]").format(
+                    storage.storage_cluster_id, self.default_storage
+                )
+            )
+        return storage
+
+    def _delete_storage_configs(self, need_delete_storages: dict[str, Any] | None) -> None:
+        """删除明确请求的额外存储，但保留默认存储和仍承载历史数据的配置。"""
+
+        for storage_type in need_delete_storages or {}:
+            if storage_type not in self.REAL_STORAGE_DICT:
+                logger.info(
+                    "try to delete storage->[%s] for table->[%s] but storage is not supported.",
+                    storage_type,
+                    self.table_id,
+                )
+                continue
+            if storage_type == self.default_storage:
+                raise ValueError(_("默认存储[{}]不能删除").format(storage_type))
+
+            if storage_type in (ClusterInfo.TYPE_ES, ClusterInfo.TYPE_DORIS):
+                cluster_ids = ClusterInfo.objects.filter(
+                    bk_tenant_id=self.bk_tenant_id, cluster_type=storage_type
+                ).values_list("cluster_id", flat=True)
+                if StorageClusterRecord.objects.filter(
+                    table_id=self.table_id,
+                    bk_tenant_id=self.bk_tenant_id,
+                    cluster_id__in=cluster_ids,
+                    is_deleted=False,
+                ).exists():
+                    raise ValueError(_("存储[{}]仍有关联的有效历史数据，不能删除配置").format(storage_type))
+
+            storage_class = self.REAL_STORAGE_DICT[storage_type]
+            storage_class.objects.filter(table_id=self.table_id, bk_tenant_id=self.bk_tenant_id).delete()
+            logger.info("table->[%s] delete storage->[%s] config success.", self.table_id, storage_type)
+
     def get_storage_info(self, storage_type):
         """
         获取结果表一个指定存储的配置信息
@@ -1177,6 +1323,10 @@ class ResultTable(models.Model):
         :param bk_biz_id_alias: 结果表业务ID别名
         :return: True | raise Exception
         """
+        # 串行化同一个 ResultTable 的修改，并刷新调用方可能持有的旧对象状态。
+        self.__class__.objects.using(config.DATABASE_CONNECTION_NAME).select_for_update().get(pk=self.pk)
+        self.refresh_from_db(using=config.DATABASE_CONNECTION_NAME)
+
         logger.info(
             "modify: try to modify result_table,operator->[%s],table_id->[%s],bk_tenant_id->[%s]",
             operator,
@@ -1184,11 +1334,25 @@ class ResultTable(models.Model):
             self.bk_tenant_id,
         )
 
+        old_default_storage = self.default_storage
+        old_is_enable = self.is_enable
+        old_active_cluster_id = self._get_storage_cluster_id(old_default_storage)
+        old_es_cluster_id = self._get_storage_cluster_id(ClusterInfo.TYPE_ES)
+        related_data_source = self.get_related_datasource()
+        is_custom_format = related_data_source.etl_config == EtlConfigs.BK_CUSTOM_FORMAT.value
+
         # 1. 判断是否需要修改中文名
         if table_name_zh is not None:
             self.table_name_zh = table_name_zh
 
         # 2. 判断是否需要修改默认的存储
+        if default_storage is not None:
+            if is_custom_format:
+                if default_storage != old_default_storage:
+                    raise ValueError(_("自定义格式 ResultTable 创建后不能修改目标存储，请创建新的 ResultTable"))
+                # 接受客户端回传未变化的 VM default_storage；它没有对应的 Storage 模型需要更新。
+                default_storage = None
+
         if default_storage is not None:
             # 判断该存储是否真实存在了
             try:
@@ -1342,7 +1506,20 @@ class ResultTable(models.Model):
                 logger.info("table->[%s] upgrade storage->[%s] config success.", self.table_id, ex_storage_type)
                 continue
 
-            ex_storage.create_table(self.table_id, bk_tenant_id=self.bk_tenant_id, is_sync_db=True, **ex_storage_config)
+            ex_storage_config = dict(ex_storage_config)
+            if ex_storage_type in (
+                ClusterInfo.TYPE_ES,
+                ClusterInfo.TYPE_DORIS,
+                ClusterInfo.TYPE_SURREALDB,
+            ):
+                # 新建配置不代表切换默认写入目标，current 由 ResultTable 统一推进。
+                ex_storage_config["create_storage_cluster_record"] = False
+            ex_storage.create_table(
+                self.table_id,
+                bk_tenant_id=self.bk_tenant_id,
+                is_sync_db=True,
+                **ex_storage_config,
+            )
             logger.info(
                 "result_table->[%s] of bk_tenant_id->[%s] has create real ex_storage on type->[%s]",
                 self.table_id,
@@ -1350,24 +1527,25 @@ class ResultTable(models.Model):
                 ex_storage_type,
             )
 
-            # 删除额外存储配置
-            need_delete_storages = need_delete_storages or {}
-            for storage_type, delete_storage in need_delete_storages.items():
-                if storage_type not in self.REAL_STORAGE_DICT:
-                    logger.info(
-                        "try to delete storage->[%s] for table->[%s] but storage is not exists.",
-                        storage_type,
-                        self.table_id,
-                    )
-                    continue
-                ex_storage = self.REAL_STORAGE_DICT[storage_type]
-                ex_storage.objects.filter(table_id=self.table_id, bk_tenant_id=self.bk_tenant_id).delete()
-                logger.info("table->[%s] delete storage->[%s] config success.", self.table_id, storage_type)
+        # 删除操作与 external_storage 是否新增无关，并且不能破坏默认存储或历史查询能力。
+        self._delete_storage_configs(need_delete_storages)
 
         force_update_datalink = False
 
         # 更新结果表option配置
         if option is not None:
+            existing_custom_option = ResultTableOption.objects.filter(
+                table_id=self.table_id,
+                bk_tenant_id=self.bk_tenant_id,
+                name=ResultTableOption.OPTION_CUSTOM_FORMAT_V4_DATA_LINK,
+            ).first()
+            new_custom_option_value = option.get(ResultTableOption.OPTION_CUSTOM_FORMAT_V4_DATA_LINK)
+            if existing_custom_option and new_custom_option_value is not None:
+                old_custom_config = CustomFormatV4DataLinkOption.from_option_value(existing_custom_option.get_value())
+                new_custom_config = CustomFormatV4DataLinkOption.from_option_value(new_custom_option_value)
+                if old_custom_config.target_storage_type != new_custom_config.target_storage_type:
+                    raise ValueError(_("自定义格式 ResultTable 创建后不能修改 target_storage_type"))
+
             # 检查ENABLE_FIELD_BLACK_LIST是否需要更新，如果需要更新，则需要强制更新数据链路
             modify_enable_field_black_list_option_value = option.get(ResultTableOption.OPTION_ENABLE_FIELD_BLACK_LIST)
             enable_field_black_list_option = ResultTableOption.objects.filter(
@@ -1386,6 +1564,47 @@ class ResultTable(models.Model):
                 modify_enable_field_black_list_option_value != enable_field_black_list_option_value
                 or modify_enable_field_black_list_option_value is False
             ):
+                force_update_datalink = True
+
+            # 检查指标组维度配置是否发生变化或指标组维度配置不为空但没有迁移到V4链路
+            metric_group_dimensions_option = ResultTableOption.objects.filter(
+                table_id=self.table_id,
+                bk_tenant_id=self.bk_tenant_id,
+                name=ResultTableOption.OPTION_METRIC_GROUP_DIMENSIONS,
+            ).first()
+            existing_metric_group_dimensions_option_value = (
+                (metric_group_dimensions_option.get_value() or []) if metric_group_dimensions_option else []
+            )
+            new_metric_group_dimensions_option_value = (
+                option.get(ResultTableOption.OPTION_METRIC_GROUP_DIMENSIONS) or []
+            )
+            if existing_metric_group_dimensions_option_value != new_metric_group_dimensions_option_value or (
+                new_metric_group_dimensions_option_value
+                and self.data_source.created_from == DataIdCreatedFromSystem.BKGSE.value
+            ):
+                force_update_datalink = True
+
+            # bk_exporter / bk_standard 会根据 cmdb_level_config 决定是否在 log_to_metric 中开启 CMDB 输出。
+            # option 是全量替换语义，因此缺少该 key 也等价于清空配置。
+            if related_data_source.etl_config in {EtlConfigs.BK_EXPORTER.value, EtlConfigs.BK_STANDARD.value}:
+                cmdb_level_option = ResultTableOption.objects.filter(
+                    table_id=self.table_id,
+                    bk_tenant_id=self.bk_tenant_id,
+                    name=ResultTableOption.OPTION_CMDB_LEVEL_CONFIG,
+                ).first()
+                existing_cmdb_levels = (cmdb_level_option.get_value() or []) if cmdb_level_option else []
+                new_cmdb_levels = option.get(ResultTableOption.OPTION_CMDB_LEVEL_CONFIG) or []
+                if existing_cmdb_levels != new_cmdb_levels:
+                    force_update_datalink = True
+
+            graph_relation_option = ResultTableOption.objects.filter(
+                table_id=self.table_id,
+                bk_tenant_id=self.bk_tenant_id,
+                name=ResultTableOption.OPTION_GRAPH_RELATION_V4_DATA_LINK,
+            ).first()
+            existing_graph_relation_option_value = graph_relation_option.get_value() if graph_relation_option else None
+            new_graph_relation_option_value = option.get(ResultTableOption.OPTION_GRAPH_RELATION_V4_DATA_LINK)
+            if existing_graph_relation_option_value != new_graph_relation_option_value:
                 force_update_datalink = True
 
             # 目前rt的option存在清洗和查询两类option，清洗的option需要清理，查询的option需要保留。
@@ -1420,33 +1639,9 @@ class ResultTable(models.Model):
         # 是否需要修改结果表是否启用
         if is_enable is not None:
             self.is_enable = is_enable
-            self.save()  # 这里需要保存下，下面的es索引创建逻辑会依赖is_enable的判断
             logger.info(
                 f"table_id->[{self.table_id}] of bk_tenant_id->[{self.bk_tenant_id}] is change to is_enable->[{self.is_enable}]"
             )
-
-            # 如果启用结果表，需要创建结果表的实际存储依赖
-            if is_enable:
-                # 需要判断存储方式是否有明确的结果表创建
-                # 目前只需要判断ES，influxdb，kafka和redis会有自动创建能力
-                es_query = ESStorage.objects.filter(table_id=self.table_id, bk_tenant_id=self.bk_tenant_id)
-                if es_query.exists():
-                    es_storage = es_query.get()
-                    if not es_storage.index_exist():
-                        #   如果该table_id的index在es中不存在，说明要走初始化流程
-                        logger.info(
-                            "table_id->[%s] of bk_tenant_id->[%s] found no index in es, will create new one",
-                            es_storage.table_id,
-                            self.bk_tenant_id,
-                        )
-                        es_storage.create_index_and_aliases(es_storage.slice_gap)
-                    else:
-                        # 否则走更新流程
-                        es_storage.update_index_and_aliases(ahead_time=es_storage.slice_gap)
-
-                    logger.info(
-                        f"table_id->[{self.table_id}] of bk_tenant_id->[{self.bk_tenant_id}] is change to is_enable {self.is_enable} and es index is created"
-                    )
 
         if bk_biz_id_alias is not None:
             logger.info(
@@ -1464,6 +1659,74 @@ class ResultTable(models.Model):
 
         self.last_modify_user = operator
         self.save()
+
+        # ResultTable 已保存最终状态，此后 ES 的启用判断和数据链路都能读取到同一份默认存储配置。
+        default_cluster_storage = None
+        if self.default_storage in (ClusterInfo.TYPE_ES, ClusterInfo.TYPE_DORIS):
+            default_cluster_storage = self._get_and_validate_default_cluster_storage()
+
+        if self.default_storage == ClusterInfo.TYPE_ES and self.is_enable:
+            es_storage_config = external_storage.get(ClusterInfo.TYPE_ES) or {}
+            is_moving_es_cluster = (
+                old_default_storage != ClusterInfo.TYPE_ES
+                or old_es_cluster_id != default_cluster_storage.storage_cluster_id
+            )
+            es_mapping_changed = field_list is not None or any(
+                key in es_storage_config for key in ("mapping_settings", "index_settings")
+            )
+            is_re_enabling = not old_is_enable and self.is_enable
+            should_prepare_es = is_moving_es_cluster or es_mapping_changed or is_re_enabling
+            if should_prepare_es:
+                logger.info(
+                    "modify: prepare ES before applying datalink, table_id->[%s], old_default->[%s], "
+                    "old_cluster->[%s], new_cluster->[%s], mapping_changed->[%s], re_enabled->[%s]",
+                    self.table_id,
+                    old_default_storage,
+                    old_es_cluster_id,
+                    default_cluster_storage.storage_cluster_id,
+                    es_mapping_changed,
+                    not old_is_enable,
+                )
+                if is_re_enabling and not default_cluster_storage.index_exist():
+                    prepared = default_cluster_storage.create_index_and_aliases(
+                        ahead_time=default_cluster_storage.slice_gap,
+                        strict=True,
+                    )
+                else:
+                    prepared = default_cluster_storage.update_index_and_aliases(
+                        ahead_time=default_cluster_storage.slice_gap if is_re_enabling else 0,
+                        is_moving_cluster=is_moving_es_cluster,
+                        strict=True,
+                    )
+                if prepared is False:
+                    raise RuntimeError(_("结果表[{}]的ES索引或写别名未准备完成").format(self.table_id))
+
+        # 使用同一个时间点关闭所有旧 current，再创建唯一的新 current；重复修改同集群时幂等。
+        if default_cluster_storage is not None and self.is_enable:
+            switch_time = django_timezone.now()
+            switch_result = StorageClusterRecord.switch_current_cluster(
+                table_id=self.table_id,
+                bk_tenant_id=self.bk_tenant_id,
+                target_cluster_id=default_cluster_storage.storage_cluster_id,
+                target_storage_type=self.default_storage,
+                switch_time=switch_time,
+                creator=operator,
+                force_new_segment=(
+                    old_default_storage != self.default_storage
+                    or old_active_cluster_id != default_cluster_storage.storage_cluster_id
+                ),
+            )
+            switched = switch_result[1]
+            logger.info(
+                "modify: storage current reconciled, table_id->[%s], old_default->[%s], old_cluster->[%s], "
+                "new_default->[%s], new_cluster->[%s], switched->[%s]",
+                self.table_id,
+                old_default_storage,
+                old_active_cluster_id,
+                self.default_storage,
+                default_cluster_storage.storage_cluster_id,
+                switched,
+            )
 
         # 异步执行时，需要在commit之后，以保证所有操作都提交
         try:
@@ -2841,6 +3104,7 @@ class LogV4DataLinkOption(pydantic.BaseModel):
         json_fields: list[str] = pydantic.Field(description="JSON字段列表", default_factory=list)
         original_json_fields: list[str] = pydantic.Field(description="原始JSON字段列表", default_factory=list)
         field_config_group: dict[str, Any] = pydantic.Field(description="字段配置组", default_factory=dict)
+        tokenizers: dict[str, str] | None = pydantic.Field(description="字段自定义分词规则", default=None)
         flush_timeout: int | None = pydantic.Field(description="刷新超时时间(s)，默认为60秒", default=None)
 
     class CleanRule(pydantic.BaseModel):
@@ -2862,6 +3126,79 @@ class LogV4DataLinkOption(pydantic.BaseModel):
         return self
 
 
+class CustomFormatV4DataLinkOption(pydantic.BaseModel):
+    """自定义格式数据链路配置；一个 ResultTable 只允许写入一个目标存储。"""
+
+    class ESStorageConfig(LogV4DataLinkOption.ESStorageConfig):
+        pass
+
+    class DorisStorageConfig(LogV4DataLinkOption.DorisStorageConfig):
+        pass
+
+    class CleanRule(LogV4DataLinkOption.CleanRule):
+        pass
+
+    target_storage_type: Literal["victoria_metrics", "elasticsearch", "doris"]
+    clean_rules: list[CleanRule] = pydantic.Field(min_length=1, description="清洗规则")
+    filter_rules: str | dict[str, Any] = pydantic.Field(default="True", description="BKBase RelExpr 过滤规则")
+    es_storage_config: ESStorageConfig | None = None
+    doris_storage_config: DorisStorageConfig | None = None
+
+    @classmethod
+    def from_option_value(cls, value: Any) -> Self:
+        if isinstance(value, str):
+            value = json.loads(value)
+        if not isinstance(value, dict):
+            raise TypeError(_("自定义格式数据链路配置必须是对象"))
+        return cls(**value)
+
+    @pydantic.model_validator(mode="after")
+    def validate_storage_config(self) -> Self:
+        if self.target_storage_type == ClusterInfo.TYPE_ES and self.es_storage_config is None:
+            raise ValueError(_("Elasticsearch 目标必须配置 es_storage_config"))
+        if self.target_storage_type == ClusterInfo.TYPE_DORIS and self.doris_storage_config is None:
+            raise ValueError(_("Doris 目标必须配置 doris_storage_config"))
+        if self.target_storage_type != ClusterInfo.TYPE_ES and self.es_storage_config is not None:
+            raise ValueError(_("非 Elasticsearch 目标不能配置 es_storage_config"))
+        if self.target_storage_type != ClusterInfo.TYPE_DORIS and self.doris_storage_config is not None:
+            raise ValueError(_("非 Doris 目标不能配置 doris_storage_config"))
+        return self
+
+
+class GraphRelationV4DataLinkOption(pydantic.BaseModel):
+    """Graph Relation V4 数据链路写入目标。"""
+
+    write_targets: list[Literal["vm", "surrealdb"]] = pydantic.Field(
+        min_length=1,
+        max_length=2,
+        description="链路写入目标",
+    )
+
+    @classmethod
+    def from_option_value(cls, value: Any) -> Self:
+        if isinstance(value, str):
+            value = json.loads(value)
+        if not isinstance(value, dict):
+            raise TypeError(_("Graph Relation V4 数据链路配置必须是对象"))
+        return cls(**value)
+
+    @pydantic.field_validator("write_targets")
+    @classmethod
+    def validate_write_targets(cls, value: list[Literal["vm", "surrealdb"]]) -> list[Literal["vm", "surrealdb"]]:
+        if len(value) != len(set(value)):
+            raise ValueError(_("Graph Relation V4 数据链路写入目标不能重复"))
+        target_order = {"vm": 0, "surrealdb": 1}
+        return sorted(value, key=target_order.__getitem__)
+
+    @property
+    def should_write_vm(self) -> bool:
+        return "vm" in self.write_targets
+
+    @property
+    def should_write_surrealdb(self) -> bool:
+        return "surrealdb" in self.write_targets
+
+
 class ResultTableOption(OptionBase):
     """结果表option配置"""
 
@@ -2874,13 +3211,22 @@ class ResultTableOption(OptionBase):
     OPTION_SEGMENTED_QUERY_ENABLE = "segmented_query_enable"
     OPTION_IS_SPLIT_MEASUREMENT = "is_split_measurement"
     OPTION_ENABLE_FIELD_BLACK_LIST = "enable_field_black_list"
+    OPTION_IS_VIRTUAL_TABLE = "is_virtual_table"
 
     OPTION_ENABLE_V4_EVENT_GROUP_DATA_LINK = "enable_v4_event_group_data_link"
     OPTION_ENABLE_V4_LOG_DATA_LINK = "enable_log_v4_data_link"
     OPTION_V4_LOG_DATA_LINK = "log_v4_data_link"
     OPTION_ENABLE_PLUGIN_V4_DATA_LINK = "enable_plugin_v4_data_link"
     OPTION_ENABLE_DATA_LINK_COMPONENT_REUSE = "enable_data_link_component_reuse"
+    OPTION_GRAPH_RELATION_V4_DATA_LINK = "graph_relation_v4_data_link"
+    OPTION_DATABUS_LABELS = "databus_labels"
+    OPTION_ENABLE_CUSTOM_FORMAT_V4_DATA_LINK = "enable_custom_format_v4_data_link"
+    OPTION_CUSTOM_FORMAT_V4_DATA_LINK = "custom_format_v4_data_link"
     OPTION_BINDING_BCS_CLUSTER_ID = "binding_bcs_cluster_id"
+    OPTION_METRIC_GROUP_DIMENSIONS = "metric_group_dimensions"
+    OPTION_QUERY_ROUTER_CONFIG = "query_router_config"
+    OPTION_DATABUS_PREFER_CLUSTER = "databus_prefer_cluster"
+    OPTION_DATA_LABEL_ALIASES = "data_label_aliases"
 
     # 选项类型
     TYPE_BOOL = "bool"
@@ -2892,6 +3238,7 @@ class ResultTableOption(OptionBase):
         "need_add_time",  # 是否需要添加时间字段
         "time_field",  # 指定查询时间单位，如：day、hour、minute、second
         OPTION_BINDING_BCS_CLUSTER_ID,  # 绑定BCS集群ID
+        OPTION_DATA_LABEL_ALIASES,  # 额外的数据标签查询别名
     ]
 
     table_id = models.CharField("结果表ID", max_length=128, db_index=True)
@@ -2905,8 +3252,14 @@ class ResultTableOption(OptionBase):
             (OPTION_SEGMENTED_QUERY_ENABLE, _("分段查询开关")),
             (OPTION_IS_SPLIT_MEASUREMENT, _("是否为单指标单表")),
             (OPTION_ENABLE_FIELD_BLACK_LIST, _("是否开启指标黑名单")),
+            (OPTION_IS_VIRTUAL_TABLE, _("是否为虚拟结果表")),
             (OPTION_ENABLE_DATA_LINK_COMPONENT_REUSE, _("是否开启DataLink组件复用")),
+            (OPTION_GRAPH_RELATION_V4_DATA_LINK, _("Graph Relation V4 数据链路配置")),
+            (OPTION_DATABUS_LABELS, _("Databus 标签注入配置")),
+            (OPTION_ENABLE_CUSTOM_FORMAT_V4_DATA_LINK, _("是否开启自定义格式 V4 数据链路")),
+            (OPTION_CUSTOM_FORMAT_V4_DATA_LINK, _("自定义格式 V4 数据链路配置")),
             (OPTION_BINDING_BCS_CLUSTER_ID, _("绑定BCS集群ID")),
+            (OPTION_DATABUS_PREFER_CLUSTER, _("Databus 优先集群配置")),
         ),
         max_length=128,
     )
@@ -3302,7 +3655,7 @@ class ESFieldQueryAliasOption(BaseModel):
             raise
 
     @staticmethod
-    @transaction.atomic
+    @atomic(config.DATABASE_CONNECTION_NAME)
     def manage_query_alias_settings(
         table_id: str,
         query_alias_settings: list[dict[str, Any]],

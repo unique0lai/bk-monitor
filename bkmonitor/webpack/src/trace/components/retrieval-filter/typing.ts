@@ -29,18 +29,32 @@ import type { PropType } from 'vue';
 export enum EFieldType {
   // 全文检索输入框
   all = 'all',
+  // 布尔类型tag输入框
   boolean = 'boolean',
+  // 字节量范围
+  bytesScope = 'bytes_scope',
+  // 级联选择器
+  cascade = 'cascade',
+  // 日期类型 (TODO)
   date = 'date',
   // 是否为耗时组件
   duration = 'duration',
   // input输入框
   input = 'input',
+  // 数字类型tag输入框
   integer = 'integer',
+  // 字符串类型tag输入框
   keyword = 'keyword',
+  // 数字类型tag输入框
   long = 'long',
+  // 数字类型输入框
+  numberInput = 'number_input',
   // textarea 输入框
   text = 'text',
+  // 带操作符选择的textarea 输入框（区别于 text：额外展示操作符下拉）
+  textWithMethods = 'text_with_methods',
 }
+
 export enum EMethod {
   containsMatchPhrase = 'contains match phrase',
   eq = 'equal',
@@ -89,6 +103,14 @@ export enum EQueryStringTokenType {
   value = 'value',
   valueCondition = 'value-condition',
 }
+
+/** 范围输入组件（ScopeInput）支持的子类型 */
+export const SCOPE_INPUT_TYPE = {
+  /** 耗时 */
+  duration: 'duration',
+  /** 字节量 */
+  bytes: 'bytes',
+};
 export interface IFavoriteListItem {
   groupName: string;
   id: string;
@@ -99,7 +121,6 @@ export interface IFavoriteListItem {
     where?: IWhereItem[];
   };
 }
-
 export interface IFieldItem {
   /* 字段别名 */
   alias: string;
@@ -110,7 +131,10 @@ export interface IFieldItem {
   /* 包含的method */
   methods: IValue[];
   type?: EFieldType;
+  /** 字段单位，范围输入组件用它作为数值的基础单位（如 μs / B） */
+  unit?: string;
 }
+
 export interface IFilterField {
   // 字段别名
   alias: string;
@@ -121,6 +145,8 @@ export interface IFilterField {
   name: string;
   // 字段类型
   type: EFieldType;
+  // 单位 当前仅供范围输入的基础单位使用
+  unit?: string;
   // 支持的操作符
   methods: {
     // 操作符别名
@@ -148,7 +174,6 @@ export interface IFilterField {
     wildcardValue?: string;
   }[];
 }
-
 export interface IFilterItem {
   condition: { id: ECondition; name: string };
   hide?: boolean;
@@ -191,11 +216,11 @@ export interface INormalWhere {
         is_wildcard?: boolean;
       };
 }
+
 export interface IOptionsInfo {
-  count: 0;
+  count: number;
   list: IValue[];
 }
-
 export interface IValue {
   id: string;
   name: string;
@@ -221,6 +246,8 @@ export interface IWhereValueOptionsItem {
     name: string;
   }[];
 }
+
+export type scopeInputTypeEnum = (typeof SCOPE_INPUT_TYPE)[keyof typeof SCOPE_INPUT_TYPE];
 export type TGetValueFn = (params: IGetValueFnParams) => Promise<IOptionsInfo>;
 
 // interface FavList {
@@ -283,6 +310,25 @@ export const qsSelectorOptionsDescMap = {
     { type: 'text', text: window.i18n.t('为真') },
   ],
 };
+
+/**
+ * 检索过滤已选条件 tag 的 value 展示格式化函数类型
+ * @param val 原始值
+ * @param params.isTips 是否为悬浮提示场景
+ * @param params.key 字段 id
+ * @param params.value 候选项（含 id / name）
+ */
+export type TTagValueDisplayFormatter = (
+  val: boolean | number | string,
+  params?: {
+    isTips: boolean;
+    key: string;
+    value: {
+      id: number | string;
+      name: number | string;
+    };
+  }
+) => JSX.Element | string;
 
 export const RETRIEVAL_FILTER_PROPS = {
   // 字段列表
@@ -431,6 +477,41 @@ export const RETRIEVAL_FILTER_PROPS = {
     type: Array as PropType<string[]>,
     default: () => [],
   },
+  // ui 模式下已选条件tag的value显示值格式化
+  tagValueDisplayFormatter: {
+    type: Function as PropType<TTagValueDisplayFormatter>,
+    default: (val, _fieldId) => `${val}`,
+  },
+  // ui只读模式
+  uiModeReadonly: {
+    type: Boolean,
+    default: false,
+  },
+  /** 拥有快捷键功能 */
+  hasShortcutKey: {
+    type: Boolean,
+    default: true,
+  },
+  // 模式切换中
+  modeChangeLoading: {
+    type: Boolean,
+    default: false,
+  },
+  // 复制条件中
+  copyLoading: {
+    type: Boolean,
+    default: false,
+  },
+  // 是否禁用 常驻设置 -> 设置筛选功能
+  residentSettingTransferDisable: {
+    type: Boolean,
+    default: false,
+  },
+  // ui模式在添加条件的时候聚焦在搜索key值的搜索框上而非默认选中第一个key值
+  fieldSearchAutoFocus: {
+    type: Boolean,
+    default: false,
+  },
 };
 export const RETRIEVAL_FILTER_EMITS = {
   favorite: (_isEdit: boolean) => true,
@@ -497,6 +578,21 @@ export const UI_SELECTOR_PROPS = {
     type: Array as PropType<string[]>,
     default: () => [],
   },
+  // ui 模式下已选条件tag的value显示值格式化
+  tagValueDisplayFormatter: {
+    type: Function as PropType<TTagValueDisplayFormatter>,
+    default: (val, _fieldId) => `${val}`,
+  },
+  // ui只读模式
+  readonly: {
+    type: Boolean,
+    default: false,
+  },
+  // ui模式在添加条件的时候聚焦在搜索key值的搜索框上而非默认选中第一个key值
+  fieldSearchAutoFocus: {
+    type: Boolean,
+    default: false,
+  },
 };
 export const UI_SELECTOR_EMITS = {
   change: (_v: IFilterItem[]) => true,
@@ -538,6 +634,11 @@ export const UI_SELECTOR_OPTIONS_PROPS = {
   noValueOfMethods: {
     type: Array as PropType<string[]>,
     default: () => [],
+  },
+  // ui模式在添加条件的时候聚焦在搜索key值的搜索框上而非默认选中第一个key值
+  fieldSearchAutoFocus: {
+    type: Boolean,
+    default: false,
   },
 };
 export const UI_SELECTOR_OPTIONS_EMITS = {
@@ -794,6 +895,10 @@ export const QS_SELECTOR_OPTIONS_EMITS = {
   select: (_v: string) => true,
 } as const;
 export const KV_TAG_PROPS = {
+  fieldInfo: {
+    type: Object as PropType<IFilterField>,
+    default: () => null,
+  },
   value: {
     type: Object as PropType<IFilterItem>,
     default: () => null,
@@ -805,6 +910,15 @@ export const KV_TAG_PROPS = {
   hasTagHidden: {
     type: Boolean,
     default: true,
+  },
+  hasTagDelete: {
+    type: Boolean,
+    default: true,
+  },
+  // ui 模式下已选条件tag的value显示值格式化
+  tagValueDisplayFormatter: {
+    type: Function as PropType<TTagValueDisplayFormatter>,
+    default: (val, _fieldId) => `${val}`,
   },
 };
 export const KV_TAG_EMITS = {
@@ -880,6 +994,7 @@ export const SETTING_KV_INPUT_PROPS = {
 };
 export const SETTING_KV_INPUT_EMITS = {
   change: (_v: INormalWhere) => true,
+  enter: (_v: INormalWhere) => true,
 } as const;
 export const RESIDENT_SETTING_PROPS = {
   fields: {
@@ -927,11 +1042,20 @@ export const RESIDENT_SETTING_PROPS = {
     type: Number,
     default: 200,
   },
+  // 是否禁用 常驻设置 -> 设置筛选功能
+  residentSettingTransferDisable: {
+    type: Boolean,
+    default: false,
+  },
 };
 export const RESIDENT_SETTING_EMITS = {
   change: (_v: INormalWhere[]) => true,
 } as const;
-export const TIME_CONSUMING_PROPS = {
+export const SCOPE_INPUT_PROPS = {
+  type: {
+    type: String as PropType<scopeInputTypeEnum>,
+    default: 'time',
+  },
   fieldInfo: {
     type: Object as PropType<IFieldItem>,
     default: () => null,
@@ -945,6 +1069,6 @@ export const TIME_CONSUMING_PROPS = {
     default: () => null,
   },
 };
-export const TIME_CONSUMING_EMITS = {
+export const SCOPE_INPUT_EMITS = {
   change: (_v: INormalWhere) => true,
 } as const;
