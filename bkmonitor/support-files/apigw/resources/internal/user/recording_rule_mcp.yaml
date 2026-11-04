@@ -2,9 +2,14 @@ paths:
   /mcp/preview_recording_rule/:
     post:
       operationId: preview_recording_rule
-      description: 'Preview a RecordingRule without saving or applying it. Returns deployment_check with counts, limits and can_apply; over-limit configurations remain parseable. Business errors use HTTP 200 with result=false, code=3300004 and data.errors entries with code/message/path. Deployment errors are SOURCE_LIMIT_EXCEEDED or RULE_LIMIT_EXCEEDED with actual/limit; inspect can_apply before applying. 预解析预计算规则，deployment_check 返回数量、上限和是否可下发，超限仍返回解析结果。解析业务错误使用 HTTP 200、result=false、code=3300004 和 data.errors（code/message/path），部署超限返回 SOURCE_LIMIT_EXCEEDED 或 RULE_LIMIT_EXCEEDED（含 actual/limit），调用方需检查 can_apply。 Requires a verified gateway
-        user and business-scoped RecordingRule permission. 必须通过网关用户鉴权并拥有当前业务的预计算规则权限。 Required IAM action: view_recording_rule_v2.
-        所需业务权限：view_recording_rule_v2。'
+      description: |-
+        Preview a RecordingRule. 预解析配置，不保存或下发；用于新建/修改前验证表达式、来源和部署数量限制。config 字段说明包含完整配置格式与示例。
+        新建时省略 id；编辑时先 list 获取 id、get 获取完整 config，再携带 id 预解析，name 必须与现有规则一致。
+        返回标准信封 result/code/message/data。成功时 data.config 为规范化配置，data.records 为解析后的 MetricQL 和来源信息，data.deployment_check 包含 can_apply、source_count/max_sources、rule_count/max_rules、errors。
+        来源数按整个 group 的 BKBase ResultTable namespace/name 去重；规则数按 rules 条数计算。限制为动态配置，以返回的 max_sources/max_rules 为准；预解析通过不保证后续下发通过。
+        先检查 result，再检查 deployment_check.can_apply。超限仍返回解析结果，can_apply=false，错误位于 deployment_check.errors，code 为 SOURCE_LIMIT_EXCEEDED 或 RULE_LIMIT_EXCEEDED，含 message/path/actual/limit；超限配置可保存，但不能下发。
+        通过鉴权及基础参数校验后的解析业务错误使用 HTTP 200、result=false、code=3300004，data.errors 含 code/message/path：INVALID_CONFIG（修正配置）、INVALID_SPACE（修正业务/空间）、RULE_NOT_FOUND（重新 list 获取 id）、RESOLVE_FAILED（按 message 排查表达式/来源/依赖）。不要只按 HTTP 状态判断成功。
+        Requires a verified gateway user. 必须通过网关用户鉴权，并拥有请求业务的 view_recording_rule_v2 权限；身份和租户取认证上下文。
       requestBody:
         required: true
         content:
@@ -20,22 +25,36 @@ paths:
                   description: Business ID used for user authorization. 业务 ID，用于用户权限校验。
                 space_uid:
                   type: string
-                  description: Optional space UID; must match the business. 可选空间 UID，必须与业务一致。
+                  description: 可省略，由 bk_biz_id 推导业务空间；传入时必须与该业务匹配，且空间属于当前认证租户。
                 config:
                   oneOf:
                   - type: object
                     additionalProperties: true
                   - type: string
-                  description: One AsCode group object or YAML string, without the outer groups field. 单个 AsCode
-                    group 对象或 YAML 字符串，不含外层 groups。
+                  description: |-
+                    单个 AsCode group 对象或 YAML 字符串，不含外层 groups。推荐传对象。
+                    必填 name（非空，最多 128 字符）和 rules（非空数组）；每条规则必填 record（输出指标名，最多 128 字符），expr 与 query 必须且只能选一个。
+                    expr 为当前业务可解析的 PromQL 字符串；query 为下述结构化查询。不要凭空构造来源指标，先使用实际指标预解析。
+                    可选 interval 为 1min/2min/5min/10min，默认 1min（也接受等价 60s、1m 等写法）；group 和 rule 的 labels 推荐使用键值对象，也支持对象数组。
+                    bkmonitor 可选字段：description（默认空字符串）、data_label（最多 128 字符，默认空字符串）、auto_refresh（布尔值，默认 true）、desired_status（running/stopped，默认 running）。
+                    bkmonitor.data_label 是该预计算 group 输出结果表的数据标签，用于后续查询预计算结果；配置后可通过数据标签定位输出指标，无需记住系统生成的结果表 ID。它不是时间序列维度 labels，也不是来源指标的数据标签。
+                    规则成功下发并产生数据后，用户可在当前业务中通过 data_label 和规则的 record 指标名查询预计算结果。
+                    PromQL 查询格式为 bkmonitor:<data_label>:<record>；例如 bkmonitor.data_label=cpu_summary、record=cpu_avg 时，使用 bkmonitor:cpu_summary:cpu_avg 查询预计算结果。
+                    data_label 留空表示不设置输出数据标签，仍可通过返回的 rule.table_id 与 record 指标名查询；修改或清空标签会更新输出表的查询路由，使用旧标签的查询需相应调整。
+                    apply=false 仅跳过本次立即下发；后台仍按 auto_refresh 自动下发。仅保存供后续手动下发时，应显式设置 bkmonitor.auto_refresh=false。
+                    query 必填 data_source、data_type 和非空 query_configs；可选 expression（默认 a）、functions（函数表达式字符串数组）、order_by（字符串数组）。
+                    query_configs 每项必填 metric；可选 method（聚合方法，如 avg）、alias（默认 a）、interval（秒，默认 60）、group_by（字符串数组）、where（筛选表达式字符串或条件数组）、functions（函数表达式字符串数组）、time_field、unit、query_string。
+                    例如监控时序查询使用 data_source=bk_monitor、data_type=time_series、metric=<结果表ID>.<指标名>；也可使用 <数据标签>.<指标名>。多查询时显式设置不同 alias，并在 expression 中组合。
+                    只接受上述字段；config 内不得传 bk_biz_id、bk_tenant_id、space_uid、bk_biz_ids；不支持 alert、for、annotations、limit、query_offset。
+                    最小配置示例（system_cpu_usage 需替换为实际可解析指标）：{"name":"cpu_summary","bkmonitor":{"data_label":"cpu_summary","auto_refresh":false},"rules":[{"record":"cpu_avg","expr":"avg(system_cpu_usage)"}]}。
+                    结构化查询规则示例（替换实际来源）：{"record":"cpu_avg","query":{"data_source":"bk_monitor","data_type":"time_series","query_configs":[{"metric":"system.cpu_detail.usage","method":"avg","alias":"a","interval":60,"group_by":["bk_target_ip"]}]}}。
                 id:
                   type: integer
                   minimum: 1
-                  description: Active rule ID from list_recording_rules in this business. 当前业务内未软删除的规则 ID，通过 list_recording_rules
-                    获取。
+                  description: 新建预解析时省略；编辑时传 list 返回的当前业务有效 id，并保持 config.name 与原规则一致。
       responses:
         '200':
-          description: 标准响应信封；保存与下发结果分别见 data.saved 和 data.execution
+          description: 标准信封 result/code/message/data；data 含 config、records、deployment_check；解析错误见 data.errors。
       x-bk-apigateway-resource:
         isPublic: false
         allowApplyPermission: true
@@ -56,9 +75,12 @@ paths:
   /mcp/create_recording_rule/:
     post:
       operationId: create_recording_rule
-      description: 'Create a RecordingRule; apply defaults to false. 新建预计算规则。 Requires a verified gateway user and
-        business-scoped RecordingRule permission. 必须通过网关用户鉴权并拥有当前业务的预计算规则权限。 Required IAM action: manage_recording_rule_v2.
-        所需业务权限：manage_recording_rule_v2。'
+      description: |-
+        Create a RecordingRule. 新建预计算规则；配置字段与示例见 preview_recording_rule 的 config 参数说明。建议先调用 preview_recording_rule 预解析拟创建的 config，检查 result 和 deployment_check.can_apply，再执行创建；向用户说明配置和是否下发，用户明确确认后传 confirm=true。
+        apply 默认 false，仅保存，不在本次请求立即下发；但 config.bkmonitor.auto_refresh 默认 true，后台仍可能自动下发。仅保存供手动下发时显式设置 auto_refresh=false；立即下发使用 apply=true。
+        返回标准信封 result/code/message/data；data 包含 saved、rule、config、execution。saved=true 表示声明已保存；apply=false 时 execution=null，apply=true 时检查 execution.succeeded/error。
+        保存成功不等于下发成功；下发失败仍保留声明，应使用返回的 rule.id 修正/update 或 apply 重试，避免重复 create。需要确认运行状态时使用 get_recording_rule(with_status=true)。
+        Requires a verified gateway user. 必须通过网关用户鉴权，并拥有请求业务的 manage_recording_rule_v2 权限；身份和租户取认证上下文。
       requestBody:
         required: true
         content:
@@ -75,14 +97,13 @@ paths:
                   description: Business ID used for user authorization. 业务 ID，用于用户权限校验。
                 space_uid:
                   type: string
-                  description: Optional space UID; must match the business. 可选空间 UID，必须与业务一致。
+                  description: 可省略，由 bk_biz_id 推导业务空间；传入时必须与该业务匹配，且空间属于当前认证租户。
                 config:
                   oneOf:
                   - type: object
                     additionalProperties: true
                   - type: string
-                  description: One AsCode group object or YAML string, without the outer groups field. 单个 AsCode
-                    group 对象或 YAML 字符串，不含外层 groups。
+                  description: 单个 AsCode group 对象或 YAML 字符串，不含外层 groups。完整字段、默认值与示例见 preview_recording_rule 的 config 参数说明；建议预解析后使用返回的 data.config。
                 apply:
                   type: boolean
                   default: false
@@ -95,7 +116,7 @@ paths:
                   description: Must be true after explicit user confirmation. 用户明确确认后必须传 true。
       responses:
         '200':
-          description: 标准响应信封；保存与下发结果分别见 data.saved 和 data.execution
+          description: 标准信封；data 含 saved、rule、config、execution；保存成功与执行成功分别判断。
       x-bk-apigateway-resource:
         isPublic: false
         allowApplyPermission: true
@@ -116,9 +137,13 @@ paths:
   /mcp/update_recording_rule/:
     post:
       operationId: update_recording_rule
-      description: 'Replace a RecordingRule configuration; its name and space cannot change. 修改预计算规则。 Requires a
-        verified gateway user and business-scoped RecordingRule permission. 必须通过网关用户鉴权并拥有当前业务的预计算规则权限。 Required
-        IAM action: manage_recording_rule_v2. 所需业务权限：manage_recording_rule_v2。'
+      description: |-
+        Replace a RecordingRule configuration. 完整替换配置，不是局部 PATCH；配置字段与示例见 preview_recording_rule 的 config 参数说明。
+        先 list 获取 id，再 get 获取完整 config；在返回配置上修改，保留 name 与业务空间，遗漏可选字段会恢复默认值（尤其 auto_refresh 默认为 true）。建议先携带 id 和修改后的完整 config 调用 preview_recording_rule，检查 result 和 deployment_check.can_apply，再执行更新；用户明确确认后传 confirm=true。
+        apply 默认 false，只跳过本次立即下发，不关闭后台 auto_refresh；如需仅保存供手动下发，应在 config.bkmonitor 中明确设置 auto_refresh=false。
+        停止/恢复规则：修改完整 config 中的 bkmonitor.desired_status 为 stopped/running，再使用 apply=true 执行；停止不同于删除。
+        返回标准信封 result/code/message/data；data 包含 saved、rule、config、execution。saved=true 仅表示保存成功，execution=null 表示未立即执行；执行结果检查 execution.succeeded/error。执行失败保留已保存配置，修正后 update 或 apply 重试。
+        Requires a verified gateway user. 必须通过网关用户鉴权，并拥有请求业务的 manage_recording_rule_v2 权限；身份和租户取认证上下文。
       requestBody:
         required: true
         content:
@@ -136,7 +161,7 @@ paths:
                   description: Business ID used for user authorization. 业务 ID，用于用户权限校验。
                 space_uid:
                   type: string
-                  description: Optional space UID; must match the business. 可选空间 UID，必须与业务一致。
+                  description: 可省略，由 bk_biz_id 推导业务空间；传入时必须与该业务匹配，且空间属于当前认证租户。
                 id:
                   type: integer
                   minimum: 1
@@ -147,8 +172,7 @@ paths:
                   - type: object
                     additionalProperties: true
                   - type: string
-                  description: One AsCode group object or YAML string, without the outer groups field. 单个 AsCode
-                    group 对象或 YAML 字符串，不含外层 groups。
+                  description: 单个 AsCode group 对象或 YAML 字符串，不含外层 groups。完整字段、默认值与示例见 preview_recording_rule 的 config 参数说明；建议预解析后使用返回的 data.config。先通过 get_recording_rule 获取完整配置再修改；此接口完整替换配置，保持 name 不变，遗漏可选字段会恢复默认值。
                 apply:
                   type: boolean
                   default: false
@@ -161,7 +185,7 @@ paths:
                   description: Must be true after explicit user confirmation. 用户明确确认后必须传 true。
       responses:
         '200':
-          description: 标准响应信封；保存与下发结果分别见 data.saved 和 data.execution
+          description: 标准信封；data 含 saved、rule、config、execution；保存成功与执行成功分别判断。
       x-bk-apigateway-resource:
         isPublic: false
         allowApplyPermission: true
@@ -182,9 +206,11 @@ paths:
   /mcp/delete_recording_rule/:
     post:
       operationId: delete_recording_rule
-      description: 'Soft-delete a RecordingRule and delete its Flow. Failed Flow deletion is retried in the background.
-        删除预计算规则。 Requires a verified gateway user and business-scoped RecordingRule permission. 必须通过网关用户鉴权并拥有当前业务的预计算规则
-        MCP 权限。 Required IAM action: manage_recording_rule_v2. 所需业务权限：manage_recording_rule_v2。'
+      description: |-
+        Delete a RecordingRule. 软删除规则并删除其 Flow，保留历史记录。先 list/get 确认目标，向用户说明将删除的规则后，明确确认再传 confirm=true。
+        返回标准信封 result/code/message/data；data 包含 is_deleted、rule、execution。is_deleted=true 表示已软删除，立即从 list/get 中不可见；Flow 是否删除成功须检查 execution.succeeded/error。
+        Flow 删除失败由后台重试，不要把软删除成功报告为 Flow 已删除，也不要反复使用已软删除 id 重试。只想停止计算时，使用 update 修改完整 config 的 bkmonitor.desired_status=stopped 并 apply=true。
+        Requires a verified gateway user. 必须通过网关用户鉴权，并拥有请求业务的 manage_recording_rule_v2 权限；身份和租户取认证上下文。
       requestBody:
         required: true
         content:
@@ -201,7 +227,7 @@ paths:
                   description: Business ID used for user authorization. 业务 ID，用于用户权限校验。
                 space_uid:
                   type: string
-                  description: Optional space UID; must match the business. 可选空间 UID，必须与业务一致。
+                  description: 可省略，由 bk_biz_id 推导业务空间；传入时必须与该业务匹配，且空间属于当前认证租户。
                 id:
                   type: integer
                   minimum: 1
@@ -214,7 +240,7 @@ paths:
                   description: Must be true after explicit user confirmation. 用户明确确认后必须传 true。
       responses:
         '200':
-          description: 标准响应信封；保存与下发结果分别见 data.saved 和 data.execution
+          description: 标准信封；data 含 is_deleted、rule、execution；软删除与 Flow 删除结果分别判断。
       x-bk-apigateway-resource:
         isPublic: false
         allowApplyPermission: true
@@ -235,12 +261,15 @@ paths:
   /mcp/get_recording_rule/:
     post:
       operationId: get_recording_rule
-      description: 'Read the current configuration; with_status optionally observes the running Flow. 查询预计算规则。 Requires
-        a verified gateway user and business-scoped RecordingRule permission. 必须通过网关用户鉴权并拥有当前业务的预计算规则权限。 Required
-        IAM action: view_recording_rule_v2. 所需业务权限：view_recording_rule_v2。'
+      description: |-
+        Get a RecordingRule. 读取当前已保存配置，用于查看详情、修改前获取完整 config、或下发后观测状态。先 list_recording_rules 获取当前业务的有效 id。
+        返回标准信封 result/code/message/data；data.rule 为本地规则元信息与状态，data.config 为可直接用于 preview/update 的单 group 配置，data.observation 为运行状态观测结果。
+        with_status 默认 false，此时 observation=null；true 时查询已下发 Flow 并刷新本地健康状态，检查 observation.succeeded/flow_status/error。尚未下发时 succeeded=false、flow_status=null、error=尚未下发 Flow。
+        观测失败不会让已保存配置读取失败；本地 rule.status 和配置保存成功均不能单独证明 Flow 正常运行。
+        Requires a verified gateway user. 必须通过网关用户鉴权，并拥有请求业务的 view_recording_rule_v2 权限；身份和租户取认证上下文。
       responses:
         '200':
-          description: 标准响应信封；保存与下发结果分别见 data.saved 和 data.execution
+          description: 标准信封；data 含 rule、config、observation；未请求观测时 observation=null。
       x-bk-apigateway-resource:
         isPublic: false
         allowApplyPermission: true
@@ -268,7 +297,7 @@ paths:
                   description: Business ID used for user authorization. 业务 ID，用于用户权限校验。
                 space_uid:
                   type: string
-                  description: Optional space UID; must match the business. 可选空间 UID，必须与业务一致。
+                  description: 可省略，由 bk_biz_id 推导业务空间；传入时必须与该业务匹配，且空间属于当前认证租户。
                 id:
                   type: integer
                   minimum: 1
@@ -287,9 +316,11 @@ paths:
   /mcp/apply_recording_rule/:
     post:
       operationId: apply_recording_rule
-      description: 'Resolve and apply the saved RecordingRule declaration. 下发预计算规则。 Requires a verified gateway
-        user and business-scoped RecordingRule permission. 必须通过网关用户鉴权并拥有当前业务的预计算规则权限。 Required IAM action: manage_recording_rule_v2.
-        所需业务权限：manage_recording_rule_v2。'
+      description: |-
+        Apply a saved RecordingRule. 重新解析并下发当前已保存声明，不接收新 config。先 list/get 确认目标与当前配置，需要检查部署条件时使用该 id/config 调用 preview；用户明确确认后传 confirm=true。
+        本次手动下发不受 auto_refresh=false 阻止，也不会修改 auto_refresh；执行当前 desired_status（running/stopped）。部署时按当前限制再次检查，预解析通过不保证本次执行成功。
+        返回标准信封 result/code/message/data；data 包含 rule、execution，必须检查 execution.succeeded/error，不能仅凭 HTTP 200 或 result=true 判断下发成功。失败保留声明，可修正配置后重试。执行成功后可用 get_recording_rule(with_status=true) 观测 Flow。
+        Requires a verified gateway user. 必须通过网关用户鉴权，并拥有请求业务的 manage_recording_rule_v2 权限；身份和租户取认证上下文。
       requestBody:
         required: true
         content:
@@ -306,7 +337,7 @@ paths:
                   description: Business ID used for user authorization. 业务 ID，用于用户权限校验。
                 space_uid:
                   type: string
-                  description: Optional space UID; must match the business. 可选空间 UID，必须与业务一致。
+                  description: 可省略，由 bk_biz_id 推导业务空间；传入时必须与该业务匹配，且空间属于当前认证租户。
                 id:
                   type: integer
                   minimum: 1
@@ -319,7 +350,7 @@ paths:
                   description: Must be true after explicit user confirmation. 用户明确确认后必须传 true。
       responses:
         '200':
-          description: 标准响应信封；保存与下发结果分别见 data.saved 和 data.execution
+          description: 标准信封；data 含 rule、execution；检查 execution.succeeded/error。
       x-bk-apigateway-resource:
         isPublic: false
         allowApplyPermission: true
@@ -340,12 +371,15 @@ paths:
   /mcp/list_recording_rules/:
     post:
       operationId: list_recording_rules
-      description: 'List active RecordingRules with pagination and local status only. 列出预计算规则。 Requires a verified
-        gateway user and business-scoped RecordingRule permission. 必须通过网关用户鉴权并拥有当前业务的预计算规则权限。 Required IAM action:
-        view_recording_rule_v2. 所需业务权限：view_recording_rule_v2。'
+      description: |-
+        List RecordingRules. 从此工具开始发现当前业务的未软删除规则和 id；只读取本地状态，不访问 BKBase。业务 ID 必填，未提供时应向用户获取，不能猜测。
+        可按 name 模糊匹配、app/status 精确筛选；page 默认 1，page_size 默认 20、最大 100。返回标准信封 result/code/message/data；data 包含 items、total、page、page_size，继续翻页直至覆盖 total。
+        items 为规则摘要，含 id/name/space_uid/app/status/desired_status/auto_refresh 等，不含完整配置。查看或修改配置用 get_recording_rule；确认 Flow 实时状态用 get_recording_rule(with_status=true)。
+        新建流程：preview → 用户确认 → create；修改流程：list → get → 修改完整 config → preview(id) → 用户确认 → update；单独下发使用 apply，删除使用 delete。
+        Requires a verified gateway user. 必须通过网关用户鉴权，并拥有请求业务的 view_recording_rule_v2 权限；身份和租户取认证上下文。
       responses:
         '200':
-          description: 标准响应信封；保存与下发结果分别见 data.saved 和 data.execution
+          description: 标准信封；data 含 items、total、page、page_size；items 不含完整 config。
       x-bk-apigateway-resource:
         isPublic: false
         allowApplyPermission: true
@@ -373,7 +407,7 @@ paths:
                   description: Business ID used for user authorization. 业务 ID，用于用户权限校验。
                 space_uid:
                   type: string
-                  description: Optional space UID; must match the business. 可选空间 UID，必须与业务一致。
+                  description: 可省略，由 bk_biz_id 推导业务空间；传入时必须与该业务匹配，且空间属于当前认证租户。
                 name:
                   type: string
                   description: Filter by part of the group name. 按规则组名称模糊筛选。
@@ -383,18 +417,18 @@ paths:
                   description: Filter by the owning AsCode app. 按托管的 AsCode app 筛选。
                 status:
                   type: string
-                  description: Filter by local rule status. 按规则本地状态筛选。
+                  description: 按本地状态精确筛选：created/pending/running/stopped/outdated/deleting/failed/deleted；软删除规则始终排除。本地状态不等同于实时 Flow 健康状态。
                 page:
                   type: integer
                   default: 1
                   minimum: 1
-                  description: Page number, starting at 1. 页码，从 1 开始。
+                  description: 页码，从 1 开始，默认 1。
                 page_size:
                   type: integer
                   default: 20
                   minimum: 1
                   maximum: 100
-                  description: Page size, up to 100. 每页数量，最多 100。
+                  description: 每页数量，默认 20，最多 100。
               required:
               - bk_biz_id
       tags:
